@@ -1,0 +1,117 @@
+# AgenticBugHunter
+
+AgenticBugHunter is a **project-local Git security gate**. Install the command once, then run `agenticbughunter init` inside any Git project. The project gets its own `.agenticbughunter.toml`, local run logs, and an optional managed `pre-push` hook.
+
+The workflow is inspired by the separation used by `no-mistakes`: review in an isolated Git worktree, run a staged agentic validation pipeline, and stop the push when accepted findings remain. AgenticBugHunter does not replace or reimplement your BM25 model; Stage 3 calls the BM25/SAST endpoint you configure.
+
+## Install
+
+```bash
+python -m pip install -e .
+agenticbughunter --help
+```
+
+
+For setting up
+conda activate agenticbughunter
+
+cd /Users/nishant/Desktop/Units/AgenticBugHunter/bm25_model
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install fastapi "uvicorn[standard]"
+
+
+
+For a global command, you can also install the package with `pipx`.
+
+## Add AgenticBugHunter to a project
+
+```bash
+cd /path/to/your/git/project
+agenticbughunter init
+```
+
+`init` creates:
+
+- `.agenticbughunter.toml` — project-local configuration
+- `.agenticbughunter/runs/` — run artifacts (ignored by Git)
+- a managed `pre-push` hook when the project does not already have an incompatible hook
+
+Then configure your OpenAI-compatible endpoint and existing BM25 endpoint in `.agenticbughunter.toml`.
+
+## Run manually
+
+```bash
+agenticbughunter review --base origin/main --head HEAD
+agenticbughunter gate --base origin/main --head HEAD
+```
+
+`review` always exits 0 when the pipeline itself completed. `gate` exits 1 when accepted findings block the change, and exits 2 for operational/configuration errors.
+
+## Git push gate
+
+After initialization, a normal push runs the security gate first:
+
+```bash
+git push origin my-branch
+```
+
+The hook reviews the exact local SHA that Git is about to push. For an existing remote branch it compares against the remote SHA supplied by Git. For a new branch it lets AgenticBugHunter resolve a safe base; it never silently compares HEAD to itself.
+
+## Run artifacts
+
+Each run is saved under:
+
+```text
+.agenticbughunter/runs/<run-id>/
+├── run.log
+├── events.jsonl
+├── config.json
+├── review.diff
+├── comments.json
+├── result.json
+├── stage1_candidates/
+├── stage2_context/
+├── stage3_hypotheses/
+├── stage4_judge/
+└── stage5_filter/
+```
+
+Failed runs also get a `result.json` with `status: "error"`.
+
+## BM25
+
+AgenticBugHunter contains an HTTP adapter only. Configure your existing service:
+
+```toml
+[bm25]
+endpoint = "http://localhost:5056/predict"
+```
+
+or set:
+
+```bash
+export SAST_RETRIEVER_URL=http://localhost:5056/predict
+```
+
+The bundled `bm25_model/` folder is retained from the supplied project for convenience; it is not imported as the AgenticBugHunter retrieval implementation.
+
+## Useful commands
+
+```bash
+agenticbughunter init
+agenticbughunter doctor
+agenticbughunter review
+agenticbughunter gate
+agenticbughunter install-hook
+agenticbughunter uninstall-hook
+agenticbughunter show-run
+```
+
+## Development
+
+```bash
+python -m pip install -e .
+python -m unittest discover -s tests -v
+```
