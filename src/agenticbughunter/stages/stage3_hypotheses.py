@@ -10,7 +10,7 @@ from ..config import Config
 from ..llm import AgentRunner, OpenAICompatibleClient, ToolRegistry
 from ..resources import prompt
 from ..runlog import RunLogger
-from ..tools.bm25 import BM25Client, compact_rules, make_bm25_tool
+from ..tools.bm25 import BM25Retriever, compact_rules, make_bm25_tool
 
 
 def _normalise_cwe(value: Any) -> str:
@@ -50,7 +50,7 @@ class Stage3Hypotheses(Stage):
         self.config = config
         self.client = client
         self._logger = logger
-        self.bm25: BM25Client | None = None
+        self.bm25: BM25Retriever | None = None
 
     def execute(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         stage_dir = self._logger.stage_dir(self.name)
@@ -60,7 +60,7 @@ class Stage3Hypotheses(Stage):
             self._logger.write_json(stage_dir / "output.json", results)
             return results
 
-        self.bm25 = BM25Client(self.config.bm25, self._logger)
+        self.bm25 = BM25Retriever(self.config.bm25, self._logger)
         system = prompt("stage3_hypotheses.md").replace("__MAX_HYPOTHESES__", str(self.config.pipeline.max_hypotheses))
 
         for candidate in candidates:

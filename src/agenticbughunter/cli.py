@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import load_config
+from . import __version__
+from .config import environment_overrides, load_config
+from .config_edit import get_config_value, known_config_keys, set_config_value
 from .git import GitError, repo_root, resolve_default_base
+from .models import Finding, PipelineResult, StageResult
 from .pipeline import PipelineExecutionError, SecureReviewPipeline
+from .ui import TerminalUI
 
 
 CONFIG_NAME = ".agenticbughunter.toml"
@@ -18,19 +23,17 @@ STATE_DIR = ".agenticbughunter"
 HOOK_BEGIN = "# >>> agenticbughunter managed gate >>>"
 HOOK_END = "# <<< agenticbughunter managed gate <<<"
 
-EXAMPLE_CONFIG = """[llm]
+EXAMPLE_CONFIG = """# AgenticBugHunter project configuration
+#
+# Every setting can also be overridden temporarily with an ABH_* environment
+# variable. Run `agenticbughunter config env` to see the full mapping.
+
+[llm]
 base_url = "http://localhost:11434/v1"
-api_key = "ollama"
 model = "qwen3-coder:30b"
 timeout_seconds = 300
 max_tokens = 6000
 temperature = 0.0
-
-[bm25]
-endpoint = "http://localhost:5056/predict"
-timeout_seconds = 120
-top_k = 10
-max_requests_per_candidate = 4
 
 [pipeline]
 max_candidates = 5
@@ -41,17 +44,28 @@ block_on_findings = true
 isolate_worktree = true
 keep_worktree = false
 
+[bm25]
+top_k = 10
+max_requests_per_candidate = 4
+
 [agents]
-stage1_max_steps = 4
-stage2_max_steps = 10
-stage3_max_steps = 8
+stage1_max_steps = 30
+stage2_max_steps = 30
+stage3_max_steps = 30
 stage4_mode = "api"
-stage4_max_steps = 5
+stage4_max_steps = 10
 
 [repository]
-context_radius = 20
-max_read_lines = 220
+context_radius = 200
+max_read_lines = 300
 max_search_results = 30
+
+# Presentation only. These settings never change review decisions.
+[ui]
+banner = true
+live_progress = true
+show_config = true
+show_stage_details = true
 """
 
 HOOK_BLOCK = f'''{HOOK_BEGIN}
@@ -90,10 +104,25 @@ done
 
 
 def _config_path(repo: Path, explicit: str | None) -> Path | None:
+    # Selection order: CLI --config, ABH_CONFIG, project TOML, defaults.
     if explicit:
         return Path(explicit).expanduser().resolve()
+    env_path = os.getenv("ABH_CONFIG")
+    if env_path:
+        candidate = Path(env_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = repo / candidate
+        return candidate.resolve()
     local = repo / CONFIG_NAME
     return local if local.is_file() else None
+
+
+def _active_environment_overrides() -> list[str]:
+    names = [name for name in environment_overrides() if name in os.environ]
+    for legacy in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"):
+        if legacy in os.environ:
+            names.append(legacy)
+    return sorted(set(names))
 
 
 def _git_hooks_dir(repo: Path) -> Path:
@@ -176,43 +205,47 @@ def _uninstall_hook(repo: Path) -> tuple[Path, bool]:
 
 def cmd_init(args: argparse.Namespace) -> int:
     repo = repo_root(args.repo)
+    ui = TerminalUI()
+    ui.title("Project setup", version=__version__)
     path = repo / CONFIG_NAME
     if path.exists() and not args.force:
-        print(f"Config already exists: {path}")
+        ui.info(f"Configuration already exists  {path}")
     else:
         path.write_text(EXAMPLE_CONFIG, encoding="utf-8")
-        print(f"Created {path}")
+        ui.success(f"Configuration created  {path}")
 
     (repo / STATE_DIR / "runs").mkdir(parents=True, exist_ok=True)
     _ensure_gitignore(repo)
-    print(f"Runtime state: {repo / STATE_DIR}")
+    ui.success(f"Runtime state ready  {repo / STATE_DIR}")
 
     if not args.no_hook:
         try:
             hook, action = _install_hook(repo, force=False)
-            print(f"Pre-push hook: {action} ({hook})")
+            ui.success(f"Pre-push hook {action}  {hook}")
         except RuntimeError as exc:
-            print(f"Hook not installed: {exc}", file=sys.stderr)
-    print("Configure [llm] and your existing [bm25].endpoint, then run: agenticbughunter doctor")
+            ui.warning(f"Hook not installed: {exc}")
+    ui.info("Next: agenticbughunter doctor")
     return 0
 
 
 def _run(args: argparse.Namespace, gate: bool) -> int:
     repo = repo_root(args.repo)
-    cfg = load_config(_config_path(repo, args.config))
-    result = SecureReviewPipeline(cfg).run(repo, base=args.base, head=args.head)
+    config_path = _config_path(repo, args.config)
+    cfg = load_config(config_path)
+    ui = TerminalUI.from_config(cfg, enabled=not args.json, color=False if args.plain else None)
+    ui.set_context(
+        cfg=cfg,
+        config_path=config_path,
+        active_env=_active_environment_overrides(),
+        version=__version__,
+    )
+    result = SecureReviewPipeline(cfg, progress=ui.progress_event if not args.json else None).run(
+        repo, base=args.base, head=args.head
+    )
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     else:
-        print(f"AgenticBugHunter: {result.status.upper()}  run={result.run_id}")
-        print(f"Logs: {result.run_dir}")
-        if result.findings:
-            for finding in result.findings:
-                change_type = str(finding.assessment.get("change_type") or "A")
-                print(f"\n{finding.filepath}:{finding.changed_line} [{change_type}]  {finding.cwe_id}  score={finding.final_score:.3f}")
-                print(finding.review_comment)
-        else:
-            print("No supported findings passed the configured threshold.")
+        ui.final_result(result)
     return 1 if gate and result.status == "block" else 0
 
 
@@ -247,7 +280,19 @@ def cmd_show_run(args: argparse.Namespace) -> int:
     if not path.is_file():
         print(f"Run result not found: {path}")
         return 1
-    print(path.read_text(encoding="utf-8"), end="")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if args.json or raw.get("status") == "error":
+        print(json.dumps(raw, ensure_ascii=False, indent=2))
+        return 0
+    result = PipelineResult(
+        run_id=str(raw.get("run_id") or path.parent.name),
+        status=str(raw.get("status") or "unknown"),
+        findings=[Finding(**item) for item in raw.get("findings", [])],
+        comments=list(raw.get("comments", [])),
+        run_dir=str(raw.get("run_dir") or path.parent),
+        stages=[StageResult(**item) for item in raw.get("stages", [])],
+    )
+    TerminalUI(color=False if args.plain else None).final_result(result)
     return 0
 
 
@@ -255,26 +300,93 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     repo = repo_root(args.repo)
     config_path = _config_path(repo, args.config)
     cfg = load_config(config_path)
-    print("AgenticBugHunter doctor")
-    print(f"  repo:   {repo}")
-    print(f"  config: {config_path or '(built-in defaults)'}")
-    print(f"  llm:    {cfg.llm.base_url}  model={cfg.llm.model}")
-    print(f"  bm25:   {cfg.bm25.endpoint}")
+    ui = TerminalUI.from_config(cfg, color=False if args.plain else None)
+    ui.set_context(cfg=cfg, config_path=config_path, active_env=_active_environment_overrides(), version=__version__)
+    ui.title("Environment check", version=__version__)
+    ui.success(f"Repository  {repo}")
+    ui.success(f"Configuration  {config_path or 'built-in defaults'}")
+    ui.success(f"LLM  {cfg.llm.model} @ {cfg.llm.base_url}")
+    from .bm25 import DEFAULT_MODEL_DIR, SASTRetriever
+    retriever = SASTRetriever(DEFAULT_MODEL_DIR)
+    ui.success(
+        "Local BM25  "
+        f"{len(retriever.rules)} rules / {retriever.metadata.get('cwe_count')} CWEs"
+    )
     try:
         base = resolve_default_base(repo, head=args.head)
-        print(f"  base:   {base}")
+        ui.success(f"Git review base  {base}")
     except GitError as exc:
-        print(f"  base:   WARNING: {exc}")
+        ui.warning(f"Git review base  {exc}")
     hook = _git_hooks_dir(repo) / "pre-push"
     managed = hook.is_file() and HOOK_BEGIN in hook.read_text(encoding="utf-8", errors="replace")
-    print(f"  hook:   {'managed' if managed else 'not installed'}")
-    print("Configuration and package checks passed.")
+    if managed:
+        ui.success(f"Pre-push gate managed  {hook}")
+    else:
+        ui.warning("Pre-push gate not installed")
+    ui.blank()
+    ui.success("AgenticBugHunter is ready")
+    return 0
+
+
+def _project_config_path(repo: Path, explicit: str | None) -> Path:
+    selected = _config_path(repo, explicit)
+    return selected if selected is not None else repo / CONFIG_NAME
+
+
+def cmd_config_show(args: argparse.Namespace) -> int:
+    repo = repo_root(args.repo)
+    path = _config_path(repo, args.config)
+    cfg = load_config(path)
+    ui = TerminalUI.from_config(cfg, color=False if args.plain else None)
+    ui.set_context(cfg=cfg, config_path=path, active_env=_active_environment_overrides(), version=__version__)
+    ui.config_summary(cfg, path=path)
+    return 0
+
+
+def cmd_config_get(args: argparse.Namespace) -> int:
+    repo = repo_root(args.repo)
+    cfg = load_config(_config_path(repo, args.config))
+    value = get_config_value(cfg, args.key)
+    if "api_key" in args.key:
+        value = "***REDACTED***" if value else ""
+    print(value)
+    return 0
+
+
+def cmd_config_set(args: argparse.Namespace) -> int:
+    repo = repo_root(args.repo)
+    path = _project_config_path(repo, args.config)
+    value = set_config_value(path, args.key, args.value)
+    ui = TerminalUI(color=False if args.plain else None)
+    display_value = "***REDACTED***" if "api_key" in args.key and value else value
+    ui.success(f"{args.key} = {display_value}")
+    ui.info(f"Saved to {path}")
+    return 0
+
+
+def cmd_config_env(args: argparse.Namespace) -> int:
+    ui = TerminalUI(color=False if args.plain else None)
+    ui.title("Environment overrides", version=__version__)
+    ui.info("TOML is the normal project configuration; environment values are temporary overrides for CI/experiments.")
+    ui.key_value("ABH_CONFIG", "select an alternate TOML file")
+    ui.blank()
+    for env_name, (section, field_name) in sorted(environment_overrides().items()):
+        ui.key_value(env_name, f"{section}.{field_name}")
+    ui.blank()
+    ui.info("OPENAI_BASE_URL, OPENAI_API_KEY and OPENAI_MODEL remain supported for compatibility.")
+    return 0
+
+
+def cmd_config_path(args: argparse.Namespace) -> int:
+    repo = repo_root(args.repo)
+    path = _config_path(repo, args.config)
+    print(path if path is not None else "built-in defaults")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agenticbughunter", description="Project-local agentic secure-code-review Git gate")
-    parser.add_argument("--version", action="version", version="AgenticBugHunter 0.2.0")
+    parser.add_argument("--version", action="version", version=f"AgenticBugHunter {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init", help="Add AgenticBugHunter configuration/runtime state to a Git project")
@@ -290,6 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--head", default="HEAD")
         p.add_argument("--config", default=None)
         p.add_argument("--json", action="store_true", help="write only result JSON to stdout")
+        p.add_argument("--plain", action="store_true", help="disable terminal colours")
         p.set_defaults(func=lambda a, g=gate: _run(a, g))
 
     p = sub.add_parser("install-hook", help="Install/update the managed project pre-push gate")
@@ -301,8 +414,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", default=".")
     p.set_defaults(func=cmd_uninstall_hook)
 
-    p = sub.add_parser("show-run", help="Print a saved run result, including failed runs")
+    p = sub.add_parser("show-run", help="Show a saved run result")
     p.add_argument("--repo", default=".")
+    p.add_argument("--json", action="store_true", help="print raw saved JSON")
+    p.add_argument("--plain", action="store_true", help="disable terminal colours")
     p.add_argument("run_id", nargs="?")
     p.set_defaults(func=cmd_show_run)
 
@@ -310,7 +425,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", default=".")
     p.add_argument("--config", default=None)
     p.add_argument("--head", default="HEAD")
+    p.add_argument("--plain", action="store_true", help="disable terminal colours")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("config", help="Inspect or change AgenticBugHunter configuration")
+    config_sub = p.add_subparsers(dest="config_command", required=True)
+
+    c = config_sub.add_parser("show", help="Show the effective configuration")
+    c.add_argument("--repo", default=".")
+    c.add_argument("--config", default=None)
+    c.add_argument("--plain", action="store_true")
+    c.set_defaults(func=cmd_config_show)
+
+    c = config_sub.add_parser("get", help="Read one effective setting")
+    c.add_argument("key", choices=known_config_keys())
+    c.add_argument("--repo", default=".")
+    c.add_argument("--config", default=None)
+    c.set_defaults(func=cmd_config_get)
+
+    c = config_sub.add_parser("set", help="Update one project setting without hand-editing TOML")
+    c.add_argument("key", choices=known_config_keys())
+    c.add_argument("value")
+    c.add_argument("--repo", default=".")
+    c.add_argument("--config", default=None)
+    c.add_argument("--plain", action="store_true")
+    c.set_defaults(func=cmd_config_set)
+
+    c = config_sub.add_parser("path", help="Show the active TOML configuration path")
+    c.add_argument("--repo", default=".")
+    c.add_argument("--config", default=None)
+    c.set_defaults(func=cmd_config_path)
+
+    c = config_sub.add_parser("env", help="Show supported ABH_* environment overrides")
+    c.add_argument("--plain", action="store_true")
+    c.set_defaults(func=cmd_config_env)
     return parser
 
 

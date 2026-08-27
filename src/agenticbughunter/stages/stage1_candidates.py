@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .base import Stage
@@ -37,9 +38,9 @@ class Stage1Candidates(Stage):
         radius: int = 8,
     ) -> str:
         values = [
-            x
-            for x in parse_unified_diff(self.diff_text)
-            if x.filepath == filepath
+            item
+            for item in parse_unified_diff(self.diff_text)
+            if item.filepath == filepath
         ]
 
         target = None
@@ -87,7 +88,6 @@ class Stage1Candidates(Stage):
         stage_dir = self._logger.stage_dir(self.name)
 
         parsed = parse_unified_diff(self.diff_text)
-
         annotated = annotate_diff(self.diff_text)
 
         self._logger.write_text(
@@ -100,16 +100,14 @@ class Stage1Candidates(Stage):
             self.diff_text,
         )
 
-        # Only actual non-empty changed lines are eligible.
+        # Only actual non-whitespace changed lines can become candidates.
         allowed = {
             key: statement
-            for key, statement
-            in changed_line_map(parsed).items()
+            for key, statement in changed_line_map(parsed).items()
             if statement.strip()
         }
 
-        # If the commit only contains blank-line changes,
-        # do not call the LLM.
+        # Nothing meaningful changed -> no reason to call the LLM.
         if not allowed:
             self._logger.write_json(
                 stage_dir / "output.json",
@@ -127,6 +125,12 @@ class Stage1Candidates(Stage):
         user = (
             "ANNOTATED DIFF:\n\n"
             + annotated
+            + "\n\n"
+            + "Return a JSON ARRAY of at most "
+            + str(self.config.pipeline.max_candidates)
+            + " candidates. "
+            + "The statement field must be a valid JSON string "
+            + "with embedded quotes properly escaped."
         )
 
         agent = AgentRunner(
@@ -138,18 +142,49 @@ class Stage1Candidates(Stage):
             artifact_dir=stage_dir,
         )
 
-        raw = agent.run(system, user)
+        raw = agent.run(
+            system,
+            user,
+        )
 
+        # ---------------------------------------------------------
+        # Normalize valid Stage-1 output shapes
+        # ---------------------------------------------------------
+
+        # Wrapped JSON may occasionally come back as a string.
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                pass
+
+        # Accept:
+        # {
+        #     "candidates": [...]
+        # }
         if (
             isinstance(raw, dict)
             and isinstance(raw.get("candidates"), list)
         ):
             raw = raw["candidates"]
 
+        # Accept a genuinely returned single candidate.
+        elif (
+            isinstance(raw, dict)
+            and raw.get("filepath")
+            and raw.get("changed_line") is not None
+        ):
+            raw = [raw]
+
         if not isinstance(raw, list):
             raise ValueError(
-                "Stage 1 final answer must be a JSON array of candidates"
+                "Stage 1 final answer must be a JSON array of candidates; "
+                f"received {type(raw).__name__}: {raw!r}"
             )
+
+        # ---------------------------------------------------------
+        # Deterministic candidate validation
+        # ---------------------------------------------------------
 
         out: list[dict[str, Any]] = []
         seen: set[tuple[str, int, str]] = set()
@@ -162,6 +197,9 @@ class Stage1Candidates(Stage):
             path = str(
                 item.get("filepath") or ""
             )
+
+            if not path:
+                continue
 
             try:
                 line = int(
@@ -185,12 +223,15 @@ class Stage1Candidates(Stage):
                 change_type,
             )
 
-            # Important:
-            # model can inspect the whole repo,
-            # but candidate must be an actual changed line.
-            if key not in allowed or key in seen:
+            # Agent can read anywhere in the repo,
+            # but the candidate itself must be an actual changed line.
+            if key not in allowed:
                 continue
 
+            if key in seen:
+                continue
+
+            # Always use the canonical statement from Git diff.
             statement = allowed[key]
 
             try:

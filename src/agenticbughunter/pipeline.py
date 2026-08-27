@@ -4,6 +4,7 @@ import hashlib
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable
 
 from .config import Config, validate_config
 from .git import diff as git_diff, isolated_workspace, repo_root, resolve_default_base, resolve_ref
@@ -30,8 +31,39 @@ class PipelineExecutionError(RuntimeError):
 class SecureReviewPipeline:
     """Five-stage project-local secure-review Git gate."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, progress: Callable[[str, dict[str, Any]], None] | None = None):
         self.config = validate_config(config)
+        self.progress = progress
+
+    def _emit(self, event: str, **payload: Any) -> None:
+        if self.progress is None:
+            return
+        try:
+            self.progress(event, payload)
+        except Exception:
+            # Presentation must never change secure-review behaviour.
+            return
+
+    def _execute_stage(self, index: int, stage, value: Any) -> StageResult:
+        self._emit("stage_started", stage=stage.name, index=index)
+        try:
+            result = stage.timed_execute(value)
+        except Exception as exc:
+            self._emit(
+                "stage_failed",
+                stage=stage.name,
+                index=index,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        self._emit(
+            "stage_completed",
+            stage=stage.name,
+            index=index,
+            duration_ms=result.duration_ms,
+            output=result.output,
+        )
+        return result
 
     def run(self, repo: str | Path = ".", *, base: str | None = None, head: str = "HEAD") -> PipelineResult:
         source_repo = repo_root(repo)
@@ -53,6 +85,15 @@ class SecureReviewPipeline:
             run_id=run_id,
         )
         logger.write_json(run_dir / "config.json", asdict(self.config))
+        self._emit(
+            "pipeline_started",
+            repo=str(source_repo),
+            base=selected_base,
+            head=head,
+            run_id=run_id,
+            model=self.config.llm.model,
+            threshold=self.config.pipeline.confidence_threshold,
+        )
 
         try:
             diff_text = git_diff(source_repo, base_sha, head_sha)
@@ -62,6 +103,7 @@ class SecureReviewPipeline:
                 logger.write_json(run_dir / "comments.json", [])
                 logger.write_json(run_dir / "result.json", result.to_dict())
                 logger.info("COMPLETED pipeline", status="pass", reason="empty_diff_between_distinct_commits")
+                self._emit("empty_diff")
                 return result
 
             with isolated_workspace(
@@ -71,18 +113,19 @@ class SecureReviewPipeline:
                 keep=self.config.pipeline.keep_worktree,
             ) as workspace:
                 logger.info("workspace ready", path=str(workspace.root), isolated=workspace.temporary)
+                self._emit("workspace_ready", path=str(workspace.root), isolated=workspace.temporary)
                 repo_tools = RepositoryTools(workspace.root, self.config.repository, base_ref=base_sha)
                 client = OpenAICompatibleClient(self.config.llm, logger)
 
-                s1 = Stage1Candidates(self.config, client, logger, repo_tools, diff_text).timed_execute(None)
+                s1 = self._execute_stage(1, Stage1Candidates(self.config, client, logger, repo_tools, diff_text), None)
                 stage_results.append(s1)
-                s2 = Stage2Context(self.config, client, logger, repo_tools).timed_execute(s1.output)
+                s2 = self._execute_stage(2, Stage2Context(self.config, client, logger, repo_tools), s1.output)
                 stage_results.append(s2)
-                s3 = Stage3Hypotheses(self.config, client, logger).timed_execute(s2.output)
+                s3 = self._execute_stage(3, Stage3Hypotheses(self.config, client, logger), s2.output)
                 stage_results.append(s3)
-                s4 = Stage4Judge(self.config, client, logger, repo_tools).timed_execute(s3.output)
+                s4 = self._execute_stage(4, Stage4Judge(self.config, client, logger, repo_tools), s3.output)
                 stage_results.append(s4)
-                s5 = Stage5Filter(self.config, logger).timed_execute(s4.output)
+                s5 = self._execute_stage(5, Stage5Filter(self.config, logger), s4.output)
                 stage_results.append(s5)
 
             findings = [Finding(**item) for item in s5.output["findings"]]

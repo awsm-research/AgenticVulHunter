@@ -1,117 +1,149 @@
 # AgenticBugHunter
 
-AgenticBugHunter is a **project-local Git security gate**. Install the command once, then run `agenticbughunter init` inside any Git project. The project gets its own `.agenticbughunter.toml`, local run logs, and an optional managed `pre-push` hook.
+AgenticBugHunter is a project-local, staged secure-code-review Git gate.
 
-The workflow is inspired by the separation used by `no-mistakes`: review in an isolated Git worktree, run a staged agentic validation pipeline, and stop the push when accepted findings remain. AgenticBugHunter does not replace or reimplement your BM25 model; Stage 3 calls the BM25/SAST endpoint you configure.
+## Pipeline
+
+1. **Stage 1 : Candidate localisation**  
+   Identifies suspicious added or deleted diff lines.
+
+2. **Stage 2 : Context enrichment**  
+   Explores relevant repository context for each candidate.
+
+3. **Stage 3 : CWE hypothesis generation**  
+   Uses the bundled BM25/SAST retriever to retrieve and reason over CWE candidates.
+
+4. **Stage 4 : Validation**  
+   Validates each candidate and CWE hypothesis.
+
+5. **Stage 5 : Filtering**  
+   Applies the confidence threshold and produces supported findings.
+
+BM25 runs locally inside AgenticBugHunter. No separate BM25 server or endpoint is required.
 
 ## Install
 
+Install AgenticBugHunter directly from GitHub:
+
+```bash
+pipx install "git+https://github.com/awsm-research/AgenticBugHunter.git"
+```
+
+For development:
+
 ```bash
 python -m pip install -e .
-agenticbughunter --help
 ```
 
-
-For setting up
-conda activate agenticbughunter
-
-cd /Users/nishant/Desktop/Units/AgenticBugHunter/bm25_model
-
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip install fastapi "uvicorn[standard]"
-
-
-
-For a global command, you can also install the package with `pipx`.
-
-## Add AgenticBugHunter to a project
-
-```bash
-cd /path/to/your/git/project
-agenticbughunter init
-```
-
-`init` creates:
-
-- `.agenticbughunter.toml` — project-local configuration
-- `.agenticbughunter/runs/` — run artifacts (ignored by Git)
-- a managed `pre-push` hook when the project does not already have an incompatible hook
-
-Then configure your OpenAI-compatible endpoint and existing BM25 endpoint in `.agenticbughunter.toml`.
-
-## Run manually
-
-```bash
-agenticbughunter review --base origin/main --head HEAD
-agenticbughunter gate --base origin/main --head HEAD
-```
-
-`review` always exits 0 when the pipeline itself completed. `gate` exits 1 when accepted findings block the change, and exits 2 for operational/configuration errors.
-
-## Git push gate
-
-After initialization, a normal push runs the security gate first:
-
-```bash
-git push origin my-branch
-```
-
-The hook reviews the exact local SHA that Git is about to push. For an existing remote branch it compares against the remote SHA supplied by Git. For a new branch it lets AgenticBugHunter resolve a safe base; it never silently compares HEAD to itself.
-
-## Run artifacts
-
-Each run is saved under:
-
-```text
-.agenticbughunter/runs/<run-id>/
-├── run.log
-├── events.jsonl
-├── config.json
-├── review.diff
-├── comments.json
-├── result.json
-├── stage1_candidates/
-├── stage2_context/
-├── stage3_hypotheses/
-├── stage4_judge/
-└── stage5_filter/
-```
-
-Failed runs also get a `result.json` with `status: "error"`.
-
-## BM25
-
-AgenticBugHunter contains an HTTP adapter only. Configure your existing service:
-
-```toml
-[bm25]
-endpoint = "http://localhost:5056/predict"
-```
-
-or set:
-
-```bash
-export SAST_RETRIEVER_URL=http://localhost:5056/predict
-```
-
-The bundled `bm25_model/` folder is retained from the supplied project for convenience; it is not imported as the AgenticBugHunter retrieval implementation.
-
-## Useful commands
+## Initialize
 
 ```bash
 agenticbughunter init
 agenticbughunter doctor
-agenticbughunter review
-agenticbughunter gate
-agenticbughunter install-hook
-agenticbughunter uninstall-hook
-agenticbughunter show-run
 ```
 
-## Development
+This creates `.agenticbughunter.toml`, runtime logs, and a managed pre-push hook.
+
+## Configuration
+`agenticbughunter init` creates a readable project-level `.agenticbughunter.toml` with all settings. These can be overirded using CLI
 
 ```bash
-python -m pip install -e .
-python -m unittest discover -s tests -v
+# Inspect the effective configuration
+agenticbughunter config show
+
+# Read one value
+agenticbughunter config get pipeline.confidence_threshold
+
+# Change one value without hand-editing TOML
+agenticbughunter config set pipeline.confidence_threshold 0.80
+agenticbughunter config set pipeline.max_candidates 3
 ```
+
+TOML is the normal project configuration, as the setting remain saved in file, until the file is deleted or overridden. 
+
+- An environment variable set using export remain active for the current terminal session,
+export ABH_PIPELINE_MAX_CANDIDATES=3 
+agenticbughunter review --base HEAD~1 --head HEAD
+
+- A environment variable added before a command applies to that command only.
+ABH_PIPELINE_MAX_CANDIDATES=3 agenticbughunter review --base HEAD~1 --head HEAD
+
+```
+
+Temporary field overrides still:
+
+```bash
+ABH_PIPELINE_MAX_CANDIDATES=3 \
+ABH_PIPELINE_CONFIDENCE_THRESHOLD=0.80 \
+ABH_BM25_TOP_K=6 \
+agenticbughunter review
+```
+
+Run `agenticbughunter config env` to see the complete mapping. The existing `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `OPENAI_MODEL` variables remain supported for compatibility.
+
+### UI settings
+
+The terminal presentation is controlled separately from the review algorithm:
+
+```toml
+[ui]
+banner = true
+live_progress = true
+show_config = true
+show_stage_details = true
+```
+
+## Run
+
+Review the latest commit:
+
+```bash
+agenticbughunter review
+```
+
+Review specific revisions:
+
+```bash
+# Review the latest commit
+agenticbughunter review --base HEAD~1 --head HEAD
+
+# Review the last 3 commits
+agenticbughunter review --base HEAD~3 --head HEAD
+
+# Review a feature branch against main
+agenticbughunter review --base main --head feature/login
+```
+
+```text
+.agenticbughunter/runs/<run-id>/
+```
+
+### Terminal experience
+
+```text
+ █████╗ ██████╗ ██╗  ██╗
+██╔══██╗██╔══██╗██║  ██║
+███████║██████╔╝███████║
+██╔══██║██╔══██╗██╔══██║
+██║  ██║██████╔╝██║  ██║
+╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝
+AGENTIC BUG HUNTER  v0.5.0
+Staged secure code review
+
+╭─ Secure review ─────────────────────────────────────────────────╮
+│ Repository  /path/to/project                                   │
+│ Review      main → HEAD                                        │
+│ Model       qwen3-coder:30b                                    │
+│ TOML        /path/to/project/.agenticbughunter.toml             │
+│ Policy      threshold 0.75 · candidates 5 · BM25 top-k 10      │
+╰─────────────────────────────────────────────────────────────────╯
+
+╭ Pipeline ───────────────────────────────────────────────────────╮
+│ ✓ 1/5  Candidate localisation                  8.4s · 3 candidates│
+│ ◐ 2/5  Context enrichment                              running │
+│ ○ 3/5  CWE hypothesis generation                       pending │
+│ ○ 4/5  Vulnerability validation                        pending │
+│ ○ 5/5  Finding filter & review comments                pending │
+╰─────────────────────────────────────────────────────────────────╯
+```
+When initialized with `agenticbughunter init`, the pre-push hook automatically runs the security review before pushing.

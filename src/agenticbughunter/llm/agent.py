@@ -10,34 +10,114 @@ from .client import OpenAICompatibleClient
 from ..runlog import RunLogger
 
 
-_JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.I | re.S)
+_JSON_FENCE = re.compile(
+    r"```(?:json)?\s*(.*?)```",
+    re.I | re.S,
+)
 
 
 def extract_json_value(text: str) -> Any:
     """
-    Extract the first valid JSON object or array from model output.
+    Extract one valid JSON action or final value.
 
-    Supports:
-    - Pure JSON
-    - ```json ... ``` fenced JSON
-    - JSON embedded inside surrounding model text
+    Behaviour:
+    - Valid complete JSON -> return it.
+    - Malformed top-level final array -> reject it.
+    - Multiple consecutive tool objects -> execute only the first tool.
+    - Prose followed by JSON -> recover the JSON.
     """
 
-    candidates = [text.strip()]
-    candidates += [
-        match.group(1).strip()
-        for match in _JSON_FENCE.finditer(text)
-    ]
+    stripped = text.strip()
 
-    # First try complete candidate strings.
-    for candidate in candidates:
+    # ---------------------------------------------------------
+    # 1. Try the complete response first
+    # ---------------------------------------------------------
+
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    # ---------------------------------------------------------
+    # 2. Try fenced JSON
+    # ---------------------------------------------------------
+
+    for match in _JSON_FENCE.finditer(text):
+        candidate = match.group(1).strip()
+
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
-            pass
+            continue
 
-    # Then search for the first decodable JSON object/array.
     decoder = json.JSONDecoder()
+
+    # ---------------------------------------------------------
+    # 3. Malformed top-level ARRAY
+    # ---------------------------------------------------------
+    #
+    # Important for Stage 1.
+    #
+    # If the model attempted:
+    #
+    # [
+    #   {broken candidate},
+    #   {valid candidate}
+    # ]
+    #
+    # do NOT salvage one inner candidate.
+    # Reject the complete response and make the agent retry.
+    # ---------------------------------------------------------
+
+    if stripped.startswith("["):
+        raise ValueError(
+            "Model returned malformed top-level JSON array"
+        )
+
+    # ---------------------------------------------------------
+    # 4. Top-level OBJECT
+    # ---------------------------------------------------------
+    #
+    # Qwen may sometimes return:
+    #
+    # {"type":"tool", ...}
+    # {"type":"tool", ...}
+    # {"type":"tool", ...}
+    #
+    # AgentRunner operates sequentially, so use only the first
+    # tool call. Its observation is then returned to the model.
+    # ---------------------------------------------------------
+
+    if stripped.startswith("{"):
+        try:
+            value, end = decoder.raw_decode(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "Model returned malformed top-level JSON object"
+            ) from exc
+
+        trailing = stripped[end:].strip()
+
+        # One clean JSON object.
+        if not trailing:
+            return value
+
+        # Multiple JSON values.
+        # Accept only the first if it is a tool call.
+        if (
+            isinstance(value, dict)
+            and str(value.get("type") or "").lower() == "tool"
+        ):
+            return value
+
+        # Never silently discard additional final objects.
+        raise ValueError(
+            "Model returned multiple top-level JSON values"
+        )
+
+    # ---------------------------------------------------------
+    # 5. Prose followed by JSON
+    # ---------------------------------------------------------
 
     for i, ch in enumerate(text):
         if ch not in "[{":
@@ -73,7 +153,10 @@ class Tool:
 
 
 class ToolRegistry:
-    def __init__(self, tools: list[Tool] | None = None):
+    def __init__(
+        self,
+        tools: list[Tool] | None = None,
+    ):
         self._tools = {
             tool.name: tool
             for tool in (tools or [])
@@ -96,7 +179,6 @@ class ToolRegistry:
         name: str,
         arguments: dict[str, Any],
     ) -> Any:
-
         if name not in self._tools:
             raise KeyError(
                 f"Unknown tool {name!r}; "
@@ -138,10 +220,15 @@ A wrapped final answer is also accepted:
 Rules:
 - Never place prose outside the JSON.
 - Never invent a tool result.
+- Return only ONE tool call per response.
+- Wait for the tool observation before choosing another tool.
+- Do not batch multiple tool calls in one response.
 - Do not repeat a final answer.
 - Do not continue calling tools once sufficient evidence has been gathered.
 - Repository context may inform your reasoning, but obey all localization
   and output constraints given by the stage prompt.
+- Always produce syntactically valid JSON.
+- Escape embedded double quotes inside JSON strings.
 """.strip()
 
     def __init__(
@@ -190,17 +277,21 @@ Rules:
         ]
 
         conversation_path = (
-            self.artifact_dir / "conversation.jsonl"
+            self.artifact_dir
+            / "conversation.jsonl"
         )
 
         previous_response: str | None = None
         repeated_response_count = 0
 
-        for step in range(1, self.max_steps + 1):
+        for step in range(
+            1,
+            self.max_steps + 1,
+        ):
 
-            # --------------------------------------------
-            # Final step protection
-            # --------------------------------------------
+            # -------------------------------------------------
+            # Final-step protection
+            # -------------------------------------------------
 
             if step == self.max_steps:
                 messages.append(
@@ -233,9 +324,9 @@ Rules:
                 },
             )
 
-            # --------------------------------------------
+            # -------------------------------------------------
             # Detect exact repeated responses
-            # --------------------------------------------
+            # -------------------------------------------------
 
             normalized_response = response.content.strip()
 
@@ -256,13 +347,14 @@ Rules:
                 )
 
                 raise RuntimeError(
-                    f"{self.stage} agent repeated the same "
-                    "response multiple times without terminating"
+                    f"{self.stage} agent repeated "
+                    "the same response multiple times "
+                    "without terminating"
                 )
 
-            # --------------------------------------------
+            # -------------------------------------------------
             # Parse JSON
-            # --------------------------------------------
+            # -------------------------------------------------
 
             try:
                 action = extract_json_value(
@@ -270,15 +362,16 @@ Rules:
                 )
 
             except ValueError as exc:
-
                 observation = {
                     "error": "invalid_json_action",
                     "detail": str(exc),
                     "instruction": (
-                        "Return exactly one valid JSON value. "
-                        "Use a tool action object if another tool "
-                        "is needed, otherwise return the requested "
-                        "final JSON value."
+                        "Your previous response contained malformed JSON. "
+                        "Return the COMPLETE requested JSON value again. "
+                        "If using a tool, return exactly ONE tool call. "
+                        "Do not return multiple tool calls together. "
+                        "Do not return only one item from a final array. "
+                        "Ensure embedded quotes inside JSON strings are escaped."
                     ),
                 }
 
@@ -304,27 +397,11 @@ Rules:
 
                 continue
 
-            # ====================================================
-            # DIRECT JSON ARRAY = FINAL ANSWER
-            # ====================================================
-
-            # This is the important fix for Stage 1.
-            #
-            # Example:
-            #
-            # [
-            #   {
-            #       "filepath": "app.py",
-            #       "changed_line": 20,
-            #       ...
-            #   }
-            # ]
-            #
-            # Previously this was rejected because it wasn't a dict,
-            # causing Qwen to return the same array repeatedly.
+            # =================================================
+            # DIRECT JSON ARRAY = FINAL
+            # =================================================
 
             if isinstance(action, list):
-
                 self.logger.event(
                     "agent_final",
                     {
@@ -337,12 +414,11 @@ Rules:
 
                 return action
 
-            # --------------------------------------------
-            # Primitive values are not valid actions
-            # --------------------------------------------
+            # -------------------------------------------------
+            # Primitive values are invalid
+            # -------------------------------------------------
 
             if not isinstance(action, dict):
-
                 messages.append(
                     {
                         "role": "assistant",
@@ -362,28 +438,17 @@ Rules:
 
                 continue
 
-            # ====================================================
-            # DIRECT JSON OBJECT = FINAL ANSWER
-            # ====================================================
-
-            # Stage 2 / Stage 4 may naturally return a JSON object
-            # without wrapping it in:
-            #
-            # {"type":"final","answer":...}
-            #
-            # Accept that.
-            #
-            # But don't accidentally accept a malformed tool call.
+            # =================================================
+            # DIRECT JSON OBJECT = FINAL
+            # =================================================
 
             if "type" not in action:
-
                 looks_like_tool_call = (
                     "tool" in action
                     or "arguments" in action
                 )
 
                 if looks_like_tool_call:
-
                     messages.append(
                         {
                             "role": "assistant",
@@ -415,21 +480,30 @@ Rules:
 
                 return action
 
-            # --------------------------------------------
+            # -------------------------------------------------
             # Wrapped protocol
-            # --------------------------------------------
+            # -------------------------------------------------
 
             kind = str(
                 action.get("type") or ""
             ).lower()
 
-            # ====================================================
+            # =================================================
             # WRAPPED FINAL
-            # ====================================================
+            # =================================================
 
             if kind == "final":
-
                 answer = action.get("answer")
+
+                # Sometimes a model puts the final JSON inside
+                # "answer" as a JSON-encoded string.
+                if isinstance(answer, str):
+                    try:
+                        answer = extract_json_value(
+                            answer
+                        )
+                    except ValueError:
+                        pass
 
                 self.logger.event(
                     "agent_final",
@@ -443,12 +517,11 @@ Rules:
 
                 return answer
 
-            # ====================================================
+            # =================================================
             # UNKNOWN ACTION
-            # ====================================================
+            # =================================================
 
             if kind != "tool":
-
                 messages.append(
                     {
                         "role": "assistant",
@@ -469,23 +542,23 @@ Rules:
 
                 continue
 
-            # ====================================================
+            # =================================================
             # TOOL CALL
-            # ====================================================
+            # =================================================
 
             tool_name = str(
                 action.get("tool") or ""
             )
 
             arguments = (
-                action.get("arguments") or {}
+                action.get("arguments")
+                or {}
             )
 
             if not isinstance(arguments, dict):
                 arguments = {}
 
             try:
-
                 result = self.tools.call(
                     tool_name,
                     arguments,
@@ -498,7 +571,6 @@ Rules:
                 }
 
             except Exception as exc:
-
                 observation = {
                     "tool": tool_name,
                     "ok": False,
@@ -526,7 +598,17 @@ Rules:
                 },
             )
 
-            # Feed the action + observation back to the model.
+            # -------------------------------------------------
+            # Feed ONLY the accepted first tool call back
+            # -------------------------------------------------
+            #
+            # Important:
+            # response.content may have contained several tool
+            # calls. Do not feed that original batched response
+            # back into the conversation.
+            #
+            # Feed the single parsed action that we actually ran.
+            # -------------------------------------------------
 
             messages.append(
                 {
@@ -546,6 +628,11 @@ Rules:
                         + json.dumps(
                             observation,
                             ensure_ascii=False,
+                        )
+                        + "\n\n"
+                        + (
+                            "Choose the next action based on this "
+                            "observation. Return at most ONE tool call."
                         )
                     ),
                 }
@@ -567,7 +654,6 @@ Rules:
             "a",
             encoding="utf-8",
         ) as f:
-
             f.write(
                 json.dumps(
                     value,
