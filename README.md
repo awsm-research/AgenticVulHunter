@@ -1,127 +1,183 @@
 # AgenticBugHunter
 
-A research-derived secure code review tool: localize changed lines, gather
-repository evidence, retrieve security knowledge, form CWE hypotheses, and
-judge the evidence before producing review comments.
+AgenticBugHunter is a secure code review tool built from my research workflow.
 
-This is the application built from the staged research workflow. The benchmark
-harness and the application are related implementations, not interchangeable
-experiments. [Research mapping and differences](docs/research.md).
+It reviews code changes in stages: it localizes suspicious changed lines, gathers repository context, retrieves relevant security knowledge, generates CWE hypotheses, validates them, and then produces review comments.
 
-## Quick start
+The research benchmark and this tool are related, but they are not exactly the same implementation.
 
-Requires Python 3.11+ and Git. Install this downloaded source release:
-c
-Inside the Git repository you want to review:
+See [research.md](docs/research.md) for more details.
+
+## Install
+
+Requires Python 3.11+ and Git.
+
+Install directly from GitHub:
 
 ```bash
-# Initial setup without changing your push workflow.
+pipx install "git+https://github.com/awsm-research/AgenticBugHunter.git"
+```
+
+To reinstall the latest version:
+
+```bash
+pipx install --force "git+https://github.com/awsm-research/AgenticBugHunter.git@main"
+```
+
+Check that it is installed:
+
+```bash
+agenticbughunter --version
+```
+
+## Setup
+
+Go inside the Git project you want to review:
+
+```bash
+cd your-project
 agenticbughunter init --no-hook
+```
 
-# Point the tool at your chosen OpenAI-compatible text model.
-export ABH_LLM_PROVIDER="openai"
-export ABH_LLM_BASE_URL="http://localhost:11435/v1"
-export ABH_LLM_MODEL="qwen3-coder:30b"
-export ABH_LLM_API_KEY="ollama"
+This creates:
 
+```text
+.agenticbughunter.toml
+```
+
+The TOML file is the main place to configure the model and pipeline.
+
+Example:
+
+```toml
+[llm]
+provider = "openai"
+base_url = "http://localhost:11435/v1"
+model = "qwen3-coder:30b"
+api_key = "ollama"
+```
+
+The Qwen model is only an example. AgenticBugHunter is not dependent on Qwen and can work with other supported model providers.
+
+Current adapters support:
+
+- OpenAI-compatible Chat Completions APIs
+- Anthropic Messages API
+- Gemini generateContent API
+
+See [models.md](docs/models.md) for model setup examples.
+
+## Check the setup
+
+Make sure your model/server is already running, then:
+
+```bash
 agenticbughunter doctor
 agenticbughunter doctor --check-llm
+```
+
+## Run a review
+
+Review the latest committed change:
+
+```bash
 agenticbughunter review --base HEAD~1 --head HEAD
 ```
 
-The model/server must already be running. The compatibility check makes a small
-model request, which may incur API cost; it sends no repository contents.
-The Qwen model above is an example and remains the backward-compatible default,
-not a required model. Model quality and context capacity still matter.
-
-## Switch models through `export`
-
-Choose a backend, endpoint, model ID, and key. No Qwen CLI, native function
-calling, MCP server, or vendor SDK is required by the application.
-
-| Provider setting | Endpoint shape | Supported transport |
-|---|---|---|
-| `openai` | `https://YOUR-ENDPOINT/v1` | Chat Completions-compatible text API |
-| `anthropic` | `https://api.anthropic.com/v1` | Anthropic Messages API |
-| `gemini` | `https://generativelanguage.googleapis.com/v1beta` | Gemini generateContent API |
-
-Use a model ID enabled by your provider. See [model setup](docs/models.md) for
-copyable exports, reasoning-model options, and custom Python backends. Native
-Responses API, Bedrock, Vertex authentication, and Azure-specific routing are
-not implemented by these adapters; use a compatible gateway or custom backend.
-
-## How the research becomes a tool
-
-| Stage | Responsibility | What the model does | What Python enforces |
-|---|---|---|---|
-| 1. Candidate localization | Anchor review to the diff | Select suspicious changed lines | Actual diff locations, canonical statement, deduplication, limits |
-| 2. Context enrichment | Establish repository evidence | Read bounded context and resolve relevant symbols | Read-only operations and immutable candidate identity |
-| 3. CWE hypotheses | Match evidence to security knowledge | Interpret/refine BM25 searches | Initial retrieval, search budget, retrieved CWE membership |
-| 4. Judge | Assess each candidate–CWE pair | Score five evidence categories | Immutable identity, numeric scores, application score caps |
-| 5. Filter | Produce comments | No model call | Threshold, verdict, comment requirement, sorting, output limit |
-
-BM25 retrieves bundled security rules **locally**. It is security-knowledge
-retrieval, not execution of a SAST scanner. There is no separate retrieval server.
-
-## Everyday use
+Or compare two branches:
 
 ```bash
-# Inspect a committed change; this does not review unstaged or staged edits.
 agenticbughunter review --base main --head feature/login
+```
 
-# Machine-readable report. A successful review returns 0 even with findings.
+For JSON output:
+
+```bash
 agenticbughunter review --base HEAD~1 --head HEAD --json > review.json
+```
 
-# CI gate: 0 = pass, 1 = findings block, 2 = execution/configuration error.
+For a CI-style gate:
+
+```bash
 agenticbughunter gate --base HEAD~1 --head HEAD --json > gate.json
+```
 
-agenticbughunter show-run
+## Model configuration
+
+Normally, configure the model in:
+
+```text
+.agenticbughunter.toml
+```
+
+Environment variables can also be used when needed, for example in CI or for API keys:
+
+```bash
+export ABH_LLM_API_KEY="your-api-key"
+```
+
+Environment variables override the TOML configuration.
+
+You can inspect the current configuration with:
+
+```bash
 agenticbughunter config show
 agenticbughunter config env
 ```
 
-Review uses a detached worktree by default, so evidence comes from the selected
-commit. Diff semantics are Git's `base...head` (merge-base to head). The actual
-merge-base revision is used for old-line evidence; see
-[operations](docs/operations.md).
+## Optional Git push hook
 
-Run artifacts live under `.agenticbughunter/runs/<run-id>/`. They contain the
-resolved commits, effective configuration, prompt hashes, inputs, model text,
-retrieval results, judgments, and final comments. API-key fields are redacted;
-repository text and model-generated text are not a general secret scrubber.
+By default I recommend starting without the hook:
 
-## Optional push gate
+```bash
+agenticbughunter init --no-hook
+```
 
-Start with manual review to understand the findings on your repositories. To
-opt into a managed pre-push gate:
+If you want AgenticBugHunter to run automatically before `git push`:
 
 ```bash
 agenticbughunter install-hook
+```
+
+To remove it:
+
+```bash
 agenticbughunter uninstall-hook
 ```
 
-`init` without `--no-hook` also installs the hook. The underlying research can
-identify weaknesses that a patch **fixes** as well as weaknesses it introduces;
-a supported comment is not automatically a new regression. Consider this
-before using findings to block pushes. Review is an aid to human assessment,
-not proof that a commit is secure.
+## Pipeline
 
-## Read or extend the code
+| Stage | Purpose |
+|---|---|
+| 1 | Candidate localization |
+| 2 | Repository context enrichment |
+| 3 | CWE hypothesis generation |
+| 4 | Vulnerability validation |
+| 5 | Finding filter and review comments |
 
-- [Architecture and module map](docs/architecture.md): where each responsibility lives.
-- [Models and provider adapters](docs/models.md): exports, compatibility, extension interface.
-- [Configuration reference](docs/configuration.md): every setting and precedence.
-- [Research mapping](docs/research.md): method, preserved policy, and benchmark differences.
-- [Operations and troubleshooting](docs/operations.md): outputs, budgets, hooks, errors.
-- [Development and validation](docs/development.md): tests and release boundaries.
-- [Release validation](VALIDATION.md): what was actually tested.
-- [Change log](CHANGELOG.md): engineering changes versus analysis changes.
+BM25 retrieval is local and uses bundled security knowledge. It is not a separate SAST server.
+
+Run outputs are stored in:
+
+```text
+.agenticbughunter/runs/
+```
+
+More details:
+
+- [Architecture](docs/architecture.md)
+- [Models](docs/models.md)
+- [Configuration](docs/configuration.md)
+- [Research mapping](docs/research.md)
+- [Operations](docs/operations.md)
+- [Development](docs/development.md)
+- [Validation](VALIDATION.md)
+- [Changelog](CHANGELOG.md)
+
+## Tests
 
 ```bash
-# Offline tests: real Git and local BM25, scripted model outputs.
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-Adapters are covered by offline request/response tests. This release has not
-been validated against live paid models or rerun on the full research benchmark;
-its test results do not establish vulnerability precision or recall.
+AgenticBugHunter is a research-derived review tool. Its findings should support human review, not be treated as proof that a repository is secure.
