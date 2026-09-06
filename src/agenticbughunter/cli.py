@@ -22,6 +22,8 @@ CONFIG_NAME = ".agenticbughunter.toml"
 STATE_DIR = ".agenticbughunter"
 HOOK_BEGIN = "# >>> agenticbughunter managed gate >>>"
 HOOK_END = "# <<< agenticbughunter managed gate <<<"
+CHAIN_MARKER = "# agenticbughunter: preserved-hook-wrapper-v1"
+PRESERVED_HOOK = "pre-push.agenticbughunter-original"
 
 EXAMPLE_CONFIG = """# AgenticBugHunter project configuration
 #
@@ -29,6 +31,7 @@ EXAMPLE_CONFIG = """# AgenticBugHunter project configuration
 # variable. Run `agenticbughunter config env` to see the full mapping.
 
 [llm]
+provider = "openai"
 base_url = "http://localhost:11434/v1"
 model = "qwen3-coder:30b"
 timeout_seconds = 300
@@ -157,13 +160,23 @@ def _install_hook(repo: Path, *, force: bool = False) -> tuple[Path, str]:
         first = existing.splitlines()[0] if existing.splitlines() else ""
         shell_compatible = first.startswith("#!") and any(x in first for x in ("sh", "bash", "zsh", "dash"))
         if shell_compatible:
-            lines = existing.splitlines()
-            shebang = lines[0]
-            remainder = "\n".join(lines[1:]).lstrip("\n")
-            content = shebang + "\n\n" + HOOK_BLOCK + "\n\n" + remainder
-            if not content.endswith("\n"):
-                content += "\n"
-            action = "chained"
+            # Preserve the original byte-for-byte and replay Git's stdin for
+            # each hook. Prepending two readers would starve the second one.
+            preserved = hook.with_name(PRESERVED_HOOK)
+            if preserved.exists():
+                raise RuntimeError(f"Preserved hook already exists: {preserved}; resolve it before installing")
+            shutil.copy2(hook, preserved)
+            preserved.chmod(preserved.stat().st_mode | 0o100)
+            content = (
+                "#!/bin/sh\n" + CHAIN_MARKER + "\n"
+                + 'abh_hook_input="$(mktemp)" || exit 2\n'
+                + "trap 'rm -f \"$abh_hook_input\"' 0\n"
+                + 'cat > "$abh_hook_input" || exit 2\n'
+                + "(\n" + HOOK_BLOCK + "\n) < \"$abh_hook_input\" || exit $?\n"
+                + 'abh_original="$(dirname "$0")/' + PRESERVED_HOOK + '"\n'
+                + '\"$abh_original\" "$@" < "$abh_hook_input"\n'
+            )
+            action = "chained (original preserved; stdin replayed for both hooks)"
         elif force:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             backup = hook.with_name(f"pre-push.agenticbughunter-backup-{stamp}")
@@ -189,6 +202,12 @@ def _uninstall_hook(repo: Path) -> tuple[Path, bool]:
     if not hook.is_file():
         return hook, False
     text = hook.read_text(encoding="utf-8", errors="replace")
+    if CHAIN_MARKER in text:
+        preserved = hook.with_name(PRESERVED_HOOK)
+        if not preserved.is_file():
+            raise RuntimeError(f"Cannot restore missing original hook: {preserved}")
+        shutil.move(str(preserved), str(hook))
+        return hook, True
     start = text.find(HOOK_BEGIN)
     end = text.find(HOOK_END)
     if start < 0 or end < start:
@@ -324,7 +343,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         ui.warning("Pre-push gate not installed")
     ui.blank()
-    ui.success("AgenticBugHunter is ready")
+    if args.check_llm:
+        from .llm import create_client, extract_json_value
+        response = create_client(cfg.llm).chat(
+            [{"role": "system", "content": "Return exactly one JSON object: {\"ok\": true}"},
+             {"role": "user", "content": "Check text JSON compatibility. Do not call any tools."}],
+            metadata={"stage": "doctor"},
+        )
+        if extract_json_value(response.content) != {"ok": True}:
+            raise RuntimeError("LLM was reachable but failed the text JSON compatibility check")
+        ui.success("LLM text JSON request succeeded (repository contents were not sent)")
+    else:
+        ui.info("Local checks complete. Endpoint not contacted; use doctor --check-llm to test it.")
+    ui.success("Local setup checks complete")
     return 0
 
 
@@ -426,6 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=None)
     p.add_argument("--head", default="HEAD")
     p.add_argument("--plain", action="store_true", help="disable terminal colours")
+    p.add_argument("--check-llm", action="store_true", help="send a small text JSON test to the configured model (may incur API cost)")
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("config", help="Inspect or change AgenticBugHunter configuration")
@@ -471,6 +503,9 @@ def main(argv: list[str] | None = None) -> int:
         print("AgenticBugHunter: interrupted", file=sys.stderr)
         return 130
     except PipelineExecutionError as exc:
+        if getattr(args, "json", False):
+            print((exc.run_dir / "result.json").read_text(encoding="utf-8"), end="")
+            return 2
         print(f"AgenticBugHunter: {exc}", file=sys.stderr)
         print(f"Logs: {exc.run_dir}", file=sys.stderr)
         return 2

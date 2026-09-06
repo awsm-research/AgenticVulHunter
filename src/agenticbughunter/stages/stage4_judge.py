@@ -5,62 +5,13 @@ from typing import Any
 
 from .base import Stage
 from ..config import Config
-from ..llm import AgentRunner, OpenAICompatibleClient, extract_json_value
+from ..llm import AgentRunner, ChatClient, extract_json_value
 from ..resources import cwe_knowledge, prompt
 from ..runlog import RunLogger
 from ..tools.repo import RepositoryTools
 
 
-_SCORE_KEYS = (
-    "exact_cwe_mechanism",
-    "connection",
-    "diff_causality",
-    "security_control",
-    "concrete_impact",
-)
-
-_RELATIONSHIP_CAPS = {
-    "exact": 1.00,
-    "family_compatible": 0.79,
-    "partial": 0.59,
-    "mismatch": 0.29,
-}
-
-_CONTRADICTION_CAPS = {
-    "none": 1.00,
-    "minor": 0.89,
-    "material": 0.69,
-    "fatal": 0.29,
-}
-
-
-def _raw_score(output: dict[str, Any]) -> float:
-    categories = output.get("category_scores")
-    if not isinstance(categories, dict):
-        raise ValueError("category_scores must be an object")
-    values: list[float] = []
-    for key in _SCORE_KEYS:
-        item = categories.get(key)
-        if not isinstance(item, dict):
-            raise ValueError(f"missing category_scores.{key}")
-        try:
-            value = float(item.get("score"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"invalid score for {key}") from exc
-        if not 0 <= value <= 1:
-            raise ValueError(f"score for {key} must be in [0,1]")
-        values.append(value)
-    return sum(values) / len(values)
-
-
-def _verdict(score: float, threshold: float, relationship: str, contradiction: str) -> str:
-    if relationship == "mismatch" or contradiction == "fatal":
-        return "rejected"
-    if relationship in {"exact", "family_compatible"} and contradiction in {"none", "minor"} and score >= threshold:
-        return "supported"
-    if score >= 0.50:
-        return "uncertain"
-    return "rejected"
+from .scoring import _RELATIONSHIP_CAPS, _CONTRADICTION_CAPS, raw_score as _raw_score, verdict as _verdict
 
 
 def _canonical_cwe(cwe_id: str, supplied_name: str = "") -> dict[str, Any]:
@@ -80,7 +31,7 @@ def _canonical_cwe(cwe_id: str, supplied_name: str = "") -> dict[str, Any]:
 class Stage4Judge(Stage):
     name = "stage4_judge"
 
-    def __init__(self, config: Config, client: OpenAICompatibleClient, logger: RunLogger, repo_tools: RepositoryTools):
+    def __init__(self, config: Config, client: ChatClient, logger: RunLogger, repo_tools: RepositoryTools):
         self.config = config
         self.client = client
         self._logger = logger

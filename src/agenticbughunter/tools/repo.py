@@ -68,7 +68,8 @@ class RepositoryTools:
         line = int(args.get("line") or 0)
         if line < 1:
             raise ValueError("line must be >= 1")
-        radius = min(max(1, int(args.get("radius") or self.config.context_radius)), 80)
+        radius = min(max(1, int(args.get("radius") or self.config.context_radius)),
+                     self.config.context_radius, (self.config.max_read_lines - 1) // 2)
         payload = {
             "path": args.get("path"),
             "start_line": max(1, line - radius),

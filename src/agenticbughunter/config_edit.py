@@ -44,7 +44,7 @@ def set_config_value(path: Path, dotted_key: str, raw_value: str) -> Any:
 
     try:
         # Validate the complete project configuration after the edit.
-        load_config(path)
+        load_config(path, use_environment=False)
     except Exception:
         if original:
             path.write_text(original, encoding="utf-8")
@@ -67,6 +67,8 @@ def _split_key(dotted_key: str) -> tuple[str, str]:
 
 
 def _coerce(raw: str, default_value: Any) -> Any:
+    if isinstance(default_value, dict):
+        return json.loads(raw)
     if isinstance(default_value, bool):
         lowered = raw.strip().lower()
         if lowered in {"true", "1", "yes", "on"}:
@@ -82,6 +84,12 @@ def _coerce(raw: str, default_value: Any) -> Any:
 
 
 def _toml_scalar(value: Any) -> str:
+    if isinstance(value, dict):
+        return "{ " + ", ".join(json.dumps(str(k)) + " = " + _toml_scalar(v) for k, v in value.items()) + " }"
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_scalar(v) for v in value) + "]"
+    if value is None:
+        raise ValueError("TOML has no null value; use ABH_LLM_EXTRA_BODY for JSON null")
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):

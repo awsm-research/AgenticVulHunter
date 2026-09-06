@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import platform
+from . import __version__
+from .resources import prompt
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from .config import Config, validate_config
-from .git import diff as git_diff, isolated_workspace, repo_root, resolve_default_base, resolve_ref
-from .llm import OpenAICompatibleClient
+from .git import merge_base, diff as git_diff, isolated_workspace, repo_root, resolve_default_base, resolve_ref
+from .llm import ChatClient, create_client
 from .models import Finding, PipelineResult, StageResult
 from .runlog import RunLogger
 from .stages import Stage1Candidates, Stage2Context, Stage3Hypotheses, Stage4Judge, Stage5Filter
@@ -31,9 +34,10 @@ class PipelineExecutionError(RuntimeError):
 class SecureReviewPipeline:
     """Five-stage project-local secure-review Git gate."""
 
-    def __init__(self, config: Config, progress: Callable[[str, dict[str, Any]], None] | None = None):
+    def __init__(self, config: Config, progress: Callable[[str, dict[str, Any]], None] | None = None, *, client: ChatClient | None = None):
         self.config = validate_config(config)
         self.progress = progress
+        self.client = client
 
     def _emit(self, event: str, **payload: Any) -> None:
         if self.progress is None:
@@ -70,6 +74,7 @@ class SecureReviewPipeline:
         head_sha = resolve_ref(source_repo, head)
         selected_base = base or resolve_default_base(source_repo, head=head)
         base_sha = resolve_ref(source_repo, selected_base)
+        diff_base_sha = merge_base(source_repo, base_sha, head_sha)
 
         run_id = _run_id(source_repo, base_sha, head_sha)
         run_dir = source_repo / ".agenticbughunter" / "runs" / run_id
@@ -85,6 +90,15 @@ class SecureReviewPipeline:
             run_id=run_id,
         )
         logger.write_json(run_dir / "config.json", asdict(self.config))
+        logger.write_json(run_dir / "provenance.json", {
+            "application_version": __version__, "python_version": platform.python_version(),
+            "base_sha": base_sha, "diff_base_sha": diff_base_sha, "head_sha": head_sha,
+            "provider": self.config.llm.provider, "model": self.config.llm.model,
+            "client_type": type(self.client).__name__ if self.client is not None else "HTTPChatClient",
+            "judge_policy": "application_relationship_contradiction_caps_v1",
+            "prompt_sha256": {name: hashlib.sha256(prompt(name).encode()).hexdigest() for name in
+                              ("stage1_candidates.md", "stage2_context.md", "stage3_hypotheses.md", "stage4_judge.md")},
+        })
         self._emit(
             "pipeline_started",
             repo=str(source_repo),
@@ -114,8 +128,8 @@ class SecureReviewPipeline:
             ) as workspace:
                 logger.info("workspace ready", path=str(workspace.root), isolated=workspace.temporary)
                 self._emit("workspace_ready", path=str(workspace.root), isolated=workspace.temporary)
-                repo_tools = RepositoryTools(workspace.root, self.config.repository, base_ref=base_sha)
-                client = OpenAICompatibleClient(self.config.llm, logger)
+                repo_tools = RepositoryTools(workspace.root, self.config.repository, base_ref=diff_base_sha)
+                client = self.client if self.client is not None else create_client(self.config.llm, logger)
 
                 s1 = self._execute_stage(1, Stage1Candidates(self.config, client, logger, repo_tools, diff_text), None)
                 stage_results.append(s1)

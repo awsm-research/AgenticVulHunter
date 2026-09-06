@@ -5,7 +5,7 @@ from typing import Any
 
 from .base import Stage
 from ..config import Config
-from ..llm import AgentRunner, OpenAICompatibleClient
+from ..llm import AgentRunner, ChatClient
 from ..resources import prompt
 from ..runlog import RunLogger
 from ..tools.repo import RepositoryTools
@@ -17,7 +17,7 @@ _IMMUTABLE = ("candidate_id", "filepath", "changed_line", "statement", "change_t
 class Stage2Context(Stage):
     name = "stage2_context"
 
-    def __init__(self, config: Config, client: OpenAICompatibleClient, logger: RunLogger, repo_tools: RepositoryTools):
+    def __init__(self, config: Config, client: ChatClient, logger: RunLogger, repo_tools: RepositoryTools):
         self.config = config
         self.client = client
         self._logger = logger

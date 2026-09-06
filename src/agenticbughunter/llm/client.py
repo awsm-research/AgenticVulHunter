@@ -1,3 +1,4 @@
+"""Dependency-free HTTP transport with bounded retries and explicit failures."""
 from __future__ import annotations
 
 import json
@@ -5,94 +6,102 @@ import socket
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from typing import Any
 
 from ..config import LLMConfig
 from ..runlog import RunLogger
+from .providers import build_request, parse_response
+from .types import LLMResponse
+
+_RETRYABLE = {408, 429, 500, 502, 503, 504, 529}
+_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
 
-@dataclass
-class LLMResponse:
-    content: str
-    usage: dict[str, Any]
-    raw: dict[str, Any]
-    duration_ms: float
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never forward API credentials to a redirected endpoint."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
-class OpenAICompatibleClient:
-    """Tiny dependency-free OpenAI-compatible chat client.
-
-    Works with endpoints that implement POST /chat/completions, including
-    Ollama's OpenAI compatibility layer, OpenRouter, vLLM and LM Studio.
-    """
+class HTTPChatClient:
+    """Text-only chat transport; provider differences live in providers.py."""
 
     def __init__(self, config: LLMConfig, logger: RunLogger | None = None):
         self.config = config
         self.logger = logger
+        self._opener = urllib.request.build_opener(_NoRedirect())
 
     @property
     def endpoint(self) -> str:
-        base = self.config.base_url.rstrip("/")
-        if base.endswith("/chat/completions"):
-            return base
-        return base + "/chat/completions"
+        return build_request(self.config, [], self.config.temperature, self.config.max_tokens)[0]
 
-    def chat(
-        self,
-        messages: list[dict[str, str]],
-        *,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> LLMResponse:
-        payload = {
-            "model": self.config.model,
-            "messages": messages,
-            "temperature": self.config.temperature if temperature is None else temperature,
-            "max_tokens": self.config.max_tokens if max_tokens is None else max_tokens,
-        }
-        body = json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        if self.config.api_key:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
+    def _safe_detail(self, detail: str) -> str:
+        return detail.replace(self.config.api_key, '***REDACTED***')[:1000] if self.config.api_key else detail[:1000]
 
-        request = urllib.request.Request(self.endpoint, data=body, headers=headers, method="POST")
-        started = time.monotonic()
-        try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
-                raw_text = response.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+    def _post(self, request: urllib.request.Request) -> dict[str, Any]:
+        """Retry transient HTTP/network errors, never schema/auth/model errors."""
+        for attempt in range(self.config.max_retries + 1):
+            try:
+                with self._opener.open(request, timeout=self.config.timeout_seconds) as response:
+                    data = response.read(_MAX_RESPONSE_BYTES + 1)
+                if len(data) > _MAX_RESPONSE_BYTES:
+                    raise RuntimeError('LLM response exceeded 16 MiB')
+                raw = json.loads(data.decode('utf-8'))
+                if not isinstance(raw, dict):
+                    raise RuntimeError('LLM response must be a JSON object')
+                return raw
+            except urllib.error.HTTPError as exc:
+                detail = self._safe_detail(exc.read(4096).decode('utf-8', errors='replace'))
+                if exc.code not in _RETRYABLE or attempt == self.config.max_retries:
+                    raise RuntimeError(f'LLM HTTP {exc.code}: {detail}') from exc
+                delay = min(30.0, self.config.retry_backoff_seconds * 2 ** attempt)
+                try:
+                    delay = min(30.0, max(delay, float(exc.headers.get('Retry-After', 0))))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+                if attempt == self.config.max_retries:
+                    raise RuntimeError(f'Unable to reach LLM endpoint: {self._safe_detail(str(exc))}') from exc
+                delay = min(30.0, self.config.retry_backoff_seconds * 2 ** attempt)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise RuntimeError('LLM endpoint returned invalid JSON; check the provider and base URL') from exc
             if self.logger:
-                self.logger.event("llm_http_error", {
-                    "status": exc.code,
-                    "endpoint": self.endpoint,
-                    "detail": detail[:4000],
-                    "metadata": metadata or {},
-                })
-            raise RuntimeError(f"LLM endpoint returned HTTP {exc.code}: {detail[:1000]}") from exc
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
-            raise RuntimeError(f"Unable to reach LLM endpoint {self.endpoint}: {exc}") from exc
+                self.logger.event('llm_retry', {'attempt': attempt + 1, 'delay_seconds': delay})
+            time.sleep(delay)
+        raise AssertionError('unreachable')
 
-        duration_ms = (time.monotonic() - started) * 1000.0
+    def chat(self, messages: list[dict[str, str]], *, temperature: float | None = None,
+             max_tokens: int | None = None, metadata: dict[str, Any] | None = None) -> LLMResponse:
+        if sum(len(m['content']) for m in messages) > self.config.max_input_chars:
+            raise RuntimeError('Input exceeds ABH_LLM_MAX_INPUT_CHARS; reduce the diff/context or raise the explicit budget')
+        endpoint, headers, payload = build_request(
+            self.config, messages,
+            self.config.temperature if temperature is None else temperature,
+            self.config.max_tokens if max_tokens is None else max_tokens,
+        )
+        request = urllib.request.Request(endpoint, data=json.dumps(payload, allow_nan=False).encode('utf-8'),
+                                         headers=headers, method='POST')
+        started = time.monotonic()
+        raw = self._post(request)
         try:
-            raw = json.loads(raw_text)
-            content = raw["choices"][0]["message"]["content"]
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"Malformed OpenAI-compatible response: {raw_text[:1500]}") from exc
-
-        usage = raw.get("usage") if isinstance(raw, dict) else {}
-        if not isinstance(usage, dict):
-            usage = {}
+            content, usage = parse_response(self.config.provider, raw)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        duration_ms = (time.monotonic() - started) * 1000
         if self.logger:
-            self.logger.event("llm_call", {
-                "endpoint": self.endpoint,
-                "model": self.config.model,
-                "duration_ms": duration_ms,
-                "usage": usage,
-                "metadata": metadata or {},
-                "request_messages": messages,
-                "response_content": content,
+            self.logger.event('llm_call', {
+                'provider': self.config.provider, 'model': self.config.model,
+                'duration_ms': duration_ms, 'usage': usage, 'metadata': metadata or {},
+                'request_messages': messages, 'response_content': content,
             })
-        return LLMResponse(str(content or ""), usage, raw, duration_ms)
+        return LLMResponse(content, usage, raw, duration_ms)
+
+
+# Preserve the old import path for integrations. New code uses create_client.
+class OpenAICompatibleClient(HTTPChatClient):
+    pass
+
+
+def create_client(config: LLMConfig, logger: RunLogger | None = None) -> HTTPChatClient:
+    """Construct a text backend from the validated provider configuration."""
+    return HTTPChatClient(config, logger)

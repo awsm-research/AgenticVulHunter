@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-_SECRET_KEYS = re.compile(r"(api[_-]?key|authorization|token|secret)", re.I)
+_SECRET_KEYS = re.compile(r"(api[_-]?key|authorization|password|secret|^(?:access_|refresh_|id_|auth_)?token$)", re.I)
 
 
 def _safe(value: Any) -> Any:

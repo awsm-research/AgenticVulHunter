@@ -7,7 +7,7 @@ from typing import Any
 
 from .base import Stage
 from ..config import Config
-from ..llm import AgentRunner, OpenAICompatibleClient, ToolRegistry
+from ..llm import AgentRunner, ChatClient, ToolRegistry
 from ..resources import prompt
 from ..runlog import RunLogger
 from ..tools.bm25 import BM25Retriever, compact_rules, make_bm25_tool
@@ -46,7 +46,7 @@ def _retrieved_cwes(item_dir: Path) -> set[str]:
 class Stage3Hypotheses(Stage):
     name = "stage3_hypotheses"
 
-    def __init__(self, config: Config, client: OpenAICompatibleClient, logger: RunLogger):
+    def __init__(self, config: Config, client: ChatClient, logger: RunLogger):
         self.config = config
         self.client = client
         self._logger = logger
@@ -127,6 +127,9 @@ class Stage3Hypotheses(Stage):
                 if len(hypotheses) >= self.config.pipeline.max_hypotheses:
                     break
 
+            if raw_hypotheses and not hypotheses:
+                raise ValueError(f"Stage 3 {cid} returned hypotheses but none passed the retrieved-CWE contract")
+            self._logger.event("hypothesis_validation", {"candidate_id": cid, "proposed": len(raw_hypotheses), "retained": len(hypotheses)})
             output = dict(candidate)
             output["hypotheses"] = hypotheses
             output["retrieved_cwe_ids"] = sorted(allowed)

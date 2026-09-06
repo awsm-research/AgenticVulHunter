@@ -63,7 +63,7 @@ def resolve_default_base(repo: Path, head: str = "HEAD") -> str:
     if remote_head:
         candidates.append(remote_head)
 
-    candidates.extend(["origin/main", "origin/master", "HEAD~1"])
+    candidates.extend(["origin/main", "origin/master", f"{head}~1"])
     seen: set[str] = set()
     for ref in candidates:
         if not ref or ref in seen:
@@ -76,6 +76,11 @@ def resolve_default_base(repo: Path, head: str = "HEAD") -> str:
         "Could not determine a safe base ref distinct from the head commit. "
         "Pass --base explicitly (for example --base origin/main)."
     )
+
+
+def merge_base(repo: Path, base: str, head: str) -> str:
+    """Return the old revision underlying the three-dot review diff."""
+    return _run(repo, "merge-base", base, head)
 
 
 def diff(repo: Path, base: str, head: str = "HEAD", unified: int = 20) -> str:

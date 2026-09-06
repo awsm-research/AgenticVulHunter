@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import math
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +18,14 @@ class LLMConfig:
     timeout_seconds: float = 300.0
     max_tokens: int = 6000
     temperature: float = 0.0
+    provider: str = "openai"
+    send_temperature: bool = True
+    token_limit_field: str = "max_tokens"
+    system_role: str = "system"
+    max_retries: int = 2
+    retry_backoff_seconds: float = 1.0
+    max_input_chars: int = 240000
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -71,6 +81,14 @@ class Config:
 
 
 _ENV_OVERRIDES: dict[str, tuple[str, str]] = {
+    "ABH_LLM_PROVIDER": ("llm", "provider"),
+    "ABH_LLM_SEND_TEMPERATURE": ("llm", "send_temperature"),
+    "ABH_LLM_TOKEN_LIMIT_FIELD": ("llm", "token_limit_field"),
+    "ABH_LLM_SYSTEM_ROLE": ("llm", "system_role"),
+    "ABH_LLM_MAX_RETRIES": ("llm", "max_retries"),
+    "ABH_LLM_RETRY_BACKOFF_SECONDS": ("llm", "retry_backoff_seconds"),
+    "ABH_LLM_MAX_INPUT_CHARS": ("llm", "max_input_chars"),
+    "ABH_LLM_EXTRA_BODY": ("llm", "extra_body"),
     "ABH_LLM_BASE_URL": ("llm", "base_url"),
     "ABH_LLM_API_KEY": ("llm", "api_key"),
     "ABH_LLM_MODEL": ("llm", "model"),
@@ -106,6 +124,8 @@ def environment_overrides() -> dict[str, tuple[str, str]]:
 
 
 def _env_value(raw: str, current: Any) -> Any:
+    if isinstance(current, dict):
+        return json.loads(raw)
     if isinstance(current, bool):
         value = raw.strip().lower()
         if value in {"1", "true", "yes", "on"}:
@@ -160,6 +180,8 @@ def _http_url(name: str, value: Any, *, required: bool = True) -> str:
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError(f"{name} must be an http(s) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(f"{name} must not contain credentials, query parameters, or fragments; use api_key")
     return value
 
 
@@ -182,6 +204,8 @@ def _as_float(name: str, value: Any, *, minimum: float | None = None, maximum: f
         parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
     if minimum is not None and (parsed <= minimum if exclusive_min else parsed < minimum):
         op = ">" if exclusive_min else ">="
         raise ValueError(f"{name} must be {op} {minimum}")
@@ -197,6 +221,30 @@ def _as_bool(name: str, value: Any) -> bool:
 
 
 def validate_config(cfg: Config) -> Config:
+    if cfg.llm.provider not in {"openai", "anthropic", "gemini"}:
+        raise ValueError("llm.provider must be openai, anthropic, or gemini")
+    if cfg.llm.system_role not in {"system", "developer", "user"}:
+        raise ValueError("llm.system_role must be system, developer, or user")
+    if cfg.llm.token_limit_field not in {"max_tokens", "max_completion_tokens", ""}:
+        raise ValueError("llm.token_limit_field must be max_tokens, max_completion_tokens, or empty")
+    cfg.llm.send_temperature = _as_bool("llm.send_temperature", cfg.llm.send_temperature)
+    cfg.llm.max_retries = _as_int("llm.max_retries", cfg.llm.max_retries, minimum=0)
+    if cfg.llm.max_retries > 5:
+        raise ValueError("llm.max_retries must be <= 5")
+    cfg.llm.retry_backoff_seconds = _as_float("llm.retry_backoff_seconds", cfg.llm.retry_backoff_seconds, minimum=0, maximum=30)
+    cfg.llm.max_input_chars = _as_int("llm.max_input_chars", cfg.llm.max_input_chars)
+    if not isinstance(cfg.llm.extra_body, dict):
+        raise ValueError("llm.extra_body must be a JSON object / TOML table")
+    reserved = {"model", "messages", "contents", "system", "systemInstruction", "tools", "tool_choice", "toolConfig", "functions", "function_call", "parallel_tool_calls", "stream", "n", "candidateCount"}
+    if reserved & cfg.llm.extra_body.keys():
+        raise ValueError("llm.extra_body cannot override model, messages, tools, streaming, or candidate count")
+    generation = cfg.llm.extra_body.get("generationConfig", {})
+    if isinstance(generation, dict) and generation.get("candidateCount", 1) != 1:
+        raise ValueError("llm.extra_body.generationConfig.candidateCount must be 1")
+    try:
+        json.dumps(cfg.llm.extra_body, allow_nan=False)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("llm.extra_body must contain finite JSON values") from exc
     cfg.llm.base_url = _http_url("llm.base_url", cfg.llm.base_url)
     if not isinstance(cfg.llm.model, str) or not cfg.llm.model.strip():
         raise ValueError("llm.model must not be empty")
@@ -232,7 +280,7 @@ def validate_config(cfg: Config) -> Config:
     cfg.ui.show_stage_details = _as_bool("ui.show_stage_details", cfg.ui.show_stage_details)
     return cfg
 
-def load_config(path: str | Path | None = None) -> Config:
+def load_config(path: str | Path | None = None, *, use_environment: bool = True) -> Config:
     raw: dict[str, Any] = {}
     if path:
         p = Path(path).expanduser().resolve()
@@ -258,6 +306,8 @@ def load_config(path: str | Path | None = None) -> Config:
 
     # Backward-compatible OpenAI-style overrides. The ABH_* namespace below
     # can override every user-facing AgenticBugHunter setting.
+    if not use_environment:
+        return validate_config(cfg)
     cfg.llm.base_url = os.getenv("OPENAI_BASE_URL", cfg.llm.base_url)
     cfg.llm.api_key = os.getenv("OPENAI_API_KEY", cfg.llm.api_key)
     cfg.llm.model = os.getenv("OPENAI_MODEL", cfg.llm.model)

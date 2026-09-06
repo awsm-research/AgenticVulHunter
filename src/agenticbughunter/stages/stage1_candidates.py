@@ -6,7 +6,7 @@ from typing import Any
 from .base import Stage
 from ..config import Config
 from ..diff import changed_line_map, annotate_diff, parse_unified_diff
-from ..llm import AgentRunner, OpenAICompatibleClient
+from ..llm import AgentRunner, ChatClient
 from ..models import Candidate
 from ..resources import prompt
 from ..runlog import RunLogger
@@ -19,7 +19,7 @@ class Stage1Candidates(Stage):
     def __init__(
         self,
         config: Config,
-        client: OpenAICompatibleClient,
+        client: ChatClient,
         logger: RunLogger,
         repo_tools: RepositoryTools,
         diff_text: str,
@@ -308,6 +308,9 @@ class Stage1Candidates(Stage):
             ):
                 break
 
+        if raw and not out:
+            raise ValueError("Stage 1 returned candidates but none matched changed diff lines; refusing a false clean result")
+        self._logger.event("candidate_validation", {"proposed": len(raw), "retained": len(out)})
         self._logger.write_json(
             stage_dir / "output.json",
             out,
