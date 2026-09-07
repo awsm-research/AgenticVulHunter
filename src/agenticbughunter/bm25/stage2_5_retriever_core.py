@@ -7,7 +7,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-
 PROJECT_DIR = Path(__file__).resolve().parent
 FILES_DIR = PROJECT_DIR / "files"
 DEFAULT_MODEL_DIR = FILES_DIR / "stage2_5_model"
@@ -101,7 +100,6 @@ def item_to_text(item: dict[str, Any]) -> str:
         item.get("enclosing_conditions"),
         item.get("context_summary"),
         item.get("statement"),
-
         # Stage 3 agent-generated refinement
         item.get("retrieval_query"),
     ]
@@ -115,6 +113,7 @@ def item_to_text(item: dict[str, Any]) -> str:
             parts.append(text)
 
     return " ".join(parts)
+
 
 def item_language(item: dict[str, Any]) -> str:
     language = str(item.get("language") or "").strip().lower()
@@ -159,9 +158,7 @@ class BM25:
         self.doc_tokens = [tokenize(document) for document in documents]
         self.doc_lengths = [len(tokens) for tokens in self.doc_tokens]
         self.avg_doc_length = (
-            sum(self.doc_lengths) / len(self.doc_lengths)
-            if self.doc_lengths
-            else 0.0
+            sum(self.doc_lengths) / len(self.doc_lengths) if self.doc_lengths else 0.0
         )
         self.term_freqs = [Counter(tokens) for tokens in self.doc_tokens]
         self.doc_freq: Counter[str] = Counter()
@@ -199,10 +196,7 @@ class BM25:
         return score
 
     def score(self, query_tokens: list[str]) -> list[float]:
-        return [
-            self.score_document(query_tokens, i)
-            for i in range(self.num_docs)
-        ]
+        return [self.score_document(query_tokens, i) for i in range(self.num_docs)]
 
 
 class SASTRetriever:
@@ -225,9 +219,7 @@ class SASTRetriever:
         self.b = float(params.get("b", DEFAULT_BM25_B))
         stored_max_df_ratio = params.get("max_df_ratio", DEFAULT_MAX_DF_RATIO)
         self.max_df_ratio = (
-            None
-            if stored_max_df_ratio is None
-            else float(stored_max_df_ratio)
+            None if stored_max_df_ratio is None else float(stored_max_df_ratio)
         )
 
     def rank(
@@ -291,8 +283,7 @@ class SASTRetriever:
                     "severity": rule.get("severity"),
                     "sast_tool": rule.get("sast_tool"),
                     "is_fallback": (
-                        str(rule.get("sast_tool") or "").lower()
-                        == "cwe-fallback"
+                        str(rule.get("sast_tool") or "").lower() == "cwe-fallback"
                     ),
                     "score": round(raw_score, 4),
                     "raw_bm25_score": round(raw_score, 4),
@@ -312,9 +303,7 @@ def model_exists(model_dir: str | Path = DEFAULT_MODEL_DIR) -> bool:
     if not all((model_dir / name).is_file() for name in required):
         return False
     try:
-        metadata = json.loads(
-            (model_dir / "metadata.json").read_text(encoding="utf-8")
-        )
+        metadata = json.loads((model_dir / "metadata.json").read_text(encoding="utf-8"))
     except Exception:
         return False
     return metadata.get("algorithm") == "rule_bm25_cwe_retriever"

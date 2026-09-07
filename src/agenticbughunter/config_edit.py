@@ -8,7 +8,6 @@ from typing import Any
 
 from .config import Config, load_config
 
-
 _SECTION_TYPES = {
     "llm": Config().llm,
     "bm25": Config().bm25,
@@ -56,7 +55,9 @@ def set_config_value(path: Path, dotted_key: str, raw_value: str) -> Any:
 
 def _split_key(dotted_key: str) -> tuple[str, str]:
     if "." not in dotted_key:
-        raise ValueError("Configuration key must use section.name, for example pipeline.confidence_threshold")
+        raise ValueError(
+            "Configuration key must use section.name, for example pipeline.confidence_threshold"
+        )
     section, field_name = dotted_key.split(".", 1)
     if section not in _SECTION_TYPES:
         raise ValueError(f"Unknown configuration section: {section}")
@@ -75,7 +76,9 @@ def _coerce(raw: str, default_value: Any) -> Any:
             return True
         if lowered in {"false", "0", "no", "off"}:
             return False
-        raise ValueError(f"Expected boolean value for configuration setting, got {raw!r}")
+        raise ValueError(
+            f"Expected boolean value for configuration setting, got {raw!r}"
+        )
     if isinstance(default_value, int) and not isinstance(default_value, bool):
         return int(raw)
     if isinstance(default_value, float):
@@ -85,7 +88,13 @@ def _coerce(raw: str, default_value: Any) -> Any:
 
 def _toml_scalar(value: Any) -> str:
     if isinstance(value, dict):
-        return "{ " + ", ".join(json.dumps(str(k)) + " = " + _toml_scalar(v) for k, v in value.items()) + " }"
+        return (
+            "{ "
+            + ", ".join(
+                json.dumps(str(k)) + " = " + _toml_scalar(v) for k, v in value.items()
+            )
+            + " }"
+        )
     if isinstance(value, list):
         return "[" + ", ".join(_toml_scalar(v) for v in value) + "]"
     if value is None:
@@ -108,7 +117,11 @@ def _replace_or_append(text: str, section: str, field_name: str, rendered: str) 
         if stripped == section_header:
             section_start = index
             continue
-        if section_start is not None and index > section_start and re.match(r"^\s*\[[^]]+\]\s*$", line):
+        if (
+            section_start is not None
+            and index > section_start
+            and re.match(r"^\s*\[[^]]+\]\s*$", line)
+        ):
             section_end = index
             break
 

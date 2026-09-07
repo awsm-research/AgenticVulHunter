@@ -6,17 +6,17 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__
 from .config import environment_overrides, load_config
 from .config_edit import get_config_value, known_config_keys, set_config_value
+from .dashboard import serve_dashboard
 from .git import GitError, repo_root, resolve_default_base
 from .models import Finding, PipelineResult, StageResult
 from .pipeline import PipelineExecutionError, SecureReviewPipeline
 from .ui import TerminalUI
-
 
 CONFIG_NAME = ".agenticbughunter.toml"
 STATE_DIR = ".agenticbughunter"
@@ -34,17 +34,16 @@ EXAMPLE_CONFIG = """# AgenticBugHunter project configuration
 provider = "openai"
 base_url = "http://localhost:11434/v1"
 model = "qwen3-coder:30b"
-timeout_seconds = 300
+timeout_seconds = 800
 max_tokens = 6000
 temperature = 0.0
 
 [pipeline]
-max_candidates = 5
+max_candidates = 3
 max_hypotheses = 5
-confidence_threshold = 0.75
-max_comments = 5
-block_on_findings = true
-isolate_worktree = true
+confidence_threshold = 0.80
+block_on_findings = false
+isolate_worktree = false
 keep_worktree = false
 
 [bm25]
@@ -52,9 +51,9 @@ top_k = 10
 max_requests_per_candidate = 4
 
 [agents]
-stage1_max_steps = 30
-stage2_max_steps = 30
-stage3_max_steps = 30
+stage1_max_steps = 50
+stage2_max_steps = 50
+stage3_max_steps = 50
 stage4_mode = "api"
 stage4_max_steps = 10
 
@@ -71,7 +70,7 @@ show_config = true
 show_stage_details = true
 """
 
-HOOK_BLOCK = f'''{HOOK_BEGIN}
+HOOK_BLOCK = f"""{HOOK_BEGIN}
 run_agenticbughunter() {{
   if command -v agenticbughunter >/dev/null 2>&1; then
     agenticbughunter "$@"
@@ -102,8 +101,7 @@ while read -r abh_local_ref abh_local_sha abh_remote_ref abh_remote_sha; do
     run_agenticbughunter gate --repo "$(git rev-parse --show-toplevel)" --base "$abh_remote_sha" --head "$abh_local_sha" || exit $?
   fi
 done
-{HOOK_END}'''
-
+{HOOK_END}"""
 
 
 def _config_path(repo: Path, explicit: str | None) -> Path | None:
@@ -145,40 +143,55 @@ def _ensure_gitignore(repo: Path) -> None:
     if f"{STATE_DIR}/" in lines or STATE_DIR in lines:
         return
     prefix = "" if not existing or existing.endswith("\n") else "\n"
-    path.write_text(existing + prefix + f"\n# AgenticBugHunter local run artifacts\n{STATE_DIR}/\n", encoding="utf-8")
+    path.write_text(
+        existing + prefix + f"\n# AgenticBugHunter local run artifacts\n{STATE_DIR}/\n",
+        encoding="utf-8",
+    )
 
 
 def _install_hook(repo: Path, *, force: bool = False) -> tuple[Path, str]:
     hook = _git_hooks_dir(repo) / "pre-push"
     hook.parent.mkdir(parents=True, exist_ok=True)
-    existing = hook.read_text(encoding="utf-8", errors="replace") if hook.is_file() else ""
+    existing = (
+        hook.read_text(encoding="utf-8", errors="replace") if hook.is_file() else ""
+    )
     if HOOK_BEGIN in existing and HOOK_END in existing:
         hook.chmod(0o755)
         return hook, "already-installed"
 
     if existing:
         first = existing.splitlines()[0] if existing.splitlines() else ""
-        shell_compatible = first.startswith("#!") and any(x in first for x in ("sh", "bash", "zsh", "dash"))
+        shell_compatible = first.startswith("#!") and any(
+            x in first for x in ("sh", "bash", "zsh", "dash")
+        )
         if shell_compatible:
             # Preserve the original byte-for-byte and replay Git's stdin for
             # each hook. Prepending two readers would starve the second one.
             preserved = hook.with_name(PRESERVED_HOOK)
             if preserved.exists():
-                raise RuntimeError(f"Preserved hook already exists: {preserved}; resolve it before installing")
+                raise RuntimeError(
+                    f"Preserved hook already exists: {preserved}; resolve it before installing"
+                )
             shutil.copy2(hook, preserved)
             preserved.chmod(preserved.stat().st_mode | 0o100)
             content = (
-                "#!/bin/sh\n" + CHAIN_MARKER + "\n"
+                "#!/bin/sh\n"
+                + CHAIN_MARKER
+                + "\n"
                 + 'abh_hook_input="$(mktemp)" || exit 2\n'
                 + "trap 'rm -f \"$abh_hook_input\"' 0\n"
                 + 'cat > "$abh_hook_input" || exit 2\n'
-                + "(\n" + HOOK_BLOCK + "\n) < \"$abh_hook_input\" || exit $?\n"
-                + 'abh_original="$(dirname "$0")/' + PRESERVED_HOOK + '"\n'
-                + '\"$abh_original\" "$@" < "$abh_hook_input"\n'
+                + "(\n"
+                + HOOK_BLOCK
+                + '\n) < "$abh_hook_input" || exit $?\n'
+                + 'abh_original="$(dirname "$0")/'
+                + PRESERVED_HOOK
+                + '"\n'
+                + '"$abh_original" "$@" < "$abh_hook_input"\n'
             )
             action = "chained (original preserved; stdin replayed for both hooks)"
         elif force:
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             backup = hook.with_name(f"pre-push.agenticbughunter-backup-{stamp}")
             shutil.copy2(hook, backup)
             content = "#!/bin/sh\nset -eu\n\n" + HOOK_BLOCK + "\n"
@@ -214,7 +227,12 @@ def _uninstall_hook(repo: Path) -> tuple[Path, bool]:
         return hook, False
     end += len(HOOK_END)
     remaining = (text[:start].rstrip() + "\n" + text[end:].lstrip()).strip()
-    if remaining in {"#!/bin/sh", "#!/bin/sh\nset -eu", "#!/usr/bin/env sh", "#!/usr/bin/env bash"}:
+    if remaining in {
+        "#!/bin/sh",
+        "#!/bin/sh\nset -eu",
+        "#!/usr/bin/env sh",
+        "#!/usr/bin/env bash",
+    }:
         hook.unlink(missing_ok=True)
     else:
         hook.write_text(remaining + "\n", encoding="utf-8")
@@ -251,16 +269,18 @@ def _run(args: argparse.Namespace, gate: bool) -> int:
     repo = repo_root(args.repo)
     config_path = _config_path(repo, args.config)
     cfg = load_config(config_path)
-    ui = TerminalUI.from_config(cfg, enabled=not args.json, color=False if args.plain else None)
+    ui = TerminalUI.from_config(
+        cfg, enabled=not args.json, color=False if args.plain else None
+    )
     ui.set_context(
         cfg=cfg,
         config_path=config_path,
         active_env=_active_environment_overrides(),
         version=__version__,
     )
-    result = SecureReviewPipeline(cfg, progress=ui.progress_event if not args.json else None).run(
-        repo, base=args.base, head=args.head
-    )
+    result = SecureReviewPipeline(
+        cfg, progress=ui.progress_event if not args.json else None
+    ).run(repo, base=args.base, head=args.head)
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     else:
@@ -291,7 +311,11 @@ def cmd_show_run(args: argparse.Namespace) -> int:
     if args.run_id:
         path = runs / args.run_id / "result.json"
     else:
-        choices = sorted((p for p in runs.glob("*") if p.is_dir()), reverse=True) if runs.is_dir() else []
+        choices = (
+            sorted((p for p in runs.glob("*") if p.is_dir()), reverse=True)
+            if runs.is_dir()
+            else []
+        )
         if not choices:
             print("No AgenticBugHunter runs found.")
             return 1
@@ -315,17 +339,35 @@ def cmd_show_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Serve the read-only local run dashboard."""
+    repo = repo_root(args.repo)
+    serve_dashboard(
+        repo,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_open,
+    )
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     repo = repo_root(args.repo)
     config_path = _config_path(repo, args.config)
     cfg = load_config(config_path)
     ui = TerminalUI.from_config(cfg, color=False if args.plain else None)
-    ui.set_context(cfg=cfg, config_path=config_path, active_env=_active_environment_overrides(), version=__version__)
+    ui.set_context(
+        cfg=cfg,
+        config_path=config_path,
+        active_env=_active_environment_overrides(),
+        version=__version__,
+    )
     ui.title("Environment check", version=__version__)
     ui.success(f"Repository  {repo}")
     ui.success(f"Configuration  {config_path or 'built-in defaults'}")
     ui.success(f"LLM  {cfg.llm.model} @ {cfg.llm.base_url}")
     from .bm25 import DEFAULT_MODEL_DIR, SASTRetriever
+
     retriever = SASTRetriever(DEFAULT_MODEL_DIR)
     ui.success(
         "Local BM25  "
@@ -337,7 +379,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except GitError as exc:
         ui.warning(f"Git review base  {exc}")
     hook = _git_hooks_dir(repo) / "pre-push"
-    managed = hook.is_file() and HOOK_BEGIN in hook.read_text(encoding="utf-8", errors="replace")
+    managed = hook.is_file() and HOOK_BEGIN in hook.read_text(
+        encoding="utf-8", errors="replace"
+    )
     if managed:
         ui.success(f"Pre-push gate managed  {hook}")
     else:
@@ -345,16 +389,31 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     ui.blank()
     if args.check_llm:
         from .llm import create_client, extract_json_value
+
         response = create_client(cfg.llm).chat(
-            [{"role": "system", "content": "Return exactly one JSON object: {\"ok\": true}"},
-             {"role": "user", "content": "Check text JSON compatibility. Do not call any tools."}],
+            [
+                {
+                    "role": "system",
+                    "content": 'Return exactly one JSON object: {"ok": true}',
+                },
+                {
+                    "role": "user",
+                    "content": "Check text JSON compatibility. Do not call any tools.",
+                },
+            ],
             metadata={"stage": "doctor"},
         )
         if extract_json_value(response.content) != {"ok": True}:
-            raise RuntimeError("LLM was reachable but failed the text JSON compatibility check")
-        ui.success("LLM text JSON request succeeded (repository contents were not sent)")
+            raise RuntimeError(
+                "LLM was reachable but failed the text JSON compatibility check"
+            )
+        ui.success(
+            "LLM text JSON request succeeded (repository contents were not sent)"
+        )
     else:
-        ui.info("Local checks complete. Endpoint not contacted; use doctor --check-llm to test it.")
+        ui.info(
+            "Local checks complete. Endpoint not contacted; use doctor --check-llm to test it."
+        )
     ui.success("Local setup checks complete")
     return 0
 
@@ -369,7 +428,12 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     path = _config_path(repo, args.config)
     cfg = load_config(path)
     ui = TerminalUI.from_config(cfg, color=False if args.plain else None)
-    ui.set_context(cfg=cfg, config_path=path, active_env=_active_environment_overrides(), version=__version__)
+    ui.set_context(
+        cfg=cfg,
+        config_path=path,
+        active_env=_active_environment_overrides(),
+        version=__version__,
+    )
     ui.config_summary(cfg, path=path)
     return 0
 
@@ -398,13 +462,17 @@ def cmd_config_set(args: argparse.Namespace) -> int:
 def cmd_config_env(args: argparse.Namespace) -> int:
     ui = TerminalUI(color=False if args.plain else None)
     ui.title("Environment overrides", version=__version__)
-    ui.info("TOML is the normal project configuration; environment values are temporary overrides for CI/experiments.")
+    ui.info(
+        "TOML is the normal project configuration; environment values are temporary overrides for CI/experiments."
+    )
     ui.key_value("ABH_CONFIG", "select an alternate TOML file")
     ui.blank()
     for env_name, (section, field_name) in sorted(environment_overrides().items()):
         ui.key_value(env_name, f"{section}.{field_name}")
     ui.blank()
-    ui.info("OPENAI_BASE_URL, OPENAI_API_KEY and OPENAI_MODEL remain supported for compatibility.")
+    ui.info(
+        "OPENAI_BASE_URL, OPENAI_API_KEY and OPENAI_MODEL remain supported for compatibility."
+    )
     return 0
 
 
@@ -416,32 +484,61 @@ def cmd_config_path(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agenticbughunter", description="Project-local agentic secure-code-review Git gate")
-    parser.add_argument("--version", action="version", version=f"AgenticBugHunter {__version__}")
+    parser = argparse.ArgumentParser(
+        prog="agenticbughunter",
+        description="Project-local agentic secure-code-review Git gate",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"AgenticBugHunter {__version__}"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("init", help="Add AgenticBugHunter configuration/runtime state to a Git project")
+    p = sub.add_parser(
+        "init", help="Add AgenticBugHunter configuration/runtime state to a Git project"
+    )
     p.add_argument("--repo", default=".")
     p.add_argument("--force", action="store_true", help="overwrite the project config")
-    p.add_argument("--no-hook", action="store_true", help="do not install the managed pre-push hook")
+    p.add_argument(
+        "--no-hook",
+        action="store_true",
+        help="do not install the managed pre-push hook",
+    )
     p.set_defaults(func=cmd_init)
 
     for name, gate in (("review", False), ("gate", True)):
-        p = sub.add_parser(name, help="Run staged secure code review" + (" and fail on supported findings" if gate else ""))
+        p = sub.add_parser(
+            name,
+            help="Run staged secure code review"
+            + (" and fail on supported findings" if gate else ""),
+        )
         p.add_argument("--repo", default=".")
-        p.add_argument("--base", default=None, help="Base Git ref; defaults to upstream/origin default branch/HEAD~1, never HEAD itself")
+        p.add_argument(
+            "--base",
+            default=None,
+            help="Base Git ref; defaults to upstream/origin default branch/HEAD~1, never HEAD itself",
+        )
         p.add_argument("--head", default="HEAD")
         p.add_argument("--config", default=None)
-        p.add_argument("--json", action="store_true", help="write only result JSON to stdout")
+        p.add_argument(
+            "--json", action="store_true", help="write only result JSON to stdout"
+        )
         p.add_argument("--plain", action="store_true", help="disable terminal colours")
         p.set_defaults(func=lambda a, g=gate: _run(a, g))
 
-    p = sub.add_parser("install-hook", help="Install/update the managed project pre-push gate")
+    p = sub.add_parser(
+        "install-hook", help="Install/update the managed project pre-push gate"
+    )
     p.add_argument("--repo", default=".")
-    p.add_argument("--force", action="store_true", help="backup and replace an incompatible existing hook")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="backup and replace an incompatible existing hook",
+    )
     p.set_defaults(func=cmd_install_hook)
 
-    p = sub.add_parser("uninstall-hook", help="Remove only the AgenticBugHunter managed hook block")
+    p = sub.add_parser(
+        "uninstall-hook", help="Remove only the AgenticBugHunter managed hook block"
+    )
     p.add_argument("--repo", default=".")
     p.set_defaults(func=cmd_uninstall_hook)
 
@@ -452,15 +549,44 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run_id", nargs="?")
     p.set_defaults(func=cmd_show_run)
 
-    p = sub.add_parser("doctor", help="Validate project/package configuration without running the LLM pipeline")
+    p = sub.add_parser(
+        "dashboard", aliases=["ui"], help="Open the live local run dashboard"
+    )
+    p.add_argument("--repo", default=".")
+    p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="listen address (default: local machine only)",
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="listen port; use 0 for an available port",
+    )
+    p.add_argument(
+        "--no-open", action="store_true", help="do not open a browser automatically"
+    )
+    p.set_defaults(func=cmd_dashboard)
+
+    p = sub.add_parser(
+        "doctor",
+        help="Validate project/package configuration without running the LLM pipeline",
+    )
     p.add_argument("--repo", default=".")
     p.add_argument("--config", default=None)
     p.add_argument("--head", default="HEAD")
     p.add_argument("--plain", action="store_true", help="disable terminal colours")
-    p.add_argument("--check-llm", action="store_true", help="send a small text JSON test to the configured model (may incur API cost)")
+    p.add_argument(
+        "--check-llm",
+        action="store_true",
+        help="send a small text JSON test to the configured model (may incur API cost)",
+    )
     p.set_defaults(func=cmd_doctor)
 
-    p = sub.add_parser("config", help="Inspect or change AgenticBugHunter configuration")
+    p = sub.add_parser(
+        "config", help="Inspect or change AgenticBugHunter configuration"
+    )
     config_sub = p.add_subparsers(dest="config_command", required=True)
 
     c = config_sub.add_parser("show", help="Show the effective configuration")
@@ -475,7 +601,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--config", default=None)
     c.set_defaults(func=cmd_config_get)
 
-    c = config_sub.add_parser("set", help="Update one project setting without hand-editing TOML")
+    c = config_sub.add_parser(
+        "set", help="Update one project setting without hand-editing TOML"
+    )
     c.add_argument("key", choices=known_config_keys())
     c.add_argument("value")
     c.add_argument("--repo", default=".")

@@ -3,13 +3,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .base import Stage
 from ..config import Config
 from ..llm import AgentRunner, ChatClient
 from ..resources import prompt
 from ..runlog import RunLogger
 from ..tools.repo import RepositoryTools
-
+from .base import Stage
 
 _IMMUTABLE = ("candidate_id", "filepath", "changed_line", "statement", "change_type")
 
@@ -17,7 +16,13 @@ _IMMUTABLE = ("candidate_id", "filepath", "changed_line", "statement", "change_t
 class Stage2Context(Stage):
     name = "stage2_context"
 
-    def __init__(self, config: Config, client: ChatClient, logger: RunLogger, repo_tools: RepositoryTools):
+    def __init__(
+        self,
+        config: Config,
+        client: ChatClient,
+        logger: RunLogger,
+        repo_tools: RepositoryTools,
+    ):
         self.config = config
         self.client = client
         self._logger = logger
@@ -41,13 +46,31 @@ class Stage2Context(Stage):
                 stage=f"{self.name}:{cid}",
                 max_steps=self.config.agents.stage2_max_steps,
                 artifact_dir=item_dir,
+                max_tool_calls=12,
             )
-            answer = agent.run(system, "CANDIDATE INPUT:\n" + json.dumps(candidate, ensure_ascii=False, indent=2))
+            try:
+                answer = agent.run(
+                    system,
+                    "CANDIDATE INPUT:\n"
+                    + json.dumps(candidate, ensure_ascii=False, indent=2),
+                )
+            except Exception as exc:
+                error = {
+                    "candidate_id": cid,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "recovery": "candidate_skipped_with_no_hypotheses",
+                }
+                self._logger.write_json(item_dir / "model_output_error.json", error)
+                self._logger.event("stage2_candidate_degraded", error)
+                continue
             if not isinstance(answer, dict):
                 raise ValueError(f"Stage 2 {cid} final answer must be a JSON object")
             for field in _IMMUTABLE:
                 if field in answer and answer[field] != candidate[field]:
-                    raise ValueError(f"Stage 2 changed immutable field {field} for {cid}")
+                    raise ValueError(
+                        f"Stage 2 changed immutable field {field} for {cid}"
+                    )
             enriched = dict(candidate)
             enriched.update(answer)
             for field in _IMMUTABLE:

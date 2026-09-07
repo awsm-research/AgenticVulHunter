@@ -11,7 +11,6 @@ from typing import Any, TextIO
 from .config import Config, environment_overrides
 from .models import PipelineResult, StageResult
 
-
 _STAGE_LABELS = {
     "stage1_candidates": "Candidate localisation",
     "stage2_context": "Context enrichment",
@@ -51,7 +50,10 @@ class TerminalUI:
     ):
         self.stream = stream or sys.stdout
         self.enabled = enabled
-        self.interactive = bool(getattr(self.stream, "isatty", lambda: False)()) and os.getenv("TERM", "") != "dumb"
+        self.interactive = (
+            bool(getattr(self.stream, "isatty", lambda: False)())
+            and os.getenv("TERM", "") != "dumb"
+        )
         if color is None:
             color = self.interactive and "NO_COLOR" not in os.environ
         self.color = bool(color)
@@ -81,7 +83,7 @@ class TerminalUI:
         stream: TextIO | None = None,
         enabled: bool = True,
         color: bool | None = None,
-    ) -> "TerminalUI":
+    ) -> TerminalUI:
         return cls(
             stream=stream,
             enabled=enabled,
@@ -114,7 +116,9 @@ class TerminalUI:
         if self.enabled:
             print(text, file=self.stream, flush=True)
 
-    def _brand(self, subtitle: str | None = None, *, version: str | None = None) -> None:
+    def _brand(
+        self, subtitle: str | None = None, *, version: str | None = None
+    ) -> None:
         version = version or self.version
         if self.banner and self.interactive and self.width >= 72:
             for line in _LOGO:
@@ -158,12 +162,24 @@ class TerminalUI:
             return
         max_width = min(100, max(60, self.width - 2))
         rendered = [f"{key:<11} {value}" for key, value in rows]
-        content_width = min(max_width - 4, max([len(title) + 4, *(len(x) for x in rendered)]))
+        content_width = min(
+            max_width - 4, max([len(title) + 4, *(len(x) for x in rendered)])
+        )
         top_fill = max(1, content_width - len(title) - 1)
         self._write(self._paint(f"╭─ {title} " + "─" * top_fill + "╮", "2"))
         for row in rendered:
-            clipped = row if len(row) <= content_width else row[: max(1, content_width - 1)] + "…"
-            self._write(self._paint("│", "2") + " " + clipped.ljust(content_width) + " " + self._paint("│", "2"))
+            clipped = (
+                row
+                if len(row) <= content_width
+                else row[: max(1, content_width - 1)] + "…"
+            )
+            self._write(
+                self._paint("│", "2")
+                + " "
+                + clipped.ljust(content_width)
+                + " "
+                + self._paint("│", "2")
+            )
         self._write(self._paint("╰" + "─" * (content_width + 2) + "╯", "2"))
 
     def _run_panel(self, payload: dict[str, Any]) -> None:
@@ -175,7 +191,12 @@ class TerminalUI:
             ("Model", payload.get("model", "")),
         ]
         if self.show_config:
-            rows.append(("TOML", str(self.config_path) if self.config_path else "built-in defaults"))
+            rows.append(
+                (
+                    "TOML",
+                    str(self.config_path) if self.config_path else "built-in defaults",
+                )
+            )
         if cfg is not None:
             rows.append(
                 (
@@ -187,7 +208,9 @@ class TerminalUI:
         else:
             rows.append(("Threshold", f"{float(payload.get('threshold', 0.0)):.2f}"))
         if self.active_env:
-            rows.append(("Overrides", f"{len(self.active_env)} environment override(s) active"))
+            rows.append(
+                ("Overrides", f"{len(self.active_env)} environment override(s) active")
+            )
         self.panel("Secure review", rows)
         self._write()
 
@@ -200,13 +223,17 @@ class TerminalUI:
             state = self._stage_state[name]
             status = state["status"]
             idx = _STAGE_INDEX[name]
-            symbol = {"pending": "○", "running": "◐", "done": "✓", "failed": "✗"}.get(status, "○")
+            symbol = {"pending": "○", "running": "◐", "done": "✓", "failed": "✗"}.get(
+                status, "○"
+            )
             right = "pending"
             if status == "running":
                 right = "running"
             elif status == "done":
                 duration = _format_duration(float(state["duration_ms"]))
-                detail = str(state.get("detail") or "") if self.show_stage_details else ""
+                detail = (
+                    str(state.get("detail") or "") if self.show_stage_details else ""
+                )
                 right = f"{duration}" + (f" · {detail}" if detail else "")
             elif status == "failed":
                 right = "failed"
@@ -226,9 +253,13 @@ class TerminalUI:
         if "✗" in line:
             return line.replace("✗", self._paint("✗", "31"), 1)
         if "◐" in line:
-            return line.replace("◐", self._paint("◐", "36"), 1).replace("running", self._paint("running", "1;36"), 1)
+            return line.replace("◐", self._paint("◐", "36"), 1).replace(
+                "running", self._paint("running", "1;36"), 1
+            )
         if "○" in line:
-            return line.replace("○", self._paint("○", "2"), 1).replace("pending", self._paint("pending", "2"), 1)
+            return line.replace("○", self._paint("○", "2"), 1).replace(
+                "pending", self._paint("pending", "2"), 1
+            )
         return self._paint(line, "2")
 
     def _render_live_pipeline(self) -> None:
@@ -277,9 +308,13 @@ class TerminalUI:
             idx = _STAGE_INDEX.get(name, payload.get("index", "?"))
             label = _STAGE_LABELS.get(name, name.replace("_", " ").title())
             duration_ms = float(payload.get("duration_ms", 0.0))
-            detail = stage_output_summary(StageResult(name, payload.get("output"), duration_ms))
+            detail = stage_output_summary(
+                StageResult(name, payload.get("output"), duration_ms)
+            )
             if name in self._stage_state:
-                self._stage_state[name].update(status="done", duration_ms=duration_ms, detail=detail)
+                self._stage_state[name].update(
+                    status="done", duration_ms=duration_ms, detail=detail
+                )
             if self.live_progress:
                 self._render_live_pipeline()
             else:
@@ -295,13 +330,17 @@ class TerminalUI:
             idx = _STAGE_INDEX.get(name, payload.get("index", "?"))
             label = _STAGE_LABELS.get(name, name.replace("_", " ").title())
             if name in self._stage_state:
-                self._stage_state[name].update(status="failed", error=str(payload.get("error", "")))
+                self._stage_state[name].update(
+                    status="failed", error=str(payload.get("error", ""))
+                )
             if self.live_progress:
                 self._render_live_pipeline()
                 self._write()
                 self.error(str(payload.get("error", "")))
             else:
-                self._write(f"  {self._paint('✗', '31')} {idx}/5  {label}  {payload.get('error', '')}")
+                self._write(
+                    f"  {self._paint('✗', '31')} {idx}/5  {label}  {payload.get('error', '')}"
+                )
             self._active_stage = None
             return
 
@@ -326,7 +365,11 @@ class TerminalUI:
 
         if not result.findings:
             self._write()
-            self._write(self._paint("No supported vulnerabilities passed the configured threshold.", "2"))
+            self._write(
+                self._paint(
+                    "No supported vulnerabilities passed the configured threshold.", "2"
+                )
+            )
             return
 
         self._write()
@@ -340,13 +383,17 @@ class TerminalUI:
                 f"{self._paint(finding.cwe_id, '33')}{cwe_name}  "
                 f"score={finding.final_score:.3f}"
             )
-            self._write(f"     {finding.filepath}:{finding.changed_line}  {change_label}")
+            self._write(
+                f"     {finding.filepath}:{finding.changed_line}  {change_label}"
+            )
             statement = " ".join(finding.statement.split())
             if statement:
                 self._write(f"     code: {statement[:140]}")
             comment = " ".join(finding.review_comment.split())
             if comment:
-                for line in textwrap.wrap(comment, width=96, subsequent_indent="       "):
+                for line in textwrap.wrap(
+                    comment, width=96, subsequent_indent="       "
+                ):
                     self._write(f"     {line}")
 
     def config_summary(self, cfg: Config, *, path: Path | None = None) -> None:
@@ -356,7 +403,12 @@ class TerminalUI:
             [
                 ("TOML", str(path) if path else "built-in defaults"),
                 ("Precedence", "environment overrides → TOML → defaults"),
-                ("Overrides", f"{len(_active_config_env())} active" if _active_config_env() else "none"),
+                (
+                    "Overrides",
+                    f"{len(_active_config_env())} active"
+                    if _active_config_env()
+                    else "none",
+                ),
             ],
         )
         raw = asdict(cfg)
@@ -368,7 +420,11 @@ class TerminalUI:
                 if "api_key" in key:
                     value = "***REDACTED***" if value else ""
                 source = env_by_key.get(f"{section}.{key}")
-                suffix = f"  {self._paint('← ' + source, '33')}" if source and source in os.environ else ""
+                suffix = (
+                    f"  {self._paint('← ' + source, '33')}"
+                    if source and source in os.environ
+                    else ""
+                )
                 self.key_value(key, f"{value}{suffix}")
 
 
@@ -381,12 +437,21 @@ def _active_config_env() -> list[str]:
 
 
 def _env_by_config_key() -> dict[str, str]:
-    mapping = {f"{section}.{field}": env for env, (section, field) in environment_overrides().items()}
+    mapping = {
+        f"{section}.{field}": env
+        for env, (section, field) in environment_overrides().items()
+    }
     mapping.update(
         {
-            "llm.base_url": "OPENAI_BASE_URL" if "OPENAI_BASE_URL" in os.environ else mapping.get("llm.base_url", ""),
-            "llm.api_key": "OPENAI_API_KEY" if "OPENAI_API_KEY" in os.environ else mapping.get("llm.api_key", ""),
-            "llm.model": "OPENAI_MODEL" if "OPENAI_MODEL" in os.environ else mapping.get("llm.model", ""),
+            "llm.base_url": "OPENAI_BASE_URL"
+            if "OPENAI_BASE_URL" in os.environ
+            else mapping.get("llm.base_url", ""),
+            "llm.api_key": "OPENAI_API_KEY"
+            if "OPENAI_API_KEY" in os.environ
+            else mapping.get("llm.api_key", ""),
+            "llm.model": "OPENAI_MODEL"
+            if "OPENAI_MODEL" in os.environ
+            else mapping.get("llm.model", ""),
         }
     )
     return mapping
@@ -399,10 +464,16 @@ def stage_output_summary(stage: StageResult) -> str:
     if stage.name == "stage2_context" and isinstance(output, list):
         return f"{len(output)} candidate(s) enriched"
     if stage.name == "stage3_hypotheses" and isinstance(output, list):
-        hypotheses = sum(len(item.get("hypotheses", [])) for item in output if isinstance(item, dict))
+        hypotheses = sum(
+            len(item.get("hypotheses", [])) for item in output if isinstance(item, dict)
+        )
         return f"{hypotheses} hypotheses"
     if stage.name == "stage4_judge" and isinstance(output, list):
-        assessments = sum(len(item.get("cwe_assessments", [])) for item in output if isinstance(item, dict))
+        assessments = sum(
+            len(item.get("cwe_assessments", []))
+            for item in output
+            if isinstance(item, dict)
+        )
         supported = sum(
             1
             for item in output

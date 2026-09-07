@@ -25,7 +25,9 @@ class Stage:
         try:
             output = self.execute(value)
         except Exception as exc:
-            self._logger.error(f"ERROR {self.name}", error_type=type(exc).__name__, error=str(exc))
+            self._logger.error(
+                f"ERROR {self.name}", error_type=type(exc).__name__, error=str(exc)
+            )
             raise
         duration_ms = (time.monotonic() - started) * 1000.0
         self._logger.info(f"END {self.name}", duration_ms=duration_ms)

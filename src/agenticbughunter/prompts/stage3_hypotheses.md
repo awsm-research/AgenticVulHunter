@@ -9,6 +9,8 @@ The program has already performed one baseline BM25 request and supplies its com
 Build hypotheses only from CWE IDs actually returned by BM25 during this session. Deduplicate by CWE ID. Prefer concrete mechanism fit:
 source/state -> sensitive operation/decision -> missing or weakened control -> vulnerability mechanism -> impact.
 
+Prefer mechanism fit over retrieval rank. Retrieved rules provide security knowledge, not new repository evidence. Stop refining when results converge, further refinement is unsupported, or the retrieval budget is exhausted.
+
 Return at most __MAX_HYPOTHESES__ hypotheses; fewer is better than weak guesses. An empty array is valid.
 
 Final answer:

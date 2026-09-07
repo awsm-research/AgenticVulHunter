@@ -1,6 +1,6 @@
 # AgenticBugHunter
 
-AgenticBugHunter is a secure code review tool built from my research workflow.
+AgenticBugHunter is a secure code review tool.
 
 It reviews code changes in stages: it localizes suspicious changed lines, gathers repository context, retrieves relevant security knowledge, generates CWE hypotheses, validates them, and then produces review comments.
 
@@ -12,7 +12,14 @@ See [research.md](docs/research.md) for more details.
 
 Requires Python 3.11+ and Git.
 
-Install directly from GitHub:
+Run directly with npm/npx (Node 18+ and Python 3.11+):
+
+```bash
+npx agenticbughunter --version
+npx agenticbughunter dashboard --repo .
+```
+
+Or install the Python CLI directly from GitHub:
 
 ```bash
 pipx install "git+https://github.com/awsm-research/AgenticBugHunter.git"
@@ -102,6 +109,21 @@ For a CI-style gate:
 agenticbughunter gate --base HEAD~1 --head HEAD --json > gate.json
 ```
 
+## Live dashboard
+
+Open the local dashboard while a review is running or to inspect previous runs:
+
+```bash
+npx agenticbughunter dashboard --repo .
+# or: agenticbughunter dashboard --repo .
+```
+
+The dashboard updates every two seconds and displays the active pipeline stage,
+stage timings, model and threshold, findings, comments, errors, recent events,
+and historical runs. It is read-only and listens on `127.0.0.1:8765` by
+default. Use `--port 0` to select an available port or `--no-open` on a remote
+machine.
+
 ## Model configuration
 
 Normally, configure the model in:
@@ -155,7 +177,8 @@ agenticbughunter uninstall-hook
 | 4 | Vulnerability validation |
 | 5 | Finding filter and review comments |
 
-BM25 retrieval is local and uses bundled security knowledge. It is not a separate SAST server.
+BM25 retrieval is local and uses bundled security knowledge.
+
 
 Run outputs are stored in:
 
@@ -163,16 +186,6 @@ Run outputs are stored in:
 .agenticbughunter/runs/
 ```
 
-More details:
-
-- [Architecture](docs/architecture.md)
-- [Models](docs/models.md)
-- [Configuration](docs/configuration.md)
-- [Research mapping](docs/research.md)
-- [Operations](docs/operations.md)
-- [Development](docs/development.md)
-- [Validation](VALIDATION.md)
-- [Changelog](CHANGELOG.md)
 
 ## Tests
 

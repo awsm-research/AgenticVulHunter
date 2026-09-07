@@ -4,9 +4,9 @@ import contextlib
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 
 class GitError(RuntimeError):
@@ -24,7 +24,11 @@ def _run(repo: Path, *args: str, check: bool = True) -> str:
     except FileNotFoundError as exc:
         raise GitError("git executable was not found on PATH") from exc
     if check and result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or f"exit {result.returncode}"
+        )
         raise GitError(f"git {' '.join(args)} failed: {detail}")
     return result.stdout.strip()
 
@@ -55,11 +59,25 @@ def resolve_default_base(repo: Path, head: str = "HEAD") -> str:
     head_sha = resolve_ref(repo, head)
     candidates: list[str] = []
 
-    upstream = _run(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False)
+    upstream = _run(
+        repo,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+        check=False,
+    )
     if upstream:
         candidates.append(upstream)
 
-    remote_head = _run(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
+    remote_head = _run(
+        repo,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+        check=False,
+    )
     if remote_head:
         candidates.append(remote_head)
 
@@ -93,7 +111,8 @@ def diff(repo: Path, base: str, head: str = "HEAD", unified: int = 20) -> str:
         )
     return _run(
         repo,
-        "-c", "core.quotepath=false",
+        "-c",
+        "core.quotepath=false",
         "diff",
         "--no-ext-diff",
         "--no-textconv",
@@ -112,7 +131,9 @@ class Workspace:
 
 
 @contextlib.contextmanager
-def isolated_workspace(repo: Path, head: str, enabled: bool = True, keep: bool = False) -> Iterator[Workspace]:
+def isolated_workspace(
+    repo: Path, head: str, enabled: bool = True, keep: bool = False
+) -> Iterator[Workspace]:
     if not enabled:
         yield Workspace(repo, repo, False)
         return
@@ -129,7 +150,15 @@ def isolated_workspace(repo: Path, head: str, enabled: bool = True, keep: bool =
         if not keep:
             if added:
                 subprocess.run(
-                    ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)],
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(worktree),
+                    ],
                     capture_output=True,
                     text=True,
                     check=False,

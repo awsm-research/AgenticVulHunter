@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import Stage
 from ..config import Config
 from ..models import Finding
 from ..runlog import RunLogger
+from .base import Stage
 
 
 class Stage5Filter(Stage):
@@ -42,21 +42,22 @@ class Stage5Filter(Stage):
             if not eligible:
                 continue
             best = eligible[0]
-            accepted.append(Finding(
-                candidate_id=str(finding.get("candidate_id") or ""),
-                filepath=str(finding.get("filepath") or ""),
-                changed_line=int(finding.get("changed_line") or 0),
-                statement=str(finding.get("statement") or ""),
-                cwe_id=str(best.get("cwe_id") or ""),
-                cwe_name=str(best.get("cwe_name") or ""),
-                final_score=float(best.get("score", 0.0)),
-                verdict="supported",
-                review_comment=str(best.get("review_comment") or ""),
-                assessment=best,
-            ))
+            accepted.append(
+                Finding(
+                    candidate_id=str(finding.get("candidate_id") or ""),
+                    filepath=str(finding.get("filepath") or ""),
+                    changed_line=int(finding.get("changed_line") or 0),
+                    statement=str(finding.get("statement") or ""),
+                    cwe_id=str(best.get("cwe_id") or ""),
+                    cwe_name=str(best.get("cwe_name") or ""),
+                    final_score=float(best.get("score", 0.0)),
+                    verdict="supported",
+                    review_comment=str(best.get("review_comment") or ""),
+                    assessment=best,
+                )
+            )
 
         accepted.sort(key=lambda x: x.final_score, reverse=True)
-        accepted = accepted[: self.config.pipeline.max_comments]
         comments = [
             {
                 "filepath": f.filepath,

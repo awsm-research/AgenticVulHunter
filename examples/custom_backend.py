@@ -3,7 +3,6 @@
 This skeleton intentionally raises until you connect a real text generator;
 it must never return an empty successful review as a placeholder.
 """
-from agenticbughunter.llm import LLMResponse
 
 
 class CustomBackend:
@@ -11,4 +10,6 @@ class CustomBackend:
 
     def chat(self, messages, *, temperature=None, max_tokens=None, metadata=None):
         """Generate text JSON actions/finals from the ordinary chat messages."""
-        raise NotImplementedError('Connect your model here and return LLMResponse with final answer text')
+        raise NotImplementedError(
+            "Connect your model here and return LLMResponse with final answer text"
+        )

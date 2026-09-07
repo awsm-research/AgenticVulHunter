@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
-_SECRET_KEYS = re.compile(r"(api[_-]?key|authorization|password|secret|^(?:access_|refresh_|id_|auth_)?token$)", re.I)
+_SECRET_KEYS = re.compile(
+    r"(api[_-]?key|authorization|password|secret|^(?:access_|refresh_|id_|auth_)?token$)",
+    re.IGNORECASE,
+)
 
 
 def _safe(value: Any) -> Any:
@@ -37,16 +39,24 @@ class RunLogger:
         self.logger.addHandler(handler)
 
     def info(self, message: str, **metadata: Any) -> None:
-        self.logger.info("%s %s", message, json.dumps(_safe(metadata), ensure_ascii=False) if metadata else "")
+        self.logger.info(
+            "%s %s",
+            message,
+            json.dumps(_safe(metadata), ensure_ascii=False) if metadata else "",
+        )
         self.event("info", {"message": message, **metadata})
 
     def error(self, message: str, **metadata: Any) -> None:
-        self.logger.error("%s %s", message, json.dumps(_safe(metadata), ensure_ascii=False) if metadata else "")
+        self.logger.error(
+            "%s %s",
+            message,
+            json.dumps(_safe(metadata), ensure_ascii=False) if metadata else "",
+        )
         self.event("error", {"message": message, **metadata})
 
     def event(self, event_type: str, payload: dict[str, Any]) -> None:
         record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "type": event_type,
             "payload": _safe(payload),
         }
@@ -60,7 +70,10 @@ class RunLogger:
 
     def write_json(self, path: Path, value: Any) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(_safe(value), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        path.write_text(
+            json.dumps(_safe(value), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         return path
 
     def write_text(self, path: Path, value: str) -> Path:

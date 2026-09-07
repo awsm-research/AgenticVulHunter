@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import os
 import json
 import math
+import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +15,7 @@ class LLMConfig:
     base_url: str = "http://localhost:11434/v1"
     api_key: str = "ollama"
     model: str = "qwen3-coder:30b"
-    timeout_seconds: float = 300.0
+    timeout_seconds: float = 800.0
     max_tokens: int = 6000
     temperature: float = 0.0
     provider: str = "openai"
@@ -36,20 +36,19 @@ class BM25Config:
 
 @dataclass
 class PipelineConfig:
-    max_candidates: int = 5
+    max_candidates: int = 3
     max_hypotheses: int = 5
-    confidence_threshold: float = 0.75
-    max_comments: int = 5
-    block_on_findings: bool = True
-    isolate_worktree: bool = True
+    confidence_threshold: float = 0.80
+    block_on_findings: bool = False
+    isolate_worktree: bool = False
     keep_worktree: bool = False
 
 
 @dataclass
 class AgentConfig:
-    stage1_max_steps: int = 30
-    stage2_max_steps: int = 30
-    stage3_max_steps: int = 30
+    stage1_max_steps: int = 50
+    stage2_max_steps: int = 50
+    stage3_max_steps: int = 50
     stage4_mode: str = "api"
     stage4_max_steps: int = 10
 
@@ -100,7 +99,6 @@ _ENV_OVERRIDES: dict[str, tuple[str, str]] = {
     "ABH_PIPELINE_MAX_CANDIDATES": ("pipeline", "max_candidates"),
     "ABH_PIPELINE_MAX_HYPOTHESES": ("pipeline", "max_hypotheses"),
     "ABH_PIPELINE_CONFIDENCE_THRESHOLD": ("pipeline", "confidence_threshold"),
-    "ABH_PIPELINE_MAX_COMMENTS": ("pipeline", "max_comments"),
     "ABH_PIPELINE_BLOCK_ON_FINDINGS": ("pipeline", "block_on_findings"),
     "ABH_PIPELINE_ISOLATE_WORKTREE": ("pipeline", "isolate_worktree"),
     "ABH_PIPELINE_KEEP_WORKTREE": ("pipeline", "keep_worktree"),
@@ -161,14 +159,13 @@ def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     return value
 
 
-
-
 def _bm25_section(raw: dict[str, Any]) -> dict[str, Any]:
     """Load BM25 settings while ignoring legacy HTTP-only fields."""
     value = dict(_section(raw, "bm25"))
     value.pop("endpoint", None)
     value.pop("timeout_seconds", None)
     return value
+
 
 def _http_url(name: str, value: Any, *, required: bool = True) -> str:
     if value in (None, ""):
@@ -181,7 +178,9 @@ def _http_url(name: str, value: Any, *, required: bool = True) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError(f"{name} must be an http(s) URL")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError(f"{name} must not contain credentials, query parameters, or fragments; use api_key")
+        raise ValueError(
+            f"{name} must not contain credentials, query parameters, or fragments; use api_key"
+        )
     return value
 
 
@@ -197,7 +196,14 @@ def _as_int(name: str, value: Any, *, minimum: int = 1) -> int:
     return parsed
 
 
-def _as_float(name: str, value: Any, *, minimum: float | None = None, maximum: float | None = None, exclusive_min: bool = False) -> float:
+def _as_float(
+    name: str,
+    value: Any,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    exclusive_min: bool = False,
+) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be numeric")
     try:
@@ -206,7 +212,9 @@ def _as_float(name: str, value: Any, *, minimum: float | None = None, maximum: f
         raise ValueError(f"{name} must be numeric") from exc
     if not math.isfinite(parsed):
         raise ValueError(f"{name} must be finite")
-    if minimum is not None and (parsed <= minimum if exclusive_min else parsed < minimum):
+    if minimum is not None and (
+        parsed <= minimum if exclusive_min else parsed < minimum
+    ):
         op = ">" if exclusive_min else ">="
         raise ValueError(f"{name} must be {op} {minimum}")
     if maximum is not None and parsed > maximum:
@@ -226,18 +234,44 @@ def validate_config(cfg: Config) -> Config:
     if cfg.llm.system_role not in {"system", "developer", "user"}:
         raise ValueError("llm.system_role must be system, developer, or user")
     if cfg.llm.token_limit_field not in {"max_tokens", "max_completion_tokens", ""}:
-        raise ValueError("llm.token_limit_field must be max_tokens, max_completion_tokens, or empty")
-    cfg.llm.send_temperature = _as_bool("llm.send_temperature", cfg.llm.send_temperature)
+        raise ValueError(
+            "llm.token_limit_field must be max_tokens, max_completion_tokens, or empty"
+        )
+    cfg.llm.send_temperature = _as_bool(
+        "llm.send_temperature", cfg.llm.send_temperature
+    )
     cfg.llm.max_retries = _as_int("llm.max_retries", cfg.llm.max_retries, minimum=0)
     if cfg.llm.max_retries > 5:
         raise ValueError("llm.max_retries must be <= 5")
-    cfg.llm.retry_backoff_seconds = _as_float("llm.retry_backoff_seconds", cfg.llm.retry_backoff_seconds, minimum=0, maximum=30)
+    cfg.llm.retry_backoff_seconds = _as_float(
+        "llm.retry_backoff_seconds",
+        cfg.llm.retry_backoff_seconds,
+        minimum=0,
+        maximum=30,
+    )
     cfg.llm.max_input_chars = _as_int("llm.max_input_chars", cfg.llm.max_input_chars)
     if not isinstance(cfg.llm.extra_body, dict):
         raise ValueError("llm.extra_body must be a JSON object / TOML table")
-    reserved = {"model", "messages", "contents", "system", "systemInstruction", "tools", "tool_choice", "toolConfig", "functions", "function_call", "parallel_tool_calls", "stream", "n", "candidateCount"}
+    reserved = {
+        "model",
+        "messages",
+        "contents",
+        "system",
+        "systemInstruction",
+        "tools",
+        "tool_choice",
+        "toolConfig",
+        "functions",
+        "function_call",
+        "parallel_tool_calls",
+        "stream",
+        "n",
+        "candidateCount",
+    }
     if reserved & cfg.llm.extra_body.keys():
-        raise ValueError("llm.extra_body cannot override model, messages, tools, streaming, or candidate count")
+        raise ValueError(
+            "llm.extra_body cannot override model, messages, tools, streaming, or candidate count"
+        )
     generation = cfg.llm.extra_body.get("generationConfig", {})
     if isinstance(generation, dict) and generation.get("candidateCount", 1) != 1:
         raise ValueError("llm.extra_body.generationConfig.candidateCount must be 1")
@@ -249,38 +283,77 @@ def validate_config(cfg: Config) -> Config:
     if not isinstance(cfg.llm.model, str) or not cfg.llm.model.strip():
         raise ValueError("llm.model must not be empty")
 
-    cfg.llm.timeout_seconds = _as_float("llm.timeout_seconds", cfg.llm.timeout_seconds, minimum=0, exclusive_min=True)
+    cfg.llm.timeout_seconds = _as_float(
+        "llm.timeout_seconds", cfg.llm.timeout_seconds, minimum=0, exclusive_min=True
+    )
     cfg.llm.max_tokens = _as_int("llm.max_tokens", cfg.llm.max_tokens)
-    cfg.llm.temperature = _as_float("llm.temperature", cfg.llm.temperature, minimum=0, maximum=2)
+    cfg.llm.temperature = _as_float(
+        "llm.temperature", cfg.llm.temperature, minimum=0, maximum=2
+    )
     cfg.bm25.top_k = _as_int("bm25.top_k", cfg.bm25.top_k)
-    cfg.bm25.max_requests_per_candidate = _as_int("bm25.max_requests_per_candidate", cfg.bm25.max_requests_per_candidate)
+    cfg.bm25.max_requests_per_candidate = _as_int(
+        "bm25.max_requests_per_candidate", cfg.bm25.max_requests_per_candidate
+    )
 
-    cfg.pipeline.max_candidates = _as_int("pipeline.max_candidates", cfg.pipeline.max_candidates)
-    cfg.pipeline.max_hypotheses = _as_int("pipeline.max_hypotheses", cfg.pipeline.max_hypotheses)
-    cfg.pipeline.max_comments = _as_int("pipeline.max_comments", cfg.pipeline.max_comments)
-    cfg.pipeline.confidence_threshold = _as_float("pipeline.confidence_threshold", cfg.pipeline.confidence_threshold, minimum=0, maximum=1)
-    cfg.pipeline.block_on_findings = _as_bool("pipeline.block_on_findings", cfg.pipeline.block_on_findings)
-    cfg.pipeline.isolate_worktree = _as_bool("pipeline.isolate_worktree", cfg.pipeline.isolate_worktree)
-    cfg.pipeline.keep_worktree = _as_bool("pipeline.keep_worktree", cfg.pipeline.keep_worktree)
+    cfg.pipeline.max_candidates = _as_int(
+        "pipeline.max_candidates", cfg.pipeline.max_candidates
+    )
+    cfg.pipeline.max_hypotheses = _as_int(
+        "pipeline.max_hypotheses", cfg.pipeline.max_hypotheses
+    )
+    cfg.pipeline.confidence_threshold = _as_float(
+        "pipeline.confidence_threshold",
+        cfg.pipeline.confidence_threshold,
+        minimum=0,
+        maximum=1,
+    )
+    cfg.pipeline.block_on_findings = _as_bool(
+        "pipeline.block_on_findings", cfg.pipeline.block_on_findings
+    )
+    cfg.pipeline.isolate_worktree = _as_bool(
+        "pipeline.isolate_worktree", cfg.pipeline.isolate_worktree
+    )
+    cfg.pipeline.keep_worktree = _as_bool(
+        "pipeline.keep_worktree", cfg.pipeline.keep_worktree
+    )
 
-    cfg.agents.stage1_max_steps = _as_int("agents.stage1_max_steps", cfg.agents.stage1_max_steps)
-    cfg.agents.stage2_max_steps = _as_int("agents.stage2_max_steps", cfg.agents.stage2_max_steps)
-    cfg.agents.stage3_max_steps = _as_int("agents.stage3_max_steps", cfg.agents.stage3_max_steps)
-    cfg.agents.stage4_max_steps = _as_int("agents.stage4_max_steps", cfg.agents.stage4_max_steps)
+    cfg.agents.stage1_max_steps = _as_int(
+        "agents.stage1_max_steps", cfg.agents.stage1_max_steps
+    )
+    cfg.agents.stage2_max_steps = _as_int(
+        "agents.stage2_max_steps", cfg.agents.stage2_max_steps
+    )
+    cfg.agents.stage3_max_steps = _as_int(
+        "agents.stage3_max_steps", cfg.agents.stage3_max_steps
+    )
+    cfg.agents.stage4_max_steps = _as_int(
+        "agents.stage4_max_steps", cfg.agents.stage4_max_steps
+    )
     if cfg.agents.stage4_mode not in {"api", "agentic"}:
         raise ValueError("agents.stage4_mode must be 'api' or 'agentic'")
 
-    cfg.repository.context_radius = _as_int("repository.context_radius", cfg.repository.context_radius)
-    cfg.repository.max_read_lines = _as_int("repository.max_read_lines", cfg.repository.max_read_lines)
-    cfg.repository.max_search_results = _as_int("repository.max_search_results", cfg.repository.max_search_results)
+    cfg.repository.context_radius = _as_int(
+        "repository.context_radius", cfg.repository.context_radius
+    )
+    cfg.repository.max_read_lines = _as_int(
+        "repository.max_read_lines", cfg.repository.max_read_lines
+    )
+    cfg.repository.max_search_results = _as_int(
+        "repository.max_search_results", cfg.repository.max_search_results
+    )
 
     cfg.ui.banner = _as_bool("ui.banner", cfg.ui.banner)
     cfg.ui.live_progress = _as_bool("ui.live_progress", cfg.ui.live_progress)
     cfg.ui.show_config = _as_bool("ui.show_config", cfg.ui.show_config)
-    cfg.ui.show_stage_details = _as_bool("ui.show_stage_details", cfg.ui.show_stage_details)
+    cfg.ui.show_stage_details = _as_bool(
+        "ui.show_stage_details", cfg.ui.show_stage_details
+    )
     return cfg
 
-def load_config(path: str | Path | None = None, *, use_environment: bool = True) -> Config:
+
+def load_config(
+    path: str | Path | None = None, *, use_environment: bool = True
+) -> Config:
     raw: dict[str, Any] = {}
     if path:
         p = Path(path).expanduser().resolve()

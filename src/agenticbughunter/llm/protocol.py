@@ -1,5 +1,7 @@
 """Text JSON protocol shared by all providers; no vendor tool-call schema."""
+
 from __future__ import annotations
+
 import json
 import re
 from typing import Any
@@ -53,9 +55,13 @@ def extract_json_value(text: str) -> Any:
     second JSON value. Invalid output is retried by the runner, not executed.
     A complete leading <think> block is ignored, not treated as an action.
     """
-    value = re.sub(r"^\s*<think>.*?</think>\s*", "", text, count=1, flags=re.S).strip()
+    value = re.sub(
+        r"^\s*<think>.*?</think>\s*", "", text, count=1, flags=re.DOTALL
+    ).strip()
     if value.startswith("```"):
-        match = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", value, flags=re.I)
+        match = re.fullmatch(
+            r"```(?:json)?\s*([\s\S]*?)\s*```", value, flags=re.IGNORECASE
+        )
         if not match:
             raise ValueError("Return exactly one complete JSON code fence")
         value = match.group(1).strip()
@@ -63,11 +69,13 @@ def extract_json_value(text: str) -> Any:
         positions = [i for i in (value.find("{"), value.find("[")) if i >= 0]
         if not positions:
             raise ValueError("No JSON object or array found")
-        value = value[min(positions):]
+        value = value[min(positions) :]
     try:
         result = json.loads(value)
     except json.JSONDecodeError as exc:
-        raise ValueError("Return one complete JSON object or array; malformed or multiple values are not accepted") from exc
+        raise ValueError(
+            f"JSON parse error at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
     if not isinstance(result, (dict, list)):
         raise ValueError("Final output must be a JSON object or array")
     return result

@@ -1,10 +1,7 @@
-"""Deterministic application judge policy (distinct from benchmark mean-only).
+"""Deterministic five-category scoring used by the research workflow."""
 
-Raw score = mean of the five evidence categories. Application relationship and
-contradiction caps are retained from v0.5.0. See docs/research.md before using
-application scores to reproduce benchmark results.
-"""
 from __future__ import annotations
+
 from typing import Any
 
 _SCORE_KEYS = (
@@ -15,19 +12,8 @@ _SCORE_KEYS = (
     "concrete_impact",
 )
 
-_RELATIONSHIP_CAPS = {
-    "exact": 1.00,
-    "family_compatible": 0.79,
-    "partial": 0.59,
-    "mismatch": 0.29,
-}
-
-_CONTRADICTION_CAPS = {
-    "none": 1.00,
-    "minor": 0.89,
-    "material": 0.69,
-    "fatal": 0.29,
-}
+CWE_RELATIONSHIPS = frozenset({"exact", "family_compatible", "partial", "mismatch"})
+CONTRADICTION_SEVERITIES = frozenset({"none", "minor", "material", "fatal"})
 
 
 def raw_score(output: dict[str, Any]) -> float:
@@ -51,13 +37,9 @@ def raw_score(output: dict[str, Any]) -> float:
     return sum(values) / len(values)
 
 
-def verdict(score: float, threshold: float, relationship: str, contradiction: str) -> str:
-    if relationship == "mismatch" or contradiction == "fatal":
-        return "rejected"
-    if relationship in {"exact", "family_compatible"} and contradiction in {"none", "minor"} and score >= threshold:
+def verdict(score: float, threshold: float) -> str:
+    if score >= threshold:
         return "supported"
     if score >= 0.50:
         return "uncertain"
     return "rejected"
-
-

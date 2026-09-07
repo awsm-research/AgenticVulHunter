@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
-
 
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -38,7 +37,7 @@ def _decode_git_path(raw: str) -> str:
 
 
 def _header_path(line: str, prefix: str) -> str:
-    value = line[len(prefix):]
+    value = line[len(prefix) :]
     # Traditional diff headers can append a timestamp after a tab.
     value = value.split("\t", 1)[0]
     return _decode_git_path(value)

@@ -5,12 +5,12 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .base import Stage
 from ..config import Config
 from ..llm import AgentRunner, ChatClient, ToolRegistry
 from ..resources import prompt
 from ..runlog import RunLogger
 from ..tools.bm25 import BM25Retriever, compact_rules, make_bm25_tool
+from .base import Stage
 
 
 def _normalise_cwe(value: Any) -> str:
@@ -61,7 +61,9 @@ class Stage3Hypotheses(Stage):
             return results
 
         self.bm25 = BM25Retriever(self.config.bm25, self._logger)
-        system = prompt("stage3_hypotheses.md").replace("__MAX_HYPOTHESES__", str(self.config.pipeline.max_hypotheses))
+        system = prompt("stage3_hypotheses.md").replace(
+            "__MAX_HYPOTHESES__", str(self.config.pipeline.max_hypotheses)
+        )
 
         for candidate in candidates:
             cid = str(candidate["candidate_id"])
@@ -90,17 +92,39 @@ class Stage3Hypotheses(Stage):
             )
             initial_rules = compact_rules(initial)
             user_prompt = (
-                "STAGE-2 CANDIDATE:\n" + json.dumps(candidate, ensure_ascii=False, indent=2)
+                "STAGE-2 CANDIDATE:\n"
+                + json.dumps(candidate, ensure_ascii=False, indent=2)
                 + "\n\nINITIAL BM25 RULES (request #1, already executed by the program):\n"
                 + json.dumps(initial_rules, ensure_ascii=False, indent=2)
             )
-            answer = agent.run(system, user_prompt)
+            try:
+                answer = agent.run(system, user_prompt)
+            except Exception as exc:
+                allowed = _retrieved_cwes(item_dir)
+                error = {
+                    "candidate_id": cid,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "recovery": "zero_hypotheses_for_candidate",
+                }
+                self._logger.write_json(item_dir / "model_output_error.json", error)
+                self._logger.event("stage3_candidate_degraded", error)
+                output = dict(candidate)
+                output["hypotheses"] = []
+                output["retrieved_cwe_ids"] = sorted(allowed)
+                output["stage3_status"] = "degraded"
+                output["stage3_error"] = error
+                results.append(output)
+                self._logger.write_json(item_dir / "output.json", output)
+                continue
             if isinstance(answer, dict) and isinstance(answer.get("hypotheses"), list):
                 raw_hypotheses = answer["hypotheses"]
             elif isinstance(answer, list):
                 raw_hypotheses = answer
             else:
-                raise ValueError(f"Stage 3 {cid} final answer must contain a hypotheses array")
+                raise ValueError(
+                    f"Stage 3 {cid} final answer must contain a hypotheses array"
+                )
 
             allowed = _retrieved_cwes(item_dir)
             if not allowed:
@@ -116,23 +140,41 @@ class Stage3Hypotheses(Stage):
                 reason = str(h.get("fit_reason") or "").strip()
                 if not reason:
                     continue
-                hypotheses.append({
-                    "cwe_id": cwe,
-                    "cwe_name": str(h.get("cwe_name") or ""),
-                    "fit_reason": reason,
-                    "proposal_source": "adaptive_bm25",
-                    "retrieved_by_sast": True,
-                })
+                hypotheses.append(
+                    {
+                        "cwe_id": cwe,
+                        "cwe_name": str(h.get("cwe_name") or ""),
+                        "fit_reason": reason,
+                        "proposal_source": "adaptive_bm25",
+                        "retrieved_by_sast": True,
+                    }
+                )
                 seen.add(cwe)
                 if len(hypotheses) >= self.config.pipeline.max_hypotheses:
                     break
 
-            if raw_hypotheses and not hypotheses:
-                raise ValueError(f"Stage 3 {cid} returned hypotheses but none passed the retrieved-CWE contract")
-            self._logger.event("hypothesis_validation", {"candidate_id": cid, "proposed": len(raw_hypotheses), "retained": len(hypotheses)})
+            degraded = bool(raw_hypotheses and not hypotheses)
+            if degraded:
+                error = {
+                    "candidate_id": cid,
+                    "error_type": "RetrievedCWEContractError",
+                    "error": "No proposed hypothesis was retrieved in this candidate's BM25 session",
+                    "recovery": "zero_hypotheses_for_candidate",
+                }
+                self._logger.write_json(item_dir / "model_output_error.json", error)
+                self._logger.event("stage3_candidate_degraded", error)
+            self._logger.event(
+                "hypothesis_validation",
+                {
+                    "candidate_id": cid,
+                    "proposed": len(raw_hypotheses),
+                    "retained": len(hypotheses),
+                },
+            )
             output = dict(candidate)
             output["hypotheses"] = hypotheses
             output["retrieved_cwe_ids"] = sorted(allowed)
+            output["stage3_status"] = "degraded" if degraded else "completed"
             results.append(output)
             self._logger.write_json(item_dir / "output.json", output)
 

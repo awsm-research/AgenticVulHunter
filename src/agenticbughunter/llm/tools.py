@@ -1,8 +1,12 @@
 """Allowlisted application operations; the model never receives a shell."""
+
 from __future__ import annotations
+
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
+
 
 @dataclass
 class Tool:
@@ -27,10 +31,7 @@ class ToolRegistry:
         self,
         tools: list[Tool] | None = None,
     ):
-        self._tools = {
-            tool.name: tool
-            for tool in (tools or [])
-        }
+        self._tools = {tool.name: tool for tool in (tools or [])}
 
     def names(self) -> list[str]:
         return list(self._tools)
@@ -39,10 +40,7 @@ class ToolRegistry:
         if not self._tools:
             return "(no tools)"
 
-        return "\n".join(
-            f"- {tool.schema_text()}"
-            for tool in self._tools.values()
-        )
+        return "\n".join(f"- {tool.schema_text()}" for tool in self._tools.values())
 
     def call(
         self,
@@ -53,9 +51,7 @@ class ToolRegistry:
             raise ValueError("Tool arguments must be a JSON object")
         if name not in self._tools:
             raise KeyError(
-                f"Unknown tool {name!r}; "
-                f"available: {', '.join(self.names())}"
+                f"Unknown tool {name!r}; available: {', '.join(self.names())}"
             )
 
         return self._tools[name].handler(arguments)
-

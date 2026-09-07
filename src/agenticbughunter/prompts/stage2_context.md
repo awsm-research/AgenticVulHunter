@@ -4,6 +4,8 @@ Work on exactly one immutable Stage-1 candidate. Preserve candidate_id, filepath
 
 Use the supplied local `code_context` first. Explore the repository only when it helps establish a concrete fact connected to this candidate. Follow relevant callers, callees, variable origins, guards, security decisions, sinks, and controls. Prefer exact-symbol searches and targeted reads. Do not browse unrelated code or search generic security vocabulary merely to build a story.
 
+Do not call data attacker-controlled unless repository evidence supports that conclusion. If a material fact cannot be established with targeted exploration, record it in `unresolved_facts` rather than widening the search or guessing.
+
 Establish, where evidence allows:
 1. `source_or_sensitive_state`: where relevant values/state originate and whether external influence is actually evidenced.
 2. `changed_operation`: exactly what the candidate statement does.
