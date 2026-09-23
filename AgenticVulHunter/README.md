@@ -106,28 +106,3 @@ agenticvulhunter review --json
 ```
 
 
-# Remove old build
-rm -rf dist
-
-# Build package
-python -m build
-
-# Check package
-python -m twine check dist/*
-
-# Upload to PyPI
-python -m twine upload dist/*
-
-# Remove old installation
-pipx uninstall agenticvulhunter
-
-# Clear cache
-uv cache clean
-
-# Install latest version
-pipx install agenticvulhunter
-
-# Check version
-agenticvulhunter --version
-
-
