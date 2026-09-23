@@ -1,76 +1,53 @@
-AgenticVulHunter
+# AgenticVulHunter
 
-This repository contains both the AgenticVulHunter Data and Tool
+This repository contains both the **AgenticVulHunter research data** and the **AgenticVulHunter tool**.
 
-Research
+## Research
 
-For the research :
+For the research setup and experiment details:
 
 https://github.com/awsm-research/AgenticVulHunter/blob/main/ResearchData/AgenticVulHunter-Research/README.md
 
-
-Tool
+## Tool
 
 For the standalone AgenticVulHunter tool:
 
 https://github.com/awsm-research/AgenticVulHunter/blob/main/AgenticVulHunter/README.md
 
-
-
-Install AgenticVulHunter
+## Install AgenticVulHunter
 
 The tool is available through PyPI.
 
-Using pipx:
+### Step 1: Install
 
+```bash
 pipx install agenticvulhunter
+```
 
-or using pip:
+### Step 2: Create setup file
 
-pip install agenticvulhunter
-
-
-
-Check the installed version:
-
-agenticvulhunter --version
-
-Setup
-
-Create the AVH setup file:
-
+```bash
 agenticvulhunter init
+```
 
-This creates:
+Update `avh_setup.toml`:
 
+```toml
 [llm]
 endpoint = "http://127.0.0.1:11435/v1"
 api_key = ""
+```
 
-The endpoint and API key can also be provided through AVH environment variables.
+### Step 3: Run review
 
-Run a review
+```bash
+agenticvulhunter review
+```
 
-agenticvulhunter review (This uses the default validation threshold of 0.6.)
+This uses the default validation threshold of `0.6`.
 
 To use another threshold:
 
+```bash
 agenticvulhunter review 0.7
-
-Pipeline
-
-AgenticVulHunter runs the following four-stage pipeline:
-
-Git diff
-   ↓
-Stage 1: Candidate localisation
-   ↓
-Stage 2: Context enrichment
-   ↓
-Stage 3: CWE hypothesis generation
-   ↓
-Stage 4: Vulnerability validation
-   ↓
-Review comments above the threshold
-
-The research implementation and the standalone tool are kept in the same repository, but they are separated so the research experiments do not need to be included in the lightweight runtime tool.
+```
