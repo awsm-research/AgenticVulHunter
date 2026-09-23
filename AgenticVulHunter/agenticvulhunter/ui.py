@@ -3,22 +3,20 @@
 from __future__ import annotations
 
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
 
-# AVH banner shown when a review starts.
 _BANNER = r"""
     █████╗ ██╗   ██╗██╗  ██╗
-   ██╔══██╗██╔══██╗██║  ██║
-   ███████║██████╔╝███████║
-   ██╔══██║██╔══██╗██╔══██║
-   ██║  ██║██████╔╝██║  ██║
-   ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝
+   ██╔══██╗██║   ██║██║  ██║
+   ███████║██║   ██║███████║
+   ██╔══██║╚██╗ ██╔╝██╔══██║
+   ██║  ██║ ╚████╔╝ ██║  ██║
+   ╚═╝  ╚═╝  ╚═══╝  ╚═╝  ╚═╝
 """.strip("\n")
 
-
-# Names shown for each stage in the terminal.
 _STAGE_LABELS = {
     1: "Candidate localisation",
     2: "Context enrichment",
@@ -34,29 +32,15 @@ class TerminalUI:
         self.threshold = threshold
         self.model = model
         self.endpoint = endpoint
-
-        # These values are updated when the review starts.
         self.repo = "-"
         self.review = "-"
-
-        # Every stage starts as pending.
-        self.status = {
-            index: "pending"
-            for index in _STAGE_LABELS
-        }
-
-        # Store stage runtime after a stage finishes.
-        self.duration = {}
-
+        self.status = {index: "pending" for index in _STAGE_LABELS}
+        self.duration: dict[int, float] = {}
         self._drawn_lines = 0
-
-        # Only use the live UI when stdout is a real terminal.
         self.enabled = sys.stdout.isatty()
 
     def _stage_line(self, index: int) -> str:
-        """Build one line of the pipeline status panel."""
         state = self.status[index]
-
         symbol = {
             "pending": "○",
             "running": "●",
@@ -65,22 +49,19 @@ class TerminalUI:
         }.get(state, "○")
 
         suffix = state
-
-        # Show the runtime after a stage completes.
         if index in self.duration and state == "done":
-            suffix = f"done  {self.duration[index] / 1000:.1f}s"
+            suffix = f"done · {self.duration[index] / 1000:.1f}s"
 
-        return (
-            f"│ {symbol} {index}/4  "
-            f"{_STAGE_LABELS[index]:<57} "
-            f"{suffix:>12} │"
-        )
+        return f"│  {symbol}  {index}/4  {_STAGE_LABELS[index]:<51} {suffix:>16}  │"
+
+    def _row(self, label: str, value: str, width: int) -> str:
+        text = f"{label:<11}{value}"
+        return f"│  {text:<{width - 6}.{width - 6}}  │"
 
     def _lines(self) -> list[str]:
-        """Build the complete terminal screen."""
-        width = 88
-
+        width = 82
         top = "╭" + "─" * (width - 2) + "╮"
+        middle = "├" + "─" * (width - 2) + "┤"
         bottom = "╰" + "─" * (width - 2) + "╯"
 
         return [
@@ -89,90 +70,72 @@ class TerminalUI:
             "Four-stage secure code review",
             "",
             top,
-            f"│ {'Secure review':<{width - 4}} │",
-            f"│ Repository  {self.repo:<72} │"[:width - 1] + "│",
-            f"│ Review      {self.review:<72} │"[:width - 1] + "│",
-            f"│ Model       {self.model:<72} │"[:width - 1] + "│",
-            f"│ Endpoint    {self.endpoint:<72} │"[:width - 1] + "│",
-            f"│ Threshold   {self.threshold:<72.2f} │"[:width - 1] + "│",
+            f"│  {'Secure review':<{width - 6}}  │",
+            middle,
+            self._row("Repository", self.repo, width),
+            self._row("Review", self.review, width),
+            self._row("Model", self.model, width),
+            self._row("Endpoint", self.endpoint, width),
+            self._row("Threshold", f"{self.threshold:.2f}", width),
             bottom,
             top,
-            f"│ {'Pipeline':<{width - 4}} │",
-            *[
-                self._stage_line(index)
-                for index in range(1, 5)
-            ],
+            f"│  {'Pipeline':<{width - 6}}  │",
+            middle,
+            *[self._stage_line(index) for index in range(1, 5)],
             bottom,
         ]
 
     def render(self) -> None:
-        """Draw or refresh the terminal UI."""
         if not self.enabled:
             return
 
         lines = self._lines()
-
-        # Move back to the start of the previous UI before redrawing it.
         if self._drawn_lines:
-            sys.stdout.write(
-                f"\x1b[{self._drawn_lines}F"
-            )
+            sys.stdout.write(f"\x1b[{self._drawn_lines}F")
 
         for line in lines:
-            # Clear the current line before writing the updated content.
-            sys.stdout.write(
-                "\x1b[2K" + line + "\n"
-            )
+            sys.stdout.write("\x1b[2K" + line + "\n")
 
         sys.stdout.flush()
         self._drawn_lines = len(lines)
 
-    def event(
-        self,
-        event: str,
-        payload: dict[str, Any],
-    ) -> None:
-        """Update the UI when the pipeline reports a progress event."""
-
+    def event(self, event: str, payload: dict[str, Any]) -> None:
         if event == "review_started":
-            self.repo = str(
-                Path(payload.get("repo", "."))
-            )
-
-            base = str(
-                payload.get("base", "")
-            )[:8]
-
-            head = str(
-                payload.get("head", "")
-            )[:8]
-
+            self.repo = str(Path(payload.get("repo", ".")))
+            base = str(payload.get("base", ""))[:8]
+            head = str(payload.get("head", ""))[:8]
             self.review = f"{base} → {head}"
-
         elif event == "stage_started":
-            index = int(payload["index"])
-            self.status[index] = "running"
-
+            self.status[int(payload["index"])] = "running"
         elif event == "stage_completed":
             index = int(payload["index"])
-
             self.status[index] = "done"
-
-            self.duration[index] = float(
-                payload.get(
-                    "duration_ms",
-                    0.0,
-                )
-            )
-
+            self.duration[index] = float(payload.get("duration_ms", 0.0))
         elif event == "stage_failed":
-            index = int(payload["index"])
-            self.status[index] = "failed"
+            self.status[int(payload["index"])] = "failed"
 
         self.render()
 
     def finish(self) -> None:
-        """Leave one empty line after the live UI finishes."""
         if self.enabled:
             sys.stdout.write("\n")
             sys.stdout.flush()
+
+    def print_results(self, comments: list[dict[str, Any]]) -> None:
+        """Print the final findings in a short readable format."""
+        print(f"Review complete · threshold {self.threshold:.2f} · findings {len(comments)}")
+
+        if not comments:
+            print("No findings passed the threshold.")
+            return
+
+        for index, comment in enumerate(comments, start=1):
+            filepath = comment.get("filepath", "-")
+            line = comment.get("line_number", "-")
+            score = float(comment.get("judge_final_score", 0.0))
+            message = str(comment.get("review_comment", "")).strip()
+
+            print()
+            print(f"[{index}] {filepath}:{line}  score {score:.2f}")
+            for wrapped in textwrap.wrap(message, width=76):
+                print(f"    {wrapped}")

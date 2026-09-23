@@ -39,8 +39,8 @@ agenticvulhunter --version
 
 ## LLM setup
 
-Only the endpoint and API key are public setup values. The model and research
-settings stay inside AgenticVulHunter.
+The endpoint, API key, and model are the only public LLM setup values. Other
+research settings stay inside AgenticVulHunter.
 
 ### Option 1: `avh_setup.toml`
 
@@ -50,6 +50,7 @@ Create `avh_setup.toml` in the repository where the review is run:
 [llm]
 endpoint = "http://localhost:11434/v1"
 api_key = ""
+model = "qwen3-coder:30b"
 ```
 
 For an API endpoint that requires a key:
@@ -58,6 +59,7 @@ For an API endpoint that requires a key:
 [llm]
 endpoint = "https://example.com/v1"
 api_key = "your-key"
+model = "your-model"
 ```
 
 ### Option 2: exports
@@ -65,6 +67,7 @@ api_key = "your-key"
 ```bash
 export AVH_ENDPOINT="http://localhost:11434/v1"
 export AVH_API_KEY="your-key"
+export AVH_MODEL="qwen3-coder:30b"
 ```
 
 Exports take priority over `avh_setup.toml` when both are present.

@@ -1,8 +1,9 @@
 """Small runtime configuration for AgenticVulHunter.
 
-The public setup only contains the LLM endpoint and API key. They can come from
-AVH_ENDPOINT / AVH_API_KEY or from avh_setup.toml. All research settings stay
-inside the tool so normal runs use the same pipeline configuration.
+The public setup contains the LLM endpoint, API key, and model. They can come
+from AVH_ENDPOINT / AVH_API_KEY / AVH_MODEL or from avh_setup.toml. All other
+research settings stay inside the tool so normal runs use the same pipeline
+configuration.
 """
 
 from __future__ import annotations
@@ -21,12 +22,12 @@ DEFAULT_MODEL = "qwen3-coder:30b"
 
 @dataclass
 class LLMConfig:
-    # Public connection setup.
+    # Public LLM setup.
     base_url: str = "http://localhost:11434/v1"
     api_key: str = ""
-
-    # Internal model and research defaults.
     model: str = DEFAULT_MODEL
+
+    # Internal research defaults.
     timeout_seconds: float = 800.0
     max_tokens: int = 6000
     temperature: float = 0.0
@@ -114,7 +115,7 @@ def validate_config(cfg: Config) -> Config:
     if not isinstance(cfg.llm.api_key, str):
         raise ValueError("llm.api_key must be a string")
     if not isinstance(cfg.llm.model, str) or not cfg.llm.model.strip():
-        raise ValueError("internal model must not be empty")
+        raise ValueError("llm.model must not be empty")
 
     cfg.llm.timeout_seconds = _number(
         "llm.timeout_seconds", cfg.llm.timeout_seconds, 1.0, 3600.0
@@ -175,20 +176,24 @@ def load_config(path: str | Path | None = None) -> Config:
         if not isinstance(llm, dict):
             raise ValueError("[llm] must be a TOML table")
 
-        unknown_fields = set(llm) - {"endpoint", "api_key"}
+        unknown_fields = set(llm) - {"endpoint", "api_key", "model"}
         if unknown_fields:
             names = ", ".join(sorted(unknown_fields))
-            raise ValueError(f"[llm] only supports endpoint and api_key; remove: {names}")
+            raise ValueError(f"[llm] only supports endpoint, api_key, and model; remove: {names}")
 
         if "endpoint" in llm:
             cfg.llm.base_url = llm["endpoint"]
         if "api_key" in llm:
             cfg.llm.api_key = llm["api_key"]
+        if "model" in llm:
+            cfg.llm.model = llm["model"]
 
     # Exports take priority so a user can override a local setup file temporarily.
     if os.getenv("AVH_ENDPOINT"):
         cfg.llm.base_url = os.environ["AVH_ENDPOINT"]
     if os.getenv("AVH_API_KEY") is not None:
         cfg.llm.api_key = os.environ["AVH_API_KEY"]
+    if os.getenv("AVH_MODEL"):
+        cfg.llm.model = os.environ["AVH_MODEL"]
 
     return validate_config(cfg)

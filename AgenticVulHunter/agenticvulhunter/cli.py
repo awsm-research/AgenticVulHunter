@@ -1,7 +1,7 @@
 """Command line entry point for AgenticVulHunter.
 
 The public command stays small. A review uses threshold 0.6 by default and the
-connection can be supplied through AVH exports or avh_setup.toml.
+LLM setup can be supplied through AVH exports or avh_setup.toml.
 """
 
 from __future__ import annotations
@@ -65,17 +65,19 @@ def _run_review(args: argparse.Namespace) -> int:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0
 
-    print(f"AgenticVulHunter review complete (threshold {args.threshold:.2f})")
-    if not result.comments:
-        print("No findings passed the threshold.")
-        return 0
-
-    for comment in result.comments:
-        print(
-            f"{comment['filepath']}:{comment['line_number']} "
-            f"[{comment['judge_final_score']:.2f}] "
-            f"{comment['review_comment']}"
-        )
+    if ui:
+        ui.print_results(result.comments)
+    else:
+        print(f"AgenticVulHunter review complete (threshold {args.threshold:.2f})")
+        if not result.comments:
+            print("No findings passed the threshold.")
+        else:
+            for comment in result.comments:
+                print(
+                    f"{comment['filepath']}:{comment['line_number']} "
+                    f"[{comment['judge_final_score']:.2f}] "
+                    f"{comment['review_comment']}"
+                )
     return 0
 
 def _run_init(args: argparse.Namespace) -> int:
@@ -87,6 +89,7 @@ def _run_init(args: argparse.Namespace) -> int:
         """[llm]
 endpoint = "http://localhost:11434/v1"
 api_key = ""
+model = "qwen3-coder:30b"
 """,
         encoding="utf-8",
     )
@@ -126,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument(
         "--config",
         default=None,
-        help="Setup file containing only [llm] endpoint and api_key",
+        help="Setup file containing [llm] endpoint, api_key, and model",
     )
     review.add_argument("--json", action="store_true", help="Print full JSON output")
     review.set_defaults(func=_run_review)
