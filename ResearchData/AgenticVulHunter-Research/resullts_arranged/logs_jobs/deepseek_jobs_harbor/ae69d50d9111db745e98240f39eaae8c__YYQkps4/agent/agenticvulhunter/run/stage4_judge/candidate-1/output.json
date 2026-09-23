@@ -1,0 +1,392 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "shell/server/backup.js",
+  "changed_line": 65,
+  "statement": "waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));",
+  "change_type": "A",
+  "function_name": "backupGrain",
+  "operation_type": "backup_operation_execution",
+  "selection_reason": "user-controlled token ID and grain data -> executes backend backup operation -> creates backup files with potential path traversal risk",
+  "security_relevance_score": 0.9,
+  "code_context": "1: // Sandstorm - Personal Cloud Sandbox\n2: // Copyright (c) 2014 Sandstorm Development Group, Inc. and contributors\n3: // All rights reserved.\n4: //\n5: // Licensed under the Apache License, Version 2.0 (the \"License\");\n6: // you may not use this file except in compliance with the License.\n7: // You may obtain a copy of the License at\n8: //\n9: //   http://www.apache.org/licenses/LICENSE-2.0\n10: //\n11: // Unless required by applicable law or agreed to in writing, software\n12: // distributed under the License is distributed on an \"AS IS\" BASIS,\n13: // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: // See the License for the specific language governing permissions and\n15: // limitations under the License.\n16: \n17: var ChildProcess = Npm.require(\"child_process\");\n18: var Future = Npm.require(\"fibers/future\");\n19: var Promise = Npm.require(\"es6-promise\").Promise;\n20: var Capnp = Npm.require(\"capnp\");\n21: \n22: var GrainInfo = Capnp.importSystem(\"sandstorm/grain.capnp\").GrainInfo;\n23: \n24: var TOKEN_CLEANUP_MINUTES = 15;\n25: var TOKEN_CLEANUP_TIMER = TOKEN_CLEANUP_MINUTES * 60 * 1000;\n26: \n27: function cleanupToken(tokenId) {\n28:   check(tokenId, String);\n29:   waitPromise(sandstormBackend.deleteBackup(tokenId));\n30:   FileTokens.remove({_id: tokenId});\n31: }\n32: \n33: Meteor.startup(function () {\n34:   // Cleanup tokens every TOKEN_CLEANUP_MINUTES\n35:   Meteor.setInterval(function () {\n36:     var queryDate = new Date(Date.now() - TOKEN_CLEANUP_TIMER);\n37: \n38:     FileTokens.find({timestamp: {$lt: queryDate}}).forEach(function (token) {\n39:       cleanupToken(token._id);\n40:     });\n41:   }, TOKEN_CLEANUP_TIMER);\n42: });\n43: \n44: Meteor.methods({\n45:   backupGrain: function (grainId) {\n46:     check(grainId, String);\n47:     var grain = Grains.findOne(grainId);\n48:     if (!grain || !this.userId || grain.userId !== this.userId) {\n49:       throw new Meteor.Error(403, \"Unauthorized\", \"User is not the owner of this grain\");\n50:     }\n51: \n52:     this.unblock();\n53: \n54:     var token = {\n55:       _id: Random.id(),\n56:       timestamp: new Date(),\n57:       name: grain.title\n58:     };\n59: \n60:     // TODO(soon): does the grain need to be offline?\n61: \n62:     var grainInfo = _.pick(grain, \"appId\", \"appVersion\", \"title\");\n63: \n64:     FileTokens.insert(token);\n65:     waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));\n66: \n67:     return token._id;\n68:   },\n69: \n70:   restoreGrain: function (tokenId) {\n71:     check(tokenId, String);\n72:     var token = FileTokens.findOne(tokenId);\n73:     if (!token || !isSignedUpOrDemo()) {\n74:       throw new Meteor.Error(403, \"Unauthorized\",\n75:           \"Token was not found, or user cannot create grains\");\n76:     }\n77: \n78:     this.unblock();\n79: \n80:     var grainId = Random.id(22);\n81: \n82:     try {\n83:       var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;\n84:       if (!grainInfo.appId) {\n85:           throw new Meteor.Error(500, \"Metadata object for uploaded grain has no AppId\");\n86:       }\n87: \n88:       var action = UserActions.findOne({appId: grainInfo.appId, userId: this.userId});\n89:       if (!action) {\n90:         throw new Meteor.Error(500,\n91:                                \"App id for uploaded grain not installed\",\n92:                                \"App Id: \" + grainInfo.appId);\n93:       }\n94:       if (action.appVersion < grainInfo.appVersion) {\n95:         throw new Meteor.Error(500,\n96:                                \"App version for uploaded grain is newer than any \" +\n97:                                \"installed version. You need to upgrade your app first\",\n98:                                \"New version: \" + grainInfo.appVersion +\n99:                                \", Old version: \" + action.appVersion);\n100:       }\n101: \n102:       Grains.insert({\n103:         _id: grainId,\n104:         packageId: action.packageId,\n105:         appId: action.appId,\n106:         appVersion: action.appVersion,\n107:         userId: this.userId,\n108:         title: grainInfo.title,\n109:         private: true\n110:       });\n111:     } finally {\n112:       cleanupToken(tokenId);\n113:     }\n114: \n115:     return grainId;\n116:   },\n117: });\n118: \n119: Router.map(function () {\n120:   this.route(\"downloadBackup\", {\n121:     where: \"server\",\n122:     path: \"/downloadBackup/:tokenId\",\n123:     action: function () {\n124:       var token = FileTokens.findOne(this.params.tokenId);\n125:       var response = this.response;\n126:       if (!token) {\n127:         response.writeHead(404, {\"Content-Type\": \"text/plain\"});\n128:         return response.end(\"File does not exist\");\n129:       }\n130: \n131:       var started = false;\n132:       var filename = (token.name.replace(/[\"\\n]/g, \"\") || \"backup\") + \".zip\";\n133:       var sawEnd = false;\n134: \n135:       var stream = {\n136:         expectSize: function (size) {\n137:           if (!started) {\n138:             started = true;\n139:             response.writeHead(200, {\n140:               \"Content-Length\": size,\n141:               \"Content-Type\": \"application/zip\",\n142:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n143:             });\n144:           }\n145:         },\n146:         write: function (data) {\n147:           if (!started) {\n148:             started = true;\n149:             response.writeHead(200, {\n150:               \"Content-Type\": \"application/zip\",\n151:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n152:             });\n153:           }\n154:           response.write(data);\n155:         },\n156:         done: function (data) {\n157:           if (!started) {\n158:             started = true;\n159:             response.writeHead(200, {\n160:               \"Content-Length\": 0,\n161:               \"Content-Type\": \"application/zip\",\n162:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n163:             });\n164:           }\n165:           sawEnd = true;\n166:           response.end();\n167:         }\n168:       };\n169: \n170:       waitPromise(sandstormBackend.downloadBackup(this.params.tokenId, stream));\n171: \n172:       if (!sawEnd) {\n173:         console.error(\"backend failed to call done() when downloading backup\");\n174:         if (!started) {\n175:           throw new Meteor.Error(500, \"backend failed to produce data\");\n176:         }\n177:         response.end();\n178:       }\n179: \n180:       cleanupToken(this.params.tokenId);\n181:     }\n182:   });\n183: \n184:   this.route(\"uploadBackup\", {\n185:     where: \"server\",\n186:     path: \"/uploadBackup\",\n187:     action: function () {\n188:       if (this.request.method === \"POST\") {\n189:         var request = this.request;\n190:         try {\n191:           var token = {\n192:             _id: Random.id(),\n193:             timestamp: new Date()\n194:           };\n195:           var stream = sandstormBackend.uploadBackup(token._id).stream;\n196: \n197:           FileTokens.insert(token);\n198: \n199:           waitPromise(new Promise(function (resolve, reject) {\n200:             request.on(\"data\", function (data) {\n201:               stream.write(data);\n202:             });\n203:             request.on(\"end\", function () {\n204:               resolve(stream.done());\n205:             });\n206:             request.on(\"error\", function (err) {\n207:               stream.close();\n208:             });\n209:           }));\n210: \n211:           this.response.writeHead(200, {\n212:             \"Content-Length\": token._id.length,\n213:             \"Content-Type\": \"text/plain\"\n214:           });",
+  "source_summary": "grainId from method parameter, userId from Meteor authentication context, token._id randomly generated, grainInfo extracted from grain object with appId, appVersion, title",
+  "sink_summary": "sandstormBackend.backupGrain creates backup files at /var/sandstorm/backups/{backupId} and spawns subprocess with grain directory path /var/sandstorm/grains/{grainId}",
+  "guard_summary": "Authentication check: user must be logged in and own the grain (line 48). Authorization: grain.userId must match this.userId. Input validation: grainId checked as String. Token cleanup after 15 minutes.",
+  "risk_pattern": "Authenticated user triggers backup operation that writes grain data to filesystem using user-controlled grainId in path construction, spawning external backup process with file paths containing user input",
+  "used_variable_sources": [
+    "grainId (method parameter)",
+    "this.userId (Meteor auth context)",
+    "token._id (randomly generated)",
+    "grainInfo (from grain object)"
+  ],
+  "called_function_context": [
+    "sandstormBackend.backupGrain creates backup filesystem operations and spawns backup subprocess"
+  ],
+  "enclosing_conditions": [
+    "User authentication check",
+    "Grain ownership verification"
+  ],
+  "context_summary": "Backup operation called after authentication and authorization checks, creates temporary token for backup access, spawns external backup process to copy grain data",
+  "unresolved_facts": [
+    "Exact implementation of backup subprocess and its security controls",
+    "Path traversal validation in backupId and grainId parameters",
+    "Filesystem permission model for backup directory",
+    "Input sanitization in backup command implementation"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-77",
+      "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+      "fit_reason": "Stage-2 evidence: user-controlled grainId passed to sandstormBackend.backupGrain which spawns backup subprocess; missing neutralization could allow command injection via grainId in command arguments.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "Stage-2 evidence: grainId used in filesystem path /var/sandstorm/grains/{grainId} and backup directory; lack of path validation could allow traversal outside intended directory.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-88",
+      "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+      "fit_reason": "Stage-2 evidence: grainId used as argument to backup subprocess; improper delimiting could allow injection of additional command arguments.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-23",
+      "cwe_name": "Relative Path Traversal",
+      "fit_reason": "Stage-2 evidence: grainId influences relative path in backup operation; could allow accessing parent directories via '../' sequences.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "fit_reason": "Stage-2 evidence: grainId validated only as String, no validation for path traversal or command injection characters; broader input validation weakness.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-20",
+    "CWE-22",
+    "CWE-23",
+    "CWE-378",
+    "CWE-506",
+    "CWE-561",
+    "CWE-59",
+    "CWE-643",
+    "CWE-754",
+    "CWE-77",
+    "CWE-78",
+    "CWE-843",
+    "CWE-863",
+    "CWE-88",
+    "CWE-90",
+    "CWE-94"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 65,
+      "statement": "waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));",
+      "cwe_id": "CWE-77",
+      "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code passes user-controlled grainId to sandstormBackend.backupGrain which spawns a backup subprocess. However, the exact command construction and whether grainId is used in command arguments is not demonstrated."
+        },
+        "connection": {
+          "score": 0.45,
+          "evidence": "grainId from method parameter flows to backupGrain call. The sink summary indicates backup subprocess spawns with grain directory path containing grainId."
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "This line is the primary execution point for the backup operation. Reverting would prevent the backup subprocess from being called with the user-controlled grainId."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "",
+          "required_control": "command parameterization or input validation for grainId",
+          "control_requirement_evidence": "CWE-77 requires neutralization of special elements when user input is used in command construction",
+          "existing_controls_checked": [
+            "grainId type check (String validation)",
+            "authentication and ownership verification"
+          ],
+          "deficiency_evidence": "No evidence of command parameterization or special character neutralization for grainId when used in backup subprocess command construction"
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Potential for command execution if grainId contains shell metacharacters and is used unsafely in backup command, but the exact impact depends on backend implementation details not shown"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the backup operation would not execute, preventing any potential command injection vulnerability in the backup subprocess.",
+      "supporting_evidence": [
+        "grainId flows from user input to backupGrain function call",
+        "sink summary indicates backup subprocess spawns with grain directory path containing grainId",
+        "no visible command parameterization or input sanitization for grainId"
+      ],
+      "contradicting_evidence": [
+        "grainId undergoes type validation (String check)",
+        "authentication and ownership verification required before reaching this point",
+        "exact command construction and grainId usage in backup subprocess not demonstrated"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "How sandstormBackend.backupGrain constructs the backup command",
+        "Whether grainId is used in command arguments or only in safe contexts",
+        "What command parameterization or input validation exists in the backend implementation",
+        "Whether the backup subprocess executes with shell metacharacter interpretation"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.41,
+      "score": 0.41
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 65,
+      "statement": "waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The candidate calls a backend function that likely constructs filesystem paths using grainId and token._id. The CWE-22 mechanism requires constructing a pathname from external input without proper neutralization of special elements. The evidence shows user input (grainId) flows to a filesystem operation, but the exact path construction and neutralization behavior is not demonstrated in the provided code."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "grainId (user-controlled method parameter) is directly passed to sandstormBackend.backupGrain. The sink summary indicates this function creates backup files at /var/sandstorm/backups/{backupId} and spawns subprocess with grain directory path /var/sandstorm/grains/{grainId}. The connection from user input to filesystem path construction is established through the function call."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "The candidate line is an addition (change_type: 'A'). If this line were reverted, the backup operation would not execute, preventing any potential path traversal vulnerability that might exist in the backend implementation. The patch materially creates the execution path where user-controlled grainId reaches the backend filesystem operations."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "The candidate code shows authentication (user must own grain) and authorization checks, but no path validation or sanitization for grainId before passing to backend. The backend implementation's controls are not visible in evidence.",
+          "required_control": "Path validation/sanitization to prevent directory traversal sequences (../, absolute paths, etc.)",
+          "control_requirement_evidence": "CWE-22 requires neutralizing special path elements when constructing filesystem paths from user input. The demonstrated mechanism passes user-controlled grainId to backend functions that construct paths.",
+          "existing_controls_checked": [
+            "Authentication check (line 48): user must own grain",
+            "Authorization check: grain.userId must match this.userId",
+            "Input type validation: grainId checked as String (line 46)"
+          ],
+          "deficiency_evidence": "No evidence of path traversal validation or sanitization in the visible code. The grainId passes through without checking for ../, absolute paths, or other traversal sequences. The backend implementation's controls are unknown."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "If the backend improperly handles grainId without path validation, an attacker could potentially traverse outside the intended /var/sandstorm/grains/ directory. However, the exact impact depends on backend implementation details not in evidence."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the backupGrain method would create a token but not execute the backend backup operation, preventing any filesystem operations with the user-controlled grainId parameter.",
+      "supporting_evidence": [
+        "grainId (user-controlled method parameter) flows directly to sandstormBackend.backupGrain",
+        "Sink summary indicates backend constructs paths: /var/sandstorm/grains/{grainId} and /var/sandstorm/backups/{backupId}",
+        "No path validation or sanitization visible in the candidate code for grainId"
+      ],
+      "contradicting_evidence": [
+        "Authentication and authorization checks prevent unauthorized users from triggering the operation",
+        "token._id is randomly generated (Random.id()), not user-controlled"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Exact implementation of sandstormBackend.backupGrain and its path construction logic",
+        "Whether backend validates/sanitizes grainId for path traversal sequences",
+        "Filesystem permission model for backup and grain directories",
+        "Whether grainId values are restricted to safe characters by the system"
+      ],
+      "review_comment": "The backup operation passes user-controlled grainId to backend filesystem functions without visible path validation. While authentication ensures only grain owners can trigger backups, if the backend doesn't sanitize grainId, path traversal could allow accessing files outside the intended grain directory. Validate grainId contains only alphanumeric characters before passing to backend filesystem operations.",
+      "change_type": "A",
+      "raw_score": 0.48999999999999994,
+      "score": 0.48999999999999994
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 65,
+      "statement": "waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));",
+      "cwe_id": "CWE-88",
+      "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.25,
+          "evidence": "The candidate line calls a backend function. The CWE-88 mechanism requires constructing a command string with user input improperly delimited as arguments. The evidence shows user input (grainId) is passed to a backend function, but does not demonstrate command string construction or argument delimitation."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "User-controlled grainId (method parameter) is passed to sandstormBackend.backupGrain. The sink summary indicates this backend function spawns a subprocess with grain directory path containing grainId. The path from user input to subprocess execution is partially established via the backend call."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "The candidate line is an addition. If reverted, the backup operation would not be executed, removing the call that passes user input to the backend subprocess. The patch materially creates the execution path for the backup operation."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "The required control for CWE-88 is proper argument delimitation or parameterization when constructing command strings from user input. The evidence does not demonstrate command string construction, delimitation, or validation. The existing controls checked are authentication and grain ownership (lines 48-50), which are unrelated to argument injection. The deficiency evidence is unsupported; we cannot observe the backend's command construction.",
+          "required_control": "Proper argument delimitation or parameterization when constructing command strings from user input",
+          "control_requirement_evidence": "CWE-88 requires that when user input is used to construct command arguments, it must be properly delimited to prevent injection of additional arguments. This is required to prevent an attacker from breaking out of intended argument boundaries.",
+          "existing_controls_checked": [
+            "Authentication check (user must own grain)",
+            "Input type validation (grainId checked as String)"
+          ],
+          "deficiency_evidence": "Unsupported. The evidence does not show how the backend constructs commands or whether it delimits arguments. The authentication and type checks do not prevent argument injection if command strings are improperly constructed."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "The impact is speculative. If argument injection were possible, it could lead to arbitrary command execution. However, the evidence does not demonstrate command string construction, attacker control over argument delimiters, or actual impact."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the backup operation would not be executed, removing the call that passes user-controlled grainId to the backend function that spawns a subprocess.",
+      "supporting_evidence": [
+        "User-controlled grainId is passed to sandstormBackend.backupGrain.",
+        "Sink summary indicates backend spawns subprocess with grain directory path containing grainId.",
+        "The candidate line is an addition, creating the execution path."
+      ],
+      "contradicting_evidence": [
+        "The evidence does not show command string construction or argument delimitation.",
+        "The backend function interface suggests structured parameters rather than a command string."
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "How sandstormBackend.backupGrain constructs commands or processes arguments.",
+        "Whether grainId is used in a command string or as a structured parameter.",
+        "Whether argument delimiters are present or can be injected.",
+        "The exact implementation of the backup subprocess and its security controls."
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.43,
+      "score": 0.43
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 65,
+      "statement": "waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));",
+      "cwe_id": "CWE-23",
+      "cwe_name": "Relative Path Traversal",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.3,
+          "evidence": "The candidate calls a backend function that likely constructs filesystem paths using grainId and token._id. The CWE-23 mechanism requires constructing a pathname with external input and failing to neutralize '..' sequences. The evidence shows user input (grainId) flows to a backend operation, but the exact path construction and neutralization failure are not demonstrated in the provided code."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "grainId is a method parameter (user-controlled input) passed directly to sandstormBackend.backupGrain. The sink summary states this backend function 'creates backup files at /var/sandstorm/backups/{backupId} and spawns subprocess with grain directory path /var/sandstorm/grains/{grainId}'. This establishes a concrete connection from external input to filesystem path construction."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "The candidate line is an addition (change_type: 'A'). If this line were reverted, the backup operation would not execute at all, preventing any path construction using the user's grainId. The line materially creates the backup operation call that uses the grainId in path construction."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "The required control for CWE-23 is proper neutralization of path traversal sequences (like '..') when constructing filesystem paths from user input. The evidence shows grainId is validated as a String (line 46) but no traversal sequence filtering is demonstrated. The 'guard_summary' mentions authentication and ownership checks, but these are authorization controls, not path traversal neutralization. The 'unresolved_facts' list includes 'Path traversal validation in backupId and grainId parameters', indicating this control status is unknown.",
+          "required_control": "Neutralization of path traversal sequences (e.g., '..', '/', '\\') when constructing filesystem paths from user input",
+          "control_requirement_evidence": "CWE-23 is defined by using external input to construct a pathname without properly neutralizing sequences that can resolve outside the restricted directory. The demonstrated mechanism involves grainId being used in backup file/directory paths.",
+          "existing_controls_checked": [
+            "Input validation: grainId checked as String (line 46)",
+            "Authentication: user must be logged in and own the grain (line 48)",
+            "Authorization: grain.userId must match this.userId (line 48)"
+          ],
+          "deficiency_evidence": "No evidence of path traversal sequence filtering or canonical path resolution for grainId. The String check alone does not prevent '..' sequences. The backend implementation's handling of grainId in path construction is not visible in the provided evidence."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "If path traversal were possible, the impact could be accessing or modifying files outside the intended grain directory. However, the concrete consequence depends on the backend's implementation details (permissions, directory structure) which are not demonstrated. The impact remains speculative based on the pattern."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the backupGrain method would create a token but never call the backend backup operation, preventing any filesystem operations using the user's grainId and token._id.",
+      "supporting_evidence": [
+        "grainId is user-controlled input (method parameter) passed to sandstormBackend.backupGrain",
+        "Sink summary indicates backend uses grainId in path construction: '/var/sandstorm/grains/{grainId}'",
+        "Candidate line is an addition that creates the backup operation call"
+      ],
+      "contradicting_evidence": [
+        "No demonstration of actual path construction with traversal sequences in the provided code",
+        "Authentication and ownership checks exist before the backup operation",
+        "token._id is randomly generated, not user-controlled"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Exact implementation of sandstormBackend.backupGrain path construction",
+        "Whether grainId undergoes path traversal sequence filtering",
+        "Filesystem permission model for backup and grain directories",
+        "Whether the backend resolves paths canonically before use"
+      ],
+      "review_comment": "The backupGrain method passes user-controlled grainId to a backend function that constructs filesystem paths. While authentication and ownership checks are performed, the code does not show validation for path traversal sequences. To prevent directory traversal, ensure the backend function canonicalizes and validates that the constructed path remains within the intended grain directory, rejecting any grainId containing '..', '/', or other path separators.",
+      "change_type": "A",
+      "raw_score": 0.51,
+      "score": 0.51
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 65,
+      "statement": "waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));",
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The code validates grainId as String type but lacks comprehensive validation for path traversal, command injection, or other dangerous input patterns that could affect backup operations"
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "User-controlled grainId flows directly to sandstormBackend.backupGrain which creates filesystem operations and spawns subprocesses using this input in path construction"
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "This line is the primary execution point where user input reaches the backend backup operation. Reverting would prevent the backup from executing with potentially malicious input"
+        },
+        "security_control": {
+          "score": 0.35,
+          "evidence": "",
+          "required_control": "Comprehensive input validation for path traversal and command injection characters",
+          "control_requirement_evidence": "CWE-20 requires validation that inputs are safe for processing, especially when used in filesystem operations and subprocess execution",
+          "existing_controls_checked": [
+            "Type validation (String check line 46)",
+            "Authentication (line 48)",
+            "Authorization (grain ownership check line 48)"
+          ],
+          "deficiency_evidence": "No validation for path traversal characters, command injection patterns, or malicious input that could affect backup file paths or subprocess execution"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "Potential path traversal or command injection if grainId contains malicious characters, but impact depends on backend implementation details not visible here"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the backup operation would not execute, preventing any potential input validation bypass from reaching the backend implementation",
+      "supporting_evidence": [
+        "grainId parameter validated only as String type with no path traversal or command injection checks",
+        "grainId flows directly to backend backup operation that creates filesystem paths and spawns subprocesses"
+      ],
+      "contradicting_evidence": [
+        "Authentication and authorization checks prevent unauthorized access to the backup operation"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Backend implementation details of sandstormBackend.backupGrain and its input sanitization",
+        "Whether backupId and grainId parameters are properly sanitized in filesystem path construction",
+        "Subprocess execution security controls in the backend implementation"
+      ],
+      "review_comment": "The backup operation accepts grainId with only basic type validation, potentially allowing path traversal or command injection if the backend implementation does not properly sanitize inputs. Implement comprehensive input validation for grainId to prevent directory traversal characters and command injection patterns before passing to the backend operation.",
+      "change_type": "A",
+      "raw_score": 0.5,
+      "score": 0.5
+    }
+  ],
+  "stage4_status": "completed"
+}

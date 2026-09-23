@@ -1,0 +1,260 @@
+diff --git a/nova/scheduler/filters/__init__.py b/nova/scheduler/filters/__init__.py
+index 6a88934b008..f0dff520fa9 100644
+--- a/nova/scheduler/filters/__init__.py
++++ b/nova/scheduler/filters/__init__.py
+@@ -31,8 +31,11 @@
+ """
+ 
+ from abstract_filter import AbstractHostFilter
+-from availability_zone_filter import AvailabilityZoneFilter
++from affinity_filter import DifferentHostFilter
++from affinity_filter import SameHostFilter
++from affinity_filter import SimpleCIDRAffinityFilter
+ from all_hosts_filter import AllHostsFilter
++from availability_zone_filter import AvailabilityZoneFilter
+ from isolated_hosts_filter import IsolatedHostsFilter
+ from compute_filter import ComputeFilter
+ from core_filter import CoreFilter
+diff --git a/nova/scheduler/filters/affinity_filter.py b/nova/scheduler/filters/affinity_filter.py
+new file mode 100644
+index 00000000000..f6902e12764
+--- /dev/null
++++ b/nova/scheduler/filters/affinity_filter.py
+@@ -0,0 +1,81 @@
++# Copyright 2012, Piston Cloud Computing, Inc.
++# Copyright 2012, OpenStack LLC.
++# All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++import abstract_filter
++import netaddr
++
++from nova.compute import api as compute
++from nova import flags
++
++
++class AffinityFilter(abstract_filter.AbstractHostFilter):
++    def __init__(self):
++        self.compute_api = compute.API()
++
++    def _affinity_host(self, context, instance_id):
++        return self.compute_api.get(context, instance_id)['host']
++
++
++class DifferentHostFilter(AffinityFilter):
++    '''Schedule the instance on a different host from a set of instances.'''
++
++    def host_passes(self, host_state, filter_properties):
++        context = filter_properties['context']
++        scheduler_hints = filter_properties['scheduler_hints']
++        me = host_state.host
++
++        affinity_uuids = scheduler_hints.get('different_host', [])
++        if affinity_uuids:
++            return not any([i for i
++                              in affinity_uuids
++                              if self._affinity_host(context, i) == me])
++        # With no different_host key
++        return True
++
++
++class SameHostFilter(AffinityFilter):
++    '''Schedule the instance on the same host as another instance in a set of
++    of instances.
++    '''
++
++    def host_passes(self, host_state, filter_properties):
++        context = filter_properties['context']
++        scheduler_hints = filter_properties['scheduler_hints']
++        me = host_state.host
++
++        affinity_uuids = scheduler_hints.get('same_host', [])
++        if affinity_uuids:
++            return any([i for i
++                          in affinity_uuids
++                          if self._affinity_host(context, i) == me])
++        # With no same_host key
++        return True
++
++
++class SimpleCIDRAffinityFilter(AffinityFilter):
++    def host_passes(self, host_state, filter_properties):
++        scheduler_hints = filter_properties['scheduler_hints']
++
++        affinity_cidr = scheduler_hints.get('cidr', '/24')
++        affinity_host_addr = scheduler_hints.get('build_near_host_ip')
++        if affinity_host_addr:
++            affinity_net = netaddr.IPNetwork(str.join('', (affinity_host_addr,
++                                                           affinity_cidr)))
++            return netaddr.IPAddress(flags.FLAGS.my_ip) in affinity_net
++
++        # We don't have an affinity host address.
++        return True
+diff --git a/nova/tests/scheduler/fakes.py b/nova/tests/scheduler/fakes.py
+index 8abf68e52c6..94287bac3d9 100644
+--- a/nova/tests/scheduler/fakes.py
++++ b/nova/tests/scheduler/fakes.py
+@@ -19,6 +19,8 @@
+ import mox
+ 
+ from nova import db
++from nova.compute import instance_types
++from nova.compute import vm_states
+ from nova.scheduler import distributed_scheduler
+ from nova.scheduler import host_manager
+ from nova.scheduler import zone_manager
+@@ -96,6 +98,33 @@ def __init__(self, host, topic, attribute_dict):
+             setattr(self, key, val)
+ 
+ 
++class FakeInstance(object):
++    def __init__(self, context=None, params=None, type_name='m1.tiny'):
++        """Create a test instance. Returns uuid"""
++        self.context = context
++
++        i = self._create_fake_instance(params, type_name=type_name)
++        self.uuid = i['uuid']
++
++    def _create_fake_instance(self, params=None, type_name='m1.tiny'):
++        """Create a test instance"""
++        if not params:
++            params = {}
++
++        inst = {}
++        inst['vm_state'] = vm_states.ACTIVE
++        inst['image_ref'] = 1
++        inst['reservation_id'] = 'r-fakeres'
++        inst['launch_time'] = '10'
++        inst['user_id'] = 'fake'
++        inst['project_id'] = 'fake'
++        type_id = instance_types.get_instance_type_by_name(type_name)['id']
++        inst['instance_type_id'] = type_id
++        inst['ami_launch_index'] = 0
++        inst.update(params)
++        return db.instance_create(self.context, inst)
++
++
+ class FakeComputeAPI(object):
+     def create_db_entry_for_new_instance(self, *args, **kwargs):
+         pass
+diff --git a/nova/tests/scheduler/test_host_filters.py b/nova/tests/scheduler/test_host_filters.py
+index 8d9fa18a140..5e3ff260184 100644
+--- a/nova/tests/scheduler/test_host_filters.py
++++ b/nova/tests/scheduler/test_host_filters.py
+@@ -18,6 +18,7 @@
+ import json
+ 
+ from nova import context
++from nova import flags
+ from nova.scheduler import filters
+ from nova import test
+ from nova.tests.scheduler import fakes
+@@ -29,6 +30,7 @@ class HostFiltersTestCase(test.TestCase):
+ 
+     def setUp(self):
+         super(HostFiltersTestCase, self).setUp()
++        self.context = context.RequestContext('fake', 'fake')
+         self.json_query = json.dumps(
+                 ['and', ['>=', '$free_ram_mb', 1024],
+                         ['>=', '$free_disk_mb', 200 * 1024]])
+@@ -43,6 +45,88 @@ def fake_service_is_up(service):
+             return ret_value
+         self.stubs.Set(utils, 'service_is_up', fake_service_is_up)
+ 
++    def test_affinity_different_filter_passes(self):
++        filt_cls = filters.DifferentHostFilter()
++        host = fakes.FakeHostState('host1', 'compute', {})
++        instance = fakes.FakeInstance(context=self.context,
++                                         params={'host': 'host2'})
++        instance_uuid = instance.uuid
++
++        filter_properties = {'context': self.context.elevated(),
++                             'scheduler_hints': {
++                                'different_host': [instance_uuid], }}
++
++        self.assertTrue(filt_cls.host_passes(host, filter_properties))
++
++    def test_affinity_different_filter_fails(self):
++        filt_cls = filters.DifferentHostFilter()
++        host = fakes.FakeHostState('host1', 'compute', {})
++        instance = fakes.FakeInstance(context=self.context,
++                                         params={'host': 'host1'})
++        instance_uuid = instance.uuid
++
++        filter_properties = {'context': self.context.elevated(),
++                             'scheduler_hints': {
++                                'different_host': [instance_uuid], }}
++
++        self.assertFalse(filt_cls.host_passes(host, filter_properties))
++
++    def test_affinity_same_filter_passes(self):
++        filt_cls = filters.SameHostFilter()
++        host = fakes.FakeHostState('host1', 'compute', {})
++        instance = fakes.FakeInstance(context=self.context,
++                                         params={'host': 'host1'})
++        instance_uuid = instance.uuid
++
++        filter_properties = {'context': self.context.elevated(),
++                             'scheduler_hints': {
++                                'same_host': [instance_uuid], }}
++
++        self.assertTrue(filt_cls.host_passes(host, filter_properties))
++
++    def test_affinity_same_filter_fails(self):
++        filt_cls = filters.SameHostFilter()
++        host = fakes.FakeHostState('host1', 'compute', {})
++        instance = fakes.FakeInstance(context=self.context,
++                                         params={'host': 'host2'})
++        instance_uuid = instance.uuid
++
++        filter_properties = {'context': self.context.elevated(),
++                             'scheduler_hints': {
++                                'same_host': [instance_uuid], }}
++
++        self.assertFalse(filt_cls.host_passes(host, filter_properties))
++
++    def test_affinity_simple_cidr_filter_passes(self):
++        filt_cls = filters.SimpleCIDRAffinityFilter()
++        host = fakes.FakeHostState('host1', 'compute', {})
++
++        affinity_ip = flags.FLAGS.my_ip.split('.')[0:3]
++        affinity_ip.append('100')
++        affinity_ip = str.join('.', affinity_ip)
++
++        filter_properties = {'context': self.context.elevated(),
++                             'scheduler_hints': {
++                                 'cidr': '/24',
++                                 'build_near_host_ip': affinity_ip}}
++
++        self.assertTrue(filt_cls.host_passes(host, filter_properties))
++
++    def test_affinity_simple_cidr_filter_fails(self):
++        filt_cls = filters.SimpleCIDRAffinityFilter()
++        host = fakes.FakeHostState('host1', 'compute', {})
++
++        affinity_ip = flags.FLAGS.my_ip.split('.')
++        affinity_ip[-1] = '100' if affinity_ip[-1] != '100' else '101'
++        affinity_ip = str.join('.', affinity_ip)
++
++        filter_properties = {'context': self.context.elevated(),
++                             'scheduler_hints': {
++                                 'cidr': '/32',
++                                 'build_near_host_ip': affinity_ip}}
++
++        self.assertFalse(filt_cls.host_passes(host, filter_properties))
++
+     def test_compute_filter_passes(self):
+         self._stub_service_is_up(True)
+         filt_cls = filters.ComputeFilter()

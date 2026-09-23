@@ -1,0 +1,327 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "src/wagtail_2fa/views.py",
+  "changed_line": 79,
+  "statement": "class DeviceCreateView(OtpRequiredMixin, FormView):",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "observable input/state (view class inheritance) -> exact operation (adding OtpRequiredMixin) -> security-sensitive effect (enforces OTP requirement for device creation view)",
+  "security_relevance_score": 0.75,
+  "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: from wagtail_2fa.mixins import OtpRequiredMixin\n21: \n22: \n23: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n24:     template_name = \"wagtail_2fa/otp_form.html\"\n25:     form_class = forms.TokenForm\n26:     redirect_field_name = REDIRECT_FIELD_NAME\n27: \n28:     @method_decorator(sensitive_post_parameters())\n29:     @method_decorator(never_cache)\n30:     def dispatch(self, *args, **kwargs):\n31:         return super().dispatch(*args, **kwargs)\n32: \n33:     def get_form_kwargs(self):\n34:         kwargs = super().get_form_kwargs()\n35:         kwargs[\"user\"] = self.request.user\n36:         return kwargs\n37: \n38:     def get_context_data(self, *args, **kwargs):\n39:         context = super().get_context_data(*args, **kwargs)\n40:         context[self.redirect_field_name] = self.get_redirect_url()\n41:         return context\n42: \n43:     def form_valid(self, form):\n44:         otp_login(self.request, self.request.user.otp_device)\n45:         return super().form_valid(form)\n46: \n47:     def get_redirect_url(self):\n48:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n49:         redirect_to = self.request.POST.get(\n50:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n51:         )\n52:         url_is_safe = is_safe_url(\n53:             url=redirect_to,\n54:             allowed_hosts=self.get_success_url_allowed_hosts(),\n55:             require_https=self.request.is_secure(),\n56:         )\n57:         return redirect_to if url_is_safe else \"\"\n58: \n59:     def get_success_url(self):\n60:         url = self.get_redirect_url()\n61:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n62: \n63: \n64: class DeviceListView(OtpRequiredMixin, ListView):\n65:     template_name = \"wagtail_2fa/device_list.html\"\n66: \n67:     # require OTP if configured\n68:     if_configured = True\n69: \n70:     def get_queryset(self):\n71:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n72: \n73:     def get_context_data(self, **kwargs):\n74:         context = super().get_context_data(**kwargs)\n75:         context['user_id'] = int(self.kwargs['user_id'])\n76:         return context\n77: \n78: \n79: class DeviceCreateView(OtpRequiredMixin, FormView):\n80:     form_class = forms.DeviceForm\n81:     template_name = \"wagtail_2fa/device_form.html\"\n82: \n83:     # require OTP if configured\n84:     if_configured = True\n85: \n86:     def get_form_kwargs(self):\n87:         kwargs = super().get_form_kwargs()\n88:         kwargs[\"user\"] = self.request.user\n89:         kwargs[\"instance\"] = self.device\n90:         return kwargs\n91: \n92:     def form_valid(self, form):\n93:         form.save()\n94:         utils.delete_unconfirmed_devices(form.user)\n95: \n96:         if not self.request.user.is_verified():\n97:             otp_login(self.request, form.instance)\n98:         return super().form_valid(form)\n99: \n100:     def get_success_url(self):\n101:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n102: \n103:     @cached_property\n104:     def device(self):\n105:         if self.request.method.lower() == \"get\":\n106:             return utils.new_unconfirmed_device(self.request.user)\n107:         else:\n108:             return utils.get_unconfirmed_device(self.request.user)\n109: \n110: \n111: class DeviceUpdateView(OtpRequiredMixin, UpdateView):\n112:     form_class = forms.DeviceForm\n113:     template_name = \"wagtail_2fa/device_form.html\"\n114: \n115:     def get_queryset(self):\n116:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n117: \n118:     def get_form_kwargs(self):\n119:         kwargs = super().get_form_kwargs()\n120:         kwargs[\"user\"] = self.request.user\n121:         return kwargs\n122: \n123:     def get_success_url(self):\n124:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n125: \n126: \n127: class DeviceDeleteView(OtpRequiredMixin, DeleteView):\n128:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n129: \n130:     def get_queryset(self):\n131:         device = TOTPDevice.objects.get(**self.kwargs)\n132:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n133: \n134:     def get_success_url(self):\n135:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n136: \n137: \n138: class DeviceQRCodeView(OtpRequiredMixin, View):\n139:     # require OTP if configured\n140:     if_configured = True\n141: \n142:     def get(self, request):\n143:         device = utils.get_unconfirmed_device(self.request.user)\n144:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n145:         response = HttpResponse(content_type=\"image/svg+xml\")\n146:         img.save(response)\n147: \n148:         return response",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "fit_reason": "The DeviceCreateView inherits OtpRequiredMixin which should enforce OTP requirement for device creation. If this control is bypassed or incorrectly implemented, it could lead to improper access control where unauthorized users can create devices without proper authentication.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-264",
+      "cwe_name": "Permissions, Privileges, and Access Controls",
+      "fit_reason": "The addition of OtpRequiredMixin to DeviceCreateView represents an access control mechanism. If this mechanism fails or is improperly enforced, it would constitute a failure in permissions and access controls.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "The OTP requirement for device creation is an authorization check. If this check evaluates access incorrectly (e.g., allows access without proper OTP verification), it would be incorrect authorization.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "fit_reason": "The OTP enforcement mechanism involves credential handling. If there are issues with how OTP credentials are managed during device creation, this could lead to credential management errors.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-208",
+      "cwe_name": "Observable Timing Discrepancy",
+      "fit_reason": "If the OTP verification process has timing discrepancies that can be exploited, an attacker might bypass authentication by observing timing differences during OTP validation, particularly relevant in device creation context.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-208",
+    "CWE-254",
+    "CWE-255",
+    "CWE-264",
+    "CWE-284",
+    "CWE-287",
+    "CWE-311",
+    "CWE-425",
+    "CWE-561",
+    "CWE-581",
+    "CWE-628",
+    "CWE-685",
+    "CWE-687",
+    "CWE-74",
+    "CWE-770",
+    "CWE-863"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 79,
+      "statement": "class DeviceCreateView(OtpRequiredMixin, FormView):",
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The DeviceCreateView class inherits OtpRequiredMixin, which is designed to enforce OTP (One-Time Password) requirement for access control. This directly aligns with CWE-284's mechanism of improper access control where resources are not properly restricted."
+        },
+        "connection": {
+          "score": 1.0,
+          "evidence": "The DeviceCreateView is a security-sensitive decision point that handles device creation. The OtpRequiredMixin is applied to this view, meaning any attempt to access it requires OTP verification. This creates a clear connection between the security-sensitive state (user attempting to create a device) and the protected action (requiring OTP)."
+        },
+        "diff_causality": {
+          "score": 1.0,
+          "evidence": "If the OtpRequiredMixin were removed from DeviceCreateView, it would directly remove the access control mechanism that prevents unauthorized users from creating devices without OTP verification. This change would create a vulnerability where any user could bypass authentication and create devices."
+        },
+        "security_control": {
+          "score": 1.0,
+          "evidence": "The OtpRequiredMixin is implemented as a security control to enforce OTP requirement for device creation. The code explicitly applies this mixin to DeviceCreateView, indicating that the system enforces access control by requiring OTP verification before allowing device creation.",
+          "required_control": "OTP requirement enforcement",
+          "control_requirement_evidence": "CWE-284 requires proper access control where unauthorized actors are restricted from accessing resources. The DeviceCreateView must enforce authentication to prevent unauthorized device creation.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin applied to DeviceCreateView"
+          ],
+          "deficiency_evidence": "No deficiency found; the OtpRequiredMixin is correctly implemented and enforced."
+        },
+        "concrete_impact": {
+          "score": 0.8,
+          "evidence": "If the OTP requirement were bypassed or incorrectly implemented, an attacker could create devices without proper authentication, leading to unauthorized access control. The impact is significant as it allows bypassing multi-factor authentication for device management."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, removing OtpRequiredMixin from DeviceCreateView, then users would be able to create devices without providing OTP verification, directly violating the access control mechanism designed to protect this sensitive operation.",
+      "supporting_evidence": [
+        "DeviceCreateView inherits OtpRequiredMixin which enforces OTP requirement",
+        "The view handles device creation, a security-sensitive operation",
+        "OtpRequiredMixin is applied to prevent unauthorized access to device creation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "The DeviceCreateView enforces OTP requirement through OtpRequiredMixin, which is a necessary control for preventing unauthorized device creation. Removing this control would allow any user to bypass authentication and create devices without proper verification. The access control mechanism is correctly implemented and enforced.",
+      "change_type": "A",
+      "raw_score": 0.96,
+      "score": 0.96
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 79,
+      "statement": "class DeviceCreateView(OtpRequiredMixin, FormView):",
+      "cwe_id": "CWE-264",
+      "cwe_name": "Permissions, Privileges, and Access Controls",
+      "cwe_relationship": "family_compatible",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.6,
+          "evidence": "The addition of OtpRequiredMixin to DeviceCreateView introduces an access control mechanism. However, the mechanism itself is not fully demonstrated as the view class inherits from OtpRequiredMixin which enforces OTP requirement, but does not show a specific vulnerability in privilege enforcement or access control failure."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "The DeviceCreateView uses OtpRequiredMixin which requires OTP authentication. However, there is no explicit evidence that an attacker can bypass this requirement or that the view allows unauthorized access to device creation without proper authorization checks beyond OTP."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If the OtpRequiredMixin were removed from DeviceCreateView, it would remove the OTP enforcement for device creation, which is a direct change in access control. This demonstrates that the patch materially affects access control by adding the requirement."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "The OtpRequiredMixin provides an authentication control but does not explicitly enforce authorization or privilege checks for device creation. The view allows users to create devices only if they are authenticated with OTP, but there is no evidence of a missing authorization check that would allow unauthorized access.",
+          "required_control": "Authorization check for device creation",
+          "control_requirement_evidence": "CWE-264 requires verification of permissions and privileges at protected operations. Device creation should be authorized to the user who owns it or has appropriate privileges.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin enforces OTP authentication",
+            "DeviceCreateView inherits from FormView which does not inherently enforce authorization"
+          ],
+          "deficiency_evidence": "While OTP is enforced, there is no explicit check that the user creating a device has proper authorization or privilege to do so. The view allows any authenticated user with OTP to create a device without further authorization verification."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "If an attacker could bypass the OTP requirement, they might be able to create unauthorized devices. However, there is no concrete evidence of such a bypass or impact in the provided code context."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the DeviceCreateView would not inherit from OtpRequiredMixin, removing the OTP enforcement for device creation. This would weaken access control by allowing users to create devices without proper authentication, potentially enabling unauthorized device creation.",
+      "supporting_evidence": [
+        "DeviceCreateView inherits from OtpRequiredMixin which enforces OTP requirement",
+        "The view allows device creation only after OTP verification"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the OTP requirement is sufficient to prevent unauthorized access to device creation",
+        "Whether there are additional authorization checks needed beyond OTP for device creation"
+      ],
+      "review_comment": "The addition of OtpRequiredMixin to DeviceCreateView enforces OTP authentication, but does not explicitly verify user authorization for device creation. The view allows any authenticated user with OTP to create devices without further privilege checks. Ensure that device creation is also authorized based on user permissions or ownership to prevent unauthorized device creation.",
+      "change_type": "A",
+      "raw_score": 0.5599999999999999,
+      "score": 0.5599999999999999
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 79,
+      "statement": "class DeviceCreateView(OtpRequiredMixin, FormView):",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The candidate adds OtpRequiredMixin to DeviceCreateView, which enforces OTP verification before allowing access to the device creation view. This directly corresponds to an authorization check mechanism where access is controlled based on OTP authentication status."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The DeviceCreateView inherits from OtpRequiredMixin, which requires OTP verification for access. The connection between the security-sensitive state (user's OTP verification status) and the vulnerable operation (device creation) is clearly established through the inheritance chain."
+        },
+        "diff_causality": {
+          "score": 1.0,
+          "evidence": "If this line were reverted, DeviceCreateView would no longer inherit from OtpRequiredMixin, removing the OTP requirement for device creation. This directly removes the authorization control that prevents unauthorized access to device creation."
+        },
+        "security_control": {
+          "score": 1.0,
+          "evidence": "The OtpRequiredMixin provides a strong security control by ensuring that only users who have verified their OTP can access the DeviceCreateView. The control is correctly implemented and enforced.",
+          "required_control": "OTP verification before access to device creation",
+          "control_requirement_evidence": "CWE-863 requires correct authorization checks, which in this context means that access to device creation must be restricted to users who have verified their OTP status.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin enforces OTP verification",
+            "DeviceCreateView inherits from OtpRequiredMixin"
+          ],
+          "deficiency_evidence": "No deficiency found. The control is properly implemented and enforced."
+        },
+        "concrete_impact": {
+          "score": 0.8,
+          "evidence": "If the OTP requirement were removed, an attacker could potentially create devices without proper authentication, leading to unauthorized access to two-factor authentication mechanisms. This represents a concrete authorization vulnerability."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, DeviceCreateView would no longer inherit from OtpRequiredMixin, removing the OTP requirement for device creation and allowing any authenticated user to create devices without OTP verification.",
+      "supporting_evidence": [
+        "DeviceCreateView inherits from OtpRequiredMixin which enforces OTP verification",
+        "The change adds authorization control to device creation view",
+        "OtpRequiredMixin is a security-sensitive decision that requires OTP verification"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "Adding OtpRequiredMixin to DeviceCreateView enforces OTP verification before allowing device creation. This prevents unauthorized access to the device creation functionality. The change correctly implements authorization control by requiring OTP verification for this security-sensitive operation.",
+      "change_type": "A",
+      "raw_score": 0.9199999999999999,
+      "score": 0.9199999999999999
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 79,
+      "statement": "class DeviceCreateView(OtpRequiredMixin, FormView):",
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "cwe_relationship": "family_compatible",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The change introduces OtpRequiredMixin to DeviceCreateView, which enforces OTP requirements for device creation. While this relates to credential management, the specific mechanism of CWE-255 (credentials management errors) is not directly demonstrated in this line. The line adds a security requirement but does not show a flaw in credential handling."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The DeviceCreateView inherits from OtpRequiredMixin, which enforces OTP requirements. This means that any attempt to create a device requires OTP verification. The connection is established through the inheritance chain, but it's not clear if an attacker can bypass this or if there are credential handling flaws in the process."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If the candidate line were reverted (removing OtpRequiredMixin), then DeviceCreateView would no longer require OTP verification. This would weaken the security control, allowing potential unauthorized device creation without OTP confirmation, which directly impacts credential management by removing a necessary authentication step."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "The addition of OtpRequiredMixin enforces OTP requirement for device creation, which is a security control. However, the evidence does not show if this control is sufficient or if there are other credential management flaws in the process (e.g., how credentials are stored, validated, or transmitted).",
+          "required_control": "OTP enforcement for device creation",
+          "control_requirement_evidence": "CWE-255 involves credential management. Device creation with OTP requirement is a control to prevent unauthorized access, but it's not clear if the implementation is fully secure.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin enforces OTP requirement",
+            "Device creation requires OTP verification"
+          ],
+          "deficiency_evidence": "The evidence does not show any deficiency in the OTP enforcement mechanism itself. The control appears to be correctly implemented, but there's no demonstration of credential handling flaws."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "The concrete impact is uncertain because while OTP enforcement is added, it's not clear if this prevents credential compromise or authentication weakness. The change adds a control but doesn't demonstrate a flaw in credential management."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, DeviceCreateView would no longer require OTP verification, removing an important security control that prevents unauthorized device creation without proper authentication.",
+      "supporting_evidence": [
+        "DeviceCreateView inherits from OtpRequiredMixin which enforces OTP requirement",
+        "The change adds a security-sensitive decision to require OTP for device creation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the OTP enforcement mechanism is sufficient to prevent credential management errors",
+        "Whether there are other credential handling flaws in the device creation process"
+      ],
+      "review_comment": "The addition of OtpRequiredMixin to DeviceCreateView enforces OTP requirement for device creation, which is a security control. However, this change does not demonstrate a specific credential management flaw or vulnerability. The control appears to be correctly implemented, but further analysis is needed to determine if there are other credential handling issues in the process.",
+      "change_type": "A",
+      "raw_score": 0.5599999999999999,
+      "score": 0.5599999999999999
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 79,
+      "statement": "class DeviceCreateView(OtpRequiredMixin, FormView):",
+      "cwe_id": "CWE-208",
+      "cwe_name": "Observable Timing Discrepancy",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "The candidate line adds OtpRequiredMixin to DeviceCreateView, which enforces OTP requirement but does not demonstrate timing discrepancies in operations."
+        },
+        "connection": {
+          "score": 0.0,
+          "evidence": "No evidence of timing differences or observable delays in the OTP verification process related to this view class addition."
+        },
+        "diff_causality": {
+          "score": 0.0,
+          "evidence": "Adding OtpRequiredMixin does not introduce timing discrepancies; it only enforces authentication requirements without altering operation timing."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "No evidence of missing or weakened controls related to timing discrepancies in this context.",
+          "required_control": "None established for CWE-208 in this specific mechanism",
+          "control_requirement_evidence": "CWE-208 requires timing consistency in operations, not present in the addition of OtpRequiredMixin.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin enforces OTP requirement",
+            "Device creation form handling"
+          ],
+          "deficiency_evidence": "No timing-related control deficiency observed; the change only adds authentication enforcement."
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "No concrete security consequence related to timing discrepancies demonstrated in this change."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the DeviceCreateView would not enforce OTP requirement, but this does not introduce or remove timing discrepancies relevant to CWE-208.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "The change only adds OtpRequiredMixin without altering any timing-sensitive operations or introducing observable delays in authentication checks."
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.0,
+      "score": 0.0
+    }
+  ],
+  "stage4_status": "completed"
+}

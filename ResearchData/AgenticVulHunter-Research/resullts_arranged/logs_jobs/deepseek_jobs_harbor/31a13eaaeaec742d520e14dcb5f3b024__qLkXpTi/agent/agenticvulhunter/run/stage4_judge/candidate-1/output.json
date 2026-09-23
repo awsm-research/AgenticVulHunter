@@ -1,0 +1,244 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "src/index.js",
+  "changed_line": 252,
+  "statement": "await utils.run(`git clone ${remoteUrl} ${_tmpDir}`);",
+  "change_type": "A",
+  "function_name": "module.exports (gitDiffApply)",
+  "operation_type": "shell_command_execution",
+  "selection_reason": "user-controlled remoteUrl directly interpolated into git clone command -> executed via shell -> potential command injection",
+  "security_relevance_score": 0.9,
+  "code_context": "103: \n104:     if (!(reset || init)) {\n105:       await copyToSubDir(startTag);\n106: \n107:       await gitRemoveAll({ cwd: newTmpDir });\n108:     }\n109: \n110:     await copyToSubDir(endTag);\n111: \n112:     _tmpDir = newTmpDir;\n113:     tmpWorkingDir = newTmpSubDir;\n114:   }\n115: \n116:   async function copy() {\n117:     await utils.copy(tmpWorkingDir, cwd);\n118:   }\n119: \n120:   async function resetIgnoredFiles() {\n121:     for (let ignoredFile of ignoredFiles) {\n122:       // An exist check is not good enough.\n123:       // `git checkout` will fail unless it is also tracked.\n124:       let isTracked = await utils.run(`git ls-files ${ignoredFile}`);\n125:       if (isTracked) {\n126:         await utils.run(`git checkout -- ${ignoredFile}`);\n127:       } else {\n128:         await fs.remove(ignoredFile);\n129:       }\n130:     }\n131:   }\n132: \n133:   async function createPatchFile() {\n134:     let patchFile = path.join(await tmpDir(), 'file.patch');\n135:     await utils.run(`git diff ${startTag} ${endTag} --binary > ${patchFile}`, { cwd: _tmpDir });\n136:     if (await fs.readFile(patchFile, 'utf8') !== '') {\n137:       return patchFile;\n138:     }\n139:   }\n140: \n141:   async function applyDiff() {\n142:     let patchFile = await createPatchFile();\n143:     if (patchFile) {\n144:       // --whitespace=fix seems to prevent any unnecessary conflicts with line endings\n145:       // https://stackoverflow.com/questions/6308625/how-to-avoid-git-apply-changing-line-endings#comment54419617_11189296\n146:       await utils.run(`git apply --whitespace=fix ${patchFile}`);\n147:     }\n148:   }\n149: \n150:   async function go() {\n151:     if (reset || init) {\n152:       await checkOutTag(_tmpDir, endTag);\n153: \n154:       isCodeUntracked = true;\n155:       isCodeModified = true;\n156:       if (reset) {\n157:         await utils.gitRemoveAll({ cwd: root });\n158:       }\n159: \n160:       await copy();\n161: \n162:       await utils.run('git reset');\n163: \n164:       await resetIgnoredFiles();\n165: \n166:       return;\n167:     }\n168: \n169:     await checkOutTag(_tmpDir, startTag);\n170: \n171:     oldBranchName = await getCheckedOutBranchName();\n172:     await utils.run(`git checkout --orphan ${tempBranchName}`);\n173:     isTempBranchCheckedOut = true;\n174: \n175:     await utils.gitRemoveAll({ cwd: root });\n176: \n177:     gitIgnoredFiles = await tmpDir();\n178:     await mergeDir(cwd, gitIgnoredFiles);\n179:     shouldReturnGitIgnoredFiles = true;\n180: \n181:     isCodeUntracked = true;\n182:     await copy();\n183: \n184:     isTempBranchCommitted = true;\n185:     await commit();\n186:     isCodeUntracked = false;\n187: \n188:     isCodeUntracked = true;\n189:     isCodeModified = true;\n190:     await applyDiff();\n191: \n192:     await resetIgnoredFiles();\n193: \n194:     let wereAnyChanged = !await isGitClean();\n195: \n196:     if (wereAnyChanged) {\n197:       await commit();\n198:     }\n199:     isCodeUntracked = false;\n200:     isCodeModified = false;\n201: \n202:     let sha;\n203:     if (wereAnyChanged) {\n204:       sha = await utils.run('git rev-parse HEAD');\n205:     }\n206: \n207:     await utils.run(`git checkout ${oldBranchName}`);\n208:     isTempBranchCheckedOut = false;\n209: \n210:     if (wereAnyChanged) {\n211:       try {\n212:         await utils.run(`git cherry-pick --no-commit ${sha.trim()}`);\n213:       } catch (err) {\n214:         hasConflicts = true;\n215:       }\n216:     }\n217:   }\n218: \n219:   try {\n220:     if (startTag === endTag && !(reset || init)) {\n221:       throw 'Tags match, nothing to apply';\n222:     }\n223: \n224:     let isClean;\n225: \n226:     try {\n227:       isClean = await isGitClean();\n228:     } catch (err) {\n229:       throw 'Not a git repository';\n230:     }\n231: \n232:     if (!isClean) {\n233:       throw 'You must start with a clean working directory';\n234:     }\n235: \n236:     if (createCustomDiff) {\n237:       let tmpPath = await createCustomRemote({\n238:         startCommand,\n239:         endCommand,\n240:         startTag,\n241:         endTag,\n242:         reset,\n243:         init\n244:       });\n245: \n246:       remoteUrl = tmpPath;\n247:     }\n248: \n249:     _tmpDir = await tmpDir();\n250:     tmpWorkingDir = _tmpDir;\n251: \n252:     await utils.run(`git clone ${remoteUrl} ${_tmpDir}`);\n253: \n254:     returnObject = await buildReturnObject();\n255: \n256:     root = await getRootDir();\n257:     let subDir = await getSubDir(root);\n258:     if (subDir) {\n259:       debug('subDir', subDir);\n260: \n261:       await namespaceRepoWithSubDir(subDir);\n262:     }\n263: \n264:     cwd = process.cwd();\n265: \n266:     await go();\n267: \n268:     debug('success');\n269:   } catch (_err) {\n270:     err = _err;\n271: \n272:     try {\n273:       if (isCodeUntracked) {\n274:         await utils.run('git clean -f');\n275:       }\n276:       if (isCodeModified) {\n277:         await utils.run('git reset --hard');\n278:       }\n279: \n280:       if (isTempBranchCheckedOut) {\n281:         await utils.run(`git checkout ${oldBranchName}`);\n282:       }\n283:     } catch (err2) {\n284:       throw {\n285:         err,\n286:         err2\n287:       };\n288:     }\n289:   }\n290: \n291:   try {\n292:     if (isTempBranchCommitted && await doesBranchExist(tempBranchName)) {\n293:       await utils.run(`git branch -D ${tempBranchName}`);\n294:     }\n295: \n296:     if (shouldReturnGitIgnoredFiles) {\n297:       await mergeDir(gitIgnoredFiles, cwd);\n298:     }\n299:   } catch (err2) {\n300:     err = {\n301:       err,\n302:       err2\n303:     };\n304:   }\n305: \n306:   if (err) {\n307:     debug('failure');\n308: \n309:     throw err;\n310:   }\n311: \n312:   if (hasConflicts && _resolveConflicts) {\n313:     returnObject.resolveConflictsProcess = resolveConflicts({\n314:       shouldPipe: !wasRunAsExecutable\n315:     });\n316:   }\n317: \n318:   return returnObject;\n319: };\n320: \n321: module.exports.run = utils.run;\n322: module.exports.gitInit = gitInit;\n323: module.exports.gitStatus = gitStatus;\n324: module.exports.isGitClean = isGitClean;\n325: module.exports.gitRemoveAll = gitRemoveAll;",
+  "source_summary": "remoteUrl comes from function parameter or createCustomRemote() output; when createCustomDiff=true, remoteUrl is a temporary directory path; when false, remoteUrl is direct user input parameter",
+  "sink_summary": "git clone command executed via child_process.exec() with shell interpolation of remoteUrl and _tmpDir variables",
+  "guard_summary": "No validation or sanitization of remoteUrl before interpolation; git clean working directory check present but unrelated to command injection",
+  "risk_pattern": "User-controlled remoteUrl directly interpolated into shell command string without validation, escaping, or parameterization",
+  "used_variable_sources": [
+    "remoteUrl (function parameter)",
+    "_tmpDir (tmpDir() function output)"
+  ],
+  "called_function_context": [
+    "utils.run() -> execPromise(command, options) -> child_process.exec()"
+  ],
+  "enclosing_conditions": [
+    "if (createCustomDiff) branch determines remoteUrl source"
+  ],
+  "context_summary": "Command executes in git diff apply workflow; remoteUrl either from user input or generated temporary path",
+  "unresolved_facts": [
+    "Default value and validation of createCustomDiff parameter",
+    "Whether remoteUrl receives any validation when passed as direct parameter",
+    "Security controls in createCustomRemote's startCommand/endCommand execution"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-88",
+      "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+      "fit_reason": "git clone with user-controlled remoteUrl directly interpolated into shell command - specifically matches second-order command injection pattern for git commands",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-77",
+      "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+      "fit_reason": "User-controlled remoteUrl changes command syntax when interpolated into shell execution context",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-78",
+      "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+      "fit_reason": "Shell command execution with unsanitized user input leading to OS command injection",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-116",
+    "CWE-22",
+    "CWE-378",
+    "CWE-425",
+    "CWE-77",
+    "CWE-78",
+    "CWE-79",
+    "CWE-830",
+    "CWE-88",
+    "CWE-94",
+    "CWE-99"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/index.js",
+      "changed_line": 252,
+      "statement": "await utils.run(`git clone ${remoteUrl} ${_tmpDir}`);",
+      "cwe_id": "CWE-88",
+      "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "git clone command with user-controlled remoteUrl directly interpolated into shell command string without proper argument delimitation - exactly matches CWE-88 pattern of improper argument neutralization in command execution"
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "remoteUrl parameter flows directly from function input to git clone command execution via utils.run() -> child_process.exec()"
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This line is newly added (change_type: A) and introduces the vulnerable command interpolation pattern"
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "No validation, sanitization, or parameterization of remoteUrl before shell interpolation",
+          "required_control": "Argument validation and proper command parameterization",
+          "control_requirement_evidence": "CWE-88 requires proper delimitation of arguments when constructing shell commands to prevent injection",
+          "existing_controls_checked": [
+            "No input validation on remoteUrl parameter",
+            "No escaping or parameterization in command construction",
+            "git clean working directory check (unrelated to command injection)"
+          ],
+          "deficiency_evidence": "remoteUrl is directly interpolated into shell command string without any validation, escaping, or parameterized execution"
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "Successful argument injection could lead to arbitrary command execution with the privileges of the running process"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the git clone command with vulnerable interpolation would not be executed, eliminating the argument injection vulnerability.",
+      "supporting_evidence": [
+        "remoteUrl is a function parameter with user-controlled input",
+        "Direct string interpolation into git clone shell command",
+        "utils.run() uses child_process.exec() which executes via shell",
+        "No validation or sanitization of remoteUrl before command construction"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether createCustomDiff parameter defaults to true or false",
+        "Exact validation controls in createCustomRemote function"
+      ],
+      "review_comment": "The git clone command directly interpolates user-controlled remoteUrl into the shell command without validation or parameterization, creating an argument injection vulnerability. Use parameterized command execution by passing arguments as an array to child_process.spawn() instead of string interpolation, or validate remoteUrl against a strict allowlist of safe URL patterns before execution.",
+      "change_type": "A",
+      "raw_score": 0.8,
+      "score": 0.8
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/index.js",
+      "changed_line": 252,
+      "statement": "await utils.run(`git clone ${remoteUrl} ${_tmpDir}`);",
+      "cwe_id": "CWE-77",
+      "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The code constructs a shell command by directly interpolating user-controlled remoteUrl into a git clone command executed via child_process.exec(), which is the exact mechanism described by CWE-77"
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "remoteUrl is either direct user input parameter or output from createCustomRemote(); when createCustomDiff=false, remoteUrl flows directly from user input to shell command execution without validation"
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This line is newly added (change_type: 'A') and directly introduces the vulnerable command construction pattern where remoteUrl is interpolated into shell command"
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "No validation, sanitization, or parameterization of remoteUrl before shell interpolation",
+          "required_control": "Input validation and command parameterization",
+          "control_requirement_evidence": "CWE-77 requires neutralizing special shell characters in command arguments to prevent injection",
+          "existing_controls_checked": [
+            "No input validation on remoteUrl parameter",
+            "No escaping of shell metacharacters",
+            "Direct string interpolation into shell command"
+          ],
+          "deficiency_evidence": "The code uses template literal interpolation without any sanitization, allowing shell metacharacters in remoteUrl to modify command execution"
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "Command injection could lead to arbitrary command execution with the privileges of the application process"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the vulnerable command interpolation pattern would not exist in the codebase, preventing the command injection vulnerability.",
+      "supporting_evidence": [
+        "remoteUrl is either direct user input parameter or generated by createCustomRemote() function",
+        "The code uses template literal interpolation: `git clone ${remoteUrl} ${_tmpDir}`",
+        "utils.run() executes via child_process.exec() which uses shell interpretation",
+        "No validation or sanitization of remoteUrl before command construction"
+      ],
+      "contradicting_evidence": [
+        "When createCustomDiff=true, remoteUrl comes from createCustomRemote() which may generate safe temporary paths"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether createCustomDiff parameter has secure default value",
+        "Validation applied to remoteUrl when passed as direct parameter",
+        "Security controls in createCustomRemote's command execution"
+      ],
+      "review_comment": "The code directly interpolates user-controlled remoteUrl into a shell command without validation or parameterization, creating a command injection vulnerability. When createCustomDiff is false, remoteUrl flows from direct user input to git clone execution. Use parameterized command execution by passing remoteUrl and _tmpDir as separate arguments to avoid shell interpolation.",
+      "change_type": "A",
+      "raw_score": 0.8,
+      "score": 0.8
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/index.js",
+      "changed_line": 252,
+      "statement": "await utils.run(`git clone ${remoteUrl} ${_tmpDir}`);",
+      "cwe_id": "CWE-78",
+      "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The code constructs an OS command (git clone) by directly interpolating user-controlled input (remoteUrl) into a shell command string that is executed via child_process.exec(). This matches the CWE-78 definition of constructing OS commands with externally-influenced input without neutralization."
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "remoteUrl is a function parameter that can be directly user-controlled when createCustomDiff=false. The evidence shows remoteUrl is interpolated into the shell command string and executed via utils.run() -> execPromise() -> child_process.exec(). The path from user input to command execution is direct and demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This candidate line is the addition of the vulnerable git clone command. If this line were reverted, the command injection vulnerability would not exist at this location. The patch materially creates the vulnerable mechanism by introducing shell command execution with unsanitized interpolation."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "No validation, sanitization, escaping, or parameterization of remoteUrl before interpolation into the shell command. The required control for CWE-78 is proper neutralization of special shell elements through escaping, parameterization, or allowlisting.",
+          "required_control": "Proper neutralization of special shell elements (escaping, parameterization, or allowlisting) before command interpolation",
+          "control_requirement_evidence": "CWE-78 requires neutralization of shell metacharacters (;, &, |, $, `, etc.) that could modify command execution. Direct string interpolation without escaping allows injection of additional commands.",
+          "existing_controls_checked": [
+            "No validation/sanitization of remoteUrl before interpolation",
+            "No use of parameterized arguments or execFile() with separate arguments",
+            "Working directory cleanliness check unrelated to command injection"
+          ],
+          "deficiency_evidence": "The remoteUrl variable is directly interpolated into backticks without any escaping, validation, or parameterization. The utils.run() function uses child_process.exec() which executes through a shell, making shell metacharacters in remoteUrl dangerous."
+        },
+        "concrete_impact": {
+          "score": 0.65,
+          "evidence": "Successful command injection could lead to arbitrary command execution with the privileges of the Node.js process. The evidence demonstrates the mechanism but doesn't establish specific attacker-controlled payloads reaching this code path in production."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the git clone command execution with unsanitized remoteUrl interpolation would not occur, eliminating the command injection vulnerability at this location.",
+      "supporting_evidence": [
+        "remoteUrl is a function parameter that can be user-controlled when createCustomDiff=false",
+        "The code uses direct string interpolation: `git clone ${remoteUrl} ${_tmpDir}`",
+        "utils.run() calls execPromise() which uses child_process.exec() with shell execution",
+        "No validation, sanitization, or escaping of remoteUrl before interpolation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether createCustomDiff parameter has a default value that would make remoteUrl user-controlled by default",
+        "Whether remoteUrl receives any validation when passed as direct parameter from calling code",
+        "Whether the temporary path from createCustomRemote() could contain shell metacharacters"
+      ],
+      "review_comment": "The added git clone command directly interpolates user-controlled remoteUrl into a shell command without sanitization, enabling OS command injection. When createCustomDiff=false, remoteUrl comes directly from user input and can contain shell metacharacters like ;, &, or | to execute arbitrary commands. Replace the shell command interpolation with parameterized execution using execFile() and separate arguments, or at minimum escape the remoteUrl using shellEscape() before interpolation.",
+      "change_type": "A",
+      "raw_score": 0.77,
+      "score": 0.77
+    }
+  ],
+  "stage4_status": "completed"
+}

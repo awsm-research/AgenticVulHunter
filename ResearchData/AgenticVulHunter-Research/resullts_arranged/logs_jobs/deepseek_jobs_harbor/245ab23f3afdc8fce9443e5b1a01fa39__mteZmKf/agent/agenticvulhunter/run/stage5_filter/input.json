@@ -1,0 +1,1028 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "reviewboard/webapi/json.py",
+    "changed_line": 308,
+    "statement": "q = q | (Q(first_name__istartswith=query) |",
+    "change_type": "A",
+    "function_name": "user_list",
+    "operation_type": "database_query_construction",
+    "selection_reason": "User-controlled query parameter -> expands search to include first_name field -> potential information disclosure",
+    "security_relevance_score": 0.7,
+    "code_context": "159:                 'timestamp': o.timestamp,\n160:                 'timesince': timesince(o.timestamp),\n161:                 'public': review.public,\n162:                 'user': review.user,\n163:                 'x': o.x,\n164:                 'y': o.y,\n165:                 'w': o.w,\n166:                 'h': o.h,\n167:             }\n168:         elif isinstance(o, Screenshot):\n169:             return {\n170:                 'id': o.id,\n171:                 'caption': o.caption,\n172:                 'title': u'Screenshot: %s' % (o.caption or\n173:                                               os.path.basename(o.image.path)),\n174:                 'image_url': o.get_absolute_url(),\n175:                 'thumbnail_url': o.get_thumbnail_url(),\n176:             }\n177:         elif isinstance(o, FileDiff):\n178:             return {\n179:                 'id': o.id,\n180:                 'diffset': o.diffset,\n181:                 'source_file': o.source_file,\n182:                 'dest_file': o.dest_file,\n183:                 'source_revision': o.source_revision,\n184:                 'dest_detail': o.dest_detail,\n185:             }\n186:         elif isinstance(o, DiffSet):\n187:             return {\n188:                 'id': o.id,\n189:                 'name': o.name,\n190:                 'revision': o.revision,\n191:                 'timestamp': o.timestamp,\n192:                 'repository': o.repository,\n193:             }\n194:         elif isinstance(o, Repository):\n195:             return {\n196:                 'id': o.id,\n197:                 'name': o.name,\n198:                 'path': o.path,\n199:                 'tool': o.tool.name\n200:             }\n201:         else:\n202:             return super(ReviewBoardAPIEncoder, self).encode(o)\n203: \n204: \n205: def status_to_string(status):\n206:     if status == \"P\":\n207:         return \"pending\"\n208:     elif status == \"S\":\n209:         return \"submitted\"\n210:     elif status == \"D\":\n211:         return \"discarded\"\n212:     elif status == None:\n213:         return \"all\"\n214:     else:\n215:         raise \"Invalid status '%s'\" % status\n216: \n217: \n218: def string_to_status(status):\n219:     if status == \"pending\":\n220:         return \"P\"\n221:     elif status == \"submitted\":\n222:         return \"S\"\n223:     elif status == \"discarded\":\n224:         return \"D\"\n225:     elif status == \"all\":\n226:         return None\n227:     else:\n228:         raise \"Invalid status '%s'\" % status\n229: \n230: \n231: @webapi\n232: def service_not_configured(request):\n233:     \"\"\"\n234:     Returns an error specifying that the service has not yet been configured.\n235:     \"\"\"\n236:     return WebAPIResponseError(request, SERVICE_NOT_CONFIGURED)\n237: \n238: \n239: @webapi_check_login_required\n240: def server_info(request):\n241:     site = Site.objects.get_current()\n242:     siteconfig = site.config.get()\n243: \n244:     url = '%s://%s%s' % (siteconfig.get('site_domain_method'), site.domain,\n245:                          settings.SITE_ROOT)\n246: \n247:     return WebAPIResponse(request, {\n248:         'product': {\n249:             'name': 'Review Board',\n250:             'version': get_version_string(),\n251:             'package_version': get_package_version(),\n252:             'is_release': is_release(),\n253:         },\n254:         'site': {\n255:             'url': url,\n256:             'administrators': [{'name': name, 'email': email}\n257:                                for name, email in settings.ADMINS],\n258:         },\n259:     })\n260: \n261: \n262: @webapi_check_login_required\n263: def repository_list(request):\n264:     \"\"\"\n265:     Returns a list of all known repositories.\n266:     \"\"\"\n267:     return WebAPIResponse(request, {\n268:         'repositories': Repository.objects.all(),\n269:     })\n270: \n271: \n272: @webapi_check_login_required\n273: def repository_info(request, repository_id):\n274:     try:\n275:         repository = Repository.objects.get(id=repository_id)\n276:     except Repository.DoesNotExist:\n277:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n278: \n279:     try:\n280:         return WebAPIResponse(request, {\n281:             'info': repository.get_scmtool().get_repository_info()\n282:         })\n283:     except NotImplementedError:\n284:         return WebAPIResponseError(request, REPO_NOT_IMPLEMENTED)\n285:     except:\n286:         return WebAPIResponseError(request, REPO_INFO_ERROR)\n287: \n288: @webapi_check_login_required\n289: def user_list(request):\n290:     \"\"\"\n291:     Returns a list of all users.\n292: \n293:     If the q parameter is passed, users with a username beginning with\n294:     the query value will be returned.\n295: \n296:     If the fullname parameter is passed along with the q parameter, then full\n297:     names will be searched as well.\n298:     \"\"\"\n299:     # XXX Support \"query\" for backwards-compatibility until after 1.0.\n300:     query = request.GET.get('q', request.GET.get('query', None))\n301: \n302:     u = User.objects.filter(is_active=True)\n303: \n304:     if query:\n305:         q = Q(username__istartswith=query)\n306: \n307:         if request.GET.get('fullname', None):\n308:             q = q | (Q(first_name__istartswith=query) |\n309:                      Q(last_name__istartswith=query))\n310: \n311:         u = u.filter(q)\n312: \n313:     return WebAPIResponse(request, {\n314:         'users': u,\n315:     })\n316: \n317: @webapi_check_login_required\n318: def group_list(request):\n319:     \"\"\"\n320:     Returns a list of all review groups.\n321: \n322:     If the q parameter is passed, groups with a name beginning with\n323:     the query value will be returned.\n324: \n325:     If the displayname parameter is passed along with the q parameter, then\n326:     full names will be searched as well.\n327:     \"\"\"\n328:     # XXX Support \"query\" for backwards-compatibility until after 1.0.\n329:     query = request.GET.get('q', request.GET.get('query', None))\n330: \n331:     u = Group.objects.all()\n332: \n333:     if query:\n334:         q = Q(name__istartswith=query)\n335: \n336:         if request.GET.get('displayname', None):\n337:             q = q | Q(display_name__istartswith=query)\n338: \n339:         u = u.filter(q)\n340: \n341:     return WebAPIResponse(request, {\n342:         'groups': u,\n343:     })\n344: \n345: @webapi_check_login_required\n346: def users_in_group(request, group_name):\n347:     \"\"\"\n348:     Returns a list of users in a group.\n349:     \"\"\"\n350:     try:\n351:         g = Group.objects.get(name=group_name)\n352:     except Group.DoesNotExist:\n353:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n354: \n355:     return WebAPIResponse(request, {\n356:         'users': g.users.all(),\n357:     })\n358: \n359: @webapi_login_required\n360: def group_star(request, group_name):\n361:     \"\"\"\n362:     Adds a group to the user's watched groups list.\n363:     \"\"\"\n364:     try:\n365:         group = Group.objects.get(name=group_name)\n366:     except Group.DoesNotExist:\n367:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n368: \n369:     profile, profile_is_new = Profile.objects.get_or_create(user=request.user)\n370:     profile.starred_groups.add(group)\n371:     profile.save()\n372: \n373:     return WebAPIResponse(request)\n374: \n375: \n376: @webapi_login_required\n377: def group_unstar(request, group_name):\n378:     \"\"\"\n379:     Removes a group from the user's watched groups list.\n380:     \"\"\"\n381:     try:\n382:         group = Group.objects.get(name=group_name)\n383:     except Group.DoesNotExist:\n384:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n385: \n386:     profile, profile_is_new = Profile.objects.get_or_create(user=request.user)\n387: \n388:     if not profile_is_new:\n389:         profile.starred_groups.remove(group)\n390:         profile.save()\n391: \n392:     return WebAPIResponse(request)\n393: \n394: \n395: @webapi_login_required\n396: @require_POST\n397: def new_review_request(request):\n398:     \"\"\"\n399:     Creates a new review request.\n400: \n401:     Required parameters:\n402: \n403:       * repository_path: The repository to create the review request against.\n404:                          If both this and repository_id are set,\n405:                          repository_path's value takes precedence.\n406:       * repository_id:   The ID of the repository to create the review\n407:                          request against.\n408: \n409: \n410:     Optional parameters:\n411: \n412:       * submit_as:       The optional user to submit the review request as.\n413:                          This requires that the actual logged in user is\n414:                          either a superuser or has the\n415:                          \"reviews.can_submit_as_another_user\" property.\n416:       * changenum:       The optional changenumber to look up for the review\n417:                          request details. This only works with repositories\n418:                          that support changesets.\n419: \n420:     Returned keys:\n421: \n422:       * 'review_request': The resulting review request\n423: \n424:     Errors:\n425: \n426:       * INVALID_REPOSITORY\n427:       * CHANGE_NUMBER_IN_USE\n428:       * INVALID_CHANGE_NUMBER\n429:     \"\"\"\n430:     try:\n431:         repository_path = request.POST.get('repository_path', None)\n432:         repository_id = request.POST.get('repository_id', None)\n433:         submit_as = request.POST.get('submit_as')\n434: \n435:         if submit_as and request.user.username != submit_as:\n436:             if not request.user.has_perm('reviews.can_submit_as_another_user'):\n437:                 return WebAPIResponseError(request, PERMISSION_DENIED)\n438:             try:\n439:                 user = User.objects.get(username=submit_as)\n440:             except User.DoesNotExist:\n441:                 return WebAPIResponseError(request, INVALID_USER)\n442:         else:\n443:             user = request.user\n444: \n445:         if repository_path == None and repository_id == None:\n446:             return WebAPIResponseError(request, MISSING_REPOSITORY)\n447: \n448:         if repository_path:\n449:             repository = Repository.objects.get(\n450:                 Q(path=repository_path) |\n451:                 Q(mirror_path=repository_path))\n452:         else:\n453:             repository = Repository.objects.get(id=repository_id)\n454: \n455:         review_request = ReviewRequest.objects.create(\n456:             user, repository, request.POST.get('changenum', None))\n457: ",
+    "source_summary": "query parameter from request.GET (HTTP GET parameters), which is user-controlled input",
+    "sink_summary": "Django ORM User.objects.filter() query that returns user data including first_name and last_name fields",
+    "guard_summary": "webapi_check_login_required decorator provides conditional authentication; User.objects.filter(is_active=True) limits to active users only; no input validation/sanitization on query parameter",
+    "risk_pattern": "User-controlled search parameter directly used in case-insensitive database field matching without validation, expanding search scope to include personal name fields",
+    "used_variable_sources": [
+      "request.GET['q']",
+      "request.GET['query']",
+      "request.GET['fullname']"
+    ],
+    "called_function_context": [
+      "User.objects.filter()",
+      "Q() object construction for database queries"
+    ],
+    "enclosing_conditions": [
+      "if query:",
+      "if request.GET.get('fullname', None):"
+    ],
+    "context_summary": "API endpoint for user search that expands search scope from username to include first_name and last_name when 'fullname' parameter is present",
+    "unresolved_facts": [
+      "Whether the WebAPIResponse serialization filters sensitive user fields",
+      "Whether there are rate limiting or query complexity controls"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "User-controlled query parameter used directly in database search without validation or sanitization",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-359",
+        "cwe_name": "Exposure of Private Personal Information to an Unauthorized Actor",
+        "fit_reason": "Search functionality expands to include personal name fields (first_name, last_name) without proper access controls",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "User enumeration through search functionality that reveals existence of users via first/last name matching",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "fit_reason": "API endpoint allows searching user data with expanded scope to personal information fields",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1236",
+      "CWE-1275",
+      "CWE-20",
+      "CWE-200",
+      "CWE-208",
+      "CWE-287",
+      "CWE-359",
+      "CWE-400",
+      "CWE-425",
+      "CWE-497",
+      "CWE-534",
+      "CWE-628",
+      "CWE-643",
+      "CWE-670",
+      "CWE-770",
+      "CWE-89",
+      "CWE-90",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 308,
+        "statement": "q = q | (Q(first_name__istartswith=query) |",
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The code uses user-controlled 'query' parameter directly in Django ORM Q() objects without validation. This matches the general pattern of CWE-20 where input is not validated before use. However, the exact mechanism of CWE-20 requires demonstrating that the lack of validation leads to unsafe processing - here the input is used in a database query field lookup, not directly in security-sensitive operations like command execution or path traversal."
+          },
+          "connection": {
+            "score": 0.8,
+            "evidence": "User-controlled 'query' parameter from request.GET is directly connected to database query construction via Q(first_name__istartswith=query). The path is: request.GET → query variable → Q() object → User.objects.filter() → database query execution. The connection is concrete and demonstrated in the code."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If this candidate line were reverted, the search would not include first_name field when 'fullname' parameter is present. The patch materially expands the search scope from username-only to include personal name fields. This creates a new information disclosure vector where previously only username matching was possible."
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "The required control for this CWE is input validation before using user-controlled data in database queries. The control requirement evidence is that CWE-20 requires validating that input has safe properties before processing. Existing controls checked: webapi_check_login_required decorator provides authentication, User.objects.filter(is_active=True) limits to active users. Deficiency evidence: No validation or sanitization is performed on the 'query' parameter before using it in case-insensitive database field matching. However, the demonstrated deficiency is weak - the input is used in Django ORM's parameterized field lookup (istartswith), not in raw SQL, which provides some inherent safety against SQL injection but not against search scope expansion.",
+            "required_control": "Input validation to restrict search parameters to safe patterns before database query construction",
+            "control_requirement_evidence": "CWE-20 requires validating input properties before processing; for search functionality, validation should ensure query parameters don't enable excessive information disclosure or performance issues",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator (authentication)",
+              "User.objects.filter(is_active=True) (active users only)",
+              "Django ORM parameterized queries (SQL injection protection)"
+            ],
+            "deficiency_evidence": "No validation on 'query' parameter length, content, or pattern; parameter used directly in case-insensitive field matching without restrictions"
+          },
+          "concrete_impact": {
+            "score": 0.4,
+            "evidence": "The concrete impact is potential information disclosure through expanded search scope. Users can now search by first_name and last_name fields in addition to username, potentially revealing user associations or partial matches that weren't previously searchable. However, the exact security consequence depends on whether the returned user data includes sensitive information and whether this expansion violates intended privacy boundaries - both are unresolved."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the search functionality would only match usernames even when 'fullname' parameter is present, maintaining the original limited search scope and preventing potential information disclosure through name field matching.",
+        "supporting_evidence": [
+          "User-controlled 'query' parameter from request.GET used directly in Q(first_name__istartswith=query)",
+          "No validation or sanitization performed on 'query' parameter before database query construction",
+          "Patch expands search scope from username-only to include personal name fields"
+        ],
+        "contradicting_evidence": [
+          "Django ORM's parameterized field lookups (istartswith) provide inherent protection against SQL injection",
+          "Authentication required via webapi_check_login_required decorator",
+          "Results limited to active users only via User.objects.filter(is_active=True)"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "Whether the WebAPIResponse serialization filters sensitive user fields (first_name, last_name, email, etc.)",
+          "Whether there are rate limiting or query complexity controls to prevent brute-force enumeration",
+          "Whether the expanded search scope violates intended privacy or authorization boundaries",
+          "Whether downstream validation exists in serialization or response filtering"
+        ],
+        "review_comment": "The patch expands user search functionality to include first_name and last_name fields when the 'fullname' parameter is present, using unvalidated user input directly in database queries. While Django ORM provides SQL injection protection, the lack of input validation on the search query parameter could enable excessive information disclosure through partial name matching. Implement input validation to restrict query parameters to reasonable length and character patterns, and consider whether name field searches should require additional authorization checks.",
+        "change_type": "A",
+        "raw_score": 0.5399999999999999,
+        "score": 0.5399999999999999
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 308,
+        "statement": "q = q | (Q(first_name__istartswith=query) |",
+        "cwe_id": "CWE-359",
+        "cwe_name": "Exposure of Private Personal Information to an Unauthorized Actor",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.45,
+            "evidence": "The change expands search scope to include personal name fields (first_name, last_name) that may contain private information. However, CWE-359 requires unauthorized access to private personal information, and the evidence shows only expansion of search criteria, not confirmed exposure to unauthorized actors."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "User-controlled 'query' parameter from request.GET is directly connected to database query construction using Q() objects with istartswith lookups on first_name and last_name fields. The path is: request.GET['q'] -> query variable -> Q(first_name__istartswith=query) -> User.objects.filter()"
+          },
+          "diff_causality": {
+            "score": 0.85,
+            "evidence": "The added line materially creates the vulnerability by expanding search scope from username-only to include personal name fields when 'fullname' parameter is present. Reverting would restrict search to usernames only."
+          },
+          "security_control": {
+            "score": 0.35,
+            "evidence": "",
+            "required_control": "Access control to limit personal information exposure based on authorization",
+            "control_requirement_evidence": "CWE-359 requires preventing unauthorized access to private personal information. Personal names may be considered private information depending on context and privacy policies.",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator provides authentication",
+              "User.objects.filter(is_active=True) limits to active users"
+            ],
+            "deficiency_evidence": "No evidence of authorization checks to determine if authenticated users should have access to search personal name fields. The control deficiency is speculative - we don't know if personal names are considered private in this context or what authorization rules should apply."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "Impact is speculative. The change enables searching personal name fields, but there's no evidence that: (1) first_name/last_name contain private information in this context, (2) authenticated users are unauthorized to see this information, or (3) the search results actually expose unauthorized information."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the search functionality would only match usernames against the query parameter, preventing the expansion to personal name fields that could potentially expose private information.",
+        "supporting_evidence": [
+          "User-controlled 'query' parameter from request.GET is used without validation",
+          "Added line expands search scope to include first_name and last_name fields",
+          "Database query returns User objects containing personal information fields"
+        ],
+        "contradicting_evidence": [
+          "webapi_check_login_required decorator ensures only authenticated users can access the endpoint",
+          "No evidence that personal names are considered private information in this application context"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "Whether first_name and last_name fields contain private personal information in this context",
+          "What authorization rules govern access to user personal information",
+          "Whether the WebAPIResponse filters sensitive fields before serialization",
+          "Whether authenticated users are authorized to search personal name fields"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.52,
+        "score": 0.52
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 308,
+        "statement": "q = q | (Q(first_name__istartswith=query) |",
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.45,
+            "evidence": "The patch expands search scope to include personal name fields, potentially exposing user existence information through search responses. However, CWE-200 typically requires actual sensitive data exposure, not just enumeration capability."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "User-controlled 'query' parameter from request.GET directly flows into database query construction via Q(first_name__istartswith=query) and Q(last_name__istartswith=query), connecting to User.objects.filter() that returns user data."
+          },
+          "diff_causality": {
+            "score": 0.85,
+            "evidence": "If the candidate line were reverted, the search would only match usernames. With the change, when 'fullname' parameter is present, the search expands to include first_name and last_name fields, materially increasing the attack surface for user enumeration."
+          },
+          "security_control": {
+            "score": 0.35,
+            "evidence": "",
+            "required_control": "Access control limiting search results to authorized data and rate limiting to prevent enumeration",
+            "control_requirement_evidence": "CWE-200 requires controls to prevent unauthorized actors from accessing sensitive information through search functionality",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator provides authentication",
+              "User.objects.filter(is_active=True) limits to active users"
+            ],
+            "deficiency_evidence": "No demonstrated controls prevent authenticated users from enumerating users via name search. The patch expands search scope without adding corresponding access restrictions."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "Impact is speculative - the evidence shows expanded search capability but doesn't demonstrate what user data is actually exposed in responses or whether this constitutes sensitive information exposure beyond basic user enumeration."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the user search functionality would only search usernames when the 'fullname' parameter is present, rather than expanding to include first_name and last_name fields, reducing the potential for user enumeration through name matching.",
+        "supporting_evidence": [
+          "User-controlled 'query' parameter flows directly into database query construction",
+          "Patch expands search scope from username-only to include personal name fields",
+          "Authentication required via webapi_check_login_required decorator"
+        ],
+        "contradicting_evidence": [
+          "No evidence shows what user data is actually returned in API responses",
+          "Search is limited to active users only via is_active=True filter"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "Whether API responses include sensitive personal information or just basic user identifiers",
+          "Whether there are rate limiting controls preventing systematic enumeration",
+          "What specific user fields are serialized in WebAPIResponse"
+        ],
+        "review_comment": "The patch expands user search functionality to include first_name and last_name fields when the 'fullname' parameter is present, potentially enabling user enumeration through name matching. While authentication is required, the expanded search scope increases information disclosure risk. Consider implementing rate limiting on search endpoints and ensuring API responses only include minimal necessary user information to mitigate enumeration attacks.",
+        "change_type": "A",
+        "raw_score": 0.52,
+        "score": 0.52
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 308,
+        "statement": "q = q | (Q(first_name__istartswith=query) |",
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "CWE-425 requires inadequate authorization enforcement on restricted resources. The demonstrated code shows search functionality expansion, not authorization bypass."
+          },
+          "connection": {
+            "score": 0.3,
+            "evidence": "User-controlled 'query' parameter connects to database search, but this is legitimate search functionality, not unauthorized access to restricted URLs/files."
+          },
+          "diff_causality": {
+            "score": 0.4,
+            "evidence": "The patch adds first_name field to search scope, expanding what data can be searched, but doesn't change authorization enforcement."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Authorization enforcement for restricted resources",
+            "control_requirement_evidence": "CWE-425 requires that authorization controls prevent direct access to restricted URLs, scripts, or files",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator provides authentication",
+              "User.objects.filter(is_active=True) limits to active users"
+            ],
+            "deficiency_evidence": "No evidence of authorization bypass or inadequate enforcement of restricted resource access"
+          },
+          "concrete_impact": {
+            "score": 0.15,
+            "evidence": "No demonstrated unauthorized access to restricted resources; shows legitimate search functionality expansion"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the search functionality would only search usernames instead of also including first_name and last_name fields when the 'fullname' parameter is present.",
+        "supporting_evidence": [
+          "webapi_check_login_required decorator provides authentication",
+          "User.objects.filter(is_active=True) limits results to active users"
+        ],
+        "contradicting_evidence": [
+          "The code implements legitimate search functionality, not forced browsing",
+          "Authentication is required via decorator",
+          "No evidence of authorization bypass or direct access to restricted resources"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether the API response filters sensitive user fields",
+          "What authorization checks exist for user data access"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.22999999999999998,
+        "score": 0.22999999999999998
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "reviewboard/webapi/json.py",
+    "changed_line": 309,
+    "statement": "Q(last_name__istartswith=query))",
+    "change_type": "A",
+    "function_name": "user_list",
+    "operation_type": "database_query_field_expansion",
+    "selection_reason": "User-controlled query parameter -> expands search to include last_name field -> potential information disclosure",
+    "security_relevance_score": 0.7,
+    "code_context": "160:                 'timesince': timesince(o.timestamp),\n161:                 'public': review.public,\n162:                 'user': review.user,\n163:                 'x': o.x,\n164:                 'y': o.y,\n165:                 'w': o.w,\n166:                 'h': o.h,\n167:             }\n168:         elif isinstance(o, Screenshot):\n169:             return {\n170:                 'id': o.id,\n171:                 'caption': o.caption,\n172:                 'title': u'Screenshot: %s' % (o.caption or\n173:                                               os.path.basename(o.image.path)),\n174:                 'image_url': o.get_absolute_url(),\n175:                 'thumbnail_url': o.get_thumbnail_url(),\n176:             }\n177:         elif isinstance(o, FileDiff):\n178:             return {\n179:                 'id': o.id,\n180:                 'diffset': o.diffset,\n181:                 'source_file': o.source_file,\n182:                 'dest_file': o.dest_file,\n183:                 'source_revision': o.source_revision,\n184:                 'dest_detail': o.dest_detail,\n185:             }\n186:         elif isinstance(o, DiffSet):\n187:             return {\n188:                 'id': o.id,\n189:                 'name': o.name,\n190:                 'revision': o.revision,\n191:                 'timestamp': o.timestamp,\n192:                 'repository': o.repository,\n193:             }\n194:         elif isinstance(o, Repository):\n195:             return {\n196:                 'id': o.id,\n197:                 'name': o.name,\n198:                 'path': o.path,\n199:                 'tool': o.tool.name\n200:             }\n201:         else:\n202:             return super(ReviewBoardAPIEncoder, self).encode(o)\n203: \n204: \n205: def status_to_string(status):\n206:     if status == \"P\":\n207:         return \"pending\"\n208:     elif status == \"S\":\n209:         return \"submitted\"\n210:     elif status == \"D\":\n211:         return \"discarded\"\n212:     elif status == None:\n213:         return \"all\"\n214:     else:\n215:         raise \"Invalid status '%s'\" % status\n216: \n217: \n218: def string_to_status(status):\n219:     if status == \"pending\":\n220:         return \"P\"\n221:     elif status == \"submitted\":\n222:         return \"S\"\n223:     elif status == \"discarded\":\n224:         return \"D\"\n225:     elif status == \"all\":\n226:         return None\n227:     else:\n228:         raise \"Invalid status '%s'\" % status\n229: \n230: \n231: @webapi\n232: def service_not_configured(request):\n233:     \"\"\"\n234:     Returns an error specifying that the service has not yet been configured.\n235:     \"\"\"\n236:     return WebAPIResponseError(request, SERVICE_NOT_CONFIGURED)\n237: \n238: \n239: @webapi_check_login_required\n240: def server_info(request):\n241:     site = Site.objects.get_current()\n242:     siteconfig = site.config.get()\n243: \n244:     url = '%s://%s%s' % (siteconfig.get('site_domain_method'), site.domain,\n245:                          settings.SITE_ROOT)\n246: \n247:     return WebAPIResponse(request, {\n248:         'product': {\n249:             'name': 'Review Board',\n250:             'version': get_version_string(),\n251:             'package_version': get_package_version(),\n252:             'is_release': is_release(),\n253:         },\n254:         'site': {\n255:             'url': url,\n256:             'administrators': [{'name': name, 'email': email}\n257:                                for name, email in settings.ADMINS],\n258:         },\n259:     })\n260: \n261: \n262: @webapi_check_login_required\n263: def repository_list(request):\n264:     \"\"\"\n265:     Returns a list of all known repositories.\n266:     \"\"\"\n267:     return WebAPIResponse(request, {\n268:         'repositories': Repository.objects.all(),\n269:     })\n270: \n271: \n272: @webapi_check_login_required\n273: def repository_info(request, repository_id):\n274:     try:\n275:         repository = Repository.objects.get(id=repository_id)\n276:     except Repository.DoesNotExist:\n277:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n278: \n279:     try:\n280:         return WebAPIResponse(request, {\n281:             'info': repository.get_scmtool().get_repository_info()\n282:         })\n283:     except NotImplementedError:\n284:         return WebAPIResponseError(request, REPO_NOT_IMPLEMENTED)\n285:     except:\n286:         return WebAPIResponseError(request, REPO_INFO_ERROR)\n287: \n288: @webapi_check_login_required\n289: def user_list(request):\n290:     \"\"\"\n291:     Returns a list of all users.\n292: \n293:     If the q parameter is passed, users with a username beginning with\n294:     the query value will be returned.\n295: \n296:     If the fullname parameter is passed along with the q parameter, then full\n297:     names will be searched as well.\n298:     \"\"\"\n299:     # XXX Support \"query\" for backwards-compatibility until after 1.0.\n300:     query = request.GET.get('q', request.GET.get('query', None))\n301: \n302:     u = User.objects.filter(is_active=True)\n303: \n304:     if query:\n305:         q = Q(username__istartswith=query)\n306: \n307:         if request.GET.get('fullname', None):\n308:             q = q | (Q(first_name__istartswith=query) |\n309:                      Q(last_name__istartswith=query))\n310: \n311:         u = u.filter(q)\n312: \n313:     return WebAPIResponse(request, {\n314:         'users': u,\n315:     })\n316: \n317: @webapi_check_login_required\n318: def group_list(request):\n319:     \"\"\"\n320:     Returns a list of all review groups.\n321: \n322:     If the q parameter is passed, groups with a name beginning with\n323:     the query value will be returned.\n324: \n325:     If the displayname parameter is passed along with the q parameter, then\n326:     full names will be searched as well.\n327:     \"\"\"\n328:     # XXX Support \"query\" for backwards-compatibility until after 1.0.\n329:     query = request.GET.get('q', request.GET.get('query', None))\n330: \n331:     u = Group.objects.all()\n332: \n333:     if query:\n334:         q = Q(name__istartswith=query)\n335: \n336:         if request.GET.get('displayname', None):\n337:             q = q | Q(display_name__istartswith=query)\n338: \n339:         u = u.filter(q)\n340: \n341:     return WebAPIResponse(request, {\n342:         'groups': u,\n343:     })\n344: \n345: @webapi_check_login_required\n346: def users_in_group(request, group_name):\n347:     \"\"\"\n348:     Returns a list of users in a group.\n349:     \"\"\"\n350:     try:\n351:         g = Group.objects.get(name=group_name)\n352:     except Group.DoesNotExist:\n353:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n354: \n355:     return WebAPIResponse(request, {\n356:         'users': g.users.all(),\n357:     })\n358: \n359: @webapi_login_required\n360: def group_star(request, group_name):\n361:     \"\"\"\n362:     Adds a group to the user's watched groups list.\n363:     \"\"\"\n364:     try:\n365:         group = Group.objects.get(name=group_name)\n366:     except Group.DoesNotExist:\n367:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n368: \n369:     profile, profile_is_new = Profile.objects.get_or_create(user=request.user)\n370:     profile.starred_groups.add(group)\n371:     profile.save()\n372: \n373:     return WebAPIResponse(request)\n374: \n375: \n376: @webapi_login_required\n377: def group_unstar(request, group_name):\n378:     \"\"\"\n379:     Removes a group from the user's watched groups list.\n380:     \"\"\"\n381:     try:\n382:         group = Group.objects.get(name=group_name)\n383:     except Group.DoesNotExist:\n384:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n385: \n386:     profile, profile_is_new = Profile.objects.get_or_create(user=request.user)\n387: \n388:     if not profile_is_new:\n389:         profile.starred_groups.remove(group)\n390:         profile.save()\n391: \n392:     return WebAPIResponse(request)\n393: \n394: \n395: @webapi_login_required\n396: @require_POST\n397: def new_review_request(request):\n398:     \"\"\"\n399:     Creates a new review request.\n400: \n401:     Required parameters:\n402: \n403:       * repository_path: The repository to create the review request against.\n404:                          If both this and repository_id are set,\n405:                          repository_path's value takes precedence.\n406:       * repository_id:   The ID of the repository to create the review\n407:                          request against.\n408: \n409: \n410:     Optional parameters:\n411: \n412:       * submit_as:       The optional user to submit the review request as.\n413:                          This requires that the actual logged in user is\n414:                          either a superuser or has the\n415:                          \"reviews.can_submit_as_another_user\" property.\n416:       * changenum:       The optional changenumber to look up for the review\n417:                          request details. This only works with repositories\n418:                          that support changesets.\n419: \n420:     Returned keys:\n421: \n422:       * 'review_request': The resulting review request\n423: \n424:     Errors:\n425: \n426:       * INVALID_REPOSITORY\n427:       * CHANGE_NUMBER_IN_USE\n428:       * INVALID_CHANGE_NUMBER\n429:     \"\"\"\n430:     try:\n431:         repository_path = request.POST.get('repository_path', None)\n432:         repository_id = request.POST.get('repository_id', None)\n433:         submit_as = request.POST.get('submit_as')\n434: \n435:         if submit_as and request.user.username != submit_as:\n436:             if not request.user.has_perm('reviews.can_submit_as_another_user'):\n437:                 return WebAPIResponseError(request, PERMISSION_DENIED)\n438:             try:\n439:                 user = User.objects.get(username=submit_as)\n440:             except User.DoesNotExist:\n441:                 return WebAPIResponseError(request, INVALID_USER)\n442:         else:\n443:             user = request.user\n444: \n445:         if repository_path == None and repository_id == None:\n446:             return WebAPIResponseError(request, MISSING_REPOSITORY)\n447: \n448:         if repository_path:\n449:             repository = Repository.objects.get(\n450:                 Q(path=repository_path) |\n451:                 Q(mirror_path=repository_path))\n452:         else:\n453:             repository = Repository.objects.get(id=repository_id)\n454: \n455:         review_request = ReviewRequest.objects.create(\n456:             user, repository, request.POST.get('changenum', None))\n457: \n458:         return WebAPIResponse(request, {'review_request': review_request})",
+    "source_summary": "query parameter from request.GET (user-controlled input) used directly in database query",
+    "sink_summary": "User.objects.filter() with Q objects for username, first_name, and last_name fields",
+    "guard_summary": "webapi_check_login_required decorator provides conditional authentication (only if site-wide login required); no input validation/sanitization on query parameter",
+    "risk_pattern": "User-controlled search parameter expands search scope to include personal name fields without rate limiting or result filtering",
+    "used_variable_sources": [
+      "request.GET['q']",
+      "request.GET['query']",
+      "request.GET['fullname']"
+    ],
+    "called_function_context": [
+      "User.objects.filter()",
+      "Q()",
+      "webapi_check_login_required"
+    ],
+    "enclosing_conditions": [
+      "if query:",
+      "if request.GET.get('fullname', None):"
+    ],
+    "context_summary": "API endpoint searches users by username; when 'fullname' parameter present, expands search to include first_name and last_name fields using case-insensitive prefix matching",
+    "unresolved_facts": [
+      "Exact Django User model field definitions and sensitivity classification",
+      "Whether site-wide login is enforced in deployment",
+      "Presence of rate limiting or result size restrictions"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "fit_reason": "Search functionality allows direct access to user data through parameter manipulation without proper authorization checks",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "Authorization exists (login required) but incorrectly allows access to sensitive personal name fields through search expansion",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-285",
+        "cwe_name": "Improper Authorization",
+        "fit_reason": "Missing authorization controls for accessing sensitive user personal data fields through search functionality",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-264",
+        "cwe_name": "Permissions, Privileges, and Access Controls",
+        "fit_reason": "General access control failure allowing unauthorized access to sensitive user information through search field expansion",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1236",
+      "CWE-1275",
+      "CWE-208",
+      "CWE-264",
+      "CWE-285",
+      "CWE-287",
+      "CWE-425",
+      "CWE-628",
+      "CWE-74",
+      "CWE-79",
+      "CWE-863",
+      "CWE-89",
+      "CWE-90",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 309,
+        "statement": "Q(last_name__istartswith=query))",
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-425 requires unauthorized access to restricted URLs/files. This is a search API endpoint with authentication decorator, not direct URL/file access."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "User-controlled 'query' parameter flows directly into database filter conditions for username, first_name, and last_name fields"
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "Adding last_name field expands search scope when 'fullname' parameter is present, materially increasing information disclosure surface"
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "authorization to restrict user data access based on user roles/privileges",
+            "control_requirement_evidence": "CWE-425 requires authorization controls to prevent unauthorized access to restricted resources",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator provides authentication but no role-based authorization for user data access"
+            ],
+            "deficiency_evidence": "No evidence of authorization checks limiting which users can search/access other users' personal information"
+          },
+          "concrete_impact": {
+            "score": 0.4,
+            "evidence": "Potential information disclosure of user names, but CWE-425 requires unauthorized access to restricted URLs/files, not just data exposure through authorized API endpoints"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the search would only match usernames when 'fullname' parameter is present, reducing the information disclosure surface by excluding personal name fields.",
+        "supporting_evidence": [
+          "User-controlled query parameter expands search to include last_name field",
+          "Authentication decorator present but no authorization checks for user data access"
+        ],
+        "contradicting_evidence": [
+          "This is an API endpoint with authentication, not direct URL/file access as required by CWE-425",
+          "Endpoint appears designed for user search functionality, not unauthorized resource access"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether site-wide login is enforced in deployment",
+          "Presence of authorization controls for user data access",
+          "Whether this endpoint is intended to be publicly accessible"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.45,
+        "score": 0.45
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 309,
+        "statement": "Q(last_name__istartswith=query))",
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-863 requires an incorrect authorization check, but the evidence shows search field expansion without any authorization check modification. The authentication decorator remains unchanged."
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "User-controlled 'query' parameter flows directly to database query fields including last_name when 'fullname' parameter is present"
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "The added line expands search scope to include last_name field when it wasn't previously searched"
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Authorization check for accessing personal name fields",
+            "control_requirement_evidence": "CWE-863 requires that authorization checks correctly restrict access to sensitive resources",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator provides authentication",
+              "No additional authorization check for name field access"
+            ],
+            "deficiency_evidence": "No evidence that authorization was incorrectly implemented; the change adds search fields without modifying authorization logic"
+          },
+          "concrete_impact": {
+            "score": 0.4,
+            "evidence": "Potential information disclosure of user last names, but no demonstrated authorization bypass or privilege escalation"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the search would only match usernames even when fullname parameter is present, restricting the information disclosed.",
+        "supporting_evidence": [
+          "User-controlled query parameter expands to search last_name field",
+          "No input validation on query parameter"
+        ],
+        "contradicting_evidence": [
+          "The webapi_check_login_required decorator remains unchanged",
+          "No modification to authorization logic, only search scope expansion"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether last_name field contains sensitive information requiring special authorization",
+          "Site-wide authentication configuration",
+          "Downstream result filtering or access controls"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.48,
+        "score": 0.48
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 309,
+        "statement": "Q(last_name__istartswith=query))",
+        "cwe_id": "CWE-285",
+        "cwe_name": "Improper Authorization",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-285 requires missing/inadequate authorization checks for resource access. The code shows authentication via @webapi_check_login_required but no evidence of authorization failure for accessing user data fields."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "User-controlled 'query' parameter from request.GET flows directly into database query filtering username, first_name, and last_name fields when 'fullname' parameter is present."
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "The added line expands search scope to include last_name field. Reverting would restrict search to username only when fullname parameter is used."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Authorization check for accessing personal user data fields",
+            "control_requirement_evidence": "CWE-285 requires authorization controls to restrict access based on user privileges",
+            "existing_controls_checked": [
+              "@webapi_check_login_required decorator provides authentication",
+              "No observed authorization checks for data sensitivity levels"
+            ],
+            "deficiency_evidence": "No evidence that authorization is required or missing for accessing first_name/last_name fields specifically"
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "Potential information disclosure of user names, but no demonstrated security consequence like privilege escalation or unauthorized data modification that CWE-285 requires."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the search would only match usernames when the fullname parameter is used, reducing the scope of potentially exposed personal information.",
+        "supporting_evidence": [
+          "User-controlled 'query' parameter flows directly into database query",
+          "Search expansion to include personal name fields (first_name, last_name)"
+        ],
+        "contradicting_evidence": [
+          "@webapi_check_login_required decorator provides authentication control",
+          "No evidence that first_name/last_name fields require special authorization beyond authentication",
+          "CWE-285 requires authorization failure, not just data exposure"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether first_name/last_name fields are considered sensitive requiring authorization",
+          "Site-wide authentication enforcement status",
+          "Whether this endpoint should restrict access to certain user roles"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.39,
+        "score": 0.39
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 309,
+        "statement": "Q(last_name__istartswith=query))",
+        "cwe_id": "CWE-264",
+        "cwe_name": "Permissions, Privileges, and Access Controls",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-264 is a legacy category for general access control failures, but the demonstrated behavior is search field expansion without proper authorization checks, not a specific access control mechanism failure"
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "User-controlled 'query' parameter from request.GET flows directly into database query filtering on username, first_name, and last_name fields when 'fullname' parameter is present"
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If the candidate line were reverted, the search would only match usernames, not expand to include last_name field searches when fullname parameter is provided"
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "",
+            "required_control": "Authorization check for accessing sensitive user information",
+            "control_requirement_evidence": "CWE-264 requires demonstrating an access control failure, but this is primarily an information disclosure through search expansion",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator provides basic authentication"
+            ],
+            "deficiency_evidence": "No authorization check to restrict which users can search by personal name fields; authentication alone doesn't prevent authorized users from accessing potentially sensitive information"
+          },
+          "concrete_impact": {
+            "score": 0.4,
+            "evidence": "Potential information disclosure of user last names through search functionality, but concrete impact depends on sensitivity classification of the data and deployment configuration"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the user search functionality would only match usernames when the 'fullname' parameter is provided, preventing the expansion to include last_name field searches.",
+        "supporting_evidence": [
+          "User-controlled 'query' parameter flows directly into database filter",
+          "Addition of last_name field search expands information disclosure surface",
+          "No input validation or sanitization on the search parameter"
+        ],
+        "contradicting_evidence": [
+          "CWE-264 is a legacy category, not a specific mechanism",
+          "The primary issue appears to be information disclosure rather than access control failure",
+          "Authentication is present via webapi_check_login_required decorator"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether last_name field contains sensitive information in this deployment",
+          "Whether site-wide login is actually enforced",
+          "Presence of rate limiting or result size restrictions",
+          "Authorization requirements for accessing user directory information"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.45999999999999996,
+        "score": 0.45999999999999996
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "reviewboard/webapi/json.py",
+    "changed_line": 337,
+    "statement": "q = q | Q(display_name__istartswith=query)",
+    "change_type": "A",
+    "function_name": "group_list",
+    "operation_type": "database_query_construction",
+    "selection_reason": "User-controlled query parameter -> expands search to include display_name field -> potential information disclosure",
+    "security_relevance_score": 0.7,
+    "code_context": "188:                 'id': o.id,\n189:                 'name': o.name,\n190:                 'revision': o.revision,\n191:                 'timestamp': o.timestamp,\n192:                 'repository': o.repository,\n193:             }\n194:         elif isinstance(o, Repository):\n195:             return {\n196:                 'id': o.id,\n197:                 'name': o.name,\n198:                 'path': o.path,\n199:                 'tool': o.tool.name\n200:             }\n201:         else:\n202:             return super(ReviewBoardAPIEncoder, self).encode(o)\n203: \n204: \n205: def status_to_string(status):\n206:     if status == \"P\":\n207:         return \"pending\"\n208:     elif status == \"S\":\n209:         return \"submitted\"\n210:     elif status == \"D\":\n211:         return \"discarded\"\n212:     elif status == None:\n213:         return \"all\"\n214:     else:\n215:         raise \"Invalid status '%s'\" % status\n216: \n217: \n218: def string_to_status(status):\n219:     if status == \"pending\":\n220:         return \"P\"\n221:     elif status == \"submitted\":\n222:         return \"S\"\n223:     elif status == \"discarded\":\n224:         return \"D\"\n225:     elif status == \"all\":\n226:         return None\n227:     else:\n228:         raise \"Invalid status '%s'\" % status\n229: \n230: \n231: @webapi\n232: def service_not_configured(request):\n233:     \"\"\"\n234:     Returns an error specifying that the service has not yet been configured.\n235:     \"\"\"\n236:     return WebAPIResponseError(request, SERVICE_NOT_CONFIGURED)\n237: \n238: \n239: @webapi_check_login_required\n240: def server_info(request):\n241:     site = Site.objects.get_current()\n242:     siteconfig = site.config.get()\n243: \n244:     url = '%s://%s%s' % (siteconfig.get('site_domain_method'), site.domain,\n245:                          settings.SITE_ROOT)\n246: \n247:     return WebAPIResponse(request, {\n248:         'product': {\n249:             'name': 'Review Board',\n250:             'version': get_version_string(),\n251:             'package_version': get_package_version(),\n252:             'is_release': is_release(),\n253:         },\n254:         'site': {\n255:             'url': url,\n256:             'administrators': [{'name': name, 'email': email}\n257:                                for name, email in settings.ADMINS],\n258:         },\n259:     })\n260: \n261: \n262: @webapi_check_login_required\n263: def repository_list(request):\n264:     \"\"\"\n265:     Returns a list of all known repositories.\n266:     \"\"\"\n267:     return WebAPIResponse(request, {\n268:         'repositories': Repository.objects.all(),\n269:     })\n270: \n271: \n272: @webapi_check_login_required\n273: def repository_info(request, repository_id):\n274:     try:\n275:         repository = Repository.objects.get(id=repository_id)\n276:     except Repository.DoesNotExist:\n277:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n278: \n279:     try:\n280:         return WebAPIResponse(request, {\n281:             'info': repository.get_scmtool().get_repository_info()\n282:         })\n283:     except NotImplementedError:\n284:         return WebAPIResponseError(request, REPO_NOT_IMPLEMENTED)\n285:     except:\n286:         return WebAPIResponseError(request, REPO_INFO_ERROR)\n287: \n288: @webapi_check_login_required\n289: def user_list(request):\n290:     \"\"\"\n291:     Returns a list of all users.\n292: \n293:     If the q parameter is passed, users with a username beginning with\n294:     the query value will be returned.\n295: \n296:     If the fullname parameter is passed along with the q parameter, then full\n297:     names will be searched as well.\n298:     \"\"\"\n299:     # XXX Support \"query\" for backwards-compatibility until after 1.0.\n300:     query = request.GET.get('q', request.GET.get('query', None))\n301: \n302:     u = User.objects.filter(is_active=True)\n303: \n304:     if query:\n305:         q = Q(username__istartswith=query)\n306: \n307:         if request.GET.get('fullname', None):\n308:             q = q | (Q(first_name__istartswith=query) |\n309:                      Q(last_name__istartswith=query))\n310: \n311:         u = u.filter(q)\n312: \n313:     return WebAPIResponse(request, {\n314:         'users': u,\n315:     })\n316: \n317: @webapi_check_login_required\n318: def group_list(request):\n319:     \"\"\"\n320:     Returns a list of all review groups.\n321: \n322:     If the q parameter is passed, groups with a name beginning with\n323:     the query value will be returned.\n324: \n325:     If the displayname parameter is passed along with the q parameter, then\n326:     full names will be searched as well.\n327:     \"\"\"\n328:     # XXX Support \"query\" for backwards-compatibility until after 1.0.\n329:     query = request.GET.get('q', request.GET.get('query', None))\n330: \n331:     u = Group.objects.all()\n332: \n333:     if query:\n334:         q = Q(name__istartswith=query)\n335: \n336:         if request.GET.get('displayname', None):\n337:             q = q | Q(display_name__istartswith=query)\n338: \n339:         u = u.filter(q)\n340: \n341:     return WebAPIResponse(request, {\n342:         'groups': u,\n343:     })\n344: \n345: @webapi_check_login_required\n346: def users_in_group(request, group_name):\n347:     \"\"\"\n348:     Returns a list of users in a group.\n349:     \"\"\"\n350:     try:\n351:         g = Group.objects.get(name=group_name)\n352:     except Group.DoesNotExist:\n353:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n354: \n355:     return WebAPIResponse(request, {\n356:         'users': g.users.all(),\n357:     })\n358: \n359: @webapi_login_required\n360: def group_star(request, group_name):\n361:     \"\"\"\n362:     Adds a group to the user's watched groups list.\n363:     \"\"\"\n364:     try:\n365:         group = Group.objects.get(name=group_name)\n366:     except Group.DoesNotExist:\n367:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n368: \n369:     profile, profile_is_new = Profile.objects.get_or_create(user=request.user)\n370:     profile.starred_groups.add(group)\n371:     profile.save()\n372: \n373:     return WebAPIResponse(request)\n374: \n375: \n376: @webapi_login_required\n377: def group_unstar(request, group_name):\n378:     \"\"\"\n379:     Removes a group from the user's watched groups list.\n380:     \"\"\"\n381:     try:\n382:         group = Group.objects.get(name=group_name)\n383:     except Group.DoesNotExist:\n384:         return WebAPIResponseError(request, DOES_NOT_EXIST)\n385: \n386:     profile, profile_is_new = Profile.objects.get_or_create(user=request.user)\n387: \n388:     if not profile_is_new:\n389:         profile.starred_groups.remove(group)\n390:         profile.save()\n391: \n392:     return WebAPIResponse(request)\n393: \n394: \n395: @webapi_login_required\n396: @require_POST\n397: def new_review_request(request):\n398:     \"\"\"\n399:     Creates a new review request.\n400: \n401:     Required parameters:\n402: \n403:       * repository_path: The repository to create the review request against.\n404:                          If both this and repository_id are set,\n405:                          repository_path's value takes precedence.\n406:       * repository_id:   The ID of the repository to create the review\n407:                          request against.\n408: \n409: \n410:     Optional parameters:\n411: \n412:       * submit_as:       The optional user to submit the review request as.\n413:                          This requires that the actual logged in user is\n414:                          either a superuser or has the\n415:                          \"reviews.can_submit_as_another_user\" property.\n416:       * changenum:       The optional changenumber to look up for the review\n417:                          request details. This only works with repositories\n418:                          that support changesets.\n419: \n420:     Returned keys:\n421: \n422:       * 'review_request': The resulting review request\n423: \n424:     Errors:\n425: \n426:       * INVALID_REPOSITORY\n427:       * CHANGE_NUMBER_IN_USE\n428:       * INVALID_CHANGE_NUMBER\n429:     \"\"\"\n430:     try:\n431:         repository_path = request.POST.get('repository_path', None)\n432:         repository_id = request.POST.get('repository_id', None)\n433:         submit_as = request.POST.get('submit_as')\n434: \n435:         if submit_as and request.user.username != submit_as:\n436:             if not request.user.has_perm('reviews.can_submit_as_another_user'):\n437:                 return WebAPIResponseError(request, PERMISSION_DENIED)\n438:             try:\n439:                 user = User.objects.get(username=submit_as)\n440:             except User.DoesNotExist:\n441:                 return WebAPIResponseError(request, INVALID_USER)\n442:         else:\n443:             user = request.user\n444: \n445:         if repository_path == None and repository_id == None:\n446:             return WebAPIResponseError(request, MISSING_REPOSITORY)\n447: \n448:         if repository_path:\n449:             repository = Repository.objects.get(\n450:                 Q(path=repository_path) |\n451:                 Q(mirror_path=repository_path))\n452:         else:\n453:             repository = Repository.objects.get(id=repository_id)\n454: \n455:         review_request = ReviewRequest.objects.create(\n456:             user, repository, request.POST.get('changenum', None))\n457: \n458:         return WebAPIResponse(request, {'review_request': review_request})\n459:     except Repository.DoesNotExist, e:\n460:         return WebAPIResponseError(request, INVALID_REPOSITORY,\n461:                                  {'repository_path': repository_path})\n462:     except ChangeNumberInUseError, e:\n463:         return WebAPIResponseError(request, CHANGE_NUMBER_IN_USE,\n464:                                  {'review_request': e.review_request})\n465:     except InvalidChangeNumberError:\n466:         return WebAPIResponseError(request, INVALID_CHANGE_NUMBER)\n467:     except EmptyChangeSetError:\n468:         return WebAPIResponseError(request, EMPTY_CHANGESET)\n469: \n470: \n471: @webapi_check_login_required\n472: def review_request(request, review_request_id):\n473:     \"\"\"\n474:     Returns the review request with the specified ID.\n475:     \"\"\"\n476:     review_request = get_object_or_404(ReviewRequest, pk=review_request_id)\n477: \n478:     if not review_request.is_accessible_by(request.user):\n479:         return WebAPIResponseError(request, PERMISSION_DENIED)\n480: \n481:     return WebAPIResponse(request, {'review_request': review_request})\n482: \n483: \n484: @webapi_check_login_required\n485: def review_request_last_update(request, review_request_id):\n486:     \"\"\"",
+    "source_summary": "User-controlled 'q' or 'query' GET parameter from request.GET",
+    "sink_summary": "Django ORM filter() on Group.objects.all(), returning group information including name and display_name fields",
+    "guard_summary": "webapi_check_login_required decorator provides conditional authentication; no apparent group-specific access controls or query sanitization",
+    "risk_pattern": "User-controlled search parameter expands search scope to display_name field without additional access controls, potentially exposing group information through search functionality",
+    "used_variable_sources": [
+      "request.GET.get('q', request.GET.get('query', None))"
+    ],
+    "called_function_context": [
+      "Q() from django.db.models",
+      "Group.objects.all()",
+      "filter()"
+    ],
+    "enclosing_conditions": [
+      "if query:",
+      "if request.GET.get('displayname', None):"
+    ],
+    "context_summary": "API endpoint returns group lists with optional search filtering; added display_name search expands searchable fields",
+    "unresolved_facts": [
+      "Whether Group model has specific access controls beyond authentication",
+      "Whether group information is considered sensitive in this context",
+      "Whether there are site-wide privacy settings that restrict group visibility"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "fit_reason": "Search functionality expands filter to display_name field without proper authorization checks, potentially allowing unauthorized access to group information through direct API requests with search parameters",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "User-controlled query parameter expands search scope, potentially exposing group display_name information to users who shouldn't have access to all groups",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "webapi_check_login_required provides authentication but no group-specific authorization checks on search results, allowing authenticated users to potentially access groups they shouldn't see",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "fit_reason": "Missing access control policy on group search results; authentication present but no row-level authorization on which groups should be visible to which users",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-264",
+        "cwe_name": "Permissions, Privileges, and Access Controls",
+        "fit_reason": "Legacy category covering the failure to properly control access to group information through search functionality",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1236",
+      "CWE-1275",
+      "CWE-200",
+      "CWE-22",
+      "CWE-264",
+      "CWE-284",
+      "CWE-285",
+      "CWE-287",
+      "CWE-359",
+      "CWE-425",
+      "CWE-497",
+      "CWE-628",
+      "CWE-79",
+      "CWE-863",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 337,
+        "statement": "q = q | Q(display_name__istartswith=query)",
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "CWE-425 requires direct access to restricted URLs/files without authorization. The demonstrated mechanism is search field expansion, not bypassing URL/script/file restrictions."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "User-controlled 'q'/'query' parameter connects to database query construction via Q() objects and filter(). The path is: request.GET → query variable → Q(name__istartswith=query) → expanded with Q(display_name__istartswith=query) → filter() → returned groups."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If the candidate line were reverted, display_name field would not be searched when displayname parameter is present. The patch materially expands search scope to include display_name field."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Authorization checks on group information access",
+            "control_requirement_evidence": "CWE-425 requires authorization controls on restricted resources. For group information to be considered restricted, authorization must verify user has permission to view groups.",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator provides authentication",
+              "No group-specific authorization checks visible in function"
+            ],
+            "deficiency_evidence": "No evidence establishes that group information requires authorization beyond authentication. The function lacks group visibility controls, but CWE-425 requires demonstrated bypass of existing authorization, not absence of authorization for potentially public data."
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "Potential information disclosure if groups are sensitive and authentication is insufficient protection. No evidence establishes group sensitivity or that authentication is bypassed."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, groups would only be searchable by name field when displayname parameter is present, not by display_name field. The search scope would be narrower.",
+        "supporting_evidence": [
+          "User-controlled query parameter expands search to display_name field",
+          "Authentication decorator present but no group-specific authorization checks"
+        ],
+        "contradicting_evidence": [
+          "CWE-425 requires direct request to restricted URLs/files; this is search functionality expansion within an authenticated API endpoint",
+          "No evidence shows bypass of existing authorization controls on group access"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether Group model has specific access controls beyond authentication",
+          "Whether group information is considered sensitive/restricted in this context",
+          "Whether there are site-wide privacy settings that restrict group visibility",
+          "Whether authentication is sufficient protection for group information"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.42000000000000004,
+        "score": 0.42000000000000004
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 337,
+        "statement": "q = q | Q(display_name__istartswith=query)",
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.45,
+            "evidence": "The code expands search scope to include display_name field, potentially exposing group information. However, CWE-200 requires actual unauthorized access, not just expanded search capability."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "User-controlled 'q' parameter from request.GET directly flows into database query construction via Q(display_name__istartswith=query) and u.filter(q)"
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "The added line expands search scope from just 'name' field to include 'display_name' field when displayname parameter is present"
+          },
+          "security_control": {
+            "score": 0.35,
+            "evidence": "",
+            "required_control": "Access control verification for group information exposure",
+            "control_requirement_evidence": "CWE-200 requires preventing unauthorized actors from accessing sensitive information",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator provides authentication",
+              "No group-specific access controls visible in this function"
+            ],
+            "deficiency_evidence": "Authentication exists but no group-specific authorization checks are demonstrated for the search results"
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "No evidence that group display_name is sensitive or that unauthorized users can access information they shouldn't. The endpoint returns group lists but sensitivity of this data is not established."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the search would only match group names, not display names, reducing the search scope but not necessarily preventing information disclosure if the underlying data access is already unrestricted.",
+        "supporting_evidence": [
+          "User-controlled 'q' parameter flows directly into database query",
+          "Search scope expanded to include display_name field when displayname parameter is present",
+          "No group-specific access controls visible in the function beyond authentication"
+        ],
+        "contradicting_evidence": [
+          "webapi_check_login_required decorator ensures authentication",
+          "No evidence that group display_name contains sensitive information",
+          "No evidence that unauthorized users can access groups they shouldn't see"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether Group model has access controls that restrict visibility",
+          "Whether group display_name contains sensitive information",
+          "Whether site-wide privacy settings restrict group visibility",
+          "Whether authentication alone is sufficient authorization for group access"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.47000000000000003,
+        "score": 0.47000000000000003
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 337,
+        "statement": "q = q | Q(display_name__istartswith=query)",
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-863 requires an incorrect authorization check, but the evidence shows only search field expansion without any demonstrated authorization check being performed or bypassed"
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "User-controlled 'query' parameter connects to database query construction, but no connection to authorization decision point is demonstrated"
+          },
+          "diff_causality": {
+            "score": 0.25,
+            "evidence": "The patch adds display_name field to search scope, but does not create or modify any authorization mechanism"
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Proper authorization check for group access",
+            "control_requirement_evidence": "CWE-863 requires that authorization checks are performed but implemented incorrectly",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator provides authentication",
+              "No group-specific authorization checks visible in the code"
+            ],
+            "deficiency_evidence": "No authorization check is demonstrated to be present or bypassed; the code shows search expansion, not authorization logic"
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "No concrete security impact is demonstrated; potential information disclosure is speculative without evidence of authorization bypass"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the search would only filter by group name instead of both name and display_name, but no authorization mechanism would change.",
+        "supporting_evidence": [
+          "webapi_check_login_required decorator provides authentication",
+          "User-controlled query parameter expands search scope"
+        ],
+        "contradicting_evidence": [
+          "No authorization check logic is present in the demonstrated code",
+          "The change adds a search field, not authorization logic"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether Group model has access controls",
+          "Whether group information requires authorization beyond authentication",
+          "What authorization checks exist elsewhere in the system"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.24,
+        "score": 0.24
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 337,
+        "statement": "q = q | Q(display_name__istartswith=query)",
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.3,
+            "evidence": "CWE-284 requires demonstrating that access to a resource is improperly restricted. The candidate adds display_name search to group queries, but does not demonstrate that group visibility lacks proper authorization controls. Authentication is present via webapi_check_login_required."
+          },
+          "connection": {
+            "score": 0.8,
+            "evidence": "User-controlled 'q' or 'query' GET parameter directly connects to database query construction via Q() objects and filter(). The path is: request.GET → query variable → Q(name__istartswith=query) | Q(display_name__istartswith=query) → Group.objects.all().filter(q)."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If the candidate line were reverted, groups would only be searchable by 'name' field when displayname parameter is present. With the line, groups become searchable by both 'name' and 'display_name' fields, expanding the search scope."
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "",
+            "required_control": "Row-level authorization determining which groups a user should see",
+            "control_requirement_evidence": "For CWE-284, the required control is authorization that restricts resource access based on user permissions. Group visibility should be controlled by authorization policies.",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator provides authentication",
+              "No visible group-specific access controls in the query construction",
+              "Group.objects.all() returns all groups without filtering by user permissions"
+            ],
+            "deficiency_evidence": "The evidence shows authentication but does not demonstrate authorization deficiency. The query uses Group.objects.all() without visible permission checks, but we cannot establish that this is improper without knowing the intended access policy for groups."
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "No concrete security consequence is demonstrated. The patch expands search fields but does not show that unauthorized access to group information occurs. Group information sensitivity and access policies are unresolved."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, groups would only be searchable by the 'name' field when the displayname parameter is present, not by both 'name' and 'display_name' fields.",
+        "supporting_evidence": [
+          "User-controlled query parameter directly influences database search",
+          "Authentication decorator present but no visible authorization checks in query",
+          "Group.objects.all() returns all groups without apparent permission filtering"
+        ],
+        "contradicting_evidence": [
+          "webapi_check_login_required decorator provides authentication control",
+          "No evidence that group information should be restricted or that current access is improper"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether Group model has specific access controls beyond authentication",
+          "Whether group information is considered sensitive in this context",
+          "Whether there are site-wide privacy settings that restrict group visibility",
+          "What the intended authorization policy for group visibility should be"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.49000000000000005,
+        "score": 0.49000000000000005
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "reviewboard/webapi/json.py",
+        "changed_line": 337,
+        "statement": "q = q | Q(display_name__istartswith=query)",
+        "cwe_id": "CWE-264",
+        "cwe_name": "Permissions, Privileges, and Access Controls",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.25,
+            "evidence": "CWE-264 is a legacy category for access control weaknesses. The demonstrated mechanism is expansion of search scope to include display_name field when 'displayname' parameter is present. This is not a direct permissions/privileges bypass but could affect information disclosure if access controls are insufficient."
+          },
+          "connection": {
+            "score": 0.8,
+            "evidence": "User-controlled 'q' or 'query' GET parameter is directly connected to the database query construction. When 'displayname' parameter is present, the query expands to search display_name field in addition to name field. The path is: request.GET → query variable → Q() objects → filter() → returned groups."
+          },
+          "diff_causality": {
+            "score": 1.0,
+            "evidence": "If the candidate line were reverted, the search would only filter by name field even when 'displayname' parameter is present. The patch materially creates the display_name search capability when the displayname parameter is supplied."
+          },
+          "security_control": {
+            "score": 0.3,
+            "evidence": "The webapi_check_login_required decorator provides authentication but no group-specific authorization checks are demonstrated. The search expansion itself does not bypass existing controls but expands what authenticated users can search.",
+            "required_control": "Authorization checks to ensure users can only search/access groups they are authorized to see",
+            "control_requirement_evidence": "For CWE-264, the required control is proper authorization at the protected operation (group information retrieval). The demonstrated mechanism expands search scope without additional authorization.",
+            "existing_controls_checked": [
+              "webapi_check_login_required decorator (authentication only)",
+              "Group.objects.all() returns all groups without filtering"
+            ],
+            "deficiency_evidence": "No demonstrated authorization checks limit which groups are searchable/returnable based on user permissions. The search expansion operates on the full queryset without additional filtering."
+          },
+          "concrete_impact": {
+            "score": 0.4,
+            "evidence": "Potential information disclosure if group display_names contain sensitive information and users can search groups they shouldn't access. However, concrete impact depends on whether group information is sensitive and whether existing access controls prevent unauthorized access."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the search would only filter groups by name field (name__istartswith=query) even when the 'displayname' parameter is present. The display_name field would not be searchable.",
+        "supporting_evidence": [
+          "User-controlled 'q' or 'query' parameter from request.GET expands search scope",
+          "When 'displayname' parameter is present, search includes display_name field via Q(display_name__istartswith=query)",
+          "No additional authorization checks beyond authentication decorator",
+          "Group.objects.all() returns all groups without permission-based filtering"
+        ],
+        "contradicting_evidence": [
+          "The webapi_check_login_required decorator provides authentication",
+          "The change expands search capability but doesn't demonstrably bypass existing access controls"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "Whether Group model has specific access controls beyond authentication",
+          "Whether group information is considered sensitive in this context",
+          "Whether there are site-wide privacy settings that restrict group visibility",
+          "Whether users should be able to search all groups or only those they have permission to see"
+        ],
+        "review_comment": "The patch expands group search to include display_name field when the 'displayname' parameter is present. While authenticated users can now search by display_name, there are no demonstrated authorization checks limiting which groups are searchable based on user permissions. Review whether group information should be accessible to all authenticated users or if additional authorization is required. If group visibility should be restricted, implement permission checks before returning search results, such as filtering groups based on user membership or site-wide privacy settings.",
+        "change_type": "A",
+        "raw_score": 0.5499999999999999,
+        "score": 0.5499999999999999
+      }
+    ],
+    "stage4_status": "completed"
+  }
+]

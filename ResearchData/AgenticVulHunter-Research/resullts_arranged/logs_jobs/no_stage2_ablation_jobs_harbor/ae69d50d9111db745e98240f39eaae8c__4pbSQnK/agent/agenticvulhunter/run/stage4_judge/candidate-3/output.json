@@ -1,0 +1,350 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "shell/server/backup.js",
+  "changed_line": 191,
+  "statement": "var token = {",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "token_generation",
+  "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+  "security_relevance_score": 0.8,
+  "code_context": "42: });\n43: \n44: Meteor.methods({\n45:   backupGrain: function (grainId) {\n46:     check(grainId, String);\n47:     var grain = Grains.findOne(grainId);\n48:     if (!grain || !this.userId || grain.userId !== this.userId) {\n49:       throw new Meteor.Error(403, \"Unauthorized\", \"User is not the owner of this grain\");\n50:     }\n51: \n52:     this.unblock();\n53: \n54:     var token = {\n55:       _id: Random.id(),\n56:       timestamp: new Date(),\n57:       name: grain.title\n58:     };\n59: \n60:     // TODO(soon): does the grain need to be offline?\n61: \n62:     var grainInfo = _.pick(grain, \"appId\", \"appVersion\", \"title\");\n63: \n64:     FileTokens.insert(token);\n65:     waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));\n66: \n67:     return token._id;\n68:   },\n69: \n70:   restoreGrain: function (tokenId) {\n71:     check(tokenId, String);\n72:     var token = FileTokens.findOne(tokenId);\n73:     if (!token || !isSignedUpOrDemo()) {\n74:       throw new Meteor.Error(403, \"Unauthorized\",\n75:           \"Token was not found, or user cannot create grains\");\n76:     }\n77: \n78:     this.unblock();\n79: \n80:     var grainId = Random.id(22);\n81: \n82:     try {\n83:       var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;\n84:       if (!grainInfo.appId) {\n85:           throw new Meteor.Error(500, \"Metadata object for uploaded grain has no AppId\");\n86:       }\n87: \n88:       var action = UserActions.findOne({appId: grainInfo.appId, userId: this.userId});\n89:       if (!action) {\n90:         throw new Meteor.Error(500,\n91:                                \"App id for uploaded grain not installed\",\n92:                                \"App Id: \" + grainInfo.appId);\n93:       }\n94:       if (action.appVersion < grainInfo.appVersion) {\n95:         throw new Meteor.Error(500,\n96:                                \"App version for uploaded grain is newer than any \" +\n97:                                \"installed version. You need to upgrade your app first\",\n98:                                \"New version: \" + grainInfo.appVersion +\n99:                                \", Old version: \" + action.appVersion);\n100:       }\n101: \n102:       Grains.insert({\n103:         _id: grainId,\n104:         packageId: action.packageId,\n105:         appId: action.appId,\n106:         appVersion: action.appVersion,\n107:         userId: this.userId,\n108:         title: grainInfo.title,\n109:         private: true\n110:       });\n111:     } finally {\n112:       cleanupToken(tokenId);\n113:     }\n114: \n115:     return grainId;\n116:   },\n117: });\n118: \n119: Router.map(function () {\n120:   this.route(\"downloadBackup\", {\n121:     where: \"server\",\n122:     path: \"/downloadBackup/:tokenId\",\n123:     action: function () {\n124:       var token = FileTokens.findOne(this.params.tokenId);\n125:       var response = this.response;\n126:       if (!token) {\n127:         response.writeHead(404, {\"Content-Type\": \"text/plain\"});\n128:         return response.end(\"File does not exist\");\n129:       }\n130: \n131:       var started = false;\n132:       var filename = (token.name.replace(/[\"\\n]/g, \"\") || \"backup\") + \".zip\";\n133:       var sawEnd = false;\n134: \n135:       var stream = {\n136:         expectSize: function (size) {\n137:           if (!started) {\n138:             started = true;\n139:             response.writeHead(200, {\n140:               \"Content-Length\": size,\n141:               \"Content-Type\": \"application/zip\",\n142:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n143:             });\n144:           }\n145:         },\n146:         write: function (data) {\n147:           if (!started) {\n148:             started = true;\n149:             response.writeHead(200, {\n150:               \"Content-Type\": \"application/zip\",\n151:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n152:             });\n153:           }\n154:           response.write(data);\n155:         },\n156:         done: function (data) {\n157:           if (!started) {\n158:             started = true;\n159:             response.writeHead(200, {\n160:               \"Content-Length\": 0,\n161:               \"Content-Type\": \"application/zip\",\n162:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n163:             });\n164:           }\n165:           sawEnd = true;\n166:           response.end();\n167:         }\n168:       };\n169: \n170:       waitPromise(sandstormBackend.downloadBackup(this.params.tokenId, stream));\n171: \n172:       if (!sawEnd) {\n173:         console.error(\"backend failed to call done() when downloading backup\");\n174:         if (!started) {\n175:           throw new Meteor.Error(500, \"backend failed to produce data\");\n176:         }\n177:         response.end();\n178:       }\n179: \n180:       cleanupToken(this.params.tokenId);\n181:     }\n182:   });\n183: \n184:   this.route(\"uploadBackup\", {\n185:     where: \"server\",\n186:     path: \"/uploadBackup\",\n187:     action: function () {\n188:       if (this.request.method === \"POST\") {\n189:         var request = this.request;\n190:         try {\n191:           var token = {\n192:             _id: Random.id(),\n193:             timestamp: new Date()\n194:           };\n195:           var stream = sandstormBackend.uploadBackup(token._id).stream;\n196: \n197:           FileTokens.insert(token);\n198: \n199:           waitPromise(new Promise(function (resolve, reject) {\n200:             request.on(\"data\", function (data) {\n201:               stream.write(data);\n202:             });\n203:             request.on(\"end\", function () {\n204:               resolve(stream.done());\n205:             });\n206:             request.on(\"error\", function (err) {\n207:               stream.close();\n208:             });\n209:           }));\n210: \n211:           this.response.writeHead(200, {\n212:             \"Content-Length\": token._id.length,\n213:             \"Content-Type\": \"text/plain\"\n214:           });\n215:           this.response.write(token._id);\n216:           this.response.end();\n217:         } catch(error) {\n218:           console.error(error.stack);\n219:           this.response.writeHead(500, {\n220:             \"Content-Type\": \"text/plain\"\n221:           });\n222:           this.response.write(error.stack);\n223:           this.response.end();\n224:         }\n225:       } else {\n226:         this.response.writeHead(405, {\n227:           \"Content-Type\": \"text/plain\"\n228:         });\n229:         this.response.write(\"You can only POST here.\");\n230:         this.response.end();\n231:       }\n232:     }\n233:   });\n234: });",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-340",
+      "cwe_name": "Generation of Predictable Numbers or Identifiers",
+      "fit_reason": "Token generation using Random.id() in backup/restore operations without validation allows predictable identifier exploitation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "fit_reason": "Backup/restore functionality lacks proper access control checks on tokens, allowing unauthorized grain access",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-352",
+      "cwe_name": "Cross-Site Request Forgery (CSRF)",
+      "fit_reason": "Token-based operations may be vulnerable to CSRF attacks due to missing protection mechanisms",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-367",
+      "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+      "fit_reason": "File token validation and usage may have race conditions between check and use operations",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-200",
+      "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+      "fit_reason": "Backup/restore operations may expose grain data through improper file access controls",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-116",
+    "CWE-193",
+    "CWE-200",
+    "CWE-255",
+    "CWE-284",
+    "CWE-340",
+    "CWE-352",
+    "CWE-367",
+    "CWE-534",
+    "CWE-561",
+    "CWE-59",
+    "CWE-640",
+    "CWE-697",
+    "CWE-704",
+    "CWE-830",
+    "CWE-863",
+    "CWE-912",
+    "CWE-93",
+    "CWE-94"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 191,
+      "statement": "var token = {",
+      "cwe_id": "CWE-340",
+      "cwe_name": "Generation of Predictable Numbers or Identifiers",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code uses Random.id() to generate tokens, which is a predictable identifier generation mechanism as per CWE-340."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The generated token identifiers are used in backup/restore operations and are stored in FileTokens collection, creating a clear path from identifier generation to security-sensitive operations."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If the candidate line were reverted to not use Random.id(), the token identifiers would no longer be predictable, which would materially change the vulnerability exposure."
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "The code lacks a security control to ensure that generated identifiers are unpredictable or cryptographically secure.",
+          "required_control": "Cryptographically secure random number generation",
+          "control_requirement_evidence": "CWE-340 specifically requires that identifiers be unpredictable, which necessitates the use of cryptographically secure randomness.",
+          "existing_controls_checked": [
+            "Use of Random.id() - not cryptographically secure",
+            "No explicit validation or entropy checks on generated tokens"
+          ],
+          "deficiency_evidence": "The code uses Meteor's Random.id() function which is not cryptographically secure and generates predictable identifiers, directly violating the requirements of CWE-340."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "Predictable token identifiers could allow attackers to forge or guess tokens for backup/restore operations, potentially leading to unauthorized access to grain data."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, and Random.id() was not used for token generation, then the identifiers would be less predictable, removing the vulnerability associated with CWE-340.",
+      "supporting_evidence": [
+        "Use of Random.id() in token generation at line 191",
+        "Token identifiers are stored in FileTokens collection and used in backup/restore operations",
+        "No cryptographic randomness or entropy validation in identifier generation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the predictability of identifiers actually leads to exploitable conditions in this specific context",
+        "The exact impact of predictable tokens on backup/restore security"
+      ],
+      "review_comment": "The code uses Random.id() to generate token identifiers, which are predictable and violate CWE-340. These identifiers are used in backup/restore operations where they could be guessed or forged by attackers. The fix requires replacing Random.id() with a cryptographically secure random number generator to ensure unpredictable identifiers.",
+      "change_type": "A",
+      "raw_score": 0.76,
+      "score": 0.76
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 191,
+      "statement": "var token = {",
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The code creates a token with _id and timestamp but no access control checks are performed on the token before it is used in backup/restore operations, which aligns with CWE-284's mechanism of improper access control."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The token is created and inserted into FileTokens collection, then used in restoreGrain and downloadBackup functions. However, the connection between user input and token usage is not fully demonstrated as to whether unauthorized users can access tokens they don't own."
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "If this line were reverted (i.e., if token creation was removed or modified), the backup/restore functionality would not work as intended, indicating that this change is necessary for the access control mechanism to be bypassed."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "There are no explicit access control checks on tokens before they are used in restoreGrain or downloadBackup functions. The code relies on FileTokens.findOne(tokenId) without verifying that the user has proper authorization to access that token.",
+          "required_control": "Authorization check",
+          "control_requirement_evidence": "CWE-284 requires that access to resources be properly restricted, which means verifying that a user is authorized to perform an action on a resource before allowing it.",
+          "existing_controls_checked": [
+            "FileTokens.findOne(tokenId) - does not verify ownership or authorization",
+            "restoreGrain function checks token existence but not user authorization"
+          ],
+          "deficiency_evidence": "The code allows any user with a valid token ID to potentially restore or download a grain, without verifying that the token belongs to them or that they are authorized to access it."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "An attacker could potentially use a stolen token to restore or download a grain they don't own, leading to unauthorized access to data. However, the exact impact depends on whether tokens are properly secured and if there's a mechanism to prevent unauthorized access."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, no token would be created for uploadBackup functionality, breaking the backup/restore system entirely.",
+      "supporting_evidence": [
+        "Token is created with _id and timestamp in uploadBackup function",
+        "Token is inserted into FileTokens collection",
+        "restoreGrain function uses token without authorization check",
+        "downloadBackup function uses token without authorization check"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether unauthorized users can actually access tokens they don't own",
+        "Whether there's a mechanism to prevent unauthorized access to tokens",
+        "Whether the token is properly secured and protected from unauthorized access"
+      ],
+      "review_comment": "The code creates tokens for backup/restore operations but does not verify user authorization before allowing access. An attacker could potentially use a stolen token to restore or download a grain they don't own, leading to unauthorized data access. Implement proper authorization checks on tokens before allowing access to backup/restore functionality.",
+      "change_type": "A",
+      "raw_score": 0.5999999999999999,
+      "score": 0.5999999999999999
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 191,
+      "statement": "var token = {",
+      "cwe_id": "CWE-352",
+      "cwe_name": "Cross-Site Request Forgery (CSRF)",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The code generates tokens for backup operations, which is a CSRF protection mechanism. However, the token generation itself does not demonstrate the CSRF vulnerability - it only shows that tokens are used."
+        },
+        "connection": {
+          "score": 0.2,
+          "evidence": "There is no explicit connection shown between externally controlled input and the vulnerable operation. The token is generated but not validated for authenticity or origin in the context of a CSRF attack."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this line were reverted, the token would not be generated for uploadBackup operations, which would prevent any CSRF protection mechanism from being implemented at all. The change introduces token generation but does not address CSRF protection."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "The code generates tokens but does not implement CSRF protection mechanisms such as anti-CSRF tokens in forms or headers. There is no evidence of validation of token authenticity or origin.",
+          "required_control": "Anti-CSRF token validation",
+          "control_requirement_evidence": "CSRF attacks exploit the lack of verification that a request originated from an authenticated user. A CSRF protection mechanism requires validating that the request contains a valid, expected token.",
+          "existing_controls_checked": [
+            "Token generation in uploadBackup function",
+            "No validation of token authenticity or origin"
+          ],
+          "deficiency_evidence": "The code generates tokens but does not validate them against expected values or check for presence of CSRF protection headers. The token is inserted into FileTokens collection but never validated during restoreGrain or downloadBackup operations."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "While the code generates tokens, there is no evidence that these tokens are used to prevent CSRF attacks. The vulnerability would allow unauthorized users to forge requests if they can guess or obtain valid tokens."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the token would not be generated for uploadBackup operations, which would completely remove any CSRF protection mechanism from that endpoint. This would leave the uploadBackup route vulnerable to CSRF attacks since there would be no token validation.",
+      "supporting_evidence": [
+        "Token is generated in uploadBackup function",
+        "Token is inserted into FileTokens collection",
+        "No validation of token authenticity or origin"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether tokens are validated for CSRF protection",
+        "Whether the generated tokens are used in subsequent operations to prevent CSRF",
+        "Whether there is any mechanism to verify that requests originated from authenticated users"
+      ],
+      "review_comment": "The code generates tokens for backup operations but does not implement CSRF protection. The token generation alone does not prevent CSRF attacks, as there's no validation of token authenticity or origin. The uploadBackup endpoint lacks anti-CSRF mechanisms, making it vulnerable to forged requests. Implement CSRF protection by validating tokens against expected values or using CSRF tokens in request headers.",
+      "change_type": "A",
+      "raw_score": 0.32,
+      "score": 0.32
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 191,
+      "statement": "var token = {",
+      "cwe_id": "CWE-367",
+      "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The code shows a token creation and insertion into FileTokens collection, but does not demonstrate the specific TOCTOU pattern where a check is followed by a use of a resource whose state may change between them."
+        },
+        "connection": {
+          "score": 0.2,
+          "evidence": "There is no clear connection established between an externally controlled input and the vulnerable operation. The token is generated locally with Random.id() and timestamp, not based on external input that could be manipulated."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this line were reverted, the token would not be created in the same way, potentially removing a potential race condition point. However, the actual TOCTOU vulnerability depends on more complex interactions between multiple operations and checks."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The code does not demonstrate a clear missing or weakened control that would lead to a TOCTOU vulnerability. The token is inserted into the database, but there's no explicit check-use pattern that could be exploited.",
+          "required_control": "Atomic operations or proper synchronization between resource check and use",
+          "control_requirement_evidence": "TOCTOU requires that checks and uses of resources are atomic or synchronized to prevent state changes between them.",
+          "existing_controls_checked": [
+            "FileTokens.insert(token) - inserts token into database",
+            "Random.id() - generates unique ID for token",
+            "timestamp - records time of token creation"
+          ],
+          "deficiency_evidence": "No explicit synchronization or atomicity mechanism is demonstrated in the code to prevent race conditions between checking and using the token."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "While a TOCTOU vulnerability could theoretically exist, there is no concrete evidence of impact. The code does not show an actual attack scenario or demonstrated consequence."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the token would not be created with the same structure and insertion pattern, potentially removing a potential race condition point in the backup/restore flow.",
+      "supporting_evidence": [
+        "Token is generated with Random.id() and timestamp",
+        "Token is inserted into FileTokens collection",
+        "The code shows multiple operations involving tokens that could be vulnerable to race conditions"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the token creation and usage are actually separated in time",
+        "Whether there is an actual check-use pattern that creates a race condition",
+        "Whether external input controls the token state between check and use"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.36,
+      "score": 0.36
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 191,
+      "statement": "var token = {",
+      "cwe_id": "CWE-200",
+      "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The code creates a token with _id and timestamp but does not include user-specific or grain-specific sensitive data in the token structure, which could allow unauthorized access to backup files if tokens are guessable or improperly validated."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The token is used as a key for accessing backup files via downloadBackup route (line 124) and uploadBackup route (line 191). However, there's no explicit validation that the user has access to the grain associated with the token before allowing file access."
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "If this line were reverted, the token would not be created in the uploadBackup operation, preventing creation of a token that could later be used to access backup files. The patch introduces a new token generation mechanism without sufficient access control checks."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The code does not validate that the user has proper authorization to create or access the backup file associated with the token before inserting it into FileTokens collection. There is no check ensuring that the token corresponds to a grain owned by the current user.",
+          "required_control": "Authorization validation for backup operations",
+          "control_requirement_evidence": "CWE-200 requires preventing unauthorized access to sensitive information, which in this case includes grain data exposed through backup tokens.",
+          "existing_controls_checked": [
+            "User authentication check via this.userId (line 48)",
+            "Token existence check in restoreGrain (line 72)",
+            "Access control in downloadBackup route (line 126)"
+          ],
+          "deficiency_evidence": "While there's a check for user authentication, the token creation process does not validate that the grain being backed up belongs to the current user. The token is inserted into FileTokens without verifying ownership of the associated grain."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "An attacker could potentially access backup files by guessing or obtaining valid tokens, leading to exposure of sensitive grain data if proper access controls are not enforced during token validation."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, no token would be created for uploadBackup operations, preventing any mechanism for users to obtain a token that could later be used to access backup files. This would eliminate the potential exposure of sensitive grain data through unauthorized file access.",
+      "supporting_evidence": [
+        "Token is inserted into FileTokens collection (line 197)",
+        "Token is used as key in downloadBackup route (line 124)",
+        "Token is used as key in uploadBackup route (line 191)"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the token includes sufficient user context to prevent unauthorized access",
+        "Whether downstream validation properly checks grain ownership before allowing file access"
+      ],
+      "review_comment": "The backup token generation does not validate that the user owns the grain being backed up, creating a potential exposure of sensitive grain data. The token is created without checking grain ownership, and there's no explicit authorization check when accessing backup files via the token. Implement validation that ensures users can only create tokens for grains they own before inserting tokens into FileTokens.",
+      "change_type": "A",
+      "raw_score": 0.5999999999999999,
+      "score": 0.5999999999999999
+    }
+  ],
+  "stage4_status": "completed"
+}

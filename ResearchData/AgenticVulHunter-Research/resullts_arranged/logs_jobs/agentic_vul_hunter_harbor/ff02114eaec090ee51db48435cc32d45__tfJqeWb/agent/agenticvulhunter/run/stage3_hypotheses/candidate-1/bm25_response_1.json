@@ -1,0 +1,253 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/receive-incoming-sails-io-msg.js",
+      "changed_line": 109,
+      "statement": "path    : url.parse(options.incomingSailsIOMsg.url).pathname,",
+      "change_type": "A",
+      "function_name": "receiveIncomingSailsIOMsg",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "observable input from socket.io message -> url parsing operation -> potential path traversal or resource access control bypass",
+      "security_relevance_score": 0.7,
+      "code_context": "1: /**\n2:  * Module dependencies\n3:  */\n4: \n5: var util = require('util');\n6: var url = require('url');\n7: var _ = require('@sailshq/lodash');\n8: var semver = require('semver');\n9: var parseSdkMetadata = require('./parse-sdk-metadata');\n10: var ERRORPACK = require('./errors');\n11: var proxyaddr = require('proxy-addr');\n12: \n13: /**\n14:  * @required  {Object} app\n15:  *\n16:  * @return {Function}     [initialize]\n17:  */\n18: module.exports = function ToReceiveIncomingSailsIOMsg(app) {\n19: \n20:   /**\n21:    * Parse an incoming Socket.io message (usually from the sails.io.js client),\n22:    * build up Socket.io-specific properties for the request object, then feed\n23:    * that to the request interpreter in Sails core by calling `sails.request`.\n24:    *\n25:    * @required  {Object} options.incomingSailsIOMsg\n26:    * @required  {Function} options.socketIOClientCallback\n27:    * @required  {String} options.eventName\n28:    * @required  {Object} options.socket\n29:    */\n30: \n31:   return function receiveIncomingSailsIOMsg(options) {\n32:     app.log.verbose('Receiving incoming message from Socket.io: ', options.incomingSailsIOMsg);\n33: \n34:     // If invalid callback function specified, freak out\n35:     // (it's ok to NOT include a callback, but if it exists, it should be a function)\n36:     if (options.socketIOClientCallback && !_.isFunction(options.socketIOClientCallback)) {\n37:       delete options.socketIOClientCallback;\n38:       return respondWithParseError('Could not parse request- callback may be omitted... but if provided, it must be a function.');\n39:     }\n40: \n41:     // Check that URL is specified\n42:     if (!options.incomingSailsIOMsg.url) {\n43:       return respondWithParseError(util.format('No url provided in request: %s',options.incomingSailsIOMsg));\n44:     }\n45: \n46:     // Check that URL is valid\n47:     if (!_.isString(options.incomingSailsIOMsg.url)) {\n48:       return respondWithParseError(util.format('Invalid url provided: %s',options.incomingSailsIOMsg.url));\n49:     }\n50: \n51:     // Grab the metadata for the SDK\n52:     var sdk = parseSdkMetadata(options.socket.handshake);\n53: \n54:     // No more backwards-compatibility for clients < v0.11.0\n55:     // > Note that we round off the prerelease part of the SDK version,\n56:     // > in case there is one.  Otherwise, this check will always fail,\n57:     // > no matter the version.  For more information on this, see:\n58:     // > • https://github.com/npm/node-semver/issues/130#issuecomment-120988399\n59:     // > • https://github.com/npm/node-semver/tree/44cbc8482ac4f0f8d2de0abb7f8808056d2d55f9#prerelease-tags\n60:     var closestStableSdkVersion = semver.major(sdk.version)+'.'+semver.minor(sdk.version)+'.'+semver.patch(sdk.version);\n61:     if (!semver.satisfies(closestStableSdkVersion, '>=0.11.0')) {\n62:       return respondWithParseError(util.format('This version of Sails is not compatible with the socket.io/sails.io.js client SDK version you are using (%s). Please see https://sailsjs.com/documentation/upgrading/to-v-0-11 for more information-- then please continue upgrading all the way to the installed version of Sails.',sdk.version));\n63:     }\n64: \n65:     // Try to get the express 'trust proxy' setting value\n66:     var expressTrust;\n67:     try {\n68:       expressTrust = app.hooks.http.app.get('trust proxy fn');\n69:     }\n70:     // Something went wrong while retrieving the express settings. Default's to no Trust\n71:     catch (e) {\n72:       expressTrust = function () { return false };\n73:     }\n74: \n75:     // Dummy express req object so we can use proxy-addr\n76:     var reqDummy = {\n77:       connection: { remoteAddress: options.socket.handshake.address },\n78:       headers: options.socket.handshake.headers\n79:     };\n80: \n81:     var ip = proxyaddr(reqDummy, expressTrust);\n82: \n83:     var ips = proxyaddr.all(reqDummy, expressTrust);\n84: \n85:     // reverse the order (to farthest -> closest)\n86:     // and remove socket address\n87:     ips.reverse().pop();\n88: \n89:     // Start building up the request context which we'll pass into the interpreter in Sails core:\n90:     var requestContext = {\n91: \n92:       transport: 'socket.io', // TODO: consider if this is really helpful or just a waste of LoC\n93: \n94:       protocol: 'ws', // TODO: consider if this is really helpful or just a waste of LoC\n95: \n96:       isSocket: true,\n97: \n98:       ip      : ip,\n99: \n100:       ips     : ips,\n101: \n102:       port    : null,\n103: \n104:       // Access to underlying SIO socket\n105:       socket  : options.socket,\n106: \n107:       url     : options.incomingSailsIOMsg.url,\n108: \n109:       path    : url.parse(options.incomingSailsIOMsg.url).pathname,\n110: \n111:       method  : options.eventName,\n112: \n113:       // Attached data becomes simulated HTTP body (`req.body`)\n114:       // (allow `params` or `data` to be specified for backwards/sideways-compatibility)\n115:       body    : _.isArray(options.incomingSailsIOMsg.data) ? options.incomingSailsIOMsg.data : _.extend({}, options.incomingSailsIOMsg.params || {}, options.incomingSailsIOMsg.data || {}),\n116: \n117:       // Allow optional headers\n118:       headers: _.defaults({\n119: \n120:         host: app.config.host,\n121: \n122:         // Default the \"cookie\" request header to what was provided in the handshake.\n123:         cookie: (function (){\n124:           var _cookie;\n125:           try {\n126:             _cookie = options.socket.handshake.headers.cookie;\n127:           }\n128:           catch (e) {}\n129:           // console.log('REQUEST to \"%s %s\" IS USING COOKIE:', options.eventName, options.incomingSailsIOMsg.url, _cookie);\n130:           return _cookie;\n131:         })(),\n132: \n133:         nosession: options.socket.handshake.headers.nosession ? true : undefined,\n134: \n135:       }, options.incomingSailsIOMsg.headers || {})\n136: \n137:     };\n138: \n139:     // app.log.verbose('Interpreting socket.io message as virtual request to \"%s %s\"...', requestContext.method, requestContext.url);\n140:     // app.log.verbose('(cookie: %s)', requestContext.headers.cookie);\n141: \n142:     // Set the `origin` header to what was provided in the handshake\n143:     // (the origin header CANNOT BE OVERRIDDEN by sockets at virtual request-time-- only\n144:     //  upon first connection.)\n145:     if (requestContext.headers.origin){\n146: \n147:       // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -\n148:       // FUTURE: Further document security reasons why `origin` may not be passed manually\n149:       // at VR (virtual request) time.  Has to do w/ xdomain security concerns.\n150:       // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -\n151:       app.log.verbose('Ignoring provided `origin` header in VR (virtual request) from socket.io: It would not be safe to change `origin` for this socket now!');\n152:     }\n153:     requestContext.headers.origin = (function (){\n154:       var _origin;\n155:       try {\n156:         _origin = options.socket.handshake.headers.origin;\n157:       }\n158:       catch (e){}\n159:       return _origin;\n160:     })();\n161: \n162: \n163:     // console.log('handshake:',options.socket.handshake);\n164:     app.log.verbose('Interpreting socket.io message as VR (virtual request) to \"%s %s\"...', requestContext.method, requestContext.url);\n165: \n166: \n167: \n168:     // Start building up the response context which we'll pass into the interpreter in Sails core:\n169:     var responseContext = {\n170: \n171:       /**\n172:        * This `_clientCallback` function we provide here will be used by Sails core as a final step\n173:        * when trying to run methods like `res.send()`.\n174:        *\n175:        * Since Socket.io v1.x does not support streaming socket messages out of the box,\n176:        * currently we'll just use this callback vs passing in a stream (so the client response\n177:        * stream will just be buffered to build up clientRes.body)\n178:        *\n179:        * IMPORTANT:\n180:        * The `clientRes` provided here is a Readable client response stream, not the same `res`\n181:        * that is available in userland code.\n182:        */\n183: \n184:       _clientCallback: function _clientCallback(clientRes) {\n185: \n186:         // If no cookie was sent initially on the handshake, and a 'set-cookie' exists in response\n187:         // headers, then save the cookie on the handshake (no need to send extra data over the wire\n188:         // since we're maintaining a persistent connection on this side, plus this prevents client-side\n189:         // js from accessing the cookie)\n190:         //\n191:         // This allows for anything relying on cookies (e.g. default `req.session` support)\n192:         // to last as long as the socket connection (i.e. until the browser tab is closed)\n193:         //\n194:         // Note that we **STILL GENERATE A COOKIE** using socket.io middleware when the socket\n195:         // initially connects.  This is so that by the time we run the `onConnect` lifecycle event,\n196:         // it has access to the real session.  So in general, this should never fire.\n197:         //\n198:         // In the future, we may want to always reset the handshake's cookie based on the `set-cookie`\n199:         // response header to allow for custom HTTP cookies to work completely via sockets, but that\n200:         // should be evaluated carefully to avoid unexpected race conditions.\n201:         try {\n202:           if (!options.socket.handshake.headers.cookie && clientRes.headers['set-cookie']){\n203:               options.socket.handshake.headers.cookie = clientRes.headers['set-cookie'][0];\n204:           }\n205:         }\n206:         catch (e) {\n207:           app.log.warn('Could not persist res.headers[\"set-cookie\"] into the socket handshake:',e);\n208:         }\n209: \n210:         // If socket.io callback does not exist as a valid function, don't bother responding.\n211:         if (!_.isFunction(options.socketIOClientCallback)) {\n212:           return;\n213:         }\n214: \n215:         // Modern behavior\n216:         // (builds a complete simulation of an HTTP response.)\n217:         var jwr = {\n218:           body: clientRes.body\n219:         };\n220: \n221:         // Allow headers and status code to be disabled to allow for squeezing\n222:         // out a little more performance when relevant (and reducing bandwidth usage).\n223:         // To achieve this, set `sails.config.sockets.sendResponseHeaders=false` and/or\n224:         // `sails.config.sockets.sendStatusCode=false`.\n225:         if (app.config.sockets.sendResponseHeaders) {\n226:           jwr.headers = clientRes.headers;\n227:         }\n228:         if (app.config.sockets.sendStatusCode) {\n229:           jwr.statusCode = clientRes.statusCode;\n230:         }\n231: \n232:         // Remove 'set-cookie' header\n233:         // (to prevent cookie from reaching client-side js)\n234:         delete jwr.headers['set-cookie'];\n235: \n236:         // TODO:\n237:         // Try out http://socket.io/blog/introducing-socket-io-1-0/#socket.io-stream\n238:         // to explore how we could make it work with Sails.\n239:         // (the old way in 0.9 was streams1 style, just emitting `data` and `end` messages)\n240: \n241:         // Send down response.\n242:         options.socketIOClientCallback(jwr);\n243:         return;\n244:       }\n245: \n246:     };\n247: \n248: \n249:     // Finally, lob a virtual request at the interpreter\n250:     app.router.route(requestContext, responseContext);\n251: \n252: \n253: \n254: \n255: \n256: \n257: \n258: ",
+      "source_summary": "The URL input comes from options.incomingSailsIOMsg.url, which is sourced from a socket.io message. The code validates that this value exists and is a string, but does not perform any sanitization or validation of the URL structure beyond basic existence and type checks.",
+      "sink_summary": "The pathname extracted from the URL is used as part of the request context for routing within Sails core. It becomes part of the virtual request path that gets processed by the application router.",
+      "guard_summary": "There are basic input validation checks ensuring the URL exists and is a string, but no specific controls are in place to prevent path traversal or other malicious path manipulation. The pathname is directly extracted without sanitization or normalization.",
+      "risk_pattern": "The code extracts a pathname from a user-provided URL without validation or sanitization, potentially allowing attackers to manipulate the path used for routing within the application.",
+      "used_variable_sources": [
+        "options.incomingSailsIOMsg.url"
+      ],
+      "called_function_context": [
+        "url.parse(options.incomingSailsIOMsg.url)"
+      ],
+      "enclosing_conditions": [
+        "if (!options.incomingSailsIOMsg.url)",
+        "if (!_.isString(options.incomingSailsIOMsg.url))"
+      ],
+      "context_summary": "This code processes incoming socket.io messages and constructs a virtual request context. The URL from the message is parsed to extract the pathname, which is then used for routing within Sails core. While basic validation exists for the URL's presence and type, there are no controls to prevent malicious path manipulation.",
+      "unresolved_facts": [
+        "Whether the application router performs any additional validation or sanitization of the pathname after it's extracted",
+        "The specific security implications of using this pathname in routing decisions within Sails core"
+      ],
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/zipslip",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 32.4018,
+          "raw_bm25_score": 32.4018,
+          "description": "Extracting files from a malicious ZIP file, or similar type of archive, without validating that the destination file path is within the destination directory can allow an attacker to unexpectedly gain access to resources.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/missing-x-frame-options",
+          "cwe_id": "CWE-829",
+          "cwe_name": "Inclusion of Functionality from Untrusted Control Sphere",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.4633,
+          "raw_bm25_score": 29.4633,
+          "description": "If the 'X-Frame-Options' setting is not provided, a malicious user may be able to overlay their own UI on top of the site by using an iframe.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-451",
+            "external/cwe/cwe-829"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "fallback/cwe-863-incorrect-authorization",
+          "cwe_id": "CWE-863",
+          "cwe_name": "Incorrect Authorization",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 29.0091,
+          "raw_bm25_score": 29.0091,
+          "description": "An authorization check exists but evaluates access incorrectly.",
+          "pattern": "cwe-863 incorrect-authorization authorization-check permission-check role-check ownership-check acl-check access-decision bypass",
+          "remediation": "Evaluate authorization from trusted server-side identity and policy state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-863"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/unsafe-external-link",
+          "cwe_id": "CWE-200",
+          "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.9542,
+          "raw_bm25_score": 27.9542,
+          "description": "External links that open in a new tab or window but do not specify link type 'noopener' or 'noreferrer' are a potential security risk.",
+          "pattern": "Find code that may expose sensitive information in error messages, logs, or responses",
+          "remediation": "Implement proper access controls and avoid exposing sensitive information in responses, errors, or logs.",
+          "tags": [
+            "maintainability",
+            "security",
+            "external/cwe/cwe-200",
+            "external/cwe/cwe-1022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/misleading-indentation-after-control-statement",
+          "cwe_id": "CWE-483",
+          "cwe_name": "Incorrect Block Delimitation",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.8565,
+          "raw_bm25_score": 27.8565,
+          "description": "The body of a control statement should have appropriate indentation to clarify which statements it controls and which ones it does not control.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-483. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "readability",
+            "statistical",
+            "non-attributable"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/useless-regexp-character-escape",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.1635,
+          "raw_bm25_score": 26.1635,
+          "description": "Prepending a backslash to an ordinary character in a string does not have any effect, and may make regular expressions constructed from this string behave unexpectedly.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/type-confusion-through-parameter-tampering",
+          "cwe_id": "CWE-843",
+          "cwe_name": "Access of Resource Using Incompatible Type ('Type Confusion')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.2145,
+          "raw_bm25_score": 25.2145,
+          "description": "Sanitizing an HTTP request parameter may be ineffective if the user controls its type.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-843"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/regex/unmatchable-dollar",
+          "cwe_id": "CWE-561",
+          "cwe_name": "Dead Code",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.7994,
+          "raw_bm25_score": 23.7994,
+          "description": "If a dollar assertion '$' appears in a regular expression before another term that cannot match the empty string, then this assertion can never match, so the entire regular expression cannot match any string.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove dead code through static analysis. Use code coverage tools to identify unreachable code. Implement regular code reviews to eliminate unused functionality.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "regular-expressions",
+            "external/cwe/cwe-561"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/xpath-injection",
+          "cwe_id": "CWE-643",
+          "cwe_name": "Improper Neutralization of Data within XPath Expressions ('XPath Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.8643,
+          "raw_bm25_score": 22.8643,
+          "description": "Building an XPath expression from user-controlled sources is vulnerable to insertion of malicious code by the user.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-643"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/eval-like-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.9186,
+          "raw_bm25_score": 21.9186,
+          "description": "DOM functions that act like 'eval' and execute strings as code are dangerous and impede program analysis and understanding. Consequently, they should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "readability",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

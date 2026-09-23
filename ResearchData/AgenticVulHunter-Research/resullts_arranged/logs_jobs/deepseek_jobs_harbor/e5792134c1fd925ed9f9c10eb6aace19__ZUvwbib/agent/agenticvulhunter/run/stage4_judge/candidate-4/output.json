@@ -1,0 +1,306 @@
+{
+  "candidate_id": "candidate-4",
+  "filepath": "sydent/http/servlets/store_invite_servlet.py",
+  "changed_line": 99,
+  "statement": "subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')",
+  "change_type": "A",
+  "function_name": "render_POST",
+  "operation_type": "email_header_encoding",
+  "selection_reason": "Encodes email subject header with proper MIME encoding for safe header injection prevention",
+  "security_relevance_score": 0.7,
+  "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: import nacl.signing\n17: import random\n18: import string\n19: from email.header import Header\n20: \n21: from twisted.web.resource import Resource\n22: from unpaddedbase64 import encode_base64\n23: \n24: import json\n25: from sydent.db.invite_tokens import JoinTokenStore\n26: from sydent.db.threepid_associations import GlobalAssociationStore\n27: \n28: from sydent.http.servlets import require_args, send_cors\n29: from sydent.util.emailutils import sendEmail\n30: \n31: \n32: class StoreInviteServlet(Resource):\n33:     def __init__(self, syd):\n34:         self.sydent = syd\n35: \n36:     def render_POST(self, request):\n37:         send_cors(request)\n38:         err = require_args(request, (\"medium\", \"address\", \"room_id\", \"sender\",))\n39:         if err:\n40:             return json.dumps(err)\n41:         medium = request.args[\"medium\"][0]\n42:         address = request.args[\"address\"][0]\n43:         roomId = request.args[\"room_id\"][0]\n44:         sender = request.args[\"sender\"][0]\n45: \n46:         globalAssocStore = GlobalAssociationStore(self.sydent)\n47:         mxid = globalAssocStore.getMxid(medium, address)\n48:         if mxid:\n49:             request.setResponseCode(400)\n50:             return json.dumps({\n51:                 \"errcode\": \"THREEPID_IN_USE\",\n52:                 \"error\": \"Binding already known\",\n53:                 \"mxid\": mxid,\n54:             })\n55: \n56:         if medium != \"email\":\n57:             request.setResponseCode(400)\n58:             return json.dumps({\n59:                 \"errcode\": \"M_UNRECOGNIZED\",\n60:                 \"error\": \"Didn't understand medium '%s'\" % (medium,),\n61:             })\n62: \n63:         token = self._randomString(128)\n64: \n65:         tokenStore = JoinTokenStore(self.sydent)\n66: \n67:         ephemeralPrivateKey = nacl.signing.SigningKey.generate()\n68:         ephemeralPublicKey = ephemeralPrivateKey.verify_key\n69: \n70:         ephemeralPrivateKeyBase64 = encode_base64(ephemeralPrivateKey.encode(), True)\n71:         ephemeralPublicKeyBase64 = encode_base64(ephemeralPublicKey.encode(), True)\n72: \n73:         tokenStore.storeEphemeralPublicKey(ephemeralPublicKeyBase64)\n74:         tokenStore.storeToken(medium, address, roomId, sender, token)\n75: \n76:         substitutions = {}\n77:         for key, values in request.args.items():\n78:             if len(values) == 1 and type(values[0]) == str:\n79:                 substitutions[key] = values[0]\n80:         substitutions[\"token\"] = token\n81: \n82:         required = [\n83:             'sender_display_name',\n84:             'token',\n85:             'room_name',\n86:             'bracketed_room_name',\n87:             'room_avatar_url',\n88:             'sender_display_name',\n89:             'guest_user_id',\n90:             'guest_access_token',\n91:         ]\n92:         for k in required:\n93:             substitutions.setdefault(k, '')\n94: \n95:         substitutions[\"ephemeral_private_key\"] = ephemeralPrivateKeyBase64\n96:         if substitutions[\"room_name\"] != '':\n97:             substitutions[\"bracketed_room_name\"] = \"(%s)\" % substitutions[\"room_name\"]\n98: \n99:         subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')\n100:         substitutions[\"subject_header_value\"] = subject_header.encode()\n101: \n102:         sendEmail(self.sydent, \"email.invite_template\", address, substitutions)\n103: \n104:         pubKey = self.sydent.keyring.ed25519.verify_key\n105:         pubKeyBase64 = encode_base64(pubKey.encode())\n106: \n107:         baseUrl = \"%s/_matrix/identity/api/v1\" % (self.sydent.cfg.get('http', 'client_http_base'),)\n108: \n109:         keysToReturn = []\n110:         keysToReturn.append({\n111:             \"public_key\": pubKeyBase64,\n112:             \"key_validity_url\": baseUrl + \"/pubkey/isvalid\",\n113:         })\n114:         keysToReturn.append({\n115:             \"public_key\": ephemeralPublicKeyBase64,\n116:             \"key_validity_url\": baseUrl + \"/pubkey/ephemeral/isvalid\",\n117:         })\n118: \n119:         resp = {\n120:             \"token\": token,\n121:             \"public_key\": pubKeyBase64,\n122:             \"public_keys\": keysToReturn,\n123:             \"display_name\": self.redact(address),\n124:         }\n125: \n126:         return json.dumps(resp)\n127: \n128:     def redact(self, address):\n129:         return \"@\".join(map(self._redact, address.split(\"@\", 1)))\n130: \n131:     def _redact(self, s):\n132:         if len(s) > 5:\n133:             return s[:3] + \"...\"\n134:         elif len(s) > 1:\n135:             return s[0] + \"...\"\n136:         else:\n137:             return \"...\"\n138: \n139:     def _randomString(self, length):\n140:         return ''.join(random.choice(string.ascii_letters) for _ in xrange(length))",
+  "source_summary": "Request arguments (medium, address, room_id, sender) and additional substitution values including user-provided sender_display_name, room_name, etc. are processed into substitutions dictionary",
+  "sink_summary": "Email Subject header via template substitution in res/invite_template_vector.eml, ultimately sent via SMTP",
+  "guard_summary": "Header class from email.header provides MIME encoding for safe header injection prevention; template uses %(subject_header_value)s placeholder",
+  "risk_pattern": "User-controlled values from HTTP request arguments are substituted into email subject template, then properly MIME-encoded for header safety",
+  "used_variable_sources": [
+    "request.args (user input)",
+    "configuration template 'email.invite.subject'"
+  ],
+  "called_function_context": [
+    "Header.encode()",
+    "sendEmail()",
+    "self.sydent.cfg.get()"
+  ],
+  "enclosing_conditions": [
+    "medium == 'email'",
+    "required substitution keys present"
+  ],
+  "context_summary": "Email invitation system where user-provided values are substituted into email subject and body templates, with proper header encoding to prevent injection",
+  "unresolved_facts": [
+    "Exact content of email.invite.subject configuration template",
+    "Full validation of user input values before substitution"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-93",
+      "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+      "fit_reason": "User-controlled values from HTTP request are substituted into email subject template before MIME encoding; CR/LF characters could enable email header injection despite Header encoding",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-113",
+      "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+      "fit_reason": "Similar mechanism to CWE-93 but specific to HTTP headers; code uses Header class for MIME encoding which may not fully prevent all header injection attacks",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-74",
+      "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+      "fit_reason": "User input used in email template substitution could allow injection into email headers or body through format string manipulation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-77",
+      "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+      "fit_reason": "Template substitution with user input could potentially affect downstream email processing, though less direct than command injection",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-113",
+    "CWE-1236",
+    "CWE-200",
+    "CWE-208",
+    "CWE-348",
+    "CWE-571",
+    "CWE-628",
+    "CWE-685",
+    "CWE-687",
+    "CWE-74",
+    "CWE-77",
+    "CWE-79",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 99,
+      "statement": "subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')",
+      "cwe_id": "CWE-93",
+      "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "The code uses Python's email.header.Header class which properly encodes headers for MIME compliance, preventing CRLF injection by design. The Header class handles encoding of special characters including CR/LF sequences."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "User-controlled values from HTTP request arguments (sender_display_name, room_name, etc.) flow through substitutions dictionary into the email subject template via string formatting, then to email header encoding."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "This line adds proper MIME header encoding using the Header class. If reverted, user input would be directly interpolated into email headers without encoding protection."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "CRLF neutralization for email headers",
+          "control_requirement_evidence": "CWE-93 requires neutralization of CRLF sequences when user input flows into contexts where CRLF has special meaning (like email headers)",
+          "existing_controls_checked": [
+            "Python email.header.Header class which provides MIME-compliant header encoding"
+          ],
+          "deficiency_evidence": "The Header class implementation properly handles CRLF encoding, making this control effective. No deficiency is demonstrated."
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No concrete impact is demonstrated because the Header encoding prevents CRLF injection. The patch adds protection rather than exposing vulnerability."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, user-controlled values would be directly interpolated into email headers without MIME encoding, potentially allowing header injection attacks.",
+      "supporting_evidence": [
+        "User-controlled values from HTTP request flow into email subject template via substitutions dictionary",
+        "Email headers are a context where CRLF sequences have special meaning"
+      ],
+      "contradicting_evidence": [
+        "Python's email.header.Header class properly encodes headers and neutralizes CRLF sequences by design",
+        "The code explicitly uses MIME encoding ('utf8') which handles special characters safely"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Exact content of email.invite.subject configuration template",
+        "Whether user input undergoes additional validation before substitution"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.39,
+      "score": 0.39
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 99,
+      "statement": "subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')",
+      "cwe_id": "CWE-113",
+      "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-113 specifically targets HTTP request/response headers, but this code handles email headers via SMTP, which uses different protocols and injection vectors"
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "User-controlled values from HTTP request arguments flow into email subject header construction, but the path ends at SMTP email generation, not HTTP response headers"
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "The patch adds proper MIME header encoding using Python's email.header.Header class, which provides protection against email header injection attacks"
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "The Header class provides MIME encoding for safe header construction",
+          "required_control": "Proper encoding/neutralization of CRLF sequences in headers",
+          "control_requirement_evidence": "Email headers require proper encoding to prevent header injection and SMTP command injection",
+          "existing_controls_checked": [
+            "email.header.Header class for MIME encoding"
+          ],
+          "deficiency_evidence": "The patch demonstrates adding proper header encoding where it may have been missing before"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No evidence of HTTP response splitting; potential impact would be email header injection affecting SMTP delivery, not HTTP protocol manipulation"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, email subject headers would not be properly MIME-encoded, potentially allowing email header injection attacks through user-controlled substitution values.",
+      "supporting_evidence": [
+        "User-controlled values from HTTP request arguments flow into email subject construction",
+        "The code handles header-like data that requires proper encoding"
+      ],
+      "contradicting_evidence": [
+        "CWE-113 specifically targets HTTP protocol headers, but this code generates SMTP email headers",
+        "The vulnerability mechanism involves HTTP request/response splitting, not email header injection"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether user input values contain CRLF sequences that could affect email headers",
+        "Exact content and validation of the email.invite.subject template"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.38,
+      "score": 0.38
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 99,
+      "statement": "subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')",
+      "cwe_id": "CWE-74",
+      "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "The code demonstrates proper neutralization using MIME header encoding, which is the correct defense against injection, not the vulnerability itself"
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "User-controlled input from request.args flows through substitutions dictionary to email subject template, but the Header class properly encodes it"
+        },
+        "diff_causality": {
+          "score": 0.1,
+          "evidence": "The candidate line adds proper MIME encoding, which prevents injection rather than creating it"
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "The Header class provides proper MIME encoding control that neutralizes special characters in email headers",
+          "required_control": "Proper encoding/neutralization of special characters in email headers",
+          "control_requirement_evidence": "CWE-74 requires neutralization of special elements that could modify parsing by downstream components",
+          "existing_controls_checked": [
+            "Header class from email.header module provides MIME encoding"
+          ],
+          "deficiency_evidence": "The control is properly implemented, not deficient - Header.encode() correctly handles special characters for email headers"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No demonstrated injection impact; the code implements proper encoding that prevents injection"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the email subject would not be properly MIME-encoded, potentially allowing header injection vulnerabilities that this patch prevents",
+      "supporting_evidence": [
+        "User-controlled values from request.args flow into substitutions dictionary",
+        "Substitutions are used in email.invite.subject template via string formatting"
+      ],
+      "contradicting_evidence": [
+        "The Header class properly encodes the subject with MIME encoding ('utf8' parameter)",
+        "subject_header.encode() is called to apply the encoding before use",
+        "This is a defensive patch adding proper neutralization, not introducing vulnerability"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Exact content of email.invite.subject configuration template",
+        "Whether user input validation occurs before template substitution"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.19,
+      "score": 0.19
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 99,
+      "statement": "subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')",
+      "cwe_id": "CWE-77",
+      "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "The code constructs an email header using user input, but email headers are not commands. CWE-77 specifically requires construction of commands (OS/shell commands, SQL queries, etc.) that are executed by a downstream component."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "User-controlled input from request.args flows through substitutions dictionary into email subject template, then to email header encoding and email sending"
+        },
+        "diff_causality": {
+          "score": 0.3,
+          "evidence": "The patch adds proper MIME header encoding, which is a security improvement rather than introducing vulnerability. Reverting would remove proper encoding but not create command injection."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "Command parameterization or input validation for command execution",
+          "control_requirement_evidence": "CWE-77 requires controls to prevent command injection when constructing executable commands",
+          "existing_controls_checked": [
+            "MIME header encoding for email safety",
+            "Template substitution with user input"
+          ],
+          "deficiency_evidence": "No command execution is demonstrated; the code sends email headers, not commands to an interpreter"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No command execution mechanism is present; the code constructs email headers for SMTP transmission, not executable commands"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the email subject header would not be properly MIME-encoded, potentially allowing header injection but not command injection.",
+      "supporting_evidence": [
+        "User input from request.args flows into email subject construction",
+        "Template substitution with % formatting"
+      ],
+      "contradicting_evidence": [
+        "The code constructs email headers, not executable commands",
+        "No shell, SQL, or other command interpreter is invoked",
+        "The Header class provides MIME encoding for email safety, not command execution"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Exact content of email.invite.subject configuration template",
+        "Downstream email processing behavior beyond SMTP transmission"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.23000000000000004,
+      "score": 0.23000000000000004
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,255 @@
+{
+  "candidate_id": "candidate-6",
+  "filepath": "lib/send.js",
+  "changed_line": 418,
+  "statement": "path = resolve(path)",
+  "change_type": "A",
+  "function_name": "SendStream.prototype.pipe",
+  "operation_type": "path_resolution",
+  "selection_reason": "User-controlled path without root -> resolve() -> ensures absolute path resolution for security",
+  "security_relevance_score": 0.7,
+  "code_context": "269: \n270: /**\n271:  * Respond with 304 not modified.\n272:  *\n273:  * @api private\n274:  */\n275: \n276: SendStream.prototype.notModified = function(){\n277:   var res = this.res;\n278:   debug('not modified');\n279:   this.removeContentHeaderFields();\n280:   res.statusCode = 304;\n281:   res.end();\n282: };\n283: \n284: /**\n285:  * Raise error that headers already sent.\n286:  *\n287:  * @api private\n288:  */\n289: \n290: SendStream.prototype.headersAlreadySent = function headersAlreadySent(){\n291:   var err = new Error('Can\\'t set headers after they are sent.');\n292:   debug('headers already sent');\n293:   this.error(500, err);\n294: };\n295: \n296: /**\n297:  * Check if the request is cacheable, aka\n298:  * responded with 2xx or 304 (see RFC 2616 section 14.2{5,6}).\n299:  *\n300:  * @return {Boolean}\n301:  * @api private\n302:  */\n303: \n304: SendStream.prototype.isCachable = function(){\n305:   var res = this.res;\n306:   return (res.statusCode >= 200 && res.statusCode < 300) || 304 == res.statusCode;\n307: };\n308: \n309: /**\n310:  * Handle stat() error.\n311:  *\n312:  * @param {Error} err\n313:  * @api private\n314:  */\n315: \n316: SendStream.prototype.onStatError = function(err){\n317:   var notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR'];\n318:   if (~notfound.indexOf(err.code)) return this.error(404, err);\n319:   this.error(500, err);\n320: };\n321: \n322: /**\n323:  * Check if the cache is fresh.\n324:  *\n325:  * @return {Boolean}\n326:  * @api private\n327:  */\n328: \n329: SendStream.prototype.isFresh = function(){\n330:   return fresh(this.req.headers, this.res._headers);\n331: };\n332: \n333: /**\n334:  * Check if the range is fresh.\n335:  *\n336:  * @return {Boolean}\n337:  * @api private\n338:  */\n339: \n340: SendStream.prototype.isRangeFresh = function isRangeFresh(){\n341:   var ifRange = this.req.headers['if-range'];\n342: \n343:   if (!ifRange) return true;\n344: \n345:   return ~ifRange.indexOf('\"')\n346:     ? ~ifRange.indexOf(this.res._headers['etag'])\n347:     : Date.parse(this.res._headers['last-modified']) <= Date.parse(ifRange);\n348: };\n349: \n350: /**\n351:  * Redirect to `path`.\n352:  *\n353:  * @param {String} path\n354:  * @api private\n355:  */\n356: \n357: SendStream.prototype.redirect = function(path){\n358:   if (listenerCount(this, 'directory') !== 0) {\n359:     return this.emit('directory');\n360:   }\n361: \n362:   if (this.hasTrailingSlash()) return this.error(403);\n363:   var res = this.res;\n364:   path += '/';\n365:   res.statusCode = 301;\n366:   res.setHeader('Content-Type', 'text/html; charset=utf-8');\n367:   res.setHeader('Location', path);\n368:   res.end('Redirecting to <a href=\"' + escapeHtml(path) + '\">' + escapeHtml(path) + '</a>\\n');\n369: };\n370: \n371: /**\n372:  * Pipe to `res.\n373:  *\n374:  * @param {Stream} res\n375:  * @return {Stream} res\n376:  * @api public\n377:  */\n378: \n379: SendStream.prototype.pipe = function(res){\n380:   var self = this\n381:     , args = arguments\n382:     , root = this._root;\n383: \n384:   // references\n385:   this.res = res;\n386: \n387:   // decode the path\n388:   var path = utils.decode(this.path)\n389:   if (path === -1) return this.error(400)\n390: \n391:   // null byte(s)\n392:   if (~path.indexOf('\\0')) return this.error(400);\n393: \n394:   var parts\n395:   if (root !== null) {\n396:     // join / normalize from optional root dir\n397:     path = normalize(join(root, path))\n398: \n399:     // malicious path\n400:     if (path.substr(0, root.length) !== root) {\n401:       debug('malicious path \"%s\"', path)\n402:       return this.error(403)\n403:     }\n404: \n405:     // explode path parts\n406:     parts = path.substr(root.length + 1).split(sep)\n407:   } else {\n408:     // \"..\" is malicious without \"root\"\n409:     if (upPathRegexp.test(path)) {\n410:       debug('malicious path \"%s\"', path)\n411:       return this.error(403)\n412:     }\n413: \n414:     // explode path parts\n415:     parts = normalize(path).split(sep)\n416: \n417:     // resolve the path\n418:     path = resolve(path)\n419:   }\n420: \n421:   // dotfile handling\n422:   if (containsDotFile(parts)) {\n423:     var access = this._hidden\n424:       ? 'allow'\n425:       : 'ignore'\n426: \n427:     debug('%s dotfile \"%s\"', access, path)\n428:     switch (access) {\n429:       case 'allow':\n430:         break\n431:       case 'ignore':\n432:       default:\n433:         return this.error(404)\n434:     }\n435:   }\n436: \n437:   // index file support\n438:   if (this._index.length && this.hasTrailingSlash()) {\n439:     this.sendIndex(path);\n440:     return res;\n441:   }\n442: \n443:   debug('stat \"%s\"', path);\n444:   fs.stat(path, function(err, stat){\n445:     if (err) return self.onStatError(err);\n446:     if (stat.isDirectory()) return self.redirect(self.path);\n447:     self.emit('file', path, stat);\n448:     self.send(path, stat);\n449:   });\n450: \n451:   return res;\n452: };\n453: \n454: /**\n455:  * Transfer `path`.\n456:  *\n457:  * @param {String} path\n458:  * @api public\n459:  */\n460: \n461: SendStream.prototype.send = function(path, stat){\n462:   var options = this.options;\n463:   var len = stat.size;\n464:   var res = this.res;\n465:   var req = this.req;\n466:   var ranges = req.headers.range;\n467:   var offset = options.start || 0;\n468: \n469:   if (res._header) {\n470:     // impossible to send now\n471:     return this.headersAlreadySent();\n472:   }\n473: \n474:   debug('pipe \"%s\"', path)\n475: \n476:   // set header fields\n477:   this.setHeader(path, stat);\n478: \n479:   // set content-type\n480:   this.type(path);\n481: \n482:   // conditional GET support\n483:   if (this.isConditionalGET()\n484:     && this.isCachable()\n485:     && this.isFresh()) {\n486:     return this.notModified();\n487:   }\n488: \n489:   // adjust len to start/end options\n490:   len = Math.max(0, len - offset);\n491:   if (options.end !== undefined) {\n492:     var bytes = options.end - offset + 1;\n493:     if (len > bytes) len = bytes;\n494:   }\n495: \n496:   // Range support\n497:   if (ranges) {\n498:     ranges = parseRange(len, ranges);\n499: \n500:     // If-Range support\n501:     if (!this.isRangeFresh()) {\n502:       debug('range stale');\n503:       ranges = -2;\n504:     }\n505: \n506:     // unsatisfiable\n507:     if (-1 == ranges) {\n508:       debug('range unsatisfiable');\n509:       res.setHeader('Content-Range', 'bytes */' + stat.size);\n510:       return this.error(416);\n511:     }\n512: \n513:     // valid (syntactically invalid/multiple ranges are treated as a regular response)\n514:     if (-2 != ranges && ranges.length === 1) {\n515:       debug('range %j', ranges);\n516: \n517:       options.start = offset + ranges[0].start;\n518:       options.end = offset + ranges[0].end;\n519: \n520:       // Content-Range\n521:       res.statusCode = 206;\n522:       res.setHeader('Content-Range', 'bytes '\n523:         + ranges[0].start\n524:         + '-'\n525:         + ranges[0].end\n526:         + '/'\n527:         + len);\n528:       len = options.end - options.start + 1;\n529:     }\n530:   }\n531: \n532:   // content-length\n533:   res.setHeader('Content-Length', len);\n534: \n535:   // HEAD support\n536:   if ('HEAD' == req.method) return res.end();\n537: \n538:   this.stream(path, options);\n539: };\n540: \n541: /**\n542:  * Transfer index for `path`.\n543:  *\n544:  * @param {String} path\n545:  * @api private\n546:  */\n547: SendStream.prototype.sendIndex = function sendIndex(path){\n548:   var i = -1;\n549:   var self = this;\n550: \n551:   function next(err){\n552:     if (++i >= self._index.length) {\n553:       if (err) return self.onStatError(err);\n554:       return self.error(404);\n555:     }\n556: \n557:     var p = path + self._index[i];\n558: \n559:     debug('stat \"%s\"', p);\n560:     fs.stat(p, function(err, stat){\n561:       if (err) return next(err);\n562:       if (stat.isDirectory()) return next();\n563:       self.emit('file', p, stat);\n564:       self.send(p, stat);\n565:     });\n566:   }\n567: ",
+  "source_summary": "this.path comes from SendStream constructor parameter, which is typically user-controlled request path",
+  "sink_summary": "fs.stat(path) and this.send(path, stat) for file system operations",
+  "guard_summary": "Null byte check, '..' path traversal check via upPathRegexp, dotfile handling with _hidden option, root directory confinement when root is set",
+  "risk_pattern": "User-controlled path resolved to absolute path without root confinement, then used in file system operations",
+  "used_variable_sources": [
+    "this.path (constructor parameter)",
+    "path (resolved absolute path)"
+  ],
+  "called_function_context": [
+    "utils.decode",
+    "normalize",
+    "resolve (path.resolve)",
+    "containsDotFile",
+    "fs.stat",
+    "this.send"
+  ],
+  "enclosing_conditions": [
+    "root === null (no root directory set)",
+    "!upPathRegexp.test(path) (no parent directory traversal)"
+  ],
+  "context_summary": "When no root directory is configured, user path is normalized, checked for '..' patterns, then resolved to absolute path before file operations",
+  "unresolved_facts": [
+    "Specific validation in utils.decode function",
+    "Exact behavior of upPathRegexp pattern matching",
+    "Whether path.resolve provides any security benefits over normalization alone"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "User-controlled path resolved to absolute path without root confinement; path used in fs.stat and file operations; matches path traversal mechanism",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-23",
+      "cwe_name": "Relative Path Traversal",
+      "fit_reason": "Path resolution when root is null uses relative path checks; '..' detection but absolute path resolution may bypass; relative traversal risk",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "fit_reason": "Resolved absolute path may contain symlinks; fs.stat follows symlinks; link following could lead to unintended file access",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-119",
+    "CWE-178",
+    "CWE-20",
+    "CWE-200",
+    "CWE-22",
+    "CWE-23",
+    "CWE-367",
+    "CWE-425",
+    "CWE-561",
+    "CWE-59",
+    "CWE-676",
+    "CWE-693",
+    "CWE-754",
+    "CWE-829",
+    "CWE-843",
+    "CWE-863",
+    "CWE-912"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "lib/send.js",
+      "changed_line": 418,
+      "statement": "path = resolve(path)",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The CWE-22 mechanism requires constructing a pathname intended for a restricted directory but failing to neutralize special elements, allowing escape. The candidate adds `resolve(path)` which converts a relative path to absolute but does not itself restrict the resolved location. The existing guard `upPathRegexp.test(path)` blocks '..' sequences in the *input* path, but `resolve()` could still produce an absolute path outside any intended root when `root === null`. The exact CWE mechanism of escaping a *restricted directory* is not fully demonstrated because no parent directory restriction is established when `root === null`."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "`this.path` is user-controlled request path (source summary). It is decoded, checked for null bytes, and when `root === null`, normalized and passed to `resolve(path)`. The resulting `path` variable is used directly in `fs.stat(path, ...)` and later `this.send(path, stat)` (sink). The connection from external input to file operation sink is concrete and demonstrated in the code flow."
+        },
+        "diff_causality": {
+          "score": 0.3,
+          "evidence": "The added line `path = resolve(path)` converts a normalized relative path to an absolute path. If reverted, `path` would remain the normalized relative path (from `normalize(path)`). The absolute vs. relative difference could affect how `fs.stat` interprets the path relative to the current working directory, but the existing guard `upPathRegexp.test(path)` already blocks '..' in the input. The change does not materially create, expose, or weaken a path traversal mechanism; it changes path representation but not the security boundary. The patch may be intended to ensure absolute resolution, but the causal link to a new or modified vulnerability is weak."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "The required control for CWE-22 is proper limitation of the pathname to a restricted directory (e.g., chroot, root directory, access control). The evidence shows that when `root !== null`, a root confinement check (`path.substr(0, root.length) !== root`) exists. When `root === null`, the only control is the `upPathRegexp` check blocking '..' in the input path. No restriction to a specific parent directory is demonstrated for the `root === null` case. The `resolve()` call does not add a restriction; it only makes the path absolute. The deficiency is that without a `root`, there is no restricted directory boundary, but that is a design choice, not a demonstrated bypass of an intended restriction. The control requirement for CWE-22 assumes an intended restricted directory; if none is intended, the CWE may not apply.",
+          "required_control": "Restriction of resolved path to a specific parent directory (e.g., chroot, root directory, sandbox).",
+          "control_requirement_evidence": "CWE-22 defines the weakness as improper limitation to a restricted directory. The mechanism requires an intended restricted parent directory that is bypassed.",
+          "existing_controls_checked": [
+            "`upPathRegexp` blocks '..' sequences in input path when `root === null`.",
+            "`root` confinement check (`path.substr(0, root.length) !== root`) when `root !== null`."
+          ],
+          "deficiency_evidence": "When `root === null`, there is no demonstrated restricted directory boundary to bypass. The `upPathRegexp` prevents directory traversal via '..' but does not define a restricted parent. The `resolve()` call does not introduce a restriction. Therefore, the required control (limitation to a restricted directory) is not present, but its absence is not a deficiency because no such restriction is evidenced as intended."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "A concrete security consequence (e.g., reading files outside intended directory) is not demonstrated because the intended restricted directory is not established. When `root === null`, the allowed file set is not defined. The `upPathRegexp` prevents '..' but the absolute path after `resolve()` could still point anywhere the process has permissions. Impact is speculative without evidence of an intended confinement boundary being bypassed."
+        }
+      },
+      "diff_counterfactual": "If the candidate line `path = resolve(path)` were reverted, `path` would remain the normalized relative path (`normalize(path)`). `fs.stat` would then interpret that path relative to the current working directory instead of as an absolute path. This might affect behavior if the working directory changes, but does not materially alter the security controls: the `upPathRegexp` still blocks '..' in input, and no root confinement exists when `root === null`.",
+      "supporting_evidence": [
+        "User-controlled `this.path` flows to `fs.stat(path, ...)` and `this.send(path, stat)`.",
+        "When `root === null`, the code path includes the candidate line `path = resolve(path)`.",
+        "The `upPathRegexp` check blocks '..' sequences in the input path, indicating path traversal is a concern."
+      ],
+      "contradicting_evidence": [
+        "The `upPathRegexp` check prevents directory traversal via '..' in the input path before `resolve()` is called.",
+        "When `root !== null`, a separate root confinement check exists; the candidate line is not executed in that branch.",
+        "No evidence shows an intended restricted directory when `root === null`; thus, the CWE-22 premise of escaping a restricted directory is not established."
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether there is an implicit intended restricted directory (e.g., current working directory or a document root) when `root === null`.",
+        "Whether `resolve()` introduces any security benefit or risk relative to the normalized relative path.",
+        "Whether downstream code or deployment expects a restricted directory that is not evidenced in this file."
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.41000000000000003,
+      "score": 0.41000000000000003
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "lib/send.js",
+      "changed_line": 418,
+      "statement": "path = resolve(path)",
+      "cwe_id": "CWE-23",
+      "cwe_name": "Relative Path Traversal",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-23 requires improper neutralization of '..' sequences that allow escaping restricted directories. The code has explicit '..' detection via upPathRegexp.test(path) that returns 403 error, which prevents the CWE-23 mechanism."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "User-controlled this.path is decoded, checked for null bytes, then when root is null, checked for '..' patterns, normalized, resolved to absolute path, and passed to fs.stat() and this.send() for file operations."
+        },
+        "diff_causality": {
+          "score": 0.1,
+          "evidence": "The path resolution occurs after the '..' detection that would block traversal attempts. If the candidate line were removed, the path would remain normalized but not resolved to absolute, which doesn't materially affect the security mechanism since traversal is already blocked."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "Proper neutralization of '..' sequences to prevent directory traversal",
+          "control_requirement_evidence": "CWE-23 requires that '..' sequences are not properly handled, allowing escape from restricted directories",
+          "existing_controls_checked": [
+            "upPathRegexp.test(path) that detects and blocks paths containing '..' patterns with 403 error"
+          ],
+          "deficiency_evidence": "The control is present and effective - paths with '..' are explicitly blocked before reaching the path resolution"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No concrete impact is demonstrated because the '..' detection control prevents the traversal mechanism from being triggered."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the path would remain normalized but not resolved to absolute path. Since the '..' detection occurs before resolution and blocks traversal attempts, the security posture would not materially change.",
+      "supporting_evidence": [
+        "User-controlled this.path flows through path processing to file system operations",
+        "Path resolution occurs in the code path when no root directory is configured"
+      ],
+      "contradicting_evidence": [
+        "Explicit '..' detection via upPathRegexp.test(path) returns 403 error before path resolution",
+        "The path resolution occurs after the traversal protection, so it cannot bypass the existing control"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Exact pattern matching behavior of upPathRegexp",
+        "Whether path resolution provides any security benefits in this context"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.25,
+      "score": 0.25
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "lib/send.js",
+      "changed_line": 418,
+      "statement": "path = resolve(path)",
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-59 requires improper resolution of links/symlinks before file access. The code uses fs.stat which follows symlinks by default, but the patch adds path.resolve() which normalizes paths but does not inherently create or worsen link following behavior."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "User-controlled this.path is decoded, normalized, checked for '..' patterns, then resolved to absolute path before being passed to fs.stat() which follows symlinks."
+        },
+        "diff_causality": {
+          "score": 0.1,
+          "evidence": "The patch adds path.resolve() call. If reverted, the code would use normalized relative path instead of absolute path, but both paths would still be subject to symlink following by fs.stat()."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "symlink validation or non-following file operations",
+          "control_requirement_evidence": "CWE-59 requires preventing unintended resource access through symlinks",
+          "existing_controls_checked": [
+            "fs.stat follows symlinks by default",
+            "No symlink validation is present"
+          ],
+          "deficiency_evidence": "The code lacks symlink validation, but the patch does not create or worsen this deficiency"
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "Potential unauthorized file access if symlinks point outside intended directory, but impact depends on server configuration and symlink presence"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would use normalized relative paths instead of absolute paths, but both would still be processed by fs.stat() which follows symlinks, so the link following behavior would remain unchanged.",
+      "supporting_evidence": [
+        "fs.stat() follows symlinks by default",
+        "User-controlled path flows to file operations"
+      ],
+      "contradicting_evidence": [
+        "The patch adds path resolution but doesn't introduce symlink following - it was already present",
+        "CWE-59 requires improper resolution, but the resolution added is standard path normalization"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether symlinks exist in the deployment environment",
+        "Whether root directory confinement is properly configured",
+        "Specific behavior of fs.stat with different path formats"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.22000000000000003,
+      "score": 0.22000000000000003
+    }
+  ],
+  "stage4_status": "completed"
+}

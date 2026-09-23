@@ -1,0 +1,90 @@
+{
+  "candidate_id": "candidate-5",
+  "filepath": "tests/test_mandrill_webhooks.py",
+  "changed_line": 37,
+  "statement": "full_url = test_client_path.replace(\"://\", \"://\" + auth + \"@\")",
+  "change_type": "A",
+  "function_name": "mandrill_args",
+  "operation_type": "URL construction with embedded credentials",
+  "selection_reason": "auth credentials -> embed into URL -> test signature construction",
+  "security_relevance_score": 0.4,
+  "code_context": "1: import json\n2: from datetime import datetime\n3: # noinspection PyUnresolvedReferences\n4: from six.moves.urllib.parse import urljoin\n5: \n6: import hashlib\n7: import hmac\n8: from base64 import b64encode\n9: from django.core.exceptions import ImproperlyConfigured\n10: from django.test import override_settings\n11: from django.utils.timezone import utc\n12: from mock import ANY\n13: \n14: from anymail.signals import AnymailTrackingEvent\n15: from anymail.webhooks.mandrill import MandrillTrackingWebhookView\n16: \n17: from .webhook_cases import WebhookTestCase, WebhookBasicAuthTestsMixin\n18: \n19: TEST_WEBHOOK_KEY = 'TEST_WEBHOOK_KEY'\n20: \n21: \n22: def mandrill_args(events=None,\n23:                   host=\"http://testserver/\",  # Django test-client default\n24:                   path='/anymail/mandrill/tracking/',  # Anymail urlconf default\n25:                   auth=\"username:password\",  # WebhookTestCase default\n26:                   key=TEST_WEBHOOK_KEY):\n27:     \"\"\"Returns TestClient.post kwargs for Mandrill webhook call with events\n28: \n29:     Computes correct signature.\n30:     \"\"\"\n31:     if events is None:\n32:         events = []\n33:     test_client_path = urljoin(host, path)  # https://testserver/anymail/mandrill/tracking/\n34:     if auth:\n35:         # we can get away with this simplification in these controlled tests,\n36:         # but don't ever construct urls like this in production code -- it's not safe!\n37:         full_url = test_client_path.replace(\"://\", \"://\" + auth + \"@\")\n38:     else:\n39:         full_url = test_client_path\n40:     mandrill_events = json.dumps(events)\n41:     signed_data = full_url + 'mandrill_events' + mandrill_events\n42:     signature = b64encode(hmac.new(key=key.encode('ascii'),\n43:                                    msg=signed_data.encode('utf-8'),\n44:                                    digestmod=hashlib.sha1).digest())\n45:     return {\n46:         'path': test_client_path,\n47:         'data': {'mandrill_events': mandrill_events},\n48:         'HTTP_X_MANDRILL_SIGNATURE': signature,\n49:     }\n50: \n51: \n52: class MandrillWebhookSettingsTestCase(WebhookTestCase):\n53:     def test_requires_webhook_key(self):\n54:         with self.assertRaisesRegex(ImproperlyConfigured, r'MANDRILL_WEBHOOK_KEY'):\n55:             self.client.post('/anymail/mandrill/tracking/',\n56:                              data={'mandrill_events': '[]'})\n57: \n58:     def test_head_does_not_require_webhook_key(self):\n59:         # Mandrill issues an unsigned HEAD request to verify the wehbook url.\n60:         # Only *after* that succeeds will Mandrill will tell you the webhook key.\n61:         # So make sure that HEAD request will go through without any key set:\n62:         response = self.client.head('/anymail/mandrill/tracking/')\n63:         self.assertEqual(response.status_code, 200)\n64: \n65: \n66: @override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)\n67: class MandrillWebhookSecurityTestCase(WebhookTestCase, WebhookBasicAuthTestsMixin):\n68:     should_warn_if_no_auth = False  # because we check webhook signature\n69: \n70:     def call_webhook(self):\n71:         kwargs = mandrill_args([{'event': 'send'}])\n72:         return self.client.post(**kwargs)\n73: \n74:     # Additional tests are in WebhookBasicAuthTestsMixin\n75: \n76:     def test_verifies_correct_signature(self):\n77:         kwargs = mandrill_args([{'event': 'send'}])\n78:         response = self.client.post(**kwargs)\n79:         self.assertEqual(response.status_code, 200)\n80: \n81:     def test_verifies_missing_signature(self):\n82:         response = self.client.post('/anymail/mandrill/tracking/',\n83:                                     data={'mandrill_events': '[{\"event\":\"send\"}]'})\n84:         self.assertEqual(response.status_code, 400)\n85: \n86:     def test_verifies_bad_signature(self):\n87:         kwargs = mandrill_args([{'event': 'send'}], key=\"wrong API key\")\n88:         response = self.client.post(**kwargs)\n89:         self.assertEqual(response.status_code, 400)\n90: \n91:     @override_settings(ANYMAIL={})  # clear WEBHOOK_AUTHORIZATION from WebhookTestCase\n92:     def test_no_basic_auth(self):\n93:         # Signature validation should work properly if you're not using basic auth\n94:         self.clear_basic_auth()\n95:         kwargs = mandrill_args([{'event': 'send'}], auth=\"\")\n96:         response = self.client.post(**kwargs)\n97:         self.assertEqual(response.status_code, 200)\n98: \n99:     @override_settings(ANYMAIL={\n100:         \"MANDRILL_WEBHOOK_URL\": \"https://abcde:12345@example.com/anymail/mandrill/tracking/\",\n101:         \"WEBHOOK_AUTHORIZATION\": \"abcde:12345\",\n102:     })\n103:     def test_webhook_url_setting(self):\n104:         # If Django can't build_absolute_uri correctly (e.g., because your proxy\n105:         # frontend isn't setting the proxy headers correctly), you must set\n106:         # MANDRILL_WEBHOOK_URL to the actual public url where Mandrill calls the webhook.\n107:         self.set_basic_auth(\"abcde\", \"12345\")\n108:         kwargs = mandrill_args([{'event': 'send'}], host=\"https://example.com/\", auth=\"abcde:12345\")\n109:         response = self.client.post(SERVER_NAME=\"127.0.0.1\", **kwargs)\n110:         self.assertEqual(response.status_code, 200)\n111: \n112:     # override WebhookBasicAuthTestsMixin version of this test\n113:     @override_settings(ANYMAIL={'WEBHOOK_AUTHORIZATION': ['cred1:pass1', 'cred2:pass2']})\n114:     def test_supports_credential_rotation(self):\n115:         \"\"\"You can supply a list of basic auth credentials, and any is allowed\"\"\"\n116:         self.set_basic_auth('cred1', 'pass1')\n117:         response = self.client.post(**mandrill_args(auth=\"cred1:pass1\"))\n118:         self.assertEqual(response.status_code, 200)\n119: \n120:         self.set_basic_auth('cred2', 'pass2')\n121:         response = self.client.post(**mandrill_args(auth=\"cred2:pass2\"))\n122:         self.assertEqual(response.status_code, 200)\n123: \n124:         self.set_basic_auth('baduser', 'wrongpassword')\n125:         response = self.client.post(**mandrill_args(auth=\"baduser:wrongpassword\"))\n126:         self.assertEqual(response.status_code, 400)\n127: \n128: \n129: @override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)\n130: class MandrillTrackingTestCase(WebhookTestCase):\n131: \n132:     def test_head_request(self):\n133:         # Mandrill verifies webhooks at config time with a HEAD request\n134:         response = self.client.head('/anymail/mandrill/tracking/')\n135:         self.assertEqual(response.status_code, 200)\n136: \n137:     def test_post_request_invalid_json(self):\n138:         kwargs = mandrill_args()\n139:         kwargs['data'] = {'mandrill_events': \"GARBAGE DATA\"}\n140:         response = self.client.post(**kwargs)\n141:         self.assertEqual(response.status_code, 400)\n142: \n143:     def test_send_event(self):\n144:         raw_events = [{\n145:             \"event\": \"send\",\n146:             \"msg\": {\n147:                 \"ts\": 1461095211,  # time send called\n148:                 \"subject\": \"Webhook Test\",\n149:                 \"email\": \"recipient@example.com\",\n150:                 \"sender\": \"sender@example.com\",\n151:                 \"tags\": [\"tag1\", \"tag2\"],\n152:                 \"metadata\": {\"custom1\": \"value1\", \"custom2\": \"value2\"},\n153:                 \"_id\": \"abcdef012345789abcdef012345789\"\n154:             },\n155:             \"_id\": \"abcdef012345789abcdef012345789\",\n156:             \"ts\": 1461095246  # time of event\n157:         }]\n158:         response = self.client.post(**mandrill_args(events=raw_events))\n159:         self.assertEqual(response.status_code, 200)\n160:         kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillTrackingWebhookView,\n161:                                                       event=ANY, esp_name='Mandrill')\n162:         event = kwargs['event']\n163:         self.assertIsInstance(event, AnymailTrackingEvent)\n164:         self.assertEqual(event.event_type, \"sent\")\n165:         self.assertEqual(event.timestamp, datetime(2016, 4, 19, 19, 47, 26, tzinfo=utc))\n166:         self.assertEqual(event.esp_event, raw_events[0])\n167:         self.assertEqual(event.message_id, \"abcdef012345789abcdef012345789\")\n168:         self.assertEqual(event.recipient, \"recipient@example.com\")\n169:         self.assertEqual(event.tags, [\"tag1\", \"tag2\"])\n170:         self.assertEqual(event.metadata, {\"custom1\": \"value1\", \"custom2\": \"value2\"})\n171: \n172:     def test_hard_bounce_event(self):\n173:         raw_events = [{\n174:             \"event\": \"hard_bounce\",\n175:             \"msg\": {\n176:                 \"ts\": 1461095211,  # time send called\n177:                 \"subject\": \"Webhook Test\",\n178:                 \"email\": \"bounce@example.com\",\n179:                 \"sender\": \"sender@example.com\",\n180:                 \"bounce_description\": \"bad_mailbox\",\n181:                 \"bgtools_code\": 10,\n182:                 \"diag\": \"smtp;550 5.1.1 The email account that you tried to reach does not exist.\",\n183:                 \"_id\": \"abcdef012345789abcdef012345789\"\n184:             },\n185:             \"_id\": \"abcdef012345789abcdef012345789\",\n186:             \"ts\": 1461095246  # time of event",
+  "source_summary": "auth parameter (default 'username:password') is passed to function; test_client_path is constructed from host and path parameters using urljoin",
+  "sink_summary": "full_url is used in HMAC signature computation for Mandrill webhook verification; signature is included in HTTP_X_MANDRILL_SIGNATURE header",
+  "guard_summary": "Comment explicitly warns 'don't ever construct urls like this in production code -- it's not safe!'; Production code uses proper URL parsing with urlsplit/urlunsplit in get_request_uri",
+  "risk_pattern": "Test code constructs URLs by string replacement to embed credentials for signature verification, mimicking production behavior but with unsafe string manipulation",
+  "used_variable_sources": [
+    "auth function parameter (default 'username:password')",
+    "test_client_path from urljoin(host, path)",
+    "host parameter (default 'http://testserver/')",
+    "path parameter (default '/anymail/mandrill/tracking/')"
+  ],
+  "called_function_context": [
+    "urljoin from six.moves.urllib.parse",
+    "json.dumps for events serialization",
+    "hmac.new with SHA1 for signature generation",
+    "b64encode for signature encoding"
+  ],
+  "enclosing_conditions": [
+    "if auth: condition (line 34)",
+    "else branch provides fallback without auth (line 39)"
+  ],
+  "context_summary": "Test helper function constructs webhook call parameters including signature; mimics production signature verification which includes basic auth in URL for HMAC computation",
+  "unresolved_facts": [],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "fit_reason": "String replacement of credentials into URL for HMAC signature computation represents insecure credential handling in security-sensitive context",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-93",
+      "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+      "fit_reason": "String replacement in URL construction could allow injection of CRLF sequences affecting signature computation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-113",
+      "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+      "fit_reason": "URL manipulation through string replacement could lead to header splitting vulnerabilities in signature context",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-347",
+      "cwe_name": "Improper Verification of Cryptographic Signature",
+      "fit_reason": "Unsafe URL construction method could lead to signature verification bypass through URL manipulation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-697",
+      "cwe_name": "Incorrect Comparison",
+      "fit_reason": "String replacement URL construction may produce non-canonical URLs leading to incorrect signature comparisons",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-113",
+    "CWE-208",
+    "CWE-22",
+    "CWE-255",
+    "CWE-340",
+    "CWE-347",
+    "CWE-390",
+    "CWE-628",
+    "CWE-643",
+    "CWE-670",
+    "CWE-685",
+    "CWE-697",
+    "CWE-74",
+    "CWE-78",
+    "CWE-90",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25"
+}

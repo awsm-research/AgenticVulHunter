@@ -1,0 +1,374 @@
+{
+  "candidate_id": "candidate-6",
+  "filepath": "src/sandstorm/backup.c++",
+  "changed_line": 143,
+  "statement": "Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();",
+  "change_type": "A",
+  "function_name": "BackupMain::run",
+  "operation_type": "external_command_execution",
+  "selection_reason": "executes unzip on user-controlled archive content -> potential archive extraction vulnerabilities",
+  "security_relevance_score": 0.8,
+  "code_context": "1: // Sandstorm - Personal Cloud Sandbox\n2: // Copyright (c) 2015 Sandstorm Development Group, Inc. and contributors\n3: // All rights reserved.\n4: //\n5: // Licensed under the Apache License, Version 2.0 (the \"License\");\n6: // you may not use this file except in compliance with the License.\n7: // You may obtain a copy of the License at\n8: //\n9: //   http://www.apache.org/licenses/LICENSE-2.0\n10: //\n11: // Unless required by applicable law or agreed to in writing, software\n12: // distributed under the License is distributed on an \"AS IS\" BASIS,\n13: // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: // See the License for the specific language governing permissions and\n15: // limitations under the License.\n16: \n17: #include \"backup.h\"\n18: #include \"util.h\"\n19: #include \"version.h\"\n20: #include <kj/debug.h>\n21: #include <sched.h>\n22: #include <sys/mount.h>\n23: #include <sys/syscall.h>\n24: #include <sys/stat.h>\n25: #include <sys/types.h>\n26: \n27: namespace sandstorm {\n28: \n29: class BackupMain: public AbstractMain {\n30: public:\n31:   BackupMain(kj::ProcessContext& context): context(context) {}\n32: \n33:   kj::MainFunc getMain() override {\n34:     return kj::MainBuilder(context, \"Sandstorm version \" SANDSTORM_VERSION,\n35:                            \"Backs up the grain directory in <grain> to <file>, reading the grain \"\n36:                            \"metadata struct on stdin. Or, restores the backup in <file>, \"\n37:                            \"unpacking it to <grain>, and writing the metadata to stdout. In \"\n38:                            \"backup mode, <file> can be `-` to write the data to stdout.\")\n39:         .addOption({'r', \"restore\"}, KJ_BIND_METHOD(*this, setRestore),\n40:                    \"Restore a backup, rather than create a backup.\")\n41:         .addOptionWithArg({\"root\"}, KJ_BIND_METHOD(*this, setRoot), \"<root>\",\n42:                    \"Set the \\\"root directory\\\" to map in, which contains the zip/unzip binaries.\")\n43:         .expectArg(\"<file>\", KJ_BIND_METHOD(*this, setFile))\n44:         .expectArg(\"<grain>\", KJ_BIND_METHOD(*this, run))\n45:         .build();\n46:   }\n47: \n48: private:\n49:   kj::ProcessContext& context;\n50:   bool restore = false;\n51:   kj::StringPtr filename;\n52:   kj::StringPtr root = \"\";\n53: \n54:   bool setRestore() {\n55:     restore = true;\n56:     return true;\n57:   }\n58: \n59:   bool setFile(kj::StringPtr arg) {\n60:     filename = arg;\n61:     return true;\n62:   }\n63: \n64:   bool setRoot(kj::StringPtr arg) {\n65:     root = arg;\n66:     return true;\n67:   }\n68: \n69:   void writeSetgroupsIfPresent(const char *contents) {\n70:     KJ_IF_MAYBE(fd, raiiOpenIfExists(\"/proc/self/setgroups\", O_WRONLY | O_CLOEXEC)) {\n71:       kj::FdOutputStream(kj::mv(*fd)).write(contents, strlen(contents));\n72:     }\n73:   }\n74: \n75:   void writeUserNSMap(const char *type, kj::StringPtr contents) {\n76:     kj::FdOutputStream(raiiOpen(kj::str(\"/proc/self/\", type, \"_map\").cStr(), O_WRONLY | O_CLOEXEC))\n77:         .write(contents.begin(), contents.size());\n78:   }\n79: \n80:   bool run(kj::StringPtr grainDir) {\n81:     uid_t uid = getuid();\n82:     gid_t gid = getgid();\n83: \n84:     KJ_SYSCALL(unshare(CLONE_NEWUSER | CLONE_NEWNS));\n85:     writeSetgroupsIfPresent(\"deny\\n\");\n86:     writeUserNSMap(\"uid\", kj::str(\"1000 \", uid, \" 1\\n\"));\n87:     writeUserNSMap(\"gid\", kj::str(\"1000 \", gid, \" 1\\n\"));\n88: \n89:     // Mount root read-only.\n90:     KJ_SYSCALL(mount(kj::str(root, \"/\").cStr(), \"/tmp\", nullptr,\n91:                      MS_BIND | MS_REC | MS_RDONLY, nullptr));\n92: \n93:     if (access(\"/tmp/dev/null\", F_OK) != 0) {\n94:       // Looks like we need to bind in /dev.\n95:       KJ_SYSCALL(mount(\"/dev\", \"/tmp/dev\", nullptr, MS_BIND, nullptr));\n96:     }\n97: \n98:     // Hide sensitive directories.\n99:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/proc\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n100:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/var\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n101:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/etc\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n102: \n103:     // Mount inner tmpfs.\n104:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/tmp\", \"tmpfs\", 0, \"size=8m,nr_inodes=128,mode=777\"));\n105: \n106:     // Bind in the grain's `data` (=`sandbox`).\n107:     if (restore) {\n108:       KJ_SYSCALL(mkdir(kj::str(grainDir, \"/sandbox\").cStr(), 0770));\n109:     }\n110:     KJ_SYSCALL(mkdir(\"/tmp/tmp/data\", 0700));\n111:     KJ_SYSCALL(mount(kj::str(grainDir, \"/sandbox\").cStr(), \"/tmp/tmp/data\", nullptr,\n112:                      MS_BIND | (restore ? 0 : MS_RDONLY), nullptr));\n113: \n114:     // Bind in the grain's `log`. When restoring, we discard the log.\n115:     if (!restore) {\n116:       KJ_SYSCALL(mknod(\"/tmp/tmp/log\", S_IFREG | 0600, 0));\n117:       KJ_SYSCALL(mount(kj::str(grainDir, \"/log\").cStr(), \"/tmp/tmp/log\", nullptr,\n118:                        MS_BIND | MS_RDONLY, nullptr));\n119:     }\n120: \n121:     // Bind in the file.\n122:     if (restore) {\n123:       KJ_SYSCALL(mknod(\"/tmp/tmp/file.zip\", S_IFREG | 0600, 0));\n124:       KJ_SYSCALL(mount(filename.cStr(), \"/tmp/tmp/file.zip\", nullptr, MS_BIND, nullptr));\n125:     } else if (filename != \"-\") {\n126:       // Instead of binding, just open the file and we'll compress to stdout.\n127:       KJ_SYSCALL(dup2(raiiOpen(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC), STDOUT_FILENO));\n128:     }\n129: \n130:     // Use Andy's ridiculous pivot_root trick to place ourselves into the sandbox.\n131:     // See supervisor-main.c++ for more discussion.\n132:     {\n133:       auto oldRootDir = raiiOpen(\"/\", O_RDONLY | O_DIRECTORY | O_CLOEXEC);\n134:       KJ_SYSCALL(syscall(SYS_pivot_root, \"/tmp\", \"/tmp\"));\n135:       KJ_SYSCALL(fchdir(oldRootDir));\n136:       KJ_SYSCALL(umount2(\".\", MNT_DETACH));\n137:       KJ_SYSCALL(chdir(\"/tmp\"));\n138:     }\n139: \n140:     // TODO(someday): Find a zip library that doesn't suck and use it instead of shelling out\n141:     //   to zip/unzip.\n142:     if (restore) {\n143:       Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();\n144: \n145:       // Read metadata file to stdout.\n146:       kj::FdInputStream in(raiiOpen(\"metadata\", O_RDONLY | O_CLOEXEC));\n147:       kj::FdOutputStream out(STDOUT_FILENO);\n148:       pump(in, out);\n149:     } else {\n150:       // Read stdin to metadata file.\n151:       {\n152:         kj::FdInputStream in(STDIN_FILENO);\n153:         kj::FdOutputStream out(raiiOpen(\"metadata\", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC));\n154:         pump(in, out);\n155:       }\n156: \n157:       Subprocess::Options zipOptions({\"zip\", \"-qy@\", \"-\"});\n158:       auto inPipe = Pipe::make();\n159:       zipOptions.stdin = inPipe.readEnd;\n160:       Subprocess zip(kj::mv(zipOptions));\n161:       inPipe.readEnd = nullptr;\n162: \n163:       {\n164:         kj::FdOutputStream out(kj::mv(inPipe.writeEnd));\n165:         for (auto& entry: listDirectory(\".\")) {\n166:           findFilesToZip(entry, out);\n167:         }\n168:       }\n169: \n170:       zip.waitForSuccess();\n171:     }\n172: \n173:     return true;\n174:   }\n175: \n176:   static void pump(kj::InputStream& in, kj::OutputStream& out) {\n177:     byte buffer[4096];\n178:     while (size_t n = in.tryRead(buffer, 1, sizeof(buffer))) {\n179:       out.write(buffer, n);\n180:     }\n181:   }\n182: \n183:   void findFilesToZip(kj::StringPtr path, kj::OutputStream& out) {\n184:     struct stat stats;\n185:     KJ_SYSCALL(lstat(path.cStr(), &stats));\n186:     if (S_ISREG(stats.st_mode) || S_ISLNK(stats.st_mode)) {\n187:       // Regular file or link can be zipped; write to file stream.\n188:       // If the path contains a newline, we cannot correctly pass it to `zip` since `zip` expects\n189:       // one file per line. For security reasons, we must detect and filter out these files.\n190:       // Hopefully this never happens legitimately?\n191:       if (path.findFirst('\\n') == nullptr) {\n192:         kj::ArrayPtr<const byte> pieces[2];\n193:         pieces[0] = path.asBytes();\n194:         pieces[1] = kj::StringPtr(\"\\n\").asBytes();\n195:         out.write(pieces);\n196:       } else {\n197:         KJ_LOG(ERROR, \"tried to backup file containing newlines\", path);\n198:       }\n199:     } else if (S_ISDIR(stats.st_mode)) {\n200:       // Subdirectory; enumerate contents.\n201:       for (auto& entry: listDirectory(path)) {\n202:         findFilesToZip(kj::str(path, '/', entry), out);\n203:       }\n204:     }\n205:   }\n206: };\n207: \n208: kj::Own<AbstractMain> getBackupMain(kj::ProcessContext& context) {\n209:   return kj::heap<BackupMain>(context);\n210: }\n211: \n212: } // namespace sandstorm\n213: ",
+  "source_summary": "The 'file.zip' argument comes from the 'filename' member variable set via command-line argument parsing. The 'unzip' executable is searched in PATH via Subprocess's default searchPath=true behavior.",
+  "sink_summary": "Executes unzip command with fixed arguments on user-provided archive file, extracting contents to current directory which is a sandboxed environment created via pivot_root.",
+  "guard_summary": "The command executes within a sandbox created via unshare(CLONE_NEWUSER|CLONE_NEWNS), pivot_root, and restricted mounts. However, no validation or sanitization of the archive contents occurs before extraction. The Subprocess class uses execvp() which searches PATH for the unzip binary.",
+  "risk_pattern": "Unvalidated archive extraction of user-controlled file using external unzip command within a sandboxed but potentially insufficiently isolated environment.",
+  "used_variable_sources": [
+    "filename (command-line argument)",
+    "restore (command-line flag)"
+  ],
+  "called_function_context": [
+    "Subprocess constructor uses execvp() for PATH search",
+    "waitForSuccess() waits for process completion"
+  ],
+  "enclosing_conditions": [
+    "if (restore) condition at line 142"
+  ],
+  "context_summary": "The unzip command executes during restore mode on a user-provided archive file mounted from the filesystem. The operation occurs after extensive sandbox setup including namespace isolation and filesystem restrictions.",
+  "unresolved_facts": [
+    "Whether the sandbox environment sufficiently isolates the unzip process from sensitive system resources",
+    "Whether PATH search for unzip binary could be manipulated",
+    "Whether archive contents could exploit unzip vulnerabilities or extract malicious files"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "User-controlled archive extraction without path validation - matches unsafe unpacking pattern",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-88",
+      "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+      "fit_reason": "External unzip command execution with user-influenced filename argument",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-77",
+      "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+      "fit_reason": "External command execution pattern with user-controlled input",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "fit_reason": "Archive extraction could follow symlinks to unintended resources",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-78",
+      "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+      "fit_reason": "OS command execution via external unzip binary",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-22",
+    "CWE-571",
+    "CWE-59",
+    "CWE-628",
+    "CWE-685",
+    "CWE-758",
+    "CWE-77",
+    "CWE-78",
+    "CWE-88",
+    "CWE-94",
+    "CWE-99"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 143,
+      "statement": "Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.3,
+          "evidence": "The exact CWE-22 mechanism requires constructing a pathname from external input that escapes a restricted directory. The demonstrated behavior is executing `unzip` on a user-controlled archive file with fixed extraction arguments. The archive contents could contain path traversal sequences, but the code does not construct a pathname from external input; it passes fixed strings to `unzip`. The vulnerability, if any, would be in `unzip`'s handling of archive entries, not in the product's path construction."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "The user-controlled `filename` command-line argument is bound-mounted as `/tmp/tmp/file.zip` (lines 122-124). The `unzip` command is executed on this file. The archive contents are externally controlled. The extraction target is the current directory, which is the sandboxed `/tmp` after pivot_root. The path from user input (`filename`) to the extraction sink (`unzip`) is concretely demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "The candidate line is added inside the `if (restore)` block. If this line were reverted, the archive extraction would not occur during restore mode, eliminating any potential path traversal via archive extraction. The patch materially creates the extraction behavior."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "",
+          "required_control": "Validation/sanitization of archive entry paths before or during extraction to prevent traversal outside the intended extraction directory.",
+          "control_requirement_evidence": "CWE-22 requires neutralizing special elements in pathnames constructed from external input. When extracting archives, the product should validate that extracted entry paths stay within the target directory.",
+          "existing_controls_checked": [
+            "Sandbox via unshare, pivot_root, and restricted mounts (lines 84-138)",
+            "Fixed extraction arguments `data/*` and `metadata` limit what `unzip` extracts",
+            "No validation of archive entry paths before extraction"
+          ],
+          "deficiency_evidence": "The code does not validate or sanitize archive entry paths. It relies on `unzip`'s behavior and the sandbox. The sandbox restricts the extraction to `/tmp`, but if `unzip` follows symlinks or extracts absolute paths, files could be written outside the intended subdirectory. The deficiency is that archive entry validation is absent."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "If `unzip` extracts archive entries with path traversal sequences (e.g., `../../etc/passwd`) and the sandbox does not prevent it, files could be written outside the intended `data/` subdirectory within the sandbox. The sandbox is isolated via namespaces, but the impact within the sandbox could affect other sandboxed components or escape if the sandbox is insufficient. The consequence is speculative without evidence of `unzip` vulnerability or sandbox bypass."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the `unzip` command would not execute during restore mode, so no archive extraction would occur, eliminating any path traversal risk from archive extraction.",
+      "supporting_evidence": [
+        "User-controlled `filename` is bound-mounted as `file.zip` (lines 122-124).",
+        "`unzip` is executed on this file with fixed arguments `data/*` and `metadata`.",
+        "The extraction occurs in the current directory, which is a sandboxed `/tmp` after pivot_root.",
+        "No validation of archive entry paths is performed before extraction."
+      ],
+      "contradicting_evidence": [
+        "The code does not construct a pathname from external input; it passes fixed strings to `unzip`. The path traversal, if any, would be in `unzip`'s handling of archive entries, not in the product's path construction.",
+        "The sandbox includes namespace isolation and restricted mounts, which may limit the impact."
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether the `unzip` binary is vulnerable to path traversal via archive entries.",
+        "Whether the sandbox environment prevents `unzip` from writing outside the intended directory via symlinks or absolute paths.",
+        "Whether archive contents are attacker-controlled (likely, but not explicitly demonstrated)."
+      ],
+      "review_comment": "The added line executes `unzip` on a user-provided archive file during restore mode. While the extraction arguments are fixed, the archive contents are not validated, potentially allowing path traversal if `unzip` extracts entries with `../` sequences. The sandbox limits the impact, but archive entry validation is missing. To remediate, validate all extracted entry paths from the archive to ensure they remain within the target directory before or during extraction, or use a library that safely restricts extraction paths.",
+      "change_type": "A",
+      "raw_score": 0.5599999999999999,
+      "score": 0.5599999999999999
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 143,
+      "statement": "Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();",
+      "cwe_id": "CWE-88",
+      "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.05,
+          "evidence": "CWE-88 requires improper delimitation of arguments within a constructed command string, allowing an attacker to inject delimiters (like spaces, quotes, semicolons) to alter argument boundaries. The demonstrated command uses a fixed array of string literals: {\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}. The user-provided 'filename' is not interpolated into this command string; it is bound as a separate filesystem object via mount at line 124. No argument construction from user input occurs here."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "User-controlled input 'filename' (command-line argument) is bound via mount to the path \"/tmp/tmp/file.zip\" at line 124. The unzip command at line 143 executes with the fixed argument \"file.zip\", which refers to this bound file. The connection is concrete: the user-provided archive file content is what unzip extracts. However, the connection is via filesystem binding, not via command argument interpolation."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this candidate line were reverted, the unzip command execution during restore mode would not occur. The patch materially adds the extraction of the user-provided archive file. The counterfactual is clear: removal eliminates the extraction operation."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "Required control for CWE-88 is proper delimitation/neutralization of arguments when constructing a command from user input. No such construction occurs; arguments are fixed literals. The relevant control deficiency for CWE-88 is not present. Existing controls checked: command arguments are hardcoded. Deficiency evidence: N/A for CWE-88. (Note: Other controls like archive validation or sandboxing are not required for CWE-88.)",
+          "required_control": "Proper delimitation/neutralization of arguments when constructing a command string from user input",
+          "control_requirement_evidence": "CWE-88 is defined by improper argument delimitation during command string construction, allowing injection of delimiters to alter argument boundaries.",
+          "existing_controls_checked": [
+            "Command arguments are provided as a fixed array of string literals; no string interpolation or concatenation from user input is performed."
+          ],
+          "deficiency_evidence": "No deficiency for CWE-88 mechanism is demonstrated because user input is not used to construct the command arguments. The 'filename' is bound as a filesystem object, not interpolated into the command string."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "For CWE-88, the concrete impact would be argument injection leading to altered command behavior (e.g., executing arbitrary commands). No such injection path is demonstrated. The concrete impact here is extraction of user-controlled archive content within a sandbox, which is a different vulnerability class (e.g., archive extraction)."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the unzip command would not execute during restore mode, and the user-provided archive file would not be extracted.",
+      "supporting_evidence": [
+        "User-provided filename is bound as a filesystem object at line 124.",
+        "The unzip command executes with fixed arguments, including \"file.zip\", which refers to the bound file.",
+        "The command runs within a sandboxed environment created via namespace isolation."
+      ],
+      "contradicting_evidence": [
+        "The command arguments are a fixed array of string literals; no string interpolation or concatenation from user input is present.",
+        "The user-provided 'filename' is not used as a command-line argument to unzip; it is mounted as a file.",
+        "The CWE-88 mechanism requires improper delimitation within a constructed command string, which is not demonstrated."
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether the sandbox environment sufficiently isolates the unzip process from sensitive system resources.",
+        "Whether archive contents could exploit unzip vulnerabilities or extract malicious files.",
+        "Whether PATH search for unzip binary could be manipulated (though not relevant to CWE-88)."
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.39,
+      "score": 0.39
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 143,
+      "statement": "Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();",
+      "cwe_id": "CWE-77",
+      "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "The command arguments are hardcoded literals; 'file.zip' refers to a fixed filename in the sandbox, not user-controlled command elements. No command injection mechanism is demonstrated."
+        },
+        "connection": {
+          "score": 0.15,
+          "evidence": "User-controlled filename is mounted as '/tmp/tmp/file.zip' but the command uses the fixed string 'file.zip'. The connection is indirect through filesystem mounting, not direct command argument injection."
+        },
+        "diff_causality": {
+          "score": 0.3,
+          "evidence": "If this line were reverted, archive extraction functionality would be removed, but the command injection mechanism itself is not created by this specific line since the arguments are hardcoded."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "command argument validation/sanitization",
+          "control_requirement_evidence": "CWE-77 requires validation of user input used in command construction",
+          "existing_controls_checked": [
+            "hardcoded command arguments prevent injection",
+            "sandbox environment provides isolation"
+          ],
+          "deficiency_evidence": "No deficiency demonstrated for CWE-77 since command arguments are fixed literals, not user-controlled"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No command injection impact is demonstrated since the command arguments are hardcoded and cannot be modified by user input in a way that would alter the command structure."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the unzip command execution would not occur, but the command injection vulnerability mechanism would remain unchanged since the arguments are hardcoded.",
+      "supporting_evidence": [
+        "External command execution pattern using Subprocess class"
+      ],
+      "contradicting_evidence": [
+        "Command arguments are hardcoded literals: 'unzip', '-q', 'file.zip', 'data/*', 'metadata'",
+        "User input is mounted as a file, not passed as command arguments"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether the sandbox environment sufficiently isolates the unzip process",
+        "Whether PATH search for unzip binary could be manipulated"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.16999999999999998,
+      "score": 0.16999999999999998
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 143,
+      "statement": "Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();",
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-59 specifically addresses link resolution during file access operations. The candidate executes unzip on an archive file, but the vulnerability mechanism would require the unzip binary itself to improperly resolve links when accessing files within the archive or during extraction, which is not demonstrated."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "User-controlled filename is mounted as file.zip and passed to unzip command. The connection exists from external input to archive extraction operation."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The added line introduces archive extraction functionality during restore mode. If reverted, no archive extraction would occur, but the link-following vulnerability would not exist since the operation wouldn't happen."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "The sandbox environment provides some isolation but no specific link resolution controls are implemented. The unzip binary's behavior regarding symlink handling is not validated or constrained.",
+          "required_control": "Proper symlink resolution validation during archive extraction",
+          "control_requirement_evidence": "CWE-59 requires controls to prevent following unintended symlinks during file operations",
+          "existing_controls_checked": [
+            "Sandbox isolation via unshare/pivot_root",
+            "Filesystem namespace restrictions"
+          ],
+          "deficiency_evidence": "No validation of unzip's symlink handling behavior or constraints on link resolution during extraction"
+        },
+        "concrete_impact": {
+          "score": 0.15,
+          "evidence": "No evidence demonstrates that unzip would improperly follow symlinks or that malicious archive contents could exploit this specific vulnerability. The sandbox environment may mitigate potential impacts."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the restore functionality would not extract the archive, eliminating the extraction operation entirely but also removing the potential attack surface.",
+      "supporting_evidence": [
+        "User-controlled filename is passed to unzip command for archive extraction",
+        "Archive extraction occurs within a sandboxed environment"
+      ],
+      "contradicting_evidence": [
+        "CWE-59 requires improper link resolution during file access, but the evidence shows archive extraction without demonstrating link resolution behavior",
+        "The sandbox environment may prevent access to unintended resources even if links were followed"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether the unzip binary improperly resolves symlinks during extraction",
+        "Whether archive contents could contain malicious symlinks that would be followed",
+        "Whether the sandbox environment sufficiently prevents unintended resource access via symlinks"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.22999999999999998,
+      "score": 0.22999999999999998
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 143,
+      "statement": "Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();",
+      "cwe_id": "CWE-78",
+      "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "The code uses fixed command arguments with no user input interpolation into the command string. CWE-78 requires injection of special elements into OS commands, but all arguments are hardcoded literals."
+        },
+        "connection": {
+          "score": 0.25,
+          "evidence": "User-controlled 'filename' is mounted as 'file.zip' but this occurs via filesystem binding, not command argument construction. The command arguments themselves are static."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "If this line were reverted, the archive extraction functionality would be removed, but the command injection mechanism itself is not created by this specific line since the arguments are fixed."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "No command injection controls are needed or missing since no user input is interpolated into command arguments. The fixed arguments provide inherent protection against command injection.",
+          "required_control": "neutralization of special elements in command arguments",
+          "control_requirement_evidence": "CWE-78 requires validation/sanitization when user input is incorporated into command strings",
+          "existing_controls_checked": [
+            "fixed command arguments prevent interpolation",
+            "filesystem binding separates data from command construction"
+          ],
+          "deficiency_evidence": "No deficiency exists for command injection since user input is not used in command construction"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No command injection impact is demonstrated since the command arguments are hardcoded and cannot be modified by user input."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the unzip command execution would be removed, eliminating archive extraction functionality but not affecting command injection vulnerability since no injection mechanism exists.",
+      "supporting_evidence": [
+        "External command execution via Subprocess class",
+        "User-controlled filename is processed by the command"
+      ],
+      "contradicting_evidence": [
+        "All command arguments are hardcoded string literals",
+        "No user input interpolation into command string",
+        "Filename is passed via filesystem binding, not command construction"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether PATH search for unzip binary could be manipulated",
+        "Whether archive contents could exploit unzip vulnerabilities"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.22000000000000003,
+      "score": 0.22000000000000003
+    }
+  ],
+  "stage4_status": "completed"
+}

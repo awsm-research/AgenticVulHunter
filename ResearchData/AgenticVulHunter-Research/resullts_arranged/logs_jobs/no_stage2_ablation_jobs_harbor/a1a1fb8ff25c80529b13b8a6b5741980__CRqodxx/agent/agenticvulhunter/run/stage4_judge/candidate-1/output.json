@@ -1,0 +1,210 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "index.js",
+  "changed_line": 250,
+  "statement": "var srcpath = path.resolve(cwd, header.linkname)",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "path_construction",
+  "selection_reason": "observable input (header.linkname) -> path resolution -> potential path traversal vulnerability",
+  "security_relevance_score": 0.7,
+  "code_context": "101:     }\n102: \n103:     if (stat.isDirectory()) {\n104:       header.size = 0\n105:       header.type = 'directory'\n106:       header = map(header) || header\n107:       return pack.entry(header, onnextentry)\n108:     }\n109: \n110:     if (stat.isSymbolicLink()) {\n111:       header.size = 0\n112:       header.type = 'symlink'\n113:       header = map(header) || header\n114:       return onsymlink(filename, header)\n115:     }\n116: \n117:     // TODO: add fifo etc...\n118: \n119:     header = map(header) || header\n120: \n121:     if (!stat.isFile()) {\n122:       if (strict) return pack.destroy(new Error('unsupported type for ' + filename))\n123:       return onnextentry()\n124:     }\n125: \n126:     var entry = pack.entry(header, onnextentry)\n127:     if (!entry) return\n128: \n129:     var rs = mapStream(xfs.createReadStream(path.join(cwd, filename)), header)\n130: \n131:     rs.on('error', function (err) { // always forward errors on destroy\n132:       entry.destroy(err)\n133:     })\n134: \n135:     pump(rs, entry)\n136:   }\n137: \n138:   var onnextentry = function (err) {\n139:     if (err) return pack.destroy(err)\n140:     statNext(onstat)\n141:   }\n142: \n143:   onnextentry()\n144: \n145:   return pack\n146: }\n147: \n148: var head = function (list) {\n149:   return list.length ? list[list.length - 1] : null\n150: }\n151: \n152: var processGetuid = function () {\n153:   return process.getuid ? process.getuid() : -1\n154: }\n155: \n156: var processUmask = function () {\n157:   return process.umask ? process.umask() : 0\n158: }\n159: \n160: exports.extract = function (cwd, opts) {\n161:   if (!cwd) cwd = '.'\n162:   if (!opts) opts = {}\n163: \n164:   var xfs = opts.fs || fs\n165:   var ignore = opts.ignore || opts.filter || noop\n166:   var map = opts.map || noop\n167:   var mapStream = opts.mapStream || echo\n168:   var own = opts.chown !== false && !win32 && processGetuid() === 0\n169:   var extract = opts.extract || tar.extract()\n170:   var stack = []\n171:   var now = new Date()\n172:   var umask = typeof opts.umask === 'number' ? ~opts.umask : ~processUmask()\n173:   var dmode = typeof opts.dmode === 'number' ? opts.dmode : 0\n174:   var fmode = typeof opts.fmode === 'number' ? opts.fmode : 0\n175:   var strict = opts.strict !== false\n176: \n177:   if (opts.strip) map = strip(map, opts.strip)\n178: \n179:   if (opts.readable) {\n180:     dmode |= parseInt(555, 8)\n181:     fmode |= parseInt(444, 8)\n182:   }\n183:   if (opts.writable) {\n184:     dmode |= parseInt(333, 8)\n185:     fmode |= parseInt(222, 8)\n186:   }\n187: \n188:   var utimesParent = function (name, cb) { // we just set the mtime on the parent dir again everytime we write an entry\n189:     var top\n190:     while ((top = head(stack)) && name.slice(0, top[0].length) !== top[0]) stack.pop()\n191:     if (!top) return cb()\n192:     xfs.utimes(top[0], now, top[1], cb)\n193:   }\n194: \n195:   var utimes = function (name, header, cb) {\n196:     if (opts.utimes === false) return cb()\n197: \n198:     if (header.type === 'directory') return xfs.utimes(name, now, header.mtime, cb)\n199:     if (header.type === 'symlink') return utimesParent(name, cb) // TODO: how to set mtime on link?\n200: \n201:     xfs.utimes(name, now, header.mtime, function (err) {\n202:       if (err) return cb(err)\n203:       utimesParent(name, cb)\n204:     })\n205:   }\n206: \n207:   var chperm = function (name, header, cb) {\n208:     var link = header.type === 'symlink'\n209:     var chmod = link ? xfs.lchmod : xfs.chmod\n210:     var chown = link ? xfs.lchown : xfs.chown\n211: \n212:     if (!chmod) return cb()\n213:     chmod(name, (header.mode | (header.type === 'directory' ? dmode : fmode)) & umask, function (err) {\n214:       if (err) return cb(err)\n215:       if (!own) return cb()\n216:       if (!chown) return cb()\n217:       chown(name, header.uid, header.gid, cb)\n218:     })\n219:   }\n220: \n221:   extract.on('entry', function (header, stream, next) {\n222:     header = map(header) || header\n223:     header.name = normalize(header.name)\n224:     var name = path.join(cwd, path.join('/', header.name))\n225: \n226:     if (ignore(name, header)) {\n227:       stream.resume()\n228:       return next()\n229:     }\n230: \n231:     var stat = function (err) {\n232:       if (err) return next(err)\n233:       utimes(name, header, function (err) {\n234:         if (err) return next(err)\n235:         if (win32) return next()\n236:         chperm(name, header, next)\n237:       })\n238:     }\n239: \n240:     var onsymlink = function () {\n241:       if (win32) return next() // skip symlinks on win for now before it can be tested\n242:       xfs.unlink(name, function () {\n243:         xfs.symlink(header.linkname, name, stat)\n244:       })\n245:     }\n246: \n247:     var onlink = function () {\n248:       if (win32) return next() // skip links on win for now before it can be tested\n249:       xfs.unlink(name, function () {\n250:         var srcpath = path.resolve(cwd, header.linkname)\n251: \n252:         xfs.link(srcpath, name, function (err) {\n253:           if (err && err.code === 'EPERM' && opts.hardlinkAsFilesFallback) {\n254:             stream = xfs.createReadStream(srcpath)\n255:             return onfile()\n256:           }\n257: \n258:           stat(err)\n259:         })\n260:       })\n261:     }\n262: \n263:     var onfile = function () {\n264:       var ws = xfs.createWriteStream(name)\n265:       var rs = mapStream(stream, header)\n266: \n267:       ws.on('error', function (err) { // always forward errors on destroy\n268:         rs.destroy(err)\n269:       })\n270: \n271:       pump(rs, ws, function (err) {\n272:         if (err) return next(err)\n273:         ws.on('close', stat)\n274:       })\n275:     }\n276: \n277:     if (header.type === 'directory') {\n278:       stack.push([name, header.mtime])\n279:       return mkdirp(name, {fs: xfs}, stat)\n280:     }\n281: \n282:     mkdirp(path.dirname(name), {fs: xfs}, function (err) {\n283:       if (err) return next(err)\n284: \n285:       switch (header.type) {\n286:         case 'file': return onfile()\n287:         case 'link': return onlink()\n288:         case 'symlink': return onsymlink()\n289:       }\n290: \n291:       if (strict) return next(new Error('unsupported type for ' + name + ' (' + header.type + ')'))\n292: \n293:       stream.resume()\n294:       next()\n295:     })\n296:   })\n297: \n298:   return extract\n299: }",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "fit_reason": "The code uses `header.linkname` to create hardlinks without validating the path, allowing potential symlink traversal to unintended resources.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "The use of `path.resolve(cwd, header.linkname)` in link creation can lead to path traversal if `header.linkname` contains directory traversal sequences.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-23",
+      "cwe_name": "Relative Path Traversal",
+      "fit_reason": "The code is vulnerable to relative path traversal because `header.linkname` can contain relative paths that escape the intended extraction directory.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-200",
+    "CWE-22",
+    "CWE-23",
+    "CWE-321",
+    "CWE-59",
+    "CWE-640",
+    "CWE-643",
+    "CWE-77",
+    "CWE-79",
+    "CWE-829",
+    "CWE-912",
+    "CWE-93",
+    "CWE-94"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "index.js",
+      "changed_line": 250,
+      "statement": "var srcpath = path.resolve(cwd, header.linkname)",
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code directly uses `header.linkname` to construct a path for creating hardlinks without validating or sanitizing the linkname, which is the exact mechanism of CWE-59."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The `header.linkname` is externally controlled input from an archive entry and is used directly in path resolution via `path.resolve(cwd, header.linkname)`. This creates a clear connection between attacker-controlled data and the vulnerable operation."
+        },
+        "diff_causality": {
+          "score": 1.0,
+          "evidence": "If this line were reverted or modified to validate/sanitize `header.linkname` before path resolution, it would prevent the vulnerability. The patch directly addresses the mechanism by introducing a path resolution step that does not properly validate the linkname."
+        },
+        "security_control": {
+          "score": 0.9,
+          "evidence": "There is no validation or sanitization of `header.linkname` before it is used in `path.resolve`. The required control is input validation/sanitization to prevent path traversal, which is demonstrably missing.",
+          "required_control": "Input validation/sanitization of linkname",
+          "control_requirement_evidence": "CWE-59 requires that links be resolved properly before file access to prevent unintended resource access. The code does not validate or sanitize the linkname.",
+          "existing_controls_checked": [
+            "No explicit validation of header.linkname",
+            "No canonical path resolution check",
+            "No access control enforcement"
+          ],
+          "deficiency_evidence": "The code directly uses `header.linkname` in `path.resolve(cwd, header.linkname)` without any checks to ensure it does not point outside the intended directory."
+        },
+        "concrete_impact": {
+          "score": 0.8,
+          "evidence": "An attacker can craft a tar entry with a malicious `linkname` that points to a file outside the extraction directory, allowing them to create hardlinks to unintended resources. This leads to path traversal and potential privilege escalation."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would not resolve `header.linkname` against `cwd`, which would prevent creating hardlinks to arbitrary locations outside the intended extraction directory.",
+      "supporting_evidence": [
+        "The code uses `header.linkname` directly in path resolution without validation",
+        "The vulnerable operation occurs in `onlink()` function when creating hardlinks",
+        "The `path.resolve(cwd, header.linkname)` allows traversal if `header.linkname` contains '../'",
+        "The code does not check for or sanitize the linkname to prevent directory traversal"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "The code directly uses externally controlled `header.linkname` in path resolution without validation, allowing attackers to create hardlinks to unintended resources. The fix should validate or sanitize the linkname before resolving it against the extraction directory.",
+      "change_type": "A",
+      "raw_score": 0.9,
+      "score": 0.9
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "index.js",
+      "changed_line": 250,
+      "statement": "var srcpath = path.resolve(cwd, header.linkname)",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The statement `var srcpath = path.resolve(cwd, header.linkname)` directly uses external input (`header.linkname`) in path construction without validation or sanitization, which is the core mechanism of CWE-22 (Path Traversal)."
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "The `header.linkname` input comes from an external tar archive header and is used directly in `path.resolve(cwd, header.linkname)` without any checks or sanitization, creating a clear path from attacker-controlled input to file system access."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If this line were reverted, the hardlink creation would not resolve `header.linkname` against `cwd`, removing the potential for path traversal. The patch adds a direct path resolution that enables the vulnerability."
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "There is no validation or sanitization of `header.linkname` before it's used in `path.resolve`. The required control is input validation/sanitization to prevent directory traversal sequences, which is completely missing.",
+          "required_control": "Input validation/sanitization of external path inputs",
+          "control_requirement_evidence": "CWE-22 requires that all external inputs used in path construction be validated to prevent traversal sequences like '../'.",
+          "existing_controls_checked": [
+            "No explicit validation or sanitization of header.linkname",
+            "No canonical path resolution or access control enforcement"
+          ],
+          "deficiency_evidence": "The code directly uses `header.linkname` without checking for traversal sequences, allowing an attacker to specify paths outside the intended directory."
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "An attacker can create hardlinks that point to files outside the extraction directory by using traversal sequences in `header.linkname`, potentially leading to data modification or access in restricted locations."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would not resolve `header.linkname` against `cwd` when creating hardlinks. This would prevent path traversal vulnerabilities by ensuring that hardlink sources are not constructed using attacker-controlled input in a way that could escape the target directory.",
+      "supporting_evidence": [
+        "The use of `path.resolve(cwd, header.linkname)` directly incorporates external input into path construction",
+        "The `header.linkname` is sourced from tar archive headers and can contain traversal sequences",
+        "The code does not validate or sanitize `header.linkname` before using it in path resolution"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "An attacker can control the `header.linkname` field in tar archives, which is used directly in `path.resolve(cwd, header.linkname)` without validation. This allows path traversal attacks where hardlinks can be created pointing outside the intended extraction directory. The fix should validate that `header.linkname` does not contain directory traversal sequences before resolving it against `cwd`.",
+      "change_type": "A",
+      "raw_score": 0.8,
+      "score": 0.8
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "index.js",
+      "changed_line": 250,
+      "statement": "var srcpath = path.resolve(cwd, header.linkname)",
+      "cwe_id": "CWE-23",
+      "cwe_name": "Relative Path Traversal",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code uses path.resolve(cwd, header.linkname) where header.linkname is external input. This directly enables relative path traversal as the linkname can contain .. sequences that escape the intended extraction directory."
+        },
+        "connection": {
+          "score": 1.0,
+          "evidence": "The external input 'header.linkname' flows directly into path.resolve() without sanitization or validation, creating a clear path from attacker-controlled data to vulnerable filesystem operation (xfs.link)."
+        },
+        "diff_causality": {
+          "score": 1.0,
+          "evidence": "If line 250 were reverted, the code would not resolve the symbolic link source path using the external input 'header.linkname', eliminating the relative path traversal vulnerability."
+        },
+        "security_control": {
+          "score": 1.0,
+          "evidence": "There is no validation or sanitization of header.linkname before it's used in path.resolve(). The code does not implement any control to prevent .. sequences from escaping the cwd.",
+          "required_control": "Path normalization and validation",
+          "control_requirement_evidence": "CWE-23 requires that path construction with external input must prevent escape sequences like '..' from allowing access outside a restricted directory.",
+          "existing_controls_checked": [
+            "No validation of header.linkname before path resolution",
+            "No canonical path check against cwd",
+            "No allowlist or sanitization of symbolic link targets"
+          ],
+          "deficiency_evidence": "The code directly passes external input 'header.linkname' to path.resolve() without any checks to ensure it remains within the extraction directory boundaries."
+        },
+        "concrete_impact": {
+          "score": 1.0,
+          "evidence": "An attacker can specify a linkname like '../../../../etc/passwd' which will resolve outside the intended extraction directory, allowing arbitrary file access or modification when xfs.link() is called."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would not perform path resolution on the external input 'header.linkname', eliminating the vulnerability that allows relative path traversal through symbolic links.",
+      "supporting_evidence": [
+        "The statement 'var srcpath = path.resolve(cwd, header.linkname)' directly uses external input in path construction",
+        "The vulnerable code path is in the 'onlink' function where symbolic links are processed",
+        "The code calls xfs.link(srcpath, name, ...) which can be exploited with a crafted linkname"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "The code constructs a symbolic link source path using external input 'header.linkname' without validation, enabling relative path traversal. An attacker can specify paths like '../etc/passwd' to escape the extraction directory. Add validation to ensure linkname stays within the intended directory boundaries.",
+      "change_type": "A",
+      "raw_score": 1.0,
+      "score": 1.0
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,244 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "src/wagtail_2fa/views.py",
+  "changed_line": 128,
+  "statement": "return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})",
+  "change_type": "A",
+  "function_name": "DeviceDeleteView.get_success_url",
+  "operation_type": "URL construction with user input",
+  "selection_reason": "User ID taken directly from POST data without validation, constructing a redirect URL with an attacker-controlled value, potentially enabling open redirect or confusion.",
+  "security_relevance_score": 0.8,
+  "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+  "source_summary": "user_id taken directly from POST data without validation",
+  "sink_summary": "Constructs redirect URL to wagtail_2fa_device_list view which displays devices for the specified user",
+  "guard_summary": "No validation of user_id parameter; URL pattern expects numeric user_id but POST data is not validated; authentication context unclear",
+  "risk_pattern": "Attacker-controlled user_id from POST data used to construct redirect URL, potentially allowing unauthorized access to other users' 2FA device lists",
+  "used_variable_sources": [
+    "self.request.POST.get('user_id')"
+  ],
+  "called_function_context": [
+    "reverse() - Django URL reversal function"
+  ],
+  "enclosing_conditions": [],
+  "context_summary": "DeviceDeleteView uses POST-supplied user_id for redirect instead of authenticated user's ID, unlike other views that use self.request.user.id",
+  "unresolved_facts": [
+    "Authentication requirements for DeviceDeleteView access",
+    "Whether Wagtail's admin permission system prevents unauthorized access",
+    "If user_id is validated elsewhere in the request flow"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "POST-supplied user_id used for redirect without verifying ownership; other views use authenticated user's ID, suggesting authorization check missing",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "fit_reason": "User-controlled parameter may allow direct access to other users' device list through crafted redirect",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-601",
+      "cwe_name": "URL Redirection to Untrusted Site ('Open Redirect')",
+      "fit_reason": "User input used in URL construction for redirect; though internal URL, pattern matches redirection vulnerability",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1236",
+    "CWE-200",
+    "CWE-208",
+    "CWE-22",
+    "CWE-425",
+    "CWE-471",
+    "CWE-601",
+    "CWE-628",
+    "CWE-687",
+    "CWE-732",
+    "CWE-863",
+    "CWE-93",
+    "CWE-95"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 128,
+      "statement": "return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The code uses user-supplied POST data to determine authorization context (redirect target) instead of the authenticated user's identity, but CWE-863 requires a specific authorization check failure, not just using user input for authorization decisions."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "Attacker-controlled user_id from POST data is directly connected to the redirect URL construction. The wagtail_2fa_device_list view displays devices for the specified user_id, creating a potential authorization bypass path."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "If this candidate line were reverted, the view would need to use a different method to determine the redirect target. The current implementation materially creates a vulnerability by using POST-supplied user_id instead of the authenticated user's ID like other views (lines 94, 117)."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "The required authorization control is verification that the user making the request is authorized to access the target user's 2FA device list.",
+          "required_control": "Authorization verification ensuring users can only access their own device lists",
+          "control_requirement_evidence": "CWE-863 requires proper authorization checks when accessing user-specific resources. Device lists are user-specific sensitive data.",
+          "existing_controls_checked": [
+            "Other views (DeviceCreateView line 94, DeviceUpdateView line 117) use self.request.user.id, suggesting intended authorization pattern"
+          ],
+          "deficiency_evidence": "This view bypasses the established authorization pattern by using POST-supplied user_id without verification, potentially allowing unauthorized access to other users' device lists."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "Potential unauthorized access to view other users' 2FA device lists, but authentication requirements for DeviceDeleteView access are unresolved, limiting impact certainty."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the DeviceDeleteView would need to implement proper authorization by using the authenticated user's ID (like other views) or implement explicit authorization checks, preventing potential unauthorized access to other users' device lists.",
+      "supporting_evidence": [
+        "Line 128 uses self.request.POST.get('user_id') instead of self.request.user.id",
+        "Lines 94 and 117 show correct pattern using authenticated user's ID for the same redirect",
+        "DeviceListView (line 67) displays devices for user_id from URL parameters without ownership verification"
+      ],
+      "contradicting_evidence": [
+        "Authentication context for DeviceDeleteView is unresolved - may have pre-existing authorization checks"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Authentication and authorization requirements for accessing DeviceDeleteView",
+        "Whether Wagtail's admin permission system provides protection",
+        "If user_id validation occurs elsewhere in the request flow"
+      ],
+      "review_comment": "The DeviceDeleteView uses POST-supplied user_id for redirect instead of the authenticated user's ID, unlike other views that correctly use self.request.user.id. This creates a potential authorization bypass where users could be redirected to view other users' 2FA device lists. Use self.request.user.id instead of POST data to ensure users can only access their own device management pages.",
+      "change_type": "A",
+      "raw_score": 0.62,
+      "score": 0.62
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 128,
+      "statement": "return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})",
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "CWE-425 requires inadequate authorization enforcement on restricted resources. The code constructs a redirect URL using user-supplied user_id, but does not demonstrate direct access to unauthorized resources - only URL construction."
+        },
+        "connection": {
+          "score": 0.45,
+          "evidence": "POST-supplied user_id is connected to URL construction for wagtail_2fa_device_list view, which displays devices for the specified user. However, the actual authorization check at the destination view is unresolved."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "The patch changes from using authenticated user's ID (self.request.user.id) to POST-supplied user_id, creating a potential authorization bypass vector if the destination view relies on URL parameters for access control."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "",
+          "required_control": "Authorization verification before accessing user-specific resources",
+          "control_requirement_evidence": "CWE-425 requires proper authorization checks to prevent direct access to restricted resources",
+          "existing_controls_checked": [
+            "DeviceListView.get_queryset() filters by user_id from URL parameters",
+            "Authentication context for DeviceDeleteView is unclear"
+          ],
+          "deficiency_evidence": "The redirect uses user-supplied parameter instead of authenticated user context, potentially bypassing intended authorization if the destination view trusts URL parameters"
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Impact depends on whether DeviceListView properly validates that the requesting user has permission to view the specified user_id's devices, which is unresolved."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the redirect would use the authenticated user's ID (self.request.user.id) instead of POST-supplied user_id, maintaining proper user context for authorization checks.",
+      "supporting_evidence": [
+        "DeviceDeleteView.get_success_url uses POST-supplied user_id instead of authenticated user context",
+        "DeviceListView.get_queryset filters devices by user_id from URL parameters",
+        "Other views in the same file use self.request.user.id for consistency"
+      ],
+      "contradicting_evidence": [
+        "No evidence that DeviceListView lacks proper authorization checks for the user_id parameter",
+        "Authentication requirements for accessing DeviceDeleteView are unresolved"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Authentication and authorization requirements for DeviceDeleteView access",
+        "Whether DeviceListView validates that the requesting user has permission to view the specified user_id's devices",
+        "If user_id parameter validation occurs elsewhere in the request flow"
+      ],
+      "review_comment": "The redirect URL construction uses POST-supplied user_id instead of the authenticated user's context, potentially enabling authorization bypass if the destination view relies on URL parameters without proper validation. Use self.request.user.id to maintain consistent user context and prevent potential forced browsing attacks.",
+      "change_type": "A",
+      "raw_score": 0.41999999999999993,
+      "score": 0.41999999999999993
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 128,
+      "statement": "return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})",
+      "cwe_id": "CWE-601",
+      "cwe_name": "URL Redirection to Untrusted Site ('Open Redirect')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-601 requires redirection to an external/untrusted site. The demonstrated behavior constructs an internal application URL using reverse() to 'wagtail_2fa_device_list', which is an internal Django view, not an external site."
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "POST data 'user_id' is directly connected to URL construction via reverse() function. The path is clear: self.request.POST.get('user_id') → reverse() → redirect URL construction."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "If this candidate line were reverted, the redirect would likely use authenticated user's ID instead of POST-supplied user_id, preventing potential authorization bypass. The change materially introduces user-controlled input into the redirect target."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The required control for CWE-601 is validation/whitelisting of external URLs. However, since this constructs internal URLs, the relevant control is authorization validation for the user_id parameter.",
+          "required_control": "Authorization validation for user_id parameter access",
+          "control_requirement_evidence": "When constructing internal URLs that reference user-specific resources, the application should verify the requesting user has permission to access the target user's data",
+          "existing_controls_checked": [
+            "Django authentication framework",
+            "Wagtail admin permission system"
+          ],
+          "deficiency_evidence": "No validation that the POST-supplied user_id matches the authenticated user or that the user has permission to access other users' 2FA device lists"
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "The demonstrated impact is potential unauthorized access to other users' 2FA device lists, not open redirect to external sites. The consequence is authorization bypass, not external redirection."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the redirect would likely use the authenticated user's ID (self.request.user.id) instead of POST-supplied user_id, preventing potential authorization bypass to other users' device lists.",
+      "supporting_evidence": [
+        "POST data 'user_id' is used directly without validation in URL construction",
+        "Other views in the same file (DeviceCreateView, DeviceUpdateView) use self.request.user.id for the same redirect",
+        "The URL pattern 'wagtail_2fa_device_list' displays 2FA devices for the specified user_id"
+      ],
+      "contradicting_evidence": [
+        "The reverse() function constructs internal Django URLs, not external site URLs",
+        "CWE-601 specifically requires redirection to 'untrusted site' which is not demonstrated",
+        "The target is an internal application view with authentication requirements"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Authentication and authorization requirements for accessing DeviceDeleteView",
+        "Whether Wagtail's permission system prevents unauthorized access to other users' device lists",
+        "If user_id parameter validation occurs elsewhere in the request flow"
+      ],
+      "review_comment": "The code uses POST-supplied user_id to construct a redirect URL to the device list view, unlike other views that use the authenticated user's ID. This could allow unauthorized access to other users' 2FA device information if authentication checks are insufficient. However, this represents an authorization bypass vulnerability rather than an open redirect. Use self.request.user.id instead of POST data to ensure the redirect targets the authenticated user's device list.",
+      "change_type": "A",
+      "raw_score": 0.48,
+      "score": 0.48
+    }
+  ],
+  "stage4_status": "completed"
+}

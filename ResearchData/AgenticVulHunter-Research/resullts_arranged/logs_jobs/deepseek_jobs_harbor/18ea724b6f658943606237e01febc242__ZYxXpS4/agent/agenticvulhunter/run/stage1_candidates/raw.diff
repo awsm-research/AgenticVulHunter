@@ -1,0 +1,664 @@
+diff --git a/bottle.py b/bottle.py
+index 4978ee2..c19f120 100755
+--- a/bottle.py
++++ b/bottle.py
+@@ -23,192 +23,195 @@ __license__ = 'MIT'
+ # This is why we parse the commandline parameters here but handle them later
+ if __name__ == '__main__':
+     from optparse import OptionParser
+     _cmd_parser = OptionParser(usage="usage: %prog [options] package.module:app")
+     _opt = _cmd_parser.add_option
+     _opt("--version", action="store_true", help="show version number.")
+     _opt("-b", "--bind", metavar="ADDRESS", help="bind socket to ADDRESS.")
+     _opt("-s", "--server", default='wsgiref', help="use SERVER as backend.")
+     _opt("-p", "--plugin", action="append", help="install additinal plugin/s.")
+     _opt("--debug", action="store_true", help="start server in debug mode.")
+     _opt("--reload", action="store_true", help="auto-reload on file changes.")
+     _cmd_options, _cmd_args = _cmd_parser.parse_args()
+     if _cmd_options.server and _cmd_options.server.startswith('gevent'):
+         import gevent.monkey; gevent.monkey.patch_all()
+ 
+-import base64, cgi, email.utils, functools, hmac, httplib, imp, itertools, \
+-       mimetypes, os, re, subprocess, sys, tempfile, thread, threading, time, \
+-       urllib, warnings
++import base64, cgi, email.utils, functools, hmac, imp, itertools, mimetypes,\
++        os, re, subprocess, sys, tempfile, threading, time, urllib, warnings
+ 
+-from Cookie import SimpleCookie
+ from datetime import date as datedate, datetime, timedelta
+ from tempfile import TemporaryFile
+ from traceback import format_exc, print_exc
+-from urlparse import urljoin, SplitResult as UrlSplitResult
+-
+-# Workaround for a bug in some versions of lib2to3 (fixed on CPython 2.7 and 3.2)
+-urlencode, urlquote, urlunquote = urllib.urlencode, urllib.quote, urllib.unquote
+-
+-try: from collections import MutableMapping as DictMixin
+-except ImportError: # pragma: no cover
+-    from UserDict import DictMixin
+-
+-try: from urlparse import parse_qs
+-except ImportError: # pragma: no cover
+-    from cgi import parse_qs
+-
+-try: import cPickle as pickle
+-except ImportError: # pragma: no cover
+-    import pickle
+ 
+ try: from json import dumps as json_dumps, loads as json_lds
+ except ImportError: # pragma: no cover
+     try: from simplejson import dumps as json_dumps, loads as json_lds
+-    except ImportError: # pragma: no cover
++    except ImportError:
+         try: from django.utils.simplejson import dumps as json_dumps, loads as json_lds
+-        except ImportError: # pragma: no cover
++        except ImportError:
+             def json_dumps(data):
+                 raise ImportError("JSON support requires Python 2.6 or simplejson.")
+             json_lds = json_dumps
+ 
+-py3k = sys.version_info >= (3,0,0)
+-NCTextIOWrapper = None
+ 
+-if sys.version_info < (2,6,0):
+-    msg = "Python 2.5 support may be dropped in future versions of Bottle."
+-    warnings.warn(msg, DeprecationWarning)
+ 
+-def _e():
+-    return sys.exc_info()[1]
++# We now try to fix 2.5/2.6/3.1/3.2 incompatibilities.
++# It ain't pretty but it works... Sorry for the mess.
+ 
+-_stdout = sys.stdout.write
+-_stderr = sys.stderr.write
++py   = sys.version_info
++py3k = py >= (3,0,0)
++py25 = py <  (2,6,0)
+ 
+-if py3k: # pragma: no cover
+-    json_loads = lambda s: json_lds(touni(s))
+-    # See Request.POST
++# Workaround for the missing "as" keyword in py3k.
++def _e(): return sys.exc_info()[1]
++
++# Workaround for the "print is a keyword/function" dilemma .
++_stdout, _stderr = sys.stdout.write, sys.stderr.write
++
++# Lots of import and builtin differences.
++if py3k:
++    import http.client as httplib
++    import _thread as thread
++    from urllib.parse import urljoin, parse_qs, SplitResult as UrlSplitResult
++    from urllib.parse import urlencode, quote as urlquote, unquote as urlunquote
++    from http.cookies import SimpleCookie
++    from collections import MutableMapping as DictMixin
++    import pickle
+     from io import BytesIO
+-    def touni(x, enc='utf8', err='strict'):
+-        """ Convert anything to unicode """
+-        return str(x, enc, err) if isinstance(x, bytes) else str(x)
+-    if sys.version_info < (3,2,0):
+-        from io import TextIOWrapper
+-        class NCTextIOWrapper(TextIOWrapper):
+-            ''' Garbage collecting an io.TextIOWrapper(buffer) instance closes
+-                the wrapped buffer. This subclass keeps it open. '''
+-            def close(self): pass
++    basestring = str
++    unicode = str
++    json_loads = lambda s: json_lds(touni(s))
++    callable = lambda x: hasattr(x, '__call__')
+ else:
+-    json_loads = json_lds
++    import httplib
++    import thread
++    from urlparse import urljoin, SplitResult as UrlSplitResult
++    from urllib import urlencode, quote as urlquote, unquote as urlunquote
++    from Cookie import SimpleCookie
++    import cPickle as pickle
+     from StringIO import StringIO as BytesIO
+-    bytes = str
+-    def touni(x, enc='utf8', err='strict'):
+-        """ Convert anything to unicode """
+-        return x if isinstance(x, unicode) else unicode(str(x), enc, err)
+-
+-def tob(data, enc='utf8'):
+-    """ Convert anything to bytes """
+-    return data.encode(enc) if isinstance(data, unicode) else bytes(data)
++    if py25:
++        msg = "Python 2.5 support may be dropped in future versions of Bottle."
++        warnings.warn(msg, DeprecationWarning)
++        from cgi import parse_qs
++        from UserDict import DictMixin
++        bytes = str
++    else: # 2.6, 2.7
++        from urlparse import parse_qs
++        from collections import MutableMapping as DictMixin
++    json_loads = json_lds
+ 
++# Some helpers for string/byte handling
++def tob(s, enc='utf8'):
++    return s.encode(enc) if isinstance(s, unicode) else bytes(s)
++def touni(s, enc='utf8', err='strict'):
++    return s.decode(enc, err) if isinstance(s, bytes) else unicode(s)
+ tonat = touni if py3k else tob
+-tonat.__doc__ = """ Convert anything to native strings """
+ 
+-def try_update_wrapper(wrapper, wrapped, *a, **ka):
+-    try: # Bug: functools breaks if wrapper is an instane method
+-        functools.update_wrapper(wrapper, wrapped, *a, **ka)
++# 3.2 fixes cgi.FieldStorage to accept bytes (which makes a lot of sense).
++# 3.1 needs a workaround.
++NCTextIOWrapper = None
++if (3,0,0) < py < (3,2,0):
++    from io import TextIOWrapper
++    class NCTextIOWrapper(TextIOWrapper):
++        def close(self): pass # Keep wrapped buffer open.
++
++# A bug in functools causes it to break if the wrapper is an instance method
++def update_wrapper(wrapper, wrapped, *a, **ka):
++    try: functools.update_wrapper(wrapper, wrapped, *a, **ka)
+     except AttributeError: pass
+ 
+-# Backward compatibility
++
++
++# These helpers are used at module level and need to be defined first.
++# And yes, I know PEP-8, but sometimes a lower-case classname makes more sense.
++
+ def depr(message):
+     warnings.warn(message, DeprecationWarning, stacklevel=3)
+ 
+-
+-# Small helpers
+-def makelist(data):
++def makelist(data): # This is just to handy
+     if isinstance(data, (tuple, list, set, dict)): return list(data)
+     elif data: return [data]
+     else: return []
+ 
+ 
+ class DictProperty(object):
+     ''' Property that maps to a key in a local dict-like attribute. '''
+     def __init__(self, attr, key=None, read_only=False):
+         self.attr, self.key, self.read_only = attr, key, read_only
+ 
+     def __call__(self, func):
+         functools.update_wrapper(self, func, updated=[])
+         self.getter, self.key = func, self.key or func.__name__
+         return self
+ 
+     def __get__(self, obj, cls):
+         if obj is None: return self
+         key, storage = self.key, getattr(obj, self.attr)
+         if key not in storage: storage[key] = self.getter(obj)
+         return storage[key]
+ 
+     def __set__(self, obj, value):
+         if self.read_only: raise AttributeError("Read-Only property.")
+         getattr(obj, self.attr)[self.key] = value
+ 
+     def __delete__(self, obj):
+         if self.read_only: raise AttributeError("Read-Only property.")
+         del getattr(obj, self.attr)[self.key]
+ 
+ 
+-class CachedProperty(object):
++class cached_property(object):
+     ''' A property that is only computed once per instance and then replaces
+         itself with an ordinary attribute. Deleting the attribute resets the
+         property. '''
+ 
+     def __init__(self, func):
+         self.func = func
+ 
+     def __get__(self, obj, cls):
+         if obj is None: return self
+         value = obj.__dict__[self.func.__name__] = self.func(obj)
+         return value
+ 
+-cached_property = CachedProperty
+-
+ 
+-class lazy_attribute(object): # Does not need configuration -> lower-case name
++class lazy_attribute(object):
+     ''' A property that caches itself to the class object. '''
+     def __init__(self, func):
+         functools.update_wrapper(self, func, updated=[])
+         self.getter = func
+ 
+     def __get__(self, obj, cls):
+         value = self.getter(cls)
+         setattr(cls, self.__name__, value)
+         return value
+ 
+ 
+ 
+ 
+ 
+ 
+ ###############################################################################
+ # Exceptions and Events ########################################################
+ ###############################################################################
+ 
+ 
+ class BottleException(Exception):
+     """ A base class for exceptions used by bottle. """
+     pass
+ 
+ 
+-#TODO: These should subclass BaseRequest
+-
++#TODO: This should subclass BaseRequest
+ class HTTPResponse(BottleException):
+     """ Used to break execution and immediately finish the response """
+     def __init__(self, output='', status=200, header=None):
+         super(BottleException, self).__init__("HTTP Response %d" % status)
+         self.status = int(status)
+         self.output = output
+         self.headers = HeaderDict(header) if header else None
+ 
+     def apply(self, response):
+         if self.headers:
+             for key, value in self.headers.iterallitems():
+                 response.headers[key] = value
+         response.status = self.status
+ 
+ 
+@@ -544,31 +547,31 @@ class Bottle(object):
+         ''' Mount an application (:class:`Bottle` or plain WSGI) to a specific
+             URL prefix. Example::
+ 
+                 root_app.mount('/admin/', admin_app)
+ 
+             :param prefix: path prefix or `mount-point`. If it ends in a slash,
+                 that slash is mandatory.
+             :param app: an instance of :class:`Bottle` or a WSGI application.
+ 
+             All other parameters are passed to the underlying :meth:`route` call.
+         '''
+         if isinstance(app, basestring):
+             prefix, app = app, prefix
+             depr('Parameter order of Bottle.mount() changed.') # 0.10
+ 
+-        parts = filter(None, prefix.split('/'))
++        parts = [p for p in prefix.split('/') if p]
+         if not parts: raise ValueError('Empty path prefix.')
+         path_depth = len(parts)
+         options.setdefault('skip', True)
+         options.setdefault('method', 'ANY')
+ 
+         @self.route('/%s/:#.*#' % '/'.join(parts), **options)
+         def mountpoint():
+             try:
+                 request.path_shift(path_depth)
+                 rs = BaseResponse([], 200)
+                 def start_response(status, header):
+                     rs.status = status
+                     for name, value in header: rs.add_header(name, value)
+                     return rs.body.append
+                 rs.body = itertools.chain(rs.body, app(request.environ, start_response))
+@@ -877,52 +880,52 @@ class BaseRequest(DictMixin):
+     @DictProperty('environ', 'bottle.request.headers', read_only=True)
+     def headers(self):
+         ''' A :class:`WSGIHeaderDict` that provides case-insensitive access to
+             HTTP request headers. '''
+         return WSGIHeaderDict(self.environ)
+ 
+     def get_header(self, name, default=None):
+         ''' Return the value of a request header, or a given default value. '''
+         return self.headers.get(name, default)
+ 
+     @DictProperty('environ', 'bottle.request.cookies', read_only=True)
+     def cookies(self):
+         """ Cookies parsed into a :class:`FormsDict`. Signed cookies are NOT
+             decoded. Use :meth:`get_cookie` if you expect signed cookies. """
+         cookies = SimpleCookie(self.environ.get('HTTP_COOKIE',''))
+-        return FormsDict((c.key, c.value) for c in cookies.itervalues())
++        return FormsDict((c.key, c.value) for c in cookies.values())
+ 
+     def get_cookie(self, key, default=None, secret=None):
+         """ Return the content of a cookie. To read a `Signed Cookie`, the
+             `secret` must match the one used to create the cookie (see
+             :meth:`BaseResponse.set_cookie`). If anything goes wrong (missing
+             cookie or wrong signature), return a default value. """
+         value = self.cookies.get(key)
+         if secret and value:
+             dec = cookie_decode(value, secret) # (key, value) tuple or None
+             return dec[1] if dec and dec[0] == key else default
+         return value or default
+ 
+     @DictProperty('environ', 'bottle.request.query', read_only=True)
+     def query(self):
+         ''' The :attr:`query_string` parsed into a :class:`FormsDict`. These
+             values are sometimes called "URL arguments" or "GET parameters", but
+             not to be confused with "URL wildcards" as they are provided by the
+             :class:`Router`. '''
+         data = parse_qs(self.query_string, keep_blank_values=True)
+         get = self.environ['bottle.get'] = FormsDict()
+-        for key, values in data.iteritems():
++        for key, values in data.items():
+             for value in values:
+                 get[key] = value
+         return get
+ 
+     @DictProperty('environ', 'bottle.request.forms', read_only=True)
+     def forms(self):
+         """ Form values parsed from an `url-encoded` or `multipart/form-data`
+             encoded POST or PUT request body. The result is retuned as a
+             :class:`FormsDict`. All keys and values are strings. File uploads
+             are stored separately in :attr:`files`. """
+         forms = FormsDict()
+         for name, item in self.POST.iterallitems():
+             if not hasattr(item, 'filename'):
+                 forms[name] = item
+         return forms
+@@ -1284,31 +1287,31 @@ class BaseResponse(object):
+     def set_header(self, name, value, append=False):
+         ''' Create a new response header, replacing any previously defined
+             headers with the same name. '''
+         if append:
+             self.add_header(name, value)
+         else:
+             self._headers[_hkey(name)] = [str(value)]
+ 
+     def add_header(self, name, value):
+         ''' Add an additional response header, not removing duplicates. '''
+         self._headers.setdefault(_hkey(name), []).append(str(value))
+ 
+     def iter_headers(self):
+         ''' Yield (header, value) tuples, skipping headers that are not
+             allowed with the current response status code. '''
+-        headers = self._headers.iteritems()
++        headers = self._headers.items()
+         bad_headers = self.bad_headers.get(self._status_code)
+         if bad_headers:
+             headers = [h for h in headers if h[0] not in bad_headers]
+         for name, values in headers:
+             for value in values:
+                 yield name, value
+         if self._cookies:
+             for c in self._cookies.values():
+                 yield 'Set-Cookie', c.OutputString()
+ 
+     def wsgiheader(self):
+         depr('The wsgiheader method is deprecated. See headerlist.') #0.10
+         return self.headerlist
+ 
+     @property
+@@ -1367,31 +1370,31 @@ class BaseResponse(object):
+             the content) and not copy-protected (the client can restore an old
+             cookie). The main intention is to make pickling and unpickling
+             save, not to store secret information at client side.
+         '''
+         if not self._cookies:
+             self._cookies = SimpleCookie()
+ 
+         if secret:
+             value = touni(cookie_encode((name, value), secret))
+         elif not isinstance(value, basestring):
+             raise TypeError('Secret key missing for non-string Cookie.')
+ 
+         if len(value) > 4096: raise ValueError('Cookie value to long.')
+         self._cookies[name] = value
+ 
+-        for key, value in options.iteritems():
++        for key, value in options.items():
+             if key == 'max_age':
+                 if isinstance(value, timedelta):
+                     value = value.seconds + value.days * 24 * 3600
+             if key == 'expires':
+                 if isinstance(value, (datedate, datetime)):
+                     value = value.timetuple()
+                 elif isinstance(value, (int, float)):
+                     value = time.gmtime(value)
+                 value = time.strftime("%a, %d %b %Y %H:%M:%S GMT", value)
+             self._cookies[name][key.replace('_', '-')] = value
+ 
+     def delete_cookie(self, key, **kwargs):
+         ''' Delete a cookie. Be sure to use the same `domain` and `path`
+             settings as used to create the cookie. '''
+         kwargs['max_age'] = -1
+@@ -1549,42 +1552,42 @@ class _ImportRedirect(object):
+ 
+ 
+ 
+ ###############################################################################
+ # Common Utilities #############################################################
+ ###############################################################################
+ 
+ 
+ class MultiDict(DictMixin):
+     """ This dict stores multiple values per key, but behaves exactly like a
+         normal dict in that it returns only the newest value for any given key.
+         There are special methods available to access the full list of values.
+     """
+ 
+     def __init__(self, *a, **k):
+-        self.dict = dict((k, [v]) for k, v in dict(*a, **k).iteritems())
++        self.dict = dict((k, [v]) for k, v in dict(*a, **k).items())
+     def __len__(self): return len(self.dict)
+     def __iter__(self): return iter(self.dict)
+     def __contains__(self, key): return key in self.dict
+     def __delitem__(self, key): del self.dict[key]
+     def __getitem__(self, key): return self.dict[key][-1]
+     def __setitem__(self, key, value): self.append(key, value)
+     def iterkeys(self): return self.dict.iterkeys()
+     def itervalues(self): return (v[-1] for v in self.dict.itervalues())
+-    def iteritems(self): return ((k, v[-1]) for (k, v) in self.dict.iteritems())
++    def iteritems(self): return ((k, v[-1]) for (k, v) in self.dict.items())
+     def iterallitems(self):
+-        for key, values in self.dict.iteritems():
++        for key, values in self.dict.items():
+             for value in values:
+                 yield key, value
+ 
+     # 2to3 is not able to fix these automatically.
+     keys     = iterkeys     if py3k else lambda self: list(self.iterkeys())
+     values   = itervalues   if py3k else lambda self: list(self.itervalues())
+     items    = iteritems    if py3k else lambda self: list(self.iteritems())
+     allitems = iterallitems if py3k else lambda self: list(self.iterallitems())
+ 
+     def get(self, key, default=None, index=-1, type=None):
+         ''' Return the most recent value for a key.
+ 
+             :param default: The default value to be returned if the key is not
+                    present or the type conversion fails.
+             :param index: An index for the list of available values.
+@@ -1650,31 +1653,31 @@ class HeaderDict(MultiDict):
+     def __init__(self, *a, **ka):
+         self.dict = {}
+         if a or ka: self.update(*a, **ka)
+ 
+     def __contains__(self, key): return _hkey(key) in self.dict
+     def __delitem__(self, key): del self.dict[_hkey(key)]
+     def __getitem__(self, key): return self.dict[_hkey(key)][-1]
+     def __setitem__(self, key, value): self.dict[_hkey(key)] = [str(value)]
+     def append(self, key, value):
+         self.dict.setdefault(_hkey(key), []).append(str(value))
+     def replace(self, key, value): self.dict[_hkey(key)] = [str(value)]
+     def getall(self, key): return self.dict.get(_hkey(key)) or []
+     def get(self, key, default=None, index=-1):
+         return MultiDict.get(self, _hkey(key), default, index)
+     def filter(self, names):
+-        for name in map(_hkey, names):
++        for name in [_hkey(n) for n in names]:
+             if name in self.dict:
+                 del self.dict[name]
+ 
+ 
+ class WSGIHeaderDict(DictMixin):
+     ''' This dict-like class wraps a WSGI environ dict and provides convenient
+         access to HTTP_* fields. Keys and values are native strings
+         (2.x bytes or 3.x unicode) and keys are case-insensitive. If the WSGI
+         environment contains non-native string values, these are de- or encoded
+         using a lossless 'latin1' character set.
+ 
+         The API will remain stable even on changes to the relevant PEPs.
+         Currently PEP 333, 444 and 3333 are supported. (PEP 444 is the only one
+         that uses non-native strings.)
+     '''
+@@ -1733,31 +1736,31 @@ class ConfigDict(dict):
+         if key not in self and key[0].isupper():
+             self[key] = ConfigDict()
+         return self.get(key)
+ 
+     def __setattr__(self, key, value):
+         if hasattr(dict, key):
+             raise AttributeError('Read-only attribute.')
+         if key in self and self[key] and isinstance(self[key], ConfigDict):
+             raise AttributeError('Non-empty namespace attribute.')
+         self[key] = value
+ 
+     def __delattr__(self, key):
+         if key in self: del self[key]
+ 
+     def __call__(self, *a, **ka):
+-        for key, value in dict(*a, **ka).iteritems(): setattr(self, key, value)
++        for key, value in dict(*a, **ka).items(): setattr(self, key, value)
+         return self
+ 
+ 
+ class AppStack(list):
+     """ A stack-like list. Calling it returns the head of the stack. """
+ 
+     def __call__(self):
+         """ Return the current default application. """
+         return self[-1]
+ 
+     def push(self, value=None):
+         """ Add a new :class:`Bottle` instance to the stack """
+         if not isinstance(value, Bottle):
+             value = Bottle()
+         self.append(value)
+@@ -1972,31 +1975,31 @@ def path_shift(script_name, path_info, shift=1):
+     new_script_name = '/' + '/'.join(scriptlist)
+     new_path_info = '/' + '/'.join(pathlist)
+     if path_info.endswith('/') and pathlist: new_path_info += '/'
+     return new_script_name, new_path_info
+ 
+ 
+ def validate(**vkargs):
+     """
+     Validates and manipulates keyword arguments by user defined callables.
+     Handles ValueError and missing arguments by raising HTTPError(403).
+     """
+     depr('Use route wildcard filters instead.')
+     def decorator(func):
+         @functools.wraps(func)
+         def wrapper(*args, **kargs):
+-            for key, value in vkargs.iteritems():
++            for key, value in vkargs.items():
+                 if key not in kargs:
+                     abort(403, 'Missing parameter: %s' % key)
+                 try:
+                     kargs[key] = value(kargs[key])
+                 except ValueError:
+                     abort(403, 'Wrong parameter format for: %s' % key)
+             return func(*args, **kargs)
+         return wrapper
+     return decorator
+ 
+ 
+ def auth_basic(check, realm="private", text="Access denied"):
+     ''' Callback decorator to require HTTP auth (basic).
+         TODO: Add route(check_auth=...) parameter. '''
+     def decorator(func):
+@@ -2398,31 +2401,31 @@ class FileCheckerThread(threading.Thread):
+     def run(self):
+         exists = os.path.exists
+         mtime = lambda path: os.stat(path).st_mtime
+         files = dict()
+ 
+         for module in sys.modules.values():
+             path = getattr(module, '__file__', '')
+             if path[-4:] in ('.pyo', '.pyc'): path = path[:-1]
+             if path and exists(path): files[path] = mtime(path)
+ 
+         while not self.status:
+             if not exists(self.lockfile)\
+             or mtime(self.lockfile) < time.time() - self.interval - 5:
+                 self.status = 'error'
+                 thread.interrupt_main()
+-            for path, lmtime in files.iteritems():
++            for path, lmtime in files.items():
+                 if not exists(path) or mtime(path) > lmtime:
+                     self.status = 'reload'
+                     thread.interrupt_main()
+                     break
+             time.sleep(self.interval)
+     
+     def __enter__(self):
+         self.start()
+     
+     def __exit__(self, exc_type, exc_val, exc_tb):
+         if not self.status: self.status = 'exit' # silent exit
+         self.join()
+         return issubclass(exc_type, KeyboardInterrupt)
+ 
+ 
+@@ -2447,31 +2450,31 @@ class BaseTemplate(object):
+ 
+     def __init__(self, source=None, name=None, lookup=[], encoding='utf8', **settings):
+         """ Create a new template.
+         If the source parameter (str or buffer) is missing, the name argument
+         is used to guess a template filename. Subclasses can assume that
+         self.source and/or self.filename are set. Both are strings.
+         The lookup, encoding and settings parameters are stored as instance
+         variables.
+         The lookup parameter stores a list containing directory paths.
+         The encoding parameter should be used to decode byte strings or files.
+         The settings parameter contains a dict for engine-specific settings.
+         """
+         self.name = name
+         self.source = source.read() if hasattr(source, 'read') else source
+         self.filename = source.filename if hasattr(source, 'filename') else None
+-        self.lookup = map(os.path.abspath, lookup)
++        self.lookup = [os.path.abspath(x) for x in lookup]
+         self.encoding = encoding
+         self.settings = self.settings.copy() # Copy from class variable
+         self.settings.update(settings) # Apply
+         if not self.source and self.name:
+             self.filename = self.search(self.name, self.lookup)
+             if not self.filename:
+                 raise TemplateError('Template %s not found.' % repr(name))
+         if not self.source and not self.filename:
+             raise TemplateError('No template specified.')
+         self.prepare(**self.settings)
+ 
+     @classmethod
+     def search(cls, name, lookup=[]):
+         """ Search name in all directories specified in lookup.
+         First without, then with common extensions. Return first hit. """
+@@ -2821,31 +2824,31 @@ simpletal_view = functools.partial(view, template_adapter=SimpleTALTemplate)
+ ###############################################################################
+ 
+ 
+ TEMPLATE_PATH = ['./', './views/']
+ TEMPLATES = {}
+ DEBUG = False
+ NORUN = False # If set, run() does nothing. Used by load_app()
+ 
+ #: A dict to map HTTP status codes (e.g. 404) to phrases (e.g. 'Not Found')
+ HTTP_CODES = httplib.responses
+ HTTP_CODES[418] = "I'm a teapot" # RFC 2324
+ HTTP_CODES[428] = "Precondition Required"
+ HTTP_CODES[429] = "Too Many Requests"
+ HTTP_CODES[431] = "Request Header Fields Too Large"
+ HTTP_CODES[511] = "Network Authentication Required"
+-_HTTP_STATUS_LINES = dict((k, '%d %s'%(k,v)) for (k,v) in HTTP_CODES.iteritems())
++_HTTP_STATUS_LINES = dict((k, '%d %s'%(k,v)) for (k,v) in HTTP_CODES.items())
+ 
+ #: The default template used for error pages. Override with @error()
+ ERROR_PAGE_TEMPLATE = """
+ %try:
+     %from bottle import DEBUG, HTTP_CODES, request, touni
+     %status_name = HTTP_CODES.get(e.status, 'Unknown').title()
+     <!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
+     <html>
+         <head>
+             <title>Error {{e.status}}: {{status_name}}</title>
+             <style type="text/css">
+               html {background-color: #eee; font-family: sans;}
+               body {background-color: #fff; border: 1px solid #ddd;
+                     padding: 15px; margin: 15px;}
+               pre {background-color: #eee; border: 1px solid #ddd; padding: 5px;}

@@ -1,0 +1,263 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "index.js",
+      "changed_line": 100,
+      "statement": "const metadata = new IntegrityMetadata(string, opts)",
+      "change_type": "A",
+      "function_name": "_parse",
+      "operation_type": "security_sensitive_parsing",
+      "selection_reason": "parsing options -> strict mode propagation -> affects all SRI parsing operations",
+      "security_relevance_score": 0.6,
+      "code_context": "1: 'use strict'\n2: \n3: const crypto = require('crypto')\n4: const Transform = require('stream').Transform\n5: \n6: const SPEC_ALGORITHMS = ['sha256', 'sha384', 'sha512']\n7: \n8: const BASE64_REGEX = /[a-z0-9+/]+(?:=?=?)/i\n9: const SRI_REGEX = /^([^-]+)-([^?]+)([?\\S*]*)$/\n10: const STRICT_SRI_REGEX = /^([^-]+)-([A-Za-z0-9+/]+(?:=?=?))([?\\x21-\\x7E]*)$/\n11: const VCHAR_REGEX = /[\\x21-\\x7E]+/\n12: \n13: class IntegrityMetadata {\n14:   constructor (metadata, opts) {\n15:     const strict = !!(opts && opts.strict)\n16:     this.source = metadata.trim()\n17:     // 3.1. Integrity metadata\n18:     // https://w3c.github.io/webappsec-subresource-integrity/#integrity-metadata-description\n19:     const match = this.source.match(\n20:       strict\n21:       ? STRICT_SRI_REGEX\n22:       : SRI_REGEX\n23:     )\n24:     if (!match) { return }\n25:     if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }\n26:     this.algorithm = match[1]\n27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)\n194:     checker.on('error', reject)\n195:     checker.on('verified', algo => {\n196:       resolve(algo)\n197:     })\n198:   })\n199: }\n200: \n201: module.exports.createCheckerStream = createCheckerStream\n202: function createCheckerStream (sri, opts) {\n203:   opts = opts || {}\n204:   sri = parse(sri, opts)\n205:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n206:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n207:     return pickAlgorithm(acc, algo) || acc\n208:   })\n209:   const digests = sri[algorithm].map(m => m.digest)\n210:   const hash = crypto.createHash(algorithm)\n211:   const stream = new Transform({\n212:     transform: function (chunk, enc, cb) {\n213:       hash.update(chunk, enc)\n214:       cb(null, chunk, enc)\n215:     },\n216:     flush: function (cb) {\n217:       const digest = hash.digest('base64')\n218:       if (digests.some(d => d === digest)) {\n219:         stream.emit('verified', algorithm)\n220:         return cb()\n221:       } else {\n222:         const err = new Error(`${algorithm} integrity checksum failed`)\n223:         err.code = 'EBADCHECKSUM'\n224:         err.found = digest\n225:         err.expected = digests\n226:         err.algorithm = algorithm\n227:         return cb(err)\n228:       }\n229:     }\n230:   })\n231:   return stream\n232: }\n233: \n234: function getPrioritizedHash (algo1, algo2) {\n235:   return algo1\n236: }",
+      "source_summary": "The 'string' parameter comes from splitting user-provided SRI integrity strings (from checkData/checkStream calls) by whitespace. The 'opts' parameter is passed through from external calls and controls strict mode validation.",
+      "sink_summary": "Parsed metadata flows to cryptographic hash verification in checkData (line 182) and createCheckerStream (line 210), where it determines which hash algorithm to use and what digest values to compare against.",
+      "guard_summary": "Strict mode (opts.strict) enforces: 1) Only SPEC_ALGORITHMS allowed, 2) STRICT_SRI_REGEX pattern matching, 3) Base64 format validation in toString(). Non-strict mode uses more permissive SRI_REGEX. Invalid metadata returns empty/null values preventing downstream use.",
+      "risk_pattern": "Strict mode propagation affects SRI parsing validation - strict mode enforces W3C spec compliance while non-strict allows broader input acceptance, potentially affecting hash algorithm selection and digest validation security.",
+      "used_variable_sources": [
+        "integrity parameter from parse() calls",
+        "opts parameter from external API calls"
+      ],
+      "called_function_context": [
+        "IntegrityMetadata constructor validates and parses SRI strings",
+        "crypto.createHash uses parsed algorithm for digest computation"
+      ],
+      "enclosing_conditions": [
+        "if (metadata.algorithm && metadata.digest) guards downstream usage",
+        "strict mode condition in constructor affects regex selection and algorithm validation"
+      ],
+      "context_summary": "The IntegrityMetadata constructor parses Subresource Integrity strings, with strict mode enforcing W3C specification compliance for algorithm selection and format validation, affecting downstream cryptographic verification.",
+      "unresolved_facts": [
+        "Specific call sites and data sources for the 'integrity' parameter in real usage",
+        "Whether external callers properly validate or sanitize SRI input before passing to parse functions"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "inconsistent security validation between different parsing modes allowing algorithm injection or validation bypass",
+        "sensitive_operation": "cryptographic algorithm selection from parsed input",
+        "missing_control": "consistent validation policy enforcement",
+        "mechanism_keywords": [
+          "algorithm injection",
+          "validation inconsistency",
+          "parsing mode",
+          "security policy",
+          "bypass"
+        ]
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/biased-cryptographic-random",
+          "cwe_id": "CWE-327",
+          "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 58.6067,
+          "raw_bm25_score": 58.6067,
+          "description": "Some mathematical operations on random numbers can cause bias in the results and compromise security.",
+          "pattern": "Identify usage of weak or deprecated cryptographic algorithms and practices",
+          "remediation": "Use modern cryptographic algorithms and proper key management. Avoid deprecated algorithms and implement proper random number generation.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-327"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/weak-cryptographic-algorithm",
+          "cwe_id": "CWE-328",
+          "cwe_name": "Use of Weak Hash",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 31.009,
+          "raw_bm25_score": 31.009,
+          "description": "Using broken or weak cryptographic algorithms can compromise security.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-328. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-327",
+            "external/cwe/cwe-328"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/tainted-format-string-more-sources",
+          "cwe_id": "CWE-134",
+          "cwe_name": "Use of Externally-Controlled Format String",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.1616,
+          "raw_bm25_score": 28.1616,
+          "description": "Using external input in format strings can lead to garbled output.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "experimental",
+            "security",
+            "external/cwe/cwe-134"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/untrusted-data-to-external-api-more-sources",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.0506,
+          "raw_bm25_score": 28.0506,
+          "description": "Data provided remotely is used in this external API without sanitization, which could be a security risk.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "experimental",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/inconsistent-loop-direction",
+          "cwe_id": "CWE-835",
+          "cwe_name": "Loop with Unreachable Exit Condition ('Infinite Loop')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.3903,
+          "raw_bm25_score": 22.3903,
+          "description": "A 'for' loop that increments its loop variable but checks it against a lower bound, or decrements its loop variable but checks it against an upper bound, will either stop iterating immediately or keep iterating indefinitely, and is usually indicative of a typo.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement loop bounds and timeout mechanisms. Add maximum iteration counts. Use break conditions that cannot be controlled by user input.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-835"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 22.0764,
+          "raw_bm25_score": 22.0764,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/cors-permissive-configuration",
+          "cwe_id": "CWE-942",
+          "cwe_name": "Permissive Cross-domain Security Policy with Untrusted Domains",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.0383,
+          "raw_bm25_score": 22.0383,
+          "description": "Cross-origin resource sharing (CORS) policy allows overly broad access.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-942"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/eval-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.3361,
+          "raw_bm25_score": 21.3361,
+          "description": "The 'eval' function and the 'Function' constructor execute strings as code. This is dangerous and impedes program analysis and understanding. Consequently, these two functions should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/missing-x-frame-options",
+          "cwe_id": "CWE-829",
+          "cwe_name": "Inclusion of Functionality from Untrusted Control Sphere",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.0873,
+          "raw_bm25_score": 21.0873,
+          "description": "If the 'X-Frame-Options' setting is not provided, a malicious user may be able to overlay their own UI on top of the site by using an iframe.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-451",
+            "external/cwe/cwe-829"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/file-system-race",
+          "cwe_id": "CWE-367",
+          "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.6146,
+          "raw_bm25_score": 20.6146,
+          "description": "Separately checking the state of a file before operating on it may allow an attacker to modify the file between the two operations.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-367"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

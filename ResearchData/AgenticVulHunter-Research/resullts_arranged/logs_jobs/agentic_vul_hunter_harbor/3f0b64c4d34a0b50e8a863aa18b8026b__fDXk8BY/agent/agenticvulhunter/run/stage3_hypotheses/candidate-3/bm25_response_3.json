@@ -1,0 +1,257 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "index.js",
+      "changed_line": 158,
+      "statement": "const meta = new IntegrityMetadata(",
+      "change_type": "A",
+      "function_name": "fromStream",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "observable input stream data -> digest calculation and metadata construction -> security-sensitive integrity generation",
+      "security_relevance_score": 0.8,
+      "code_context": "9: const SRI_REGEX = /^([^-]+)-([^?]+)([?\\S*]*)$/\n10: const STRICT_SRI_REGEX = /^([^-]+)-([A-Za-z0-9+/]+(?:=?=?))([?\\x21-\\x7E]*)$/\n11: const VCHAR_REGEX = /[\\x21-\\x7E]+/\n12: \n13: class IntegrityMetadata {\n14:   constructor (metadata, opts) {\n15:     const strict = !!(opts && opts.strict)\n16:     this.source = metadata.trim()\n17:     // 3.1. Integrity metadata\n18:     // https://w3c.github.io/webappsec-subresource-integrity/#integrity-metadata-description\n19:     const match = this.source.match(\n20:       strict\n21:       ? STRICT_SRI_REGEX\n22:       : SRI_REGEX\n23:     )\n24:     if (!match) { return }\n25:     if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }\n26:     this.algorithm = match[1]\n27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)\n194:     checker.on('error', reject)\n195:     checker.on('verified', algo => {\n196:       resolve(algo)\n197:     })\n198:   })\n199: }\n200: \n201: module.exports.createCheckerStream = createCheckerStream\n202: function createCheckerStream (sri, opts) {\n203:   opts = opts || {}\n204:   sri = parse(sri, opts)\n205:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n206:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n207:     return pickAlgorithm(acc, algo) || acc\n208:   })\n209:   const digests = sri[algorithm].map(m => m.digest)\n210:   const hash = crypto.createHash(algorithm)\n211:   const stream = new Transform({\n212:     transform: function (chunk, enc, cb) {\n213:       hash.update(chunk, enc)\n214:       cb(null, chunk, enc)\n215:     },\n216:     flush: function (cb) {\n217:       const digest = hash.digest('base64')\n218:       if (digests.some(d => d === digest)) {\n219:         stream.emit('verified', algorithm)\n220:         return cb()\n221:       } else {\n222:         const err = new Error(`${algorithm} integrity checksum failed`)\n223:         err.code = 'EBADCHECKSUM'\n224:         err.found = digest\n225:         err.expected = digests\n226:         err.algorithm = algorithm\n227:         return cb(err)\n228:       }\n229:     }\n230:   })\n231:   return stream\n232: }\n233: \n234: function getPrioritizedHash (algo1, algo2) {\n235:   return algo1\n236: }",
+      "source_summary": "The integrity metadata is constructed from a stream of data. The digest is calculated using crypto.createHash() and base64 encoding, with algorithm and options derived from the stream processing context.",
+      "sink_summary": "The constructed IntegrityMetadata object is used to build an integrity hash for security verification purposes in subresource integrity checks.",
+      "guard_summary": "Security controls include: 1) Algorithm validation against SPEC_ALGORITHMS ['sha256', 'sha384', 'sha512'] in strict mode, 2) Base64 format validation of digest using BASE64_REGEX, 3) Option syntax validation using VCHAR_REGEX, and 4) Input sanitization through regex matching during metadata parsing.",
+      "risk_pattern": "The code constructs integrity metadata from stream data. If the stream is attacker-controlled, it could potentially lead to malformed SRI strings that bypass validation if strict mode is not enforced.",
+      "used_variable_sources": [
+        "algo",
+        "digest",
+        "optString"
+      ],
+      "called_function_context": [
+        "crypto.createHash()",
+        "hash.digest('base64')",
+        "IntegrityMetadata.constructor()"
+      ],
+      "enclosing_conditions": [],
+      "context_summary": "In the fromStream function, a stream is processed to generate integrity metadata. The digest is calculated from the stream data using cryptographic hashing, and then passed to IntegrityMetadata constructor along with algorithm and options. The metadata construction occurs within a Promise that resolves after stream processing completes.",
+      "unresolved_facts": [
+        "Whether the 'opts' parameter passed to IntegrityMetadata constructor contains strict mode settings",
+        "Whether the stream input is attacker-controlled or if there are any validation checks on it before processing"
+      ],
+      "retrieval_query": {
+        "sensitive_operation": "SRI metadata parsing and validation",
+        "missing_control": "Strict mode enforcement for SRI parsing"
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/biased-cryptographic-random",
+          "cwe_id": "CWE-327",
+          "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 45.1224,
+          "raw_bm25_score": 45.1224,
+          "description": "Some mathematical operations on random numbers can cause bias in the results and compromise security.",
+          "pattern": "Identify usage of weak or deprecated cryptographic algorithms and practices",
+          "remediation": "Use modern cryptographic algorithms and proper key management. Avoid deprecated algorithms and implement proper random number generation.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-327"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "fallback/cwe-19-data-processing-errors",
+          "cwe_id": "CWE-19",
+          "cwe_name": "Data Processing Errors",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 34.053,
+          "raw_bm25_score": 34.053,
+          "description": "Legacy category for incorrect handling or transformation of structured data.",
+          "pattern": "cwe-19 data-processing parser parsing malformed-data format-conversion serialization transformation structured-data processing-error",
+          "remediation": "Validate structured input and use safe parsing and conversion routines.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-019"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/eval-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 31.1561,
+          "raw_bm25_score": 31.1561,
+          "description": "The 'eval' function and the 'Function' constructor execute strings as code. This is dangerous and impedes program analysis and understanding. Consequently, these two functions should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/tainted-format-string",
+          "cwe_id": "CWE-134",
+          "cwe_name": "Use of Externally-Controlled Format String",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.6179,
+          "raw_bm25_score": 26.6179,
+          "description": "Using external input in format strings can lead to garbled output.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-134"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/weak-cryptographic-algorithm",
+          "cwe_id": "CWE-328",
+          "cwe_name": "Use of Weak Hash",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.3222,
+          "raw_bm25_score": 26.3222,
+          "description": "Using broken or weak cryptographic algorithms can compromise security.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-328. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-327",
+            "external/cwe/cwe-328"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/unsafe-jquery-plugin",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.4565,
+          "raw_bm25_score": 24.4565,
+          "description": "A jQuery plugin that unintentionally constructs HTML from some of its options may be unsafe to use for clients.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output operations. Implement proper escaping for HTML, JavaScript, CSS, and URL contexts.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-116",
+            "frameworks/jquery"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/regex/unmatchable-caret",
+          "cwe_id": "CWE-561",
+          "cwe_name": "Dead Code",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.1097,
+          "raw_bm25_score": 24.1097,
+          "description": "If a caret assertion '^' appears in a regular expression after another term that cannot match the empty string, then this assertion can never match, so the entire regular expression cannot match any string.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove dead code through static analysis. Use code coverage tools to identify unreachable code. Implement regular code reviews to eliminate unused functionality.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "regular-expressions",
+            "external/cwe/cwe-561"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "fallback/cwe-1321-improperly-controlled-modification-of-object-prototype-attributes-prototype-poll",
+          "cwe_id": "CWE-1321",
+          "cwe_name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 23.7664,
+          "raw_bm25_score": 23.7664,
+          "description": "Attacker-controlled object keys modify Object prototype attributes.",
+          "pattern": "cwe-1321 prototype-pollution __proto__ constructor prototype object-key property-key merge assign recursive-merge",
+          "remediation": "Reject prototype keys and use schema-constrained object updates.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-1321"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/resource-exhaustion-from-deep-object-traversal",
+          "cwe_id": "CWE-400",
+          "cwe_name": "Uncontrolled Resource Consumption",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.4558,
+          "raw_bm25_score": 22.4558,
+          "description": "Processing user-controlled object hierarchies inefficiently can lead to denial of service.",
+          "pattern": "Look for operations that can consume excessive resources without proper limits or controls",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/inconsistent-loop-direction",
+          "cwe_id": "CWE-835",
+          "cwe_name": "Loop with Unreachable Exit Condition ('Infinite Loop')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.5708,
+          "raw_bm25_score": 20.5708,
+          "description": "A 'for' loop that increments its loop variable but checks it against a lower bound, or decrements its loop variable but checks it against an upper bound, will either stop iterating immediately or keep iterating indefinitely, and is usually indicative of a typo.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement loop bounds and timeout mechanisms. Add maximum iteration counts. Use break conditions that cannot be controlled by user input.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-835"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

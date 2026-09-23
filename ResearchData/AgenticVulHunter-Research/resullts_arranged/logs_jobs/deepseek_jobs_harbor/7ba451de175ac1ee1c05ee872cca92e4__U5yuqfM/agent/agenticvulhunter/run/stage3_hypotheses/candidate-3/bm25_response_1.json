@@ -1,0 +1,261 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "index.js",
+      "changed_line": 105,
+      "statement": "if (options.allowedTags && options.allowedTags.indexOf(name) === -1) {",
+      "change_type": "A",
+      "function_name": "sanitizeHtml",
+      "operation_type": "tag_allowlist_check",
+      "selection_reason": "HTML tag name -> indexOf check -> determines if tag is allowed in output",
+      "security_relevance_score": 0.8,
+      "code_context": "1: var htmlparser = require('htmlparser2');\n2: var extend = require('xtend');\n3: var quoteRegexp = require('regexp-quote');\n4: \n5: function each(obj, cb) {\n6:   if (obj) Object.keys(obj).forEach(function (key) {\n7:     cb(obj[key], key);\n8:   });\n9: }\n10: \n11: module.exports = sanitizeHtml;\n12: \n13: // Ignore the _recursing flag; it's there for recursive\n14: // invocation as a guard against this exploit:\n15: // https://github.com/fb55/htmlparser2/issues/105\n16: \n17: function sanitizeHtml(html, options, _recursing) {\n18:   var result = '';\n19: \n20:   function Frame(tag, attribs) {\n21:     var that = this;\n22:     this.tag = tag;\n23:     this.attribs = attribs || {};\n24:     this.tagPosition = result.length;\n25:     this.text = ''; // Node inner text\n26: \n27:     this.updateParentNodeText = function() {\n28:       if (stack.length) {\n29:           var parentFrame = stack[stack.length - 1];\n30:           parentFrame.text += that.text;\n31:       }\n32:     };\n33:   }\n34: \n35:   if (!options) {\n36:     options = sanitizeHtml.defaults;\n37:   } else {\n38:     options = extend(sanitizeHtml.defaults, options);\n39:   }\n40:   // Tags that contain something other than HTML. If we are not allowing\n41:   // these tags, we should drop their content too. For other tags you would\n42:   // drop the tag but keep its content.\n43:   var nonTextTagsArray = [ 'script', 'style' ];\n44:   var allowedAttributesMap;\n45:   var allowedAttributesGlobMap;\n46:   if(options.allowedAttributes) {\n47:     allowedAttributesMap = {};\n48:     allowedAttributesGlobMap = {};\n49:     each(options.allowedAttributes, function(attributes, tag) {\n50:       allowedAttributesMap[tag] = [];\n51:       var globRegex = [];\n52:       attributes.forEach(function(name) {\n53:         if(name.indexOf('*') >= 0) {\n54:           globRegex.push(quoteRegexp(name).replace(/\\\\\\*/g, '.*'));\n55:         } else {\n56:           allowedAttributesMap[tag].push(name);\n57:         }\n58:       });\n59:       allowedAttributesGlobMap[tag] = new RegExp('^(' + globRegex.join('|') + ')$');\n60:     });\n61:   }\n62:   var allowedClassesMap = {};\n63:   each(options.allowedClasses, function(classes, tag) {\n64:     // Implicitly allows the class attribute\n65:     if(allowedAttributesMap) {\n66:       if (!allowedAttributesMap[tag]) {\n67:         allowedAttributesMap[tag] = [];\n68:       }\n69:       allowedAttributesMap[tag].push('class');\n70:     }\n71: \n72:     allowedClassesMap[tag] = classes;\n73:   });\n74: \n75:   var transformTagsMap = {};\n76:   each(options.transformTags, function(transform, tag){\n77:     if (typeof transform === 'function') {\n78:       transformTagsMap[tag] = transform;\n79:     } else if (typeof transform === \"string\") {\n80:       transformTagsMap[tag] = sanitizeHtml.simpleTransform(transform);\n81:     }\n82:   });\n83: \n84:   var depth = 0;\n85:   var stack = [];\n86:   var skipMap = {};\n87:   var transformMap = {};\n88:   var skipText = false;\n89:   var parser = new htmlparser.Parser({\n90:     onopentag: function(name, attribs) {\n91:       var frame = new Frame(name, attribs);\n92:       stack.push(frame);\n93: \n94:       var skip = false;\n95:       if (transformTagsMap[name]) {\n96:         var transformedTag = transformTagsMap[name](name, attribs);\n97: \n98:         frame.attribs = attribs = transformedTag.attribs;\n99:         if (name !== transformedTag.tagName) {\n100:           frame.name = name = transformedTag.tagName;\n101:           transformMap[depth] = transformedTag.tagName;\n102:         }\n103:       }\n104: \n105:       if (options.allowedTags && options.allowedTags.indexOf(name) === -1) {\n106:         skip = true;\n107:         if (nonTextTagsArray.indexOf(name) !== -1) {\n108:           skipText = true;\n109:         }\n110:         skipMap[depth] = true;\n111:       }\n112:       depth++;\n113:       if (skip) {\n114:         // We want the contents but not this tag\n115:         return;\n116:       }\n117:       result += '<' + name;\n118:       if (!allowedAttributesMap || allowedAttributesMap[name]) {\n119:         each(attribs, function(value, a) {\n120:           if (!allowedAttributesMap || allowedAttributesMap[name].indexOf(a) !== -1 ||\n121:               (allowedAttributesGlobMap[name] && allowedAttributesGlobMap[name].test(a))) {\n122:             if ((a === 'href') || (a === 'src')) {\n123:               if (naughtyHref(name, value)) {\n124:                 delete frame.attribs[a];\n125:                 return;\n126:               }\n127:             }\n128:             if (a === 'class') {\n129:               value = filterClasses(value, allowedClassesMap[name]);\n130:               if (!value.length) {\n131:                 delete frame.attribs[a];\n132:                 return;\n133:               }\n134:             }\n135:             result += ' ' + a;\n136:             if (value.length) {\n137:               result += '=\"' + escapeHtml(value) + '\"';\n138:             }\n139:           } else {\n140:             delete frame.attribs[a];\n141:           }\n142:         });\n143:       }\n144:       if (options.selfClosing.indexOf(name) !== -1) {\n145:         result += \" />\";\n146:       } else {\n147:         result += \">\";\n148:       }\n149:     },\n150:     ontext: function(text) {\n151:       if (skipText) {\n152:         return;\n153:       }\n154:       var tag = stack[stack.length-1] && stack[stack.length-1].tag;\n155:       if (nonTextTagsArray.indexOf(tag) !== -1) {\n156:         result += text;\n157:       } else {\n158:         var escaped = escapeHtml(text);\n159:         if (options.textFilter) {\n160:           result += options.textFilter(escaped);\n161:         } else {\n162:           result += escaped;\n163:         }\n164:       }\n165:       if (stack.length) {\n166:            var frame = stack[stack.length - 1];\n167:            frame.text += text;\n168:       }\n169:     },\n170:     onclosetag: function(name) {\n171:       var frame = stack.pop();\n172:       if (!frame) {\n173:         // Do not crash on bad markup\n174:         return;\n175:       }\n176:       skipText = false;\n177:       depth--;\n178:       if (skipMap[depth]) {\n179:         delete skipMap[depth];\n180:         frame.updateParentNodeText();\n181:         return;\n182:       }\n183: \n184:       if (transformMap[depth]) {\n185:         name = transformMap[depth];\n186:         delete transformMap[depth];\n187:       }\n188: \n189:       if (options.exclusiveFilter && options.exclusiveFilter(frame)) {\n190:          result = result.substr(0, frame.tagPosition);\n191:          return;\n192:       }\n193: \n194:       frame.updateParentNodeText();\n195: \n196:       if (options.selfClosing.indexOf(name) !== -1) {\n197:          // Already output />\n198:          return;\n199:       }\n200: \n201:       result += \"</\" + name + \">\";\n202:     }\n203:   }, { decodeEntities: true });\n204: \n205:   parser.write(html);\n206:   parser.end();\n207: \n208:   return result;\n209: \n210:   function escapeHtml(s) {\n211:     if (typeof(s) !== 'string') {\n212:       s = s + '';\n213:     }\n214:     return s.replace(/\\&/g, '&amp;').replace(/</g, '&lt;').replace(/\\>/g, '&gt;').replace(/\\\"/g, '&quot;');\n215:   }\n216: \n217:   function naughtyHref(name, href) {\n218:     // Browsers ignore character codes of 32 (space) and below in a surprising\n219:     // number of situations. Start reading here:\n220:     // https://www.owasp.org/index.php/XSS_Filter_Evasion_Cheat_Sheet#Embedded_tab\n221:     href = href.replace(/[\\x00-\\x20]+/g, '');\n222:     // Clobber any comments in URLs, which the browser might\n223:     // interpret inside an XML data island, allowing\n224:     // a javascript: URL to be snuck through\n225:     href = href.replace(/<\\!\\-\\-.*?\\-\\-\\>/g, '');\n226:     // Case insensitive so we don't get faked out by JAVASCRIPT #1\n227:     var matches = href.match(/^([a-zA-Z]+)\\:/);\n228:     if (!matches) {\n229:       // No scheme = no way to inject js (right?)\n230:       return false;\n231:     }\n232:     var scheme = matches[1].toLowerCase();\n233: \n234:     if (options.allowedSchemesByTag[name]) {\n235:       return options.allowedSchemesByTag[name].indexOf(scheme) === -1;\n236:     }\n237: \n238:     return !options.allowedSchemes || options.allowedSchemes.indexOf(scheme) === -1;\n239:   }\n240: \n241:   function filterClasses(classes, allowed) {\n242:     if (!allowed) {\n243:       // The class attribute is allowed without filtering on this tag\n244:       return classes;\n245:     }\n246:     classes = classes.split(/\\s+/);\n247:     return classes.filter(function(clss) {\n248:       return allowed.indexOf(clss) !== -1;\n249:     }).join(' ');\n250:   }\n251: }\n252: \n253: // Defaults are accessible to you so that you can use them as a starting point\n254: // programmatically if you wish",
+      "source_summary": "HTML input from 'html' parameter, tag names from HTML parser's onopentag callback",
+      "sink_summary": "HTML output string 'result' that gets returned to caller, potentially rendered in browser",
+      "guard_summary": "Multi-layered: tag allowlist check, attribute allowlist with glob patterns, href/src URL scheme validation, class filtering, HTML escaping, script/style tag content suppression",
+      "risk_pattern": "Tag-based filtering using indexOf on allowlist array; if bypassed, disallowed tags could be rendered with filtered attributes but potentially dangerous content",
+      "used_variable_sources": [
+        "html",
+        "options.allowedTags",
+        "name"
+      ],
+      "called_function_context": [
+        "htmlparser.Parser",
+        "escapeHtml",
+        "naughtyHref",
+        "filterClasses"
+      ],
+      "enclosing_conditions": [
+        "onopentag handler",
+        "skip flag logic",
+        "depth tracking"
+      ],
+      "context_summary": "The candidate line performs tag allowlist validation in an HTML sanitizer. If a tag is not in allowedTags, it's skipped (tag removed but content kept) unless it's a script/style tag where content is also suppressed. Default allowlist excludes dangerous tags. Attributes are separately filtered with URL scheme validation and class filtering.",
+      "unresolved_facts": [
+        "Whether custom options can weaken default security by allowing dangerous tags",
+        "Whether transformTags functionality could bypass tag filtering"
+      ],
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/conflicting-html-attribute",
+          "cwe_id": "CWE-758",
+          "cwe_name": "Reliance on Undefined, Unspecified, or Implementation-Defined Behavior",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 39.419,
+          "raw_bm25_score": 39.419,
+          "description": "If an HTML element has two attributes with the same name but different values, its behavior may be browser-dependent.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-758. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "maintainability",
+            "correctness",
+            "external/cwe/cwe-758"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/incomplete-url-scheme-check",
+          "cwe_id": "CWE-184",
+          "cwe_name": "Incomplete List of Disallowed Inputs",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 35.7904,
+          "raw_bm25_score": 35.7904,
+          "description": "Checking for the \"javascript:\" URL scheme without also checking for \"vbscript:\" and \"data:\" suggests a logic error or even a security vulnerability.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-184. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "security",
+            "correctness",
+            "external/cwe/cwe-020",
+            "external/cwe/cwe-184"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/incomplete-multi-character-sanitization",
+          "cwe_id": "CWE-80",
+          "cwe_name": "Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.8288,
+          "raw_bm25_score": 27.8288,
+          "description": "A sanitizer that removes a sequence of characters may reintroduce the dangerous sequence.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-080. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020",
+            "external/cwe/cwe-080",
+            "external/cwe/cwe-116"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/incorrect-suffix-check",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.5683,
+          "raw_bm25_score": 27.5683,
+          "description": "Using indexOf to implement endsWith functionality is error-prone if the -1 case is not explicitly handled.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "security",
+            "correctness",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/index-out-of-bounds",
+          "cwe_id": "CWE-193",
+          "cwe_name": "Off-by-one Error",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.663,
+          "raw_bm25_score": 26.663,
+          "description": "An array index is compared to be less than or equal to the 'length' property, and then used in an indexing operation that could be out of bounds.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-193. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "logic",
+            "language-features"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/eval-like-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.6828,
+          "raw_bm25_score": 23.6828,
+          "description": "DOM functions that act like 'eval' and execute strings as code are dangerous and impede program analysis and understanding. Consequently, they should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "readability",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/unsafe-jquery-plugin",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.8054,
+          "raw_bm25_score": 22.8054,
+          "description": "A jQuery plugin that unintentionally constructs HTML from some of its options may be unsafe to use for clients.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output operations. Implement proper escaping for HTML, JavaScript, CSS, and URL contexts.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-116",
+            "frameworks/jquery"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/missing-x-frame-options",
+          "cwe_id": "CWE-829",
+          "cwe_name": "Inclusion of Functionality from Untrusted Control Sphere",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.1839,
+          "raw_bm25_score": 22.1839,
+          "description": "If the 'X-Frame-Options' setting is not provided, a malicious user may be able to overlay their own UI on top of the site by using an iframe.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-451",
+            "external/cwe/cwe-829"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/client-exposed-cookie",
+          "cwe_id": "CWE-1004",
+          "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.5506,
+          "raw_bm25_score": 17.5506,
+          "description": "Sensitive cookies set by a server can be read by the client if the `httpOnly` flag is not set.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Set HttpOnly flag on session cookies to prevent JavaScript access. Also use Secure and SameSite attributes.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1004"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/type-confusion-through-parameter-tampering",
+          "cwe_id": "CWE-843",
+          "cwe_name": "Access of Resource Using Incompatible Type ('Type Confusion')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.173,
+          "raw_bm25_score": 17.173,
+          "description": "Sanitizing an HTTP request parameter may be ineffective if the user controls its type.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-843"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

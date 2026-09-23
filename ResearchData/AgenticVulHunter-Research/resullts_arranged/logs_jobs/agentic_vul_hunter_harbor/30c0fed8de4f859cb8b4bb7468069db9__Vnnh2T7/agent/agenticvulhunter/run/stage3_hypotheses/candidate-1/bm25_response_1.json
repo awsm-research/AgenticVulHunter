@@ -1,0 +1,257 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "kdcproxy/__init__.py",
+      "changed_line": 143,
+      "statement": "pr = codec.decode(env[\"wsgi.input\"].read(length))",
+      "change_type": "A",
+      "function_name": "__call__",
+      "operation_type": "data_decoding",
+      "selection_reason": "observable input via wsgi.input -> decoding operation -> potential code execution or data manipulation",
+      "security_relevance_score": 0.8,
+      "code_context": "1: #!/usr/bin/python3\n2: \n3: # Copyright (C) 2013, Red Hat, Inc.\n4: # All rights reserved.\n5: #\n6: # Permission is hereby granted, free of charge, to any person obtaining a copy\n7: # of this software and associated documentation files (the \"Software\"), to deal\n8: # in the Software without restriction, including without limitation the rights\n9: # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell\n10: # copies of the Software, and to permit persons to whom the Software is\n11: # furnished to do so, subject to the following conditions:\n12: #\n13: # The above copyright notice and this permission notice shall be included in\n14: # all copies or substantial portions of the Software.\n15: #\n16: # THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n17: # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n18: # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\n19: # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\n20: # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n21: # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN\n22: # THE SOFTWARE.\n23: \n24: from kdcproxy.config import MetaResolver\n25: import kdcproxy.codec as codec\n26: \n27: import select\n28: import socket\n29: import struct\n30: import sys\n31: import time\n32: import io\n33: \n34: try: # Python 3.x\n35:     import http.client as httplib\n36:     import urllib.parse as urlparse\n37: except ImportError: # Python 2.x\n38:     import httplib\n39:     import urlparse\n40: \n41: class HTTPException(Exception):\n42:     def __init__(self, code, msg, headers=[]):\n43:         headers = list(filter(lambda h: h[0] != 'Content-Length', headers))\n44:         headers.append(('Content-Length', str(len(msg))))\n45: \n46:         if 'Content-Type' not in dict(headers):\n47:             headers.append(('Content-Type', 'text/plain'))\n48: \n49:         if sys.version_info.major == 3 and isinstance(msg, str):\n50:             msg = bytes(msg, \"UTF8\")\n51: \n52:         super(HTTPException, self).__init__(code, msg, headers)\n53:         self.code = code\n54:         self.message = msg\n55:         self.headers = headers\n56: \n57:     def __str__(self):\n58:         return \"%d %s\" % (self.code, httplib.responses[self.code])\n59: \n60: class Application:\n61:     SOCKTYPES = {\n62:         \"tcp\": socket.SOCK_STREAM,\n63:         \"udp\": socket.SOCK_DGRAM,\n64:     }\n65: \n66:     def __init__(self):\n67:         self.__resolver = MetaResolver()\n68: \n69:     def __await_reply(self, pr, rsocks, wsocks, timeout):\n70:         extra = 0\n71:         while (timeout + extra) > time.time():\n72:             if not wsocks and not rsocks:\n73:                 break\n74: \n75:             r, w, x = select.select(rsocks, wsocks, rsocks + wsocks,\n76:                                     (timeout + extra) - time.time())\n77:             for sock in x:\n78:                 sock.close()\n79:                 try:\n80:                     rsocks.remove(sock)\n81:                 except ValueError:\n82:                     pass\n83:                 try:\n84:                     wsocks.remove(sock)\n85:                 except ValueError:\n86:                     pass\n87: \n88:             for sock in w:\n89:                 try:\n90:                     if sock.type & ~socket.SOCK_NONBLOCK == socket.SOCK_DGRAM:\n91:                         # If we proxy over UDP, remove the 4-byte length\n92:                         # prefix since it is TCP only.\n93:                         sock.sendall(pr.request[4:])\n94:                     else:\n95:                         sock.sendall(pr.request)\n96:                         extra = 10 # New connections get 10 extra seconds\n97:                 except:\n98:                     continue\n99:                 rsocks.append(sock)\n100:                 wsocks.remove(sock)\n101: \n102:             for sock in r:\n103:                 try:\n104:                     reply = sock.recv(1048576)\n105: \n106:                     # If we proxy over UDP, we will be missing the 4-byte\n107:                     # length prefix. So add it.\n108:                     if sock.type & ~socket.SOCK_NONBLOCK == socket.SOCK_DGRAM:\n109:                         reply = struct.pack(\"!I\", len(reply)) + reply\n110: \n111:                     return reply\n112:                 except:\n113:                     pass\n114: \n115:         return None\n116: \n117:     def __filter_addr(self, addr):\n118:         if addr[0] not in (socket.AF_INET, socket.AF_INET6):\n119:             return False\n120: \n121:         if addr[1] not in (socket.SOCK_STREAM, socket.SOCK_DGRAM):\n122:             return False\n123: \n124:         if addr[2] not in (socket.IPPROTO_TCP, socket.IPPROTO_UDP):\n125:             return False\n126: \n127:         return True\n128: \n129:     def __call__(self, env, start_response):\n130:         try:\n131:             # Validate the method\n132:             method = env[\"REQUEST_METHOD\"].upper()\n133:             if method != \"POST\":\n134:                 raise HTTPException(405, \"Method not allowed (%s).\" % method,\n135:                                     (\"Allow\", \"POST\"))\n136: \n137:             # Parse the request\n138:             try:\n139:                 length = int(env[\"CONTENT_LENGTH\"])\n140:             except AttributeError:\n141:                 length = -1\n142:             try:\n143:                 pr = codec.decode(env[\"wsgi.input\"].read(length))\n144:             except codec.ParsingError as e:\n145:                 raise HTTPException(400, e.message)\n146: \n147:             # Find the remote proxy\n148:             servers = self.__resolver.lookup(pr.realm,\n149:                                   isinstance(pr, codec.KPASSWDProxyRequest))\n150:             if not servers:\n151:                 raise HTTPException(503, \"Can't find remote (%s).\" % pr)\n152: \n153:             # Contact the remote server\n154:             reply = None\n155:             wsocks = []\n156:             rsocks = []\n157:             for server in map(urlparse.urlparse, servers):\n158:                 # Enforce valid, supported URIs\n159:                 scheme = server.scheme.lower().split(\"+\", 1)\n160:                 if scheme[0] not in (\"kerberos\", \"kpasswd\"):\n161:                     continue\n162:                 if len(scheme) > 1 and scheme[1] not in (\"tcp\", \"udp\"):\n163:                     continue\n164: \n165:                 # Do the DNS lookup\n166:                 try:\n167:                     port = server.port\n168:                     if port is None:\n169:                         port = scheme[0]\n170:                     addrs = socket.getaddrinfo(server.hostname, port)\n171:                 except socket.gaierror:\n172:                     continue\n173: \n174:                 # Sort addresses so that we get TCP first.\n175:                 #\n176:                 # Stick a None address on the end so we can get one\n177:                 # more attempt after all servers have been contacted.\n178:                 addrs = tuple(sorted(filter(self.__filter_addr, addrs)))\n179:                 for addr in addrs + (None,):\n180:                     if addr is not None:\n181:                         # Bypass unspecified socktypes\n182:                         if len(scheme) > 1 and addr[1] != self.SOCKTYPES[scheme[1]]:\n183:                             continue\n184: \n185:                         # Create the socket\n186:                         sock = socket.socket(*addr[:3])\n187:                         sock.setblocking(0)\n188: \n189:                         # Connect\n190:                         try:\n191:                             # In Python 2.x, non-blocking connect() throws\n192:                             # socket.error() with errno == EINPROGRESS. In\n193:                             # Python 3.x, it throws io.BlockingIOError().\n194:                             sock.connect(addr[4])\n195:                         except socket.error as e:\n196:                             if e.errno != 115: # errno != EINPROGRESS\n197:                                 sock.close()\n198:                                 continue\n199:                         except io.BlockingIOError:\n200:                             pass\n201:                         wsocks.append(sock)\n202: \n203:                     # Resend packets to UDP servers\n204:                     for sock in tuple(rsocks):\n205:                         if sock.type & ~socket.SOCK_NONBLOCK == socket.SOCK_DGRAM:\n206:                             wsocks.append(sock)\n207:                             rsocks.remove(sock)\n208: \n209:                     # Call select()\n210:                     timeout = time.time() + (15 if addr is None else 2)\n211:                     reply = self.__await_reply(pr, rsocks, wsocks, timeout)\n212:                     if reply is not None:\n213:                         break\n214: \n215:                 if reply is not None:\n216:                     break\n217: \n218:             for sock in rsocks + wsocks:\n219:                 sock.close()\n220: \n221:             if reply is None:\n222:                 raise HTTPException(503, \"Remote unavailable (%s).\" % pr)\n223: \n224:             # Return the result to the client\n225:             raise HTTPException(200, codec.encode(reply),\n226:                                 [(\"Content-Type\", \"application/kerberos\")])\n227:         except HTTPException as e:\n228:             start_response(str(e), e.headers)\n229:             return [e.message]\n230: \n231: application = Application()",
+      "source_summary": "The data originates from WSGI input stream (env[\"wsgi.input\"]) which is read with a length specified by CONTENT_LENGTH header. This represents HTTP request body data that can be controlled by an attacker.",
+      "sink_summary": "The decoded data is used to create a ProxyRequest object that contains realm information and request data, which is then used to look up remote servers for proxying. The decoded data eventually gets sent to remote Kerberos servers.",
+      "guard_summary": "There is minimal validation of the input data before decoding. The only validation occurs in the decode function itself through ASN.1 parsing which may raise ParsingError exceptions. There are no explicit allowlists or sanitization steps for the raw input data.",
+      "risk_pattern": "The application reads raw binary data from HTTP request body and decodes it using ASN.1 parsing without sufficient validation of the data structure, potentially allowing malformed data to cause unexpected behavior in the ASN.1 decoder.",
+      "used_variable_sources": [
+        "env[\"wsgi.input\"]",
+        "length"
+      ],
+      "called_function_context": [
+        "codec.decode",
+        "env[\"wsgi.input\"].read"
+      ],
+      "enclosing_conditions": [
+        "if method != \"POST\":",
+        "try: ... except AttributeError:",
+        "try: ... except codec.ParsingError as e:"
+      ],
+      "context_summary": "The code handles HTTP POST requests by reading the request body from wsgi.input with a length specified by CONTENT_LENGTH header. It then decodes this data using the codec.decode function which parses ASN.1 formatted data. The decoded data is used to determine which remote Kerberos server to proxy the request to.",
+      "unresolved_facts": [
+        "The exact validation performed by pyasn1 decoder during decoding process",
+        "Whether there are any bounds checks on the length parameter before reading from wsgi.input",
+        "Specific details of how the decoded ProxyRequest object is used in server lookup"
+      ],
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 32.8008,
+          "raw_bm25_score": 32.8008,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/template-injection",
+          "cwe_id": "CWE-74",
+          "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 32.278,
+          "raw_bm25_score": 32.278,
+          "description": "Using user-controlled data to create a template can lead to remote code execution or cross site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized APIs and separate data from control instructions. Validate input format and escape special characters.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-074"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 32.1402,
+          "raw_bm25_score": 32.1402,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/bind-socket-all-network-interfaces",
+          "cwe_id": "CWE-200",
+          "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.4113,
+          "raw_bm25_score": 29.4113,
+          "description": "Binding a socket to all interfaces opens it up to traffic from any IPv4 address and is therefore associated with security risks.",
+          "pattern": "Find code that may expose sensitive information in error messages, logs, or responses",
+          "remediation": "Implement proper access controls. Use generic error messages for users. Avoid exposing sensitive information in error responses, debugging output, or log files.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-200"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "fallback/cwe-125-out-of-bounds-read",
+          "cwe_id": "CWE-125",
+          "cwe_name": "Out-of-bounds Read",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 28.5873,
+          "raw_bm25_score": 28.5873,
+          "description": "A read accesses memory before or beyond the valid buffer range.",
+          "pattern": "cwe-125 out-of-bounds-read buffer-read memory-read index offset length parser decode malformed-input boundary",
+          "remediation": "Check read offsets, indexes, and lengths before buffer access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-125"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/unreachable-except",
+          "cwe_id": "CWE-561",
+          "cwe_name": "Dead Code",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.6583,
+          "raw_bm25_score": 25.6583,
+          "description": "Handling general exceptions before specific exceptions means that the specific handlers are never executed.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove dead code through static analysis. Use code coverage tools to identify unreachable code. Implement regular code reviews to eliminate unused functionality.",
+          "tags": [
+            "quality",
+            "reliability",
+            "error-handling",
+            "external/cwe/cwe-561"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/unicode-bypass-validation",
+          "cwe_id": "CWE-179",
+          "cwe_name": "Incorrect Behavior Order: Early Validation",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.4184,
+          "raw_bm25_score": 25.4184,
+          "description": "A Unicode transformation is using a remote user-controlled data. The transformation is a Unicode normalization using the algorithms \"NFC\" or \"NFKC\". In all cases, the security measures implemented or the logical validation performed to escape any injection characters, to validate using regex patterns or to perform string-based checks, before the Unicode transformation are **bypassable** by special Unicode characters.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement validation early in the processing pipeline. Ensure validation cannot be bypassed by alternate code paths. Use consistent validation across all entry points.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-176",
+            "external/cwe/cwe-179",
+            "external/cwe/cwe-180"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/ip-address-spoofing",
+          "cwe_id": "CWE-348",
+          "cwe_name": "Use of Less Trusted Source",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.7725,
+          "raw_bm25_score": 24.7725,
+          "description": "A remote endpoint identifier is read from an HTTP header. Attackers can modify the value of the identifier to forge the client ip.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-348"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/super-not-enclosing-class",
+          "cwe_id": "CWE-687",
+          "cwe_name": "Function Call With Incorrectly Specified Argument Value",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.4051,
+          "raw_bm25_score": 24.4051,
+          "description": "Calling super with something other than the enclosing class may cause incorrect object initialization.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-687. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-687"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/timing-attack-against-header-value",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.6673,
+          "raw_bm25_score": 23.6673,
+          "description": "Use of a non-constant-time verification routine to check the value of an HTTP header, possibly allowing a timing attack to infer the header's expected value.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208",
+            "experimental"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

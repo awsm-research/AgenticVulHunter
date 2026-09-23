@@ -1,0 +1,253 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/index.js",
+      "changed_line": 252,
+      "statement": "await utils.run(`git clone ${remoteUrl} ${_tmpDir}`);",
+      "change_type": "A",
+      "function_name": "module.exports (gitDiffApply)",
+      "operation_type": "shell_command_execution",
+      "selection_reason": "user-controlled remoteUrl directly interpolated into git clone command -> executed via shell -> potential command injection",
+      "security_relevance_score": 0.9,
+      "code_context": "103: \n104:     if (!(reset || init)) {\n105:       await copyToSubDir(startTag);\n106: \n107:       await gitRemoveAll({ cwd: newTmpDir });\n108:     }\n109: \n110:     await copyToSubDir(endTag);\n111: \n112:     _tmpDir = newTmpDir;\n113:     tmpWorkingDir = newTmpSubDir;\n114:   }\n115: \n116:   async function copy() {\n117:     await utils.copy(tmpWorkingDir, cwd);\n118:   }\n119: \n120:   async function resetIgnoredFiles() {\n121:     for (let ignoredFile of ignoredFiles) {\n122:       // An exist check is not good enough.\n123:       // `git checkout` will fail unless it is also tracked.\n124:       let isTracked = await utils.run(`git ls-files ${ignoredFile}`);\n125:       if (isTracked) {\n126:         await utils.run(`git checkout -- ${ignoredFile}`);\n127:       } else {\n128:         await fs.remove(ignoredFile);\n129:       }\n130:     }\n131:   }\n132: \n133:   async function createPatchFile() {\n134:     let patchFile = path.join(await tmpDir(), 'file.patch');\n135:     await utils.run(`git diff ${startTag} ${endTag} --binary > ${patchFile}`, { cwd: _tmpDir });\n136:     if (await fs.readFile(patchFile, 'utf8') !== '') {\n137:       return patchFile;\n138:     }\n139:   }\n140: \n141:   async function applyDiff() {\n142:     let patchFile = await createPatchFile();\n143:     if (patchFile) {\n144:       // --whitespace=fix seems to prevent any unnecessary conflicts with line endings\n145:       // https://stackoverflow.com/questions/6308625/how-to-avoid-git-apply-changing-line-endings#comment54419617_11189296\n146:       await utils.run(`git apply --whitespace=fix ${patchFile}`);\n147:     }\n148:   }\n149: \n150:   async function go() {\n151:     if (reset || init) {\n152:       await checkOutTag(_tmpDir, endTag);\n153: \n154:       isCodeUntracked = true;\n155:       isCodeModified = true;\n156:       if (reset) {\n157:         await utils.gitRemoveAll({ cwd: root });\n158:       }\n159: \n160:       await copy();\n161: \n162:       await utils.run('git reset');\n163: \n164:       await resetIgnoredFiles();\n165: \n166:       return;\n167:     }\n168: \n169:     await checkOutTag(_tmpDir, startTag);\n170: \n171:     oldBranchName = await getCheckedOutBranchName();\n172:     await utils.run(`git checkout --orphan ${tempBranchName}`);\n173:     isTempBranchCheckedOut = true;\n174: \n175:     await utils.gitRemoveAll({ cwd: root });\n176: \n177:     gitIgnoredFiles = await tmpDir();\n178:     await mergeDir(cwd, gitIgnoredFiles);\n179:     shouldReturnGitIgnoredFiles = true;\n180: \n181:     isCodeUntracked = true;\n182:     await copy();\n183: \n184:     isTempBranchCommitted = true;\n185:     await commit();\n186:     isCodeUntracked = false;\n187: \n188:     isCodeUntracked = true;\n189:     isCodeModified = true;\n190:     await applyDiff();\n191: \n192:     await resetIgnoredFiles();\n193: \n194:     let wereAnyChanged = !await isGitClean();\n195: \n196:     if (wereAnyChanged) {\n197:       await commit();\n198:     }\n199:     isCodeUntracked = false;\n200:     isCodeModified = false;\n201: \n202:     let sha;\n203:     if (wereAnyChanged) {\n204:       sha = await utils.run('git rev-parse HEAD');\n205:     }\n206: \n207:     await utils.run(`git checkout ${oldBranchName}`);\n208:     isTempBranchCheckedOut = false;\n209: \n210:     if (wereAnyChanged) {\n211:       try {\n212:         await utils.run(`git cherry-pick --no-commit ${sha.trim()}`);\n213:       } catch (err) {\n214:         hasConflicts = true;\n215:       }\n216:     }\n217:   }\n218: \n219:   try {\n220:     if (startTag === endTag && !(reset || init)) {\n221:       throw 'Tags match, nothing to apply';\n222:     }\n223: \n224:     let isClean;\n225: \n226:     try {\n227:       isClean = await isGitClean();\n228:     } catch (err) {\n229:       throw 'Not a git repository';\n230:     }\n231: \n232:     if (!isClean) {\n233:       throw 'You must start with a clean working directory';\n234:     }\n235: \n236:     if (createCustomDiff) {\n237:       let tmpPath = await createCustomRemote({\n238:         startCommand,\n239:         endCommand,\n240:         startTag,\n241:         endTag,\n242:         reset,\n243:         init\n244:       });\n245: \n246:       remoteUrl = tmpPath;\n247:     }\n248: \n249:     _tmpDir = await tmpDir();\n250:     tmpWorkingDir = _tmpDir;\n251: \n252:     await utils.run(`git clone ${remoteUrl} ${_tmpDir}`);\n253: \n254:     returnObject = await buildReturnObject();\n255: \n256:     root = await getRootDir();\n257:     let subDir = await getSubDir(root);\n258:     if (subDir) {\n259:       debug('subDir', subDir);\n260: \n261:       await namespaceRepoWithSubDir(subDir);\n262:     }\n263: \n264:     cwd = process.cwd();\n265: \n266:     await go();\n267: \n268:     debug('success');\n269:   } catch (_err) {\n270:     err = _err;\n271: \n272:     try {\n273:       if (isCodeUntracked) {\n274:         await utils.run('git clean -f');\n275:       }\n276:       if (isCodeModified) {\n277:         await utils.run('git reset --hard');\n278:       }\n279: \n280:       if (isTempBranchCheckedOut) {\n281:         await utils.run(`git checkout ${oldBranchName}`);\n282:       }\n283:     } catch (err2) {\n284:       throw {\n285:         err,\n286:         err2\n287:       };\n288:     }\n289:   }\n290: \n291:   try {\n292:     if (isTempBranchCommitted && await doesBranchExist(tempBranchName)) {\n293:       await utils.run(`git branch -D ${tempBranchName}`);\n294:     }\n295: \n296:     if (shouldReturnGitIgnoredFiles) {\n297:       await mergeDir(gitIgnoredFiles, cwd);\n298:     }\n299:   } catch (err2) {\n300:     err = {\n301:       err,\n302:       err2\n303:     };\n304:   }\n305: \n306:   if (err) {\n307:     debug('failure');\n308: \n309:     throw err;\n310:   }\n311: \n312:   if (hasConflicts && _resolveConflicts) {\n313:     returnObject.resolveConflictsProcess = resolveConflicts({\n314:       shouldPipe: !wasRunAsExecutable\n315:     });\n316:   }\n317: \n318:   return returnObject;\n319: };\n320: \n321: module.exports.run = utils.run;\n322: module.exports.gitInit = gitInit;\n323: module.exports.gitStatus = gitStatus;\n324: module.exports.isGitClean = isGitClean;\n325: module.exports.gitRemoveAll = gitRemoveAll;",
+      "source_summary": "remoteUrl comes from function parameter or createCustomRemote() output; when createCustomDiff=true, remoteUrl is a temporary directory path; when false, remoteUrl is direct user input parameter",
+      "sink_summary": "git clone command executed via child_process.exec() with shell interpolation of remoteUrl and _tmpDir variables",
+      "guard_summary": "No validation or sanitization of remoteUrl before interpolation; git clean working directory check present but unrelated to command injection",
+      "risk_pattern": "User-controlled remoteUrl directly interpolated into shell command string without validation, escaping, or parameterization",
+      "used_variable_sources": [
+        "remoteUrl (function parameter)",
+        "_tmpDir (tmpDir() function output)"
+      ],
+      "called_function_context": [
+        "utils.run() -> execPromise(command, options) -> child_process.exec()"
+      ],
+      "enclosing_conditions": [
+        "if (createCustomDiff) branch determines remoteUrl source"
+      ],
+      "context_summary": "Command executes in git diff apply workflow; remoteUrl either from user input or generated temporary path",
+      "unresolved_facts": [
+        "Default value and validation of createCustomDiff parameter",
+        "Whether remoteUrl receives any validation when passed as direct parameter",
+        "Security controls in createCustomRemote's startCommand/endCommand execution"
+      ],
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/unnecessary-use-of-cat",
+          "cwe_id": "CWE-78",
+          "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 33.7218,
+          "raw_bm25_score": 33.7218,
+          "description": "Using the  `cat` process to read a file is unnecessarily complex, inefficient, unportable, and can lead to subtle bugs, or even security vulnerabilities.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use safe command execution APIs with parameter arrays. Validate and sanitize command arguments against strict allowlists.",
+          "tags": [
+            "correctness",
+            "security",
+            "maintainability",
+            "external/cwe/cwe-078"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "fallback/cwe-77-improper-neutralization-of-special-elements-used-in-a-command-command-injection",
+          "cwe_id": "CWE-77",
+          "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 32.3315,
+          "raw_bm25_score": 32.3315,
+          "description": "Externally influenced data changes the syntax or meaning of a command sent to a downstream command interpreter.",
+          "pattern": "cwe-77 command-injection command-construction shell exec spawn process subprocess child_process os.system popen argument-delimiter metacharacter",
+          "remediation": "Keep external data separate from command syntax and use safe argument APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-077"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/indirect-command-line-injection",
+          "cwe_id": "CWE-88",
+          "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 30.8965,
+          "raw_bm25_score": 30.8965,
+          "description": "Forwarding command-line arguments to a child process executed within a shell may indirectly introduce command-line injection vulnerabilities.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-088. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-088"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/template-object-injection",
+          "cwe_id": "CWE-94",
+          "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.1831,
+          "raw_bm25_score": 21.1831,
+          "description": "Instantiating a template using a user-controlled object is vulnerable to local file read and potential remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-073",
+            "external/cwe/cwe-094"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/insecure-temporary-file",
+          "cwe_id": "CWE-378",
+          "cwe_name": "Creation of Temporary File With Insecure Permissions",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.9843,
+          "raw_bm25_score": 20.9843,
+          "description": "Creating a temporary file that is accessible by other users can lead to information disclosure and sometimes remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-378. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "external/cwe/cwe-377",
+            "external/cwe/cwe-378",
+            "security"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 19.0188,
+          "raw_bm25_score": 19.0188,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/identity-replacement",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 18.4134,
+          "raw_bm25_score": 18.4134,
+          "description": "Replacing a substring with itself has no effect and may indicate a mistake.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output. Implement proper encoding libraries for HTML, JavaScript, URL, and CSS contexts.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-116"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/prototype-polluting-assignment",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.7712,
+          "raw_bm25_score": 16.7712,
+          "description": "Modifying an object obtained via a user-controlled property name may lead to accidental mutation of the built-in Object prototype, and possibly escalate to remote code execution or cross-site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-094",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/env-key-and-value-injection",
+          "cwe_id": "CWE-99",
+          "cwe_name": "Improper Control of Resource Identifiers ('Resource Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.7525,
+          "raw_bm25_score": 16.7525,
+          "description": "creating arbitrary environment variables from user controlled data is not secure",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-089"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/zipslip",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.1225,
+          "raw_bm25_score": 16.1225,
+          "description": "Extracting files from a malicious ZIP file, or similar type of archive, without validating that the destination file path is within the destination directory can allow an attacker to unexpectedly gain access to resources.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

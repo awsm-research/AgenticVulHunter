@@ -1,0 +1,263 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 763,
+      "statement": "schedule_delayed_delete_from_backend(image['location'], id)",
+      "change_type": "A",
+      "function_name": "delete",
+      "operation_type": "sensitive_data_scheduled_deletion",
+      "selection_reason": "image location data -> scheduled deletion call -> deferred removal with potential timing/race condition implications",
+      "security_relevance_score": 0.8,
+      "code_context": "614:             self._enforce(req, 'publicize_image')\n615: \n616:         image_meta = self._reserve(req, image_meta)\n617:         id = image_meta['id']\n618: \n619:         image_meta = self._handle_source(req, id, image_meta, image_data)\n620: \n621:         location_uri = image_meta.get('location')\n622:         if location_uri:\n623:             self.update_store_acls(req, id, location_uri, public=is_public)\n624: \n625:         # Prevent client from learning the location, as it\n626:         # could contain security credentials\n627:         image_meta.pop('location', None)\n628: \n629:         return {'image_meta': image_meta}\n630: \n631:     @utils.mutating\n632:     def update(self, req, id, image_meta, image_data):\n633:         \"\"\"\n634:         Updates an existing image with the registry.\n635: \n636:         :param request: The WSGI/Webob Request object\n637:         :param id: The opaque image identifier\n638: \n639:         :retval Returns the updated image information as a mapping\n640:         \"\"\"\n641:         self._enforce(req, 'modify_image')\n642:         is_public = image_meta.get('is_public')\n643:         if is_public:\n644:             self._enforce(req, 'publicize_image')\n645: \n646:         orig_image_meta = self.get_image_meta_or_404(req, id)\n647:         orig_status = orig_image_meta['status']\n648: \n649:         # The default behaviour for a PUT /images/<IMAGE_ID> is to\n650:         # override any properties that were previously set. This, however,\n651:         # leads to a number of issues for the common use case where a caller\n652:         # registers an image with some properties and then almost immediately\n653:         # uploads an image file along with some more properties. Here, we\n654:         # check for a special header value to be false in order to force\n655:         # properties NOT to be purged. However we also disable purging of\n656:         # properties if an image file is being uploaded...\n657:         purge_props = req.headers.get('x-glance-registry-purge-props', True)\n658:         purge_props = (utils.bool_from_string(purge_props) and\n659:                        image_data is None)\n660: \n661:         if image_data is not None and orig_status != 'queued':\n662:             raise HTTPConflict(_(\"Cannot upload to an unqueued image\"))\n663: \n664:         # Only allow the Location|Copy-From fields to be modified if the\n665:         # image is in queued status, which indicates that the user called\n666:         # POST /images but originally supply neither a Location|Copy-From\n667:         # field NOR image data\n668:         location = self._external_source(image_meta, req)\n669:         reactivating = orig_status != 'queued' and location\n670:         activating = orig_status == 'queued' and (location or image_data)\n671: \n672:         # Make image public in the backend store (if implemented)\n673:         orig_or_updated_loc = location or orig_image_meta.get('location', None)\n674:         if orig_or_updated_loc:\n675:             self.update_store_acls(req, id, orig_or_updated_loc,\n676:                                    public=is_public)\n677: \n678:         if reactivating:\n679:             msg = _(\"Attempted to update Location field for an image \"\n680:                     \"not in queued status.\")\n681:             raise HTTPBadRequest(explanation=msg,\n682:                                  request=req,\n683:                                  content_type=\"text/plain\")\n684: \n685:         try:\n686:             if location:\n687:                 image_meta['size'] = self._get_size(req.context, image_meta,\n688:                                                     location)\n689: \n690:             image_meta = registry.update_image_metadata(req.context,\n691:                                                         id,\n692:                                                         image_meta,\n693:                                                         purge_props)\n694: \n695:             if activating:\n696:                 image_meta = self._handle_source(req, id, image_meta,\n697:                                                  image_data)\n698: \n699:         except exception.Invalid, e:\n700:             msg = (_(\"Failed to update image metadata. Got error: %(e)s\")\n701:                    % locals())\n702:             for line in msg.split('\\n'):\n703:                 LOG.error(line)\n704:             self.notifier.error('image.update', msg)\n705:             raise HTTPBadRequest(explanation=msg,\n706:                                  request=req,\n707:                                  content_type=\"text/plain\")\n708:         except exception.NotFound, e:\n709:             msg = (\"Failed to find image to update: %(e)s\" % locals())\n710:             for line in msg.split('\\n'):\n711:                 LOG.info(line)\n712:             self.notifier.info('image.update', msg)\n713:             raise HTTPNotFound(explanation=msg,\n714:                                request=req,\n715:                                content_type=\"text/plain\")\n716:         except exception.Forbidden, e:\n717:             msg = (\"Forbidden to update image: %(e)s\" % locals())\n718:             for line in msg.split('\\n'):\n719:                 LOG.info(line)\n720:             self.notifier.info('image.update', msg)\n721:             raise HTTPForbidden(explanation=msg,\n722:                                 request=req,\n723:                                 content_type=\"text/plain\")\n724:         else:\n725:             self.notifier.info('image.update', image_meta)\n726: \n727:         # Prevent client from learning the location, as it\n728:         # could contain security credentials\n729:         image_meta.pop('location', None)\n730: \n731:         return {'image_meta': image_meta}\n732: \n733:     @utils.mutating\n734:     def delete(self, req, id):\n735:         \"\"\"\n736:         Deletes the image and all its chunks from the Glance\n737: \n738:         :param req: The WSGI/Webob Request object\n739:         :param id: The opaque image identifier\n740: \n741:         :raises HttpBadRequest if image registry is invalid\n742:         :raises HttpNotFound if image or any chunk is not available\n743:         :raises HttpUnauthorized if image or any chunk is not\n744:                 deleteable by the requesting user\n745:         \"\"\"\n746:         self._enforce(req, 'delete_image')\n747: \n748:         image = self.get_image_meta_or_404(req, id)\n749:         if image['protected']:\n750:             msg = _(\"Image is protected\")\n751:             LOG.debug(msg)\n752:             raise HTTPForbidden(explanation=msg,\n753:                                 request=req,\n754:                                 content_type=\"text/plain\")\n755: \n756:         # The image's location field may be None in the case\n757:         # of a saving or queued image, therefore don't ask a backend\n758:         # to delete the image if the backend doesn't yet store it.\n759:         # See https://bugs.launchpad.net/glance/+bug/747799\n760:         try:\n761:             if image['location']:\n762:                 if CONF.delayed_delete:\n763:                     schedule_delayed_delete_from_backend(image['location'], id)\n764:                     registry.update_image_metadata(req.context, id,\n765:                                                   {'status': 'pending_delete'})\n766:                 else:\n767:                     safe_delete_from_backend(image['location'],\n768:                                              req.context, id)\n769:                     registry.update_image_metadata(req.context, id,\n770:                                                    {'status': 'deleted'})\n771:             registry.delete_image_metadata(req.context, id)\n772:         except exception.NotFound, e:\n773:             msg = (\"Failed to find image to delete: %(e)s\" % locals())\n774:             for line in msg.split('\\n'):\n775:                 LOG.info(line)\n776:             self.notifier.info('image.delete', msg)\n777:             raise HTTPNotFound(explanation=msg,\n778:                                request=req,\n779:                                content_type=\"text/plain\")\n780:         except exception.Forbidden, e:\n781:             msg = (\"Forbidden to delete image: %(e)s\" % locals())\n782:             for line in msg.split('\\n'):\n783:                 LOG.info(line)\n784:             self.notifier.info('image.delete', msg)\n785:             raise HTTPForbidden(explanation=msg,\n786:                                 request=req,\n787:                                 content_type=\"text/plain\")\n788:         else:\n789:             self.notifier.info('image.delete', image)\n790: \n791:     def get_store_or_400(self, request, scheme):\n792:         \"\"\"\n793:         Grabs the storage backend for the supplied store name\n794:         or raises an HTTPBadRequest (400) response\n795: \n796:         :param request: The WSGI/Webob Request object\n797:         :param scheme: The backend store scheme\n798: \n799:         :raises HTTPNotFound if store does not exist\n800:         \"\"\"\n801:         try:\n802:             return get_store_from_scheme(request.context, scheme)\n803:         except exception.UnknownScheme:\n804:             msg = _(\"Store for scheme %s not found\")\n805:             LOG.error(msg % scheme)\n806:             raise HTTPBadRequest(explanation=msg,\n807:                                  request=request,\n808:                                  content_type='text/plain')\n809: \n810:     def verify_scheme_or_exit(self, scheme):\n811:         \"\"\"\n812:         Verifies availability of the storage backend for the\n813:         given scheme or exits\n814: \n815:         :param scheme: The backend store scheme\n816:         \"\"\"\n817:         try:\n818:             get_store_from_scheme(context.RequestContext(), scheme)\n819:         except exception.UnknownScheme:\n820:             msg = _(\"Store for scheme %s not found\")\n821:             LOG.error(msg % scheme)\n822:             # message on stderr will only be visible if started directly via\n823:             # bin/glance-api, as opposed to being daemonized by glance-control\n824:             sys.stderr.write(msg % scheme)\n825:             sys.exit(255)\n826: \n827: \n828: class ImageDeserializer(wsgi.JSONRequestDeserializer):\n829:     \"\"\"Handles deserialization of specific controller method requests.\"\"\"\n830: \n831:     def _deserialize(self, request):\n832:         result = {}\n833:         try:\n834:             result['image_meta'] = utils.get_image_meta_from_headers(request)\n835:         except exception.Invalid:\n836:             image_size_str = request.headers['x-image-meta-size']\n837:             msg = _(\"Incoming image size of %s was not convertible to \"\n838:                     \"an integer.\") % image_size_str\n839:             raise HTTPBadRequest(explanation=msg, request=request)\n840: \n841:         image_meta = result['image_meta']\n842:         if request.content_length:\n843:             image_size = request.content_length\n844:         elif 'size' in image_meta:\n845:             image_size = image_meta['size']\n846:         else:\n847:             image_size = None\n848: \n849:         data = request.body_file if self.has_body(request) else None\n850: \n851:         if image_size is None and data is not None:\n852:             data = utils.LimitingReader(data, CONF.image_size_cap)\n853: \n854:             #NOTE(bcwaldon): this is a hack to make sure the downstream code\n855:             # gets the correct image data\n856:             request.body_file = data\n857: \n858:         elif image_size > CONF.image_size_cap:\n859:             max_image_size = CONF.image_size_cap\n860:             msg = _(\"Denying attempt to upload image larger than %d bytes.\")\n861:             LOG.warn(msg % max_image_size)\n862:             raise HTTPBadRequest(explanation=msg % max_image_size,\n863:                                  request=request)\n864: \n865:         result['image_data'] = data\n866:         return result\n867: \n868:     def create(self, request):\n869:         return self._deserialize(request)\n870: \n871:     def update(self, request):\n872:         return self._deserialize(request)\n873: \n874: \n875: class ImageSerializer(wsgi.JSONResponseSerializer):\n876:     \"\"\"Handles serialization of specific controller method responses.\"\"\"\n877: \n878:     def __init__(self):\n879:         self.notifier = notifier.Notifier()\n880: \n881:     def _inject_location_header(self, response, image_meta):\n882:         location = self._get_image_location(image_meta)\n883:         response.headers['Location'] = location\n884: \n885:     def _inject_checksum_header(self, response, image_meta):\n886:         response.headers['ETag'] = image_meta['checksum']\n887: \n888:     def _inject_image_meta_headers(self, response, image_meta):\n889:         \"\"\"\n890:         Given a response and mapping of image metadata, injects\n891:         the Response with a set of HTTP headers for the image\n892:         metadata. Each main image metadata field is injected\n893:         as a HTTP header with key 'x-image-meta-<FIELD>' except\n894:         for the properties field, which is further broken out\n895:         into a set of 'x-image-meta-property-<KEY>' headers\n896: \n897:         :param response: The Webob Response object\n898:         :param image_meta: Mapping of image metadata\n899:         \"\"\"\n900:         headers = utils.image_meta_to_http_headers(image_meta)\n901: \n902:         for k, v in headers.items():\n903:             response.headers[k] = v\n904: \n905:     def _get_image_location(self, image_meta):\n906:         \"\"\"Build a relative url to reach the image defined by image_meta.\"\"\"\n907:         return \"/v1/images/%s\" % image_meta['id']\n908: \n909:     def meta(self, response, result):\n910:         image_meta = result['image_meta']\n911:         self._inject_image_meta_headers(response, image_meta)\n912:         self._inject_location_header(response, image_meta)",
+      "source_summary": "image['location'] from image metadata retrieved via get_image_meta_or_404() which comes from registry database; image location may contain backend storage URIs with security credentials",
+      "sink_summary": "schedule_delayed_delete_from_backend writes image location URI and deletion timestamp to scrubber_datadir file, creating a deferred deletion queue entry",
+      "guard_summary": "Protected images blocked by image['protected'] check; authentication via self._enforce(req, 'delete_image'); location presence check via image['location'] conditional; CONF.delayed_delete flag controls delayed vs immediate deletion path",
+      "risk_pattern": "Image location URIs containing sensitive credentials are written to filesystem with delayed deletion timing, creating a window where credentials may be exposed if file permissions or scrubber process is compromised",
+      "used_variable_sources": [
+        "image['location'] from registry database",
+        "id from function parameter"
+      ],
+      "called_function_context": [
+        "schedule_delayed_delete_from_backend",
+        "registry.update_image_metadata",
+        "self._enforce",
+        "self.get_image_meta_or_404"
+      ],
+      "enclosing_conditions": [
+        "if image['location']",
+        "if CONF.delayed_delete",
+        "if image['protected']"
+      ],
+      "context_summary": "In image deletion flow, when delayed_delete is enabled, sensitive image location URIs are scheduled for deferred deletion by writing to scrubber_datadir with file permissions 0600 and future timestamp",
+      "unresolved_facts": [
+        "scrubber_datadir configuration security",
+        "scrubber process implementation and security controls",
+        "file permission enforcement reliability",
+        "scrub_time configuration value",
+        "registry database security for location storage"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "race condition in deferred deletion queue, temporary file exposure of credentials",
+        "sensitive_operation": "writing sensitive data to filesystem queue for delayed processing",
+        "missing_control": "secure temporary file creation, atomic operations, race condition protection",
+        "impact": "credential exposure through file system access during deletion delay window"
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-255-credentials-management-errors",
+          "cwe_id": "CWE-255",
+          "cwe_name": "Credentials Management Errors",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 31.0587,
+          "raw_bm25_score": 31.0587,
+          "description": "Legacy category for insecure credential creation, storage, validation, or handling.",
+          "pattern": "cwe-255 credential-management password token secret credential storage rotation validation authentication-secret",
+          "remediation": "Protect credentials throughout storage, validation, transport, and rotation.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-255"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "fallback/cwe-59-improper-link-resolution-before-file-access-link-following",
+          "cwe_id": "CWE-59",
+          "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 27.0423,
+          "raw_bm25_score": 27.0423,
+          "description": "File access follows a symlink, hardlink, or shortcut to an unintended resource.",
+          "pattern": "cwe-59 symlink hardlink link-following symbolic-link file-link archive-extraction path-resolution file-overwrite race filesystem",
+          "remediation": "Reject unsafe links and verify resolved file targets before access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-059"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.4438,
+          "raw_bm25_score": 26.4438,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/insecure-temporary-file",
+          "cwe_id": "CWE-377",
+          "cwe_name": "Insecure Temporary File",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.3398,
+          "raw_bm25_score": 26.3398,
+          "description": "Creating a temporary file using this method may be insecure.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "external/cwe/cwe-377",
+            "security"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/timing-attack-against-hash",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.0282,
+          "raw_bm25_score": 25.0282,
+          "description": "When checking a Hash over a message, a constant-time algorithm should be used. Otherwise, an attacker may be able to forge a valid Hash for an arbitrary message by running a timing attack if they can send to the validation procedure. A successful attack can result in authentication bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "fallback/cwe-534-information-exposure-through-debug-log-files",
+          "cwe_id": "CWE-534",
+          "cwe_name": "Information Exposure Through Debug Log Files",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 24.1366,
+          "raw_bm25_score": 24.1366,
+          "description": "Sensitive information is written to debug or diagnostic log files.",
+          "pattern": "cwe-534 debug-log diagnostic-log verbose-log sensitive-log password token credential secret exception stacktrace logging",
+          "remediation": "Redact secrets and disable sensitive diagnostic logging.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-534"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "fallback/cwe-264-permissions-privileges-and-access-controls",
+          "cwe_id": "CWE-264",
+          "cwe_name": "Permissions, Privileges, and Access Controls",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 23.4846,
+          "raw_bm25_score": 23.4846,
+          "description": "Legacy access-control category for failures in permissions, privileges, or authorization enforcement.",
+          "pattern": "cwe-264 permissions privileges access-control authorization acl role privilege owner permission enforcement",
+          "remediation": "Enforce trusted authorization, role, ownership, and permission checks.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-264"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.0455,
+          "raw_bm25_score": 20.0455,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/call/wrong-named-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.3059,
+          "raw_bm25_score": 17.3059,
+          "description": "Using a named argument whose name does not correspond to a parameter of the called function or method, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/count-untrusted-data-external-api",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.1401,
+          "raw_bm25_score": 17.1401,
+          "description": "This reports the external APIs that are used with untrusted data, along with how frequently the API is called, and how many unique sources of untrusted data flow to it.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

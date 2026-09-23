@@ -1,0 +1,804 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "anymail/utils.py",
+    "changed_line": 375,
+    "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+    "change_type": "A",
+    "function_name": "get_request_uri",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.85,
+    "code_context": "226:     ANYMAIL = { \"MAILGUN_API_KEY\": \"xyz\", ... }\n227:     ANYMAIL_MAILGUN_API_KEY = \"xyz\"\n228:     MAILGUN_API_KEY = \"xyz\"\n229:     \"\"\"\n230: \n231:     try:\n232:         value = kwargs.pop(name)\n233:         if name in ['username', 'password']:\n234:             # Work around a problem in django.core.mail.send_mail, which calls\n235:             # get_connection(... username=None, password=None) by default.\n236:             # We need to ignore those None defaults (else settings like\n237:             # 'SENDGRID_USERNAME' get unintentionally overridden from kwargs).\n238:             if value is not None:\n239:                 return value\n240:         else:\n241:             return value\n242:     except (AttributeError, KeyError):\n243:         pass\n244: \n245:     if esp_name is not None:\n246:         setting = \"{}_{}\".format(esp_name.upper(), name.upper())\n247:     else:\n248:         setting = name.upper()\n249:     anymail_setting = \"ANYMAIL_%s\" % setting\n250: \n251:     try:\n252:         return settings.ANYMAIL[setting]\n253:     except (AttributeError, KeyError):\n254:         try:\n255:             return getattr(settings, anymail_setting)\n256:         except AttributeError:\n257:             if allow_bare:\n258:                 try:\n259:                     return getattr(settings, setting)\n260:                 except AttributeError:\n261:                     pass\n262:             if default is UNSET:\n263:                 message = \"You must set %s or ANYMAIL = {'%s': ...}\" % (anymail_setting, setting)\n264:                 if allow_bare:\n265:                     message += \" or %s\" % setting\n266:                 message += \" in your Django settings\"\n267:                 raise AnymailConfigurationError(message)\n268:             else:\n269:                 return default\n270: \n271: \n272: def collect_all_methods(cls, method_name):\n273:     \"\"\"Return list of all `method_name` methods for cls and its superclass chain.\n274: \n275:     List is in MRO order, with no duplicates. Methods are unbound.\n276: \n277:     (This is used to simplify mixins and subclasses that contribute to a method set,\n278:     without requiring superclass chaining, and without requiring cooperating\n279:     superclasses.)\n280:     \"\"\"\n281:     methods = []\n282:     for ancestor in cls.__mro__:\n283:         try:\n284:             validator = getattr(ancestor, method_name)\n285:         except AttributeError:\n286:             pass\n287:         else:\n288:             if validator not in methods:\n289:                 methods.append(validator)\n290:     return methods\n291: \n292: \n293: EPOCH = datetime(1970, 1, 1, tzinfo=utc)\n294: \n295: \n296: def timestamp(dt):\n297:     \"\"\"Return the unix timestamp (seconds past the epoch) for datetime dt\"\"\"\n298:     # This is the equivalent of Python 3.3's datetime.timestamp\n299:     try:\n300:         return dt.timestamp()\n301:     except AttributeError:\n302:         if dt.tzinfo is None:\n303:             return mktime(dt.timetuple())\n304:         else:\n305:             return (dt - EPOCH).total_seconds()\n306: \n307: \n308: def rfc2822date(dt):\n309:     \"\"\"Turn a datetime into a date string as specified in RFC 2822.\"\"\"\n310:     # This is almost the equivalent of Python 3.3's email.utils.format_datetime,\n311:     # but treats naive datetimes as local rather than \"UTC with no information ...\"\n312:     timeval = timestamp(dt)\n313:     return formatdate(timeval, usegmt=True)\n314: \n315: \n316: def is_lazy(obj):\n317:     \"\"\"Return True if obj is a Django lazy object.\"\"\"\n318:     # See django.utils.functional.lazy. (This appears to be preferred\n319:     # to checking for `not isinstance(obj, six.text_type)`.)\n320:     return isinstance(obj, Promise)\n321: \n322: \n323: def force_non_lazy(obj):\n324:     \"\"\"If obj is a Django lazy object, return it coerced to text; otherwise return it unchanged.\n325: \n326:     (Similar to django.utils.encoding.force_text, but doesn't alter non-text objects.)\n327:     \"\"\"\n328:     if is_lazy(obj):\n329:         return six.text_type(obj)\n330: \n331:     return obj\n332: \n333: \n334: def force_non_lazy_list(obj):\n335:     \"\"\"Return a (shallow) copy of sequence obj, with all values forced non-lazy.\"\"\"\n336:     try:\n337:         return [force_non_lazy(item) for item in obj]\n338:     except (AttributeError, TypeError):\n339:         return force_non_lazy(obj)\n340: \n341: \n342: def force_non_lazy_dict(obj):\n343:     \"\"\"Return a (deep) copy of dict obj, with all values forced non-lazy.\"\"\"\n344:     try:\n345:         return {key: force_non_lazy_dict(value) for key, value in obj.items()}\n346:     except (AttributeError, TypeError):\n347:         return force_non_lazy(obj)\n348: \n349: \n350: def get_request_basic_auth(request):\n351:     \"\"\"Returns HTTP basic auth string sent with request, or None.\n352: \n353:     If request includes basic auth, result is string 'username:password'.\n354:     \"\"\"\n355:     try:\n356:         authtype, authdata = request.META['HTTP_AUTHORIZATION'].split()\n357:         if authtype.lower() == \"basic\":\n358:             return base64.b64decode(authdata).decode('utf-8')\n359:     except (IndexError, KeyError, TypeError, ValueError):\n360:         pass\n361:     return None\n362: \n363: \n364: def get_request_uri(request):\n365:     \"\"\"Returns the \"exact\" url used to call request.\n366: \n367:     Like :func:`django.http.request.HTTPRequest.build_absolute_uri`,\n368:     but also inlines HTTP basic auth, if present.\n369:     \"\"\"\n370:     url = request.build_absolute_uri()\n371:     basic_auth = get_request_basic_auth(request)\n372:     if basic_auth is not None:\n373:         # must reassemble url with auth\n374:         parts = urlsplit(url)\n375:         url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,\n376:                           parts.path, parts.query, parts.fragment))\n377:     return url",
+    "source_summary": "The basic authentication credentials (username and password) are extracted from the HTTP request's 'HTTP_AUTHORIZATION' header by the get_request_basic_auth function. This function decodes base64-encoded credentials and returns them as a 'username:password' string.",
+    "sink_summary": "The extracted basic authentication credentials are embedded into the URL as part of the netloc component, potentially exposing sensitive credentials in logs or URLs that might be visible to other systems or users.",
+    "guard_summary": "There are no explicit validation, sanitization, or authorization checks on the basic authentication credentials before they are included in the URL. The function directly incorporates the credentials into the URL without any filtering or escaping.",
+    "risk_pattern": "Basic authentication credentials extracted from HTTP request headers are directly embedded into a URL without sanitization or validation, potentially exposing sensitive information in logs or URLs.",
+    "used_variable_sources": [
+      "request.META['HTTP_AUTHORIZATION']"
+    ],
+    "called_function_context": [
+      "get_request_basic_auth(request)",
+      "urlsplit(url)",
+      "urlunsplit()"
+    ],
+    "enclosing_conditions": [
+      "if basic_auth is not None:"
+    ],
+    "context_summary": "The get_request_uri function constructs a URL that includes HTTP basic authentication credentials. It first retrieves the basic auth string from the request, and if present, it reassembles the URL with the credentials embedded in the netloc part of the URL. This operation occurs within a conditional block that only executes when basic_auth is not None.",
+    "unresolved_facts": [],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "The mechanism of embedding basic authentication credentials into a URL without sanitization directly leads to exposure of sensitive information in logs or URLs that might be visible to other systems or users.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-113",
+        "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+        "fit_reason": "While the primary issue is credential exposure, the lack of sanitization of credentials before URL construction could potentially allow CRLF injection if credentials contain CR/LF characters.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-93",
+        "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+        "fit_reason": "Similar to CWE-113, the lack of validation on credentials before URL construction could allow CRLF injection if credentials contain CR/LF characters.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1004",
+      "CWE-113",
+      "CWE-1236",
+      "CWE-200",
+      "CWE-208",
+      "CWE-22",
+      "CWE-255",
+      "CWE-425",
+      "CWE-685",
+      "CWE-74",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "anymail/utils.py",
+        "changed_line": 375,
+        "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 1.0,
+            "evidence": "The code directly embeds basic authentication credentials into a URL by concatenating 'basic_auth + '@' + parts.netloc', which is the exact mechanism described in CWE-200 for exposure of sensitive information."
+          },
+          "connection": {
+            "score": 1.0,
+            "evidence": "The basic authentication credentials are extracted from request.META['HTTP_AUTHORIZATION'] and directly used to construct a URL. This creates a clear path from attacker-controlled input (the HTTP_AUTHORIZATION header) to the vulnerable operation (URL construction)."
+          },
+          "diff_causality": {
+            "score": 1.0,
+            "evidence": "If this line were reverted, basic authentication credentials would not be embedded in the URL. The patch directly addresses the mechanism by which sensitive information is exposed."
+          },
+          "security_control": {
+            "score": 1.0,
+            "evidence": "There are no validation, sanitization, or authorization checks on the basic authentication credentials before they are included in the URL. The required control of input sanitization is completely missing.",
+            "required_control": "Input sanitization and validation",
+            "control_requirement_evidence": "CWE-200 requires that sensitive information not be exposed to unauthorized actors, which necessitates controls to prevent such exposure, including sanitizing inputs before they are used in contexts where they might be logged or transmitted.",
+            "existing_controls_checked": [
+              "No validation of basic_auth input",
+              "No escaping or encoding of credentials in URL context",
+              "No authorization check on the request"
+            ],
+            "deficiency_evidence": "The code directly concatenates user-provided credentials into a URL without any sanitization, making it vulnerable to exposure in logs, URLs, and network traces."
+          },
+          "concrete_impact": {
+            "score": 1.0,
+            "evidence": "The concrete impact is that basic authentication credentials are exposed in the URL, which can be logged by web servers, proxies, or other systems, making them accessible to unauthorized actors who might have access to these logs."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, basic authentication credentials would not be embedded into the URL. The function would return a URL without the credentials in the netloc component, preventing exposure of sensitive information.",
+        "supporting_evidence": [
+          "The code directly concatenates basic_auth credentials into the URL",
+          "Basic auth is extracted from HTTP_AUTHORIZATION header which is attacker-controlled",
+          "URL construction happens without any sanitization or validation of credentials",
+          "The vulnerability exposes credentials in logs and network traces"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [],
+        "review_comment": "Basic authentication credentials from HTTP_AUTHORIZATION header are directly embedded into the URL without sanitization. This exposes sensitive credentials in logs and network traces. Remove the credential embedding from URL construction to prevent information exposure.",
+        "change_type": "A",
+        "raw_score": 1.0,
+        "score": 1.0
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "anymail/utils.py",
+        "changed_line": 375,
+        "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+        "cwe_id": "CWE-113",
+        "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The mechanism described in CWE-113 involves improper neutralization of CRLF sequences in HTTP headers, which is not demonstrated in the candidate code. The candidate code embeds credentials into a URL but does not manipulate HTTP headers."
+          },
+          "connection": {
+            "score": 0.0,
+            "evidence": "There is no connection established between externally controlled input and an HTTP header sink. The input (basic auth credentials) is used to construct a URL, not an HTTP header."
+          },
+          "diff_causality": {
+            "score": 0.0,
+            "evidence": "Reverting the candidate line would not affect CRLF sequence handling in HTTP headers, as the code does not interact with HTTP headers at all."
+          },
+          "security_control": {
+            "score": 0.0,
+            "evidence": "No security control related to CRLF neutralization is present or missing in this context.",
+            "required_control": "Neutralization of CRLF sequences in HTTP headers",
+            "control_requirement_evidence": "CWE-113 specifically requires that CR and LF characters be neutralized before inclusion in HTTP headers.",
+            "existing_controls_checked": [
+              "No controls found related to CRLF handling in HTTP headers"
+            ],
+            "deficiency_evidence": "The code does not handle or sanitize CRLF sequences in any HTTP header context."
+          },
+          "concrete_impact": {
+            "score": 0.0,
+            "evidence": "There is no demonstrated impact related to HTTP request/response splitting or CRLF injection, as the vulnerability mechanism does not apply to this code path."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, there would be no change in CRLF handling for HTTP headers, since the code does not interact with HTTP headers at all.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The candidate code operates on URL construction and does not involve HTTP header manipulation or CRLF sequence handling."
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.0,
+        "score": 0.0
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "anymail/utils.py",
+        "changed_line": 375,
+        "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+        "cwe_id": "CWE-93",
+        "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The mechanism in CWE-93 involves CRLF injection into data streams, headers, or records. The candidate code does not inject CRLF sequences into such contexts; it embeds credentials into a URL netloc component."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "The basic authentication credentials are extracted from HTTP_AUTHORIZATION header and then embedded directly into the URL. There is a path from input to vulnerable operation, but no explicit evidence that CRLF characters in credentials would be processed as such."
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "If this line were reverted, basic authentication credentials would not be embedded into the URL. This change introduces the vulnerability by allowing credentials to be included in a context where they could be misinterpreted or logged."
+          },
+          "security_control": {
+            "score": 0.8,
+            "evidence": "There is no validation or sanitization of basic authentication credentials before embedding them into the URL. The required control is input sanitization for CRLF characters in credentials, which is not present.",
+            "required_control": "Input sanitization to neutralize CRLF sequences",
+            "control_requirement_evidence": "CWE-93 requires that CRLF sequences be neutralized when used in contexts where they could be interpreted as special control characters. The URL construction here does not sanitize credentials for such sequences.",
+            "existing_controls_checked": [
+              "No explicit validation or sanitization of basic_auth before embedding",
+              "No escaping or encoding of credentials in the URL context"
+            ],
+            "deficiency_evidence": "The code directly concatenates basic_auth into the URL without checking for CRLF characters. If credentials contain CR/LF, they would be embedded literally into the URL, which could lead to CRLF injection if the URL is used in headers or logs."
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "While there is a potential for CRLF injection if credentials contain CR/LF characters, no evidence shows that such credentials are actually present or that the resulting URL would be used in a context where CRLF injection could occur (e.g., HTTP headers)."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, basic authentication credentials would not be embedded into the URL. The function would return the URL without including the credentials in the netloc component, which would prevent potential exposure of credentials in logs or URLs.",
+        "supporting_evidence": [
+          "The get_request_basic_auth function extracts credentials from HTTP_AUTHORIZATION header and decodes them",
+          "The credentials are directly embedded into the URL via urlunsplit without sanitization",
+          "CWE-93 is about CRLF injection in data streams, headers, or records"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the basic authentication credentials actually contain CRLF characters",
+          "Whether the constructed URL is used in a context where CRLF injection could be exploited",
+          "Whether the URL is logged or exposed in a way that would allow CRLF injection"
+        ],
+        "review_comment": "Basic authentication credentials are embedded directly into the URL without sanitization. If credentials contain CRLF characters, they could be interpreted as control characters in contexts where the URL is used (e.g., HTTP headers). Add validation to sanitize or escape CRLF sequences from basic auth credentials before embedding them into URLs.",
+        "change_type": "A",
+        "raw_score": 0.4,
+        "score": 0.4
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "anymail/utils.py",
+    "changed_line": 358,
+    "statement": "return base64.b64decode(authdata).decode('utf-8')",
+    "change_type": "A",
+    "function_name": "get_request_basic_auth",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.75,
+    "code_context": "209:     if value is None:\n210:         return None\n211:     # _splitparam(value)[0].lower() :\n212:     return str(value).partition(';')[0].strip().lower()\n213: \n214: \n215: def get_anymail_setting(name, default=UNSET, esp_name=None, kwargs=None, allow_bare=False):\n216:     \"\"\"Returns an Anymail option from kwargs or Django settings.\n217: \n218:     Returns first of:\n219:     - kwargs[name] -- e.g., kwargs['api_key'] -- and name key will be popped from kwargs\n220:     - settings.ANYMAIL['<ESP_NAME>_<NAME>'] -- e.g., settings.ANYMAIL['MAILGUN_API_KEY']\n221:     - settings.ANYMAIL_<ESP_NAME>_<NAME> -- e.g., settings.ANYMAIL_MAILGUN_API_KEY\n222:     - settings.<ESP_NAME>_<NAME> (only if allow_bare) -- e.g., settings.MAILGUN_API_KEY\n223:     - default if provided; else raises AnymailConfigurationError\n224: \n225:     If allow_bare, allows settings.<ESP_NAME>_<NAME> without the ANYMAIL_ prefix:\n226:     ANYMAIL = { \"MAILGUN_API_KEY\": \"xyz\", ... }\n227:     ANYMAIL_MAILGUN_API_KEY = \"xyz\"\n228:     MAILGUN_API_KEY = \"xyz\"\n229:     \"\"\"\n230: \n231:     try:\n232:         value = kwargs.pop(name)\n233:         if name in ['username', 'password']:\n234:             # Work around a problem in django.core.mail.send_mail, which calls\n235:             # get_connection(... username=None, password=None) by default.\n236:             # We need to ignore those None defaults (else settings like\n237:             # 'SENDGRID_USERNAME' get unintentionally overridden from kwargs).\n238:             if value is not None:\n239:                 return value\n240:         else:\n241:             return value\n242:     except (AttributeError, KeyError):\n243:         pass\n244: \n245:     if esp_name is not None:\n246:         setting = \"{}_{}\".format(esp_name.upper(), name.upper())\n247:     else:\n248:         setting = name.upper()\n249:     anymail_setting = \"ANYMAIL_%s\" % setting\n250: \n251:     try:\n252:         return settings.ANYMAIL[setting]\n253:     except (AttributeError, KeyError):\n254:         try:\n255:             return getattr(settings, anymail_setting)\n256:         except AttributeError:\n257:             if allow_bare:\n258:                 try:\n259:                     return getattr(settings, setting)\n260:                 except AttributeError:\n261:                     pass\n262:             if default is UNSET:\n263:                 message = \"You must set %s or ANYMAIL = {'%s': ...}\" % (anymail_setting, setting)\n264:                 if allow_bare:\n265:                     message += \" or %s\" % setting\n266:                 message += \" in your Django settings\"\n267:                 raise AnymailConfigurationError(message)\n268:             else:\n269:                 return default\n270: \n271: \n272: def collect_all_methods(cls, method_name):\n273:     \"\"\"Return list of all `method_name` methods for cls and its superclass chain.\n274: \n275:     List is in MRO order, with no duplicates. Methods are unbound.\n276: \n277:     (This is used to simplify mixins and subclasses that contribute to a method set,\n278:     without requiring superclass chaining, and without requiring cooperating\n279:     superclasses.)\n280:     \"\"\"\n281:     methods = []\n282:     for ancestor in cls.__mro__:\n283:         try:\n284:             validator = getattr(ancestor, method_name)\n285:         except AttributeError:\n286:             pass\n287:         else:\n288:             if validator not in methods:\n289:                 methods.append(validator)\n290:     return methods\n291: \n292: \n293: EPOCH = datetime(1970, 1, 1, tzinfo=utc)\n294: \n295: \n296: def timestamp(dt):\n297:     \"\"\"Return the unix timestamp (seconds past the epoch) for datetime dt\"\"\"\n298:     # This is the equivalent of Python 3.3's datetime.timestamp\n299:     try:\n300:         return dt.timestamp()\n301:     except AttributeError:\n302:         if dt.tzinfo is None:\n303:             return mktime(dt.timetuple())\n304:         else:\n305:             return (dt - EPOCH).total_seconds()\n306: \n307: \n308: def rfc2822date(dt):\n309:     \"\"\"Turn a datetime into a date string as specified in RFC 2822.\"\"\"\n310:     # This is almost the equivalent of Python 3.3's email.utils.format_datetime,\n311:     # but treats naive datetimes as local rather than \"UTC with no information ...\"\n312:     timeval = timestamp(dt)\n313:     return formatdate(timeval, usegmt=True)\n314: \n315: \n316: def is_lazy(obj):\n317:     \"\"\"Return True if obj is a Django lazy object.\"\"\"\n318:     # See django.utils.functional.lazy. (This appears to be preferred\n319:     # to checking for `not isinstance(obj, six.text_type)`.)\n320:     return isinstance(obj, Promise)\n321: \n322: \n323: def force_non_lazy(obj):\n324:     \"\"\"If obj is a Django lazy object, return it coerced to text; otherwise return it unchanged.\n325: \n326:     (Similar to django.utils.encoding.force_text, but doesn't alter non-text objects.)\n327:     \"\"\"\n328:     if is_lazy(obj):\n329:         return six.text_type(obj)\n330: \n331:     return obj\n332: \n333: \n334: def force_non_lazy_list(obj):\n335:     \"\"\"Return a (shallow) copy of sequence obj, with all values forced non-lazy.\"\"\"\n336:     try:\n337:         return [force_non_lazy(item) for item in obj]\n338:     except (AttributeError, TypeError):\n339:         return force_non_lazy(obj)\n340: \n341: \n342: def force_non_lazy_dict(obj):\n343:     \"\"\"Return a (deep) copy of dict obj, with all values forced non-lazy.\"\"\"\n344:     try:\n345:         return {key: force_non_lazy_dict(value) for key, value in obj.items()}\n346:     except (AttributeError, TypeError):\n347:         return force_non_lazy(obj)\n348: \n349: \n350: def get_request_basic_auth(request):\n351:     \"\"\"Returns HTTP basic auth string sent with request, or None.\n352: \n353:     If request includes basic auth, result is string 'username:password'.\n354:     \"\"\"\n355:     try:\n356:         authtype, authdata = request.META['HTTP_AUTHORIZATION'].split()\n357:         if authtype.lower() == \"basic\":\n358:             return base64.b64decode(authdata).decode('utf-8')\n359:     except (IndexError, KeyError, TypeError, ValueError):\n360:         pass\n361:     return None\n362: \n363: \n364: def get_request_uri(request):\n365:     \"\"\"Returns the \"exact\" url used to call request.\n366: \n367:     Like :func:`django.http.request.HTTPRequest.build_absolute_uri`,\n368:     but also inlines HTTP basic auth, if present.\n369:     \"\"\"\n370:     url = request.build_absolute_uri()\n371:     basic_auth = get_request_basic_auth(request)\n372:     if basic_auth is not None:\n373:         # must reassemble url with auth\n374:         parts = urlsplit(url)\n375:         url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,\n376:                           parts.path, parts.query, parts.fragment))\n377:     return url",
+    "source_summary": "The function extracts HTTP_AUTHORIZATION from request.META, splits it to get the auth type and encoded data, and if the type is 'basic', it decodes the base64-encoded authentication data. The source of the authdata is directly from the HTTP_AUTHORIZATION header sent by the client.",
+    "sink_summary": "The decoded authentication string (username:password) is returned and used in webhooks/base.py for basic auth validation. If the decoded credentials don't match the configured webhook authorization, a validation failure is raised.",
+    "guard_summary": "The function has minimal guards - it only checks if the auth type is 'basic' but does not validate the decoded credentials against any predefined list or check. The actual security control happens in webhooks/base.py where the returned credentials are compared against self.basic_auth.",
+    "risk_pattern": "The function decodes base64-encoded authentication data from HTTP headers without validation of the encoded content, potentially allowing malformed or maliciously crafted credentials to be processed and passed to downstream validation logic.",
+    "used_variable_sources": [
+      "request.META['HTTP_AUTHORIZATION']"
+    ],
+    "called_function_context": [],
+    "enclosing_conditions": [
+      "authtype.lower() == \"basic\""
+    ],
+    "context_summary": "This function is used in the Anymail library to extract HTTP basic authentication from incoming webhook requests. It's called by AnymailBasicAuthMixin.validate_request() which compares the extracted credentials against a configured list of valid credentials. The vulnerability candidate is in the decoding step where no validation occurs on the base64 data before decoding.",
+    "unresolved_facts": [
+      "Whether the base64 data is validated for proper encoding before decoding",
+      "The exact format and validation rules applied to the decoded username:password string in downstream validation"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "The function decodes base64-encoded authentication data from HTTP headers without validating the encoded content, which is a form of improper input validation.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "The function extracts credentials but does not validate them, potentially allowing incorrect authorization decisions downstream.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-93",
+        "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+        "fit_reason": "While not directly shown in the code, the function handles HTTP headers which could be vulnerable to CRLF injection if not properly neutralized.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-113",
+      "CWE-125",
+      "CWE-179",
+      "CWE-20",
+      "CWE-208",
+      "CWE-502",
+      "CWE-628",
+      "CWE-685",
+      "CWE-863",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "anymail/utils.py",
+        "changed_line": 358,
+        "statement": "return base64.b64decode(authdata).decode('utf-8')",
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.8,
+            "evidence": "The function decodes base64-encoded data without validating the input, which directly matches CWE-20's mechanism of not validating input before processing."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The authdata comes from request.META['HTTP_AUTHORIZATION'], which is externally controlled input. The connection path is: HTTP header -> base64 decode -> returned string for downstream validation."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If this line were reverted, the decoding would not occur, and the function would return None instead of decoded credentials. The patch introduces the vulnerability by adding base64 decoding without validation."
+          },
+          "security_control": {
+            "score": 0.7,
+            "evidence": "The function lacks input validation for the base64 data before decoding. No sanitization or encoding checks are performed on authdata.",
+            "required_control": "Input validation of base64-encoded data",
+            "control_requirement_evidence": "CWE-20 requires that inputs be validated before processing to ensure they meet expected properties and are safe for handling.",
+            "existing_controls_checked": [
+              "The function only checks if the auth type is 'basic' but does not validate the encoded data",
+              "Downstream validation in webhooks/base.py compares credentials against configured values, but this occurs after decoding"
+            ],
+            "deficiency_evidence": "The base64 data is decoded without checking for valid encoding or malicious content. The function assumes valid input and proceeds to decode without validation."
+          },
+          "concrete_impact": {
+            "score": 0.6,
+            "evidence": "Malformed or maliciously crafted base64 data could cause decoding errors or unexpected behavior, potentially leading to bypass of authentication checks if the downstream validation is insufficient."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the function would not decode the base64-encoded authdata. Instead, it would return None, preventing any decoded credentials from being passed to downstream validation logic.",
+        "supporting_evidence": [
+          "The function extracts HTTP_AUTHORIZATION header and decodes base64 data without validation",
+          "The authdata is directly sourced from externally controlled input (HTTP header)",
+          "Downstream validation occurs after decoding but before authentication success"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the base64 data is validated for proper encoding before decoding",
+          "The exact format and validation rules applied to the decoded username:password string in downstream validation"
+        ],
+        "review_comment": "The function decodes base64-encoded authentication data from HTTP headers without validating the input. This allows potentially malformed or maliciously crafted base64 data to be processed, which could lead to unexpected behavior or bypass of authentication checks. The vulnerability exists at the boundary where external input is accepted and decoded without validation. Add validation to ensure authdata contains only valid base64 characters before decoding.",
+        "change_type": "A",
+        "raw_score": 0.7000000000000001,
+        "score": 0.7000000000000001
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "anymail/utils.py",
+        "changed_line": 358,
+        "statement": "return base64.b64decode(authdata).decode('utf-8')",
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.8,
+            "evidence": "The function extracts HTTP basic auth from request.META['HTTP_AUTHORIZATION'], decodes base64 data without validation, and returns credentials that are later used for authorization checks. This matches the CWE-863 mechanism of performing an authorization check when an actor attempts to access a resource but not correctly performing the check."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The HTTP_AUTHORIZATION header (source) is directly used as input to extract and decode credentials. The decoded credentials are returned by get_request_basic_auth() and consumed in webhooks/base.py for authorization validation, establishing a concrete path from input to vulnerable operation."
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "If this line were reverted or modified to include validation of base64 data before decoding, it would materially change the vulnerability by preventing potentially malformed or maliciously crafted credentials from being passed downstream for authorization checks."
+          },
+          "security_control": {
+            "score": 0.75,
+            "evidence": "The required control is validation of the base64-encoded data before decoding to ensure it conforms to expected format and content. This control is demonstrably missing as the code directly decodes without checking if authdata is valid base64 or contains malicious content.",
+            "required_control": "Validation of base64-encoded data before decoding",
+            "control_requirement_evidence": "CWE-863 requires correct authorization checks, which includes validating that credentials are properly formatted and not malformed before being used for authorization decisions.",
+            "existing_controls_checked": [
+              "The function only checks if authtype is 'basic' but does not validate the authdata content",
+              "Downstream validation in webhooks/base.py compares against self.basic_auth but does not validate the format of credentials extracted here"
+            ],
+            "deficiency_evidence": "The code directly decodes base64 data without checking for valid encoding or malicious content, allowing potentially invalid or crafted credentials to proceed to authorization checks."
+          },
+          "concrete_impact": {
+            "score": 0.5,
+            "evidence": "A concrete security consequence is that malformed or maliciously crafted base64 data could be decoded and passed to downstream authorization logic, potentially leading to incorrect authorization decisions if the validation in webhooks/base.py is insufficient or bypassed."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the function would not decode the base64-encoded authdata before returning it. This would prevent any malformed or maliciously crafted credentials from being processed and passed to downstream authorization checks, thereby removing the vulnerability.",
+        "supporting_evidence": [
+          "The function extracts HTTP_AUTHORIZATION header directly from request.META",
+          "Base64 decoding occurs without validation of input format",
+          "Decoded credentials are used in webhooks/base.py for authorization validation",
+          "Downstream validation logic exists but is not sufficient to prevent all malformed inputs"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the base64 data is validated for proper encoding before decoding",
+          "The exact format and validation rules applied to the decoded username:password string in downstream validation"
+        ],
+        "review_comment": "The function decodes base64-encoded HTTP basic auth without validating the encoded content, allowing potentially malformed credentials to be passed to downstream authorization checks. Add validation of base64 data before decoding to ensure only properly formatted credentials are processed.",
+        "change_type": "A",
+        "raw_score": 0.6699999999999999,
+        "score": 0.6699999999999999
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "anymail/utils.py",
+        "changed_line": 358,
+        "statement": "return base64.b64decode(authdata).decode('utf-8')",
+        "cwe_id": "CWE-93",
+        "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The candidate function decodes base64-encoded authentication data but does not handle CRLF sequences. CWE-93 specifically requires improper neutralization of CRLF in inputs, which is not demonstrated here."
+          },
+          "connection": {
+            "score": 0.0,
+            "evidence": "While the function processes HTTP_AUTHORIZATION header data, there is no evidence that CRLF sequences are present or processed in a way that could lead to injection. The mechanism of CWE-93 is not demonstrated."
+          },
+          "diff_causality": {
+            "score": 0.0,
+            "evidence": "Reverting the line would not affect CRLF injection since the function does not process CRLF sequences at all. The change does not introduce or remove a CRLF handling mechanism."
+          },
+          "security_control": {
+            "score": 0.0,
+            "evidence": "No security control related to CRLF neutralization is present in this function. The function simply decodes base64 data without any validation of the decoded content for special characters.",
+            "required_control": "CRLF sequence neutralization",
+            "control_requirement_evidence": "CWE-93 requires that CRLF sequences be properly neutralized when they are used as special elements in inputs, which is not demonstrated here.",
+            "existing_controls_checked": [
+              "Base64 decoding without validation of decoded content",
+              "No explicit handling or sanitization of CRLF characters"
+            ],
+            "deficiency_evidence": "The function directly decodes base64 data and returns it without any checks for CRLF sequences, which is exactly what CWE-93 addresses."
+          },
+          "concrete_impact": {
+            "score": 0.0,
+            "evidence": "There is no demonstrated path from the function to a concrete security consequence related to CRLF injection. The mechanism of CWE-93 is not present in this code."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the function would not decode base64 authentication data at all, and would return None instead. This would not affect CRLF injection since the function does not process CRLF sequences.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The function only decodes base64 data without any handling of CRLF sequences",
+          "No evidence that the decoded credentials are used in contexts where CRLF injection could occur"
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [
+          "Whether the base64 data is validated for proper encoding before decoding",
+          "The exact format and validation rules applied to the decoded username:password string in downstream validation"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.0,
+        "score": 0.0
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "anymail/webhooks/mandrill.py",
+    "changed_line": 49,
+    "statement": "url = self.webhook_url or get_request_uri(request)",
+    "change_type": "A",
+    "function_name": "MandrillSignatureMixin.validate_request",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.7,
+    "code_context": "1: import json\n2: from datetime import datetime\n3: \n4: import hashlib\n5: import hmac\n6: from base64 import b64encode\n7: from django.utils.crypto import constant_time_compare\n8: from django.utils.timezone import utc\n9: \n10: from .base import AnymailBaseWebhookView\n11: from ..exceptions import AnymailWebhookValidationFailure, AnymailConfigurationError\n12: from ..signals import tracking, AnymailTrackingEvent, EventType\n13: from ..utils import get_anymail_setting, getfirst, get_request_uri\n14: \n15: \n16: class MandrillSignatureMixin(object):\n17:     \"\"\"Validates Mandrill webhook signature\"\"\"\n18: \n19:     # These can be set from kwargs in View.as_view, or pulled from settings in init:\n20:     webhook_key = None  # required\n21:     webhook_url = None  # optional; defaults to actual url used\n22: \n23:     def __init__(self, **kwargs):\n24:         # noinspection PyUnresolvedReferences\n25:         esp_name = self.esp_name\n26:         # webhook_key is required for POST, but not for HEAD when Mandrill validates webhook url.\n27:         # Defer \"missing setting\" error until we actually try to use it in the POST...\n28:         webhook_key = get_anymail_setting('webhook_key', esp_name=esp_name, default=None,\n29:                                           kwargs=kwargs, allow_bare=True)\n30:         if webhook_key is not None:\n31:             self.webhook_key = webhook_key.encode('ascii')  # hmac.new requires bytes key in python 3\n32:         self.webhook_url = get_anymail_setting('webhook_url', esp_name=esp_name, default=None,\n33:                                                kwargs=kwargs, allow_bare=True)\n34:         # noinspection PyArgumentList\n35:         super(MandrillSignatureMixin, self).__init__(**kwargs)\n36: \n37:     def validate_request(self, request):\n38:         if self.webhook_key is None:\n39:             # issue deferred \"missing setting\" error (re-call get-setting without a default)\n40:             # noinspection PyUnresolvedReferences\n41:             get_anymail_setting('webhook_key', esp_name=self.esp_name, allow_bare=True)\n42: \n43:         try:\n44:             signature = request.META[\"HTTP_X_MANDRILL_SIGNATURE\"]\n45:         except KeyError:\n46:             raise AnymailWebhookValidationFailure(\"X-Mandrill-Signature header missing from webhook POST\")\n47: \n48:         # Mandrill signs the exact URL (including basic auth, if used) plus the sorted POST params:\n49:         url = self.webhook_url or get_request_uri(request)\n50:         params = request.POST.dict()\n51:         signed_data = url\n52:         for key in sorted(params.keys()):\n53:             signed_data += key + params[key]\n54: \n55:         expected_signature = b64encode(hmac.new(key=self.webhook_key, msg=signed_data.encode('utf-8'),\n56:                                                 digestmod=hashlib.sha1).digest())\n57:         if not constant_time_compare(signature, expected_signature):\n58:             raise AnymailWebhookValidationFailure(\n59:                 \"Mandrill webhook called with incorrect signature (for url %r)\" % url)\n60: \n61: \n62: class MandrillBaseWebhookView(MandrillSignatureMixin, AnymailBaseWebhookView):\n63:     \"\"\"Base view class for Mandrill webhooks\"\"\"\n64: \n65:     warn_if_no_basic_auth = False  # because we validate against signature\n66: \n67:     def parse_events(self, request):\n68:         esp_events = json.loads(request.POST['mandrill_events'])\n69:         return [self.esp_to_anymail_event(esp_event) for esp_event in esp_events]\n70: \n71:     def esp_to_anymail_event(self, esp_event):\n72:         raise NotImplementedError()\n73: \n74: \n75: class MandrillTrackingWebhookView(MandrillBaseWebhookView):\n76: \n77:     signal = tracking\n78: \n79:     event_types = {\n80:         # Message events:\n81:         'send': EventType.SENT,\n82:         'deferral': EventType.DEFERRED,\n83:         'hard_bounce': EventType.BOUNCED,\n84:         'soft_bounce': EventType.DEFERRED,\n85:         'open': EventType.OPENED,\n86:         'click': EventType.CLICKED,\n87:         'spam': EventType.COMPLAINED,\n88:         'unsub': EventType.UNSUBSCRIBED,\n89:         'reject': EventType.REJECTED,\n90:         # Sync events (we don't really normalize these well):\n91:         'whitelist': EventType.UNKNOWN,\n92:         'blacklist': EventType.UNKNOWN,\n93:         # Inbound events:\n94:         'inbound': EventType.INBOUND,\n95:     }\n96: \n97:     def esp_to_anymail_event(self, esp_event):\n98:         esp_type = getfirst(esp_event, ['event', 'type'], None)\n99:         event_type = self.event_types.get(esp_type, EventType.UNKNOWN)\n100:         if event_type == EventType.INBOUND:\n101:             raise AnymailConfigurationError(\n102:                 \"You seem to have set Mandrill's *inbound* webhook URL \"\n103:                 \"to Anymail's Mandrill *tracking* webhook URL.\")\n104: \n105:         try:\n106:             timestamp = datetime.fromtimestamp(esp_event['ts'], tz=utc)\n107:         except (KeyError, ValueError):\n108:             timestamp = None\n109: \n110:         try:\n111:             recipient = esp_event['msg']['email']\n112:         except KeyError:\n113:             try:\n114:                 recipient = esp_event['reject']['email']  # sync events\n115:             except KeyError:\n116:                 recipient = None\n117: \n118:         try:\n119:             mta_response = esp_event['msg']['diag']\n120:         except KeyError:\n121:             mta_response = None\n122: \n123:         try:\n124:             description = getfirst(esp_event['reject'], ['detail', 'reason'])\n125:         except KeyError:\n126:             description = None\n127: \n128:         try:\n129:             metadata = esp_event['msg']['metadata']\n130:         except KeyError:\n131:             metadata = None\n132: \n133:         try:\n134:             tags = esp_event['msg']['tags']\n135:         except KeyError:\n136:             tags = None\n137: \n138:         return AnymailTrackingEvent(\n139:             click_url=esp_event.get('url', None),\n140:             description=description,\n141:             esp_event=esp_event,\n142:             event_type=event_type,\n143:             message_id=esp_event.get('_id', None),\n144:             metadata=metadata,\n145:             mta_response=mta_response,\n146:             recipient=recipient,\n147:             reject_reason=None,  # probably map esp_event['msg']['bounce_description'], but insufficient docs\n148:             tags=tags,\n149:             timestamp=timestamp,\n150:             user_agent=esp_event.get('user_agent', None),\n151:         )",
+    "source_summary": "The url variable is sourced from either the instance's webhook_url attribute (which can be set via Django settings) or from get_request_uri(request), which constructs a URL including any basic authentication credentials present in the request.",
+    "sink_summary": "The constructed url is used as part of the signed_data for HMAC signature validation. It is also included in an error message if signature validation fails.",
+    "guard_summary": "The security control is the HMAC signature validation using webhook_key, which ensures that only requests with a valid signature (computed over the url and POST parameters) are accepted. The basic auth credentials in the URL are part of the signed data, so they must match what Mandrill used when signing.",
+    "risk_pattern": "If webhook_url is set to an attacker-controlled value, it could be used to manipulate the HMAC signature validation by changing the URL that gets signed. However, if webhook_url is not explicitly set, get_request_uri(request) is used which includes basic auth credentials from the request, making the signature dependent on those credentials.",
+    "used_variable_sources": [
+      "self.webhook_url",
+      "get_request_uri(request)"
+    ],
+    "called_function_context": [
+      "get_request_uri(request)"
+    ],
+    "enclosing_conditions": [],
+    "context_summary": "The statement determines which URL is used for HMAC signature validation. If self.webhook_url is set (potentially from Django settings), it's used directly; otherwise, get_request_uri(request) constructs the URL including any basic auth credentials present in the request.",
+    "unresolved_facts": [
+      "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+      "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Path Traversal",
+        "fit_reason": "The mechanism involves manipulation of URL in HMAC signature validation where webhook_url can be attacker-controlled, potentially leading to path traversal if the URL is used in file operations",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-471",
+        "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+        "fit_reason": "The webhook_url setting is assumed to be immutable but can be modified by an attacker, affecting the HMAC signature validation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-208",
+        "cwe_name": "Observable Timing Discrepancy",
+        "fit_reason": "HMAC signature validation could be vulnerable to timing attacks if not using constant-time comparison, potentially allowing authentication bypass",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-327",
+        "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+        "fit_reason": "The code uses SHA1 for HMAC which is considered weak and risky cryptographic algorithm",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-287",
+        "cwe_name": "Improper Authentication",
+        "fit_reason": "The authentication mechanism relies on webhook_key but if webhook_url is attacker-controlled, it could lead to improper authentication",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1004",
+      "CWE-1275",
+      "CWE-208",
+      "CWE-22",
+      "CWE-287",
+      "CWE-327",
+      "CWE-425",
+      "CWE-471",
+      "CWE-685",
+      "CWE-730",
+      "CWE-770"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "anymail/webhooks/mandrill.py",
+        "changed_line": 49,
+        "statement": "url = self.webhook_url or get_request_uri(request)",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The mechanism demonstrated in the code does not involve file path traversal. The url variable is used for HMAC signature validation, not for file system access or path resolution."
+          },
+          "connection": {
+            "score": 0.0,
+            "evidence": "There is no connection between externally controlled input and a vulnerable file system operation. The url is only used in HMAC computation and error reporting, not for file access."
+          },
+          "diff_causality": {
+            "score": 0.0,
+            "evidence": "Reverting this line would not materially change the vulnerability because the code does not perform path traversal operations. The line simply selects which URL to use for signature validation."
+          },
+          "security_control": {
+            "score": 0.0,
+            "evidence": "No security control deficiency is demonstrated for CWE-22. The code does not perform file system operations or path resolution that would be vulnerable to path traversal.",
+            "required_control": "Path validation and sanitization for file paths",
+            "control_requirement_evidence": "CWE-22 requires controls to prevent manipulation of file paths to access restricted directories.",
+            "existing_controls_checked": [
+              "HMAC signature validation",
+              "URL construction from request"
+            ],
+            "deficiency_evidence": "The code does not perform any path traversal operations or file system access that would require path validation."
+          },
+          "concrete_impact": {
+            "score": 0.0,
+            "evidence": "No concrete security consequence is demonstrated for CWE-22. The vulnerability mechanism is not present in the code."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the behavior would remain unchanged because it's simply selecting between two URL sources for signature validation. No path traversal vulnerability would be introduced or removed.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The url variable is used only for HMAC signature validation and error reporting, not for file system operations",
+          "No file path resolution or manipulation occurs in the code"
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [
+          "Whether webhook_url can be controlled by an attacker",
+          "The exact security implications of using get_request_uri(request) vs self.webhook_url"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.0,
+        "score": 0.0
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "anymail/webhooks/mandrill.py",
+        "changed_line": 49,
+        "statement": "url = self.webhook_url or get_request_uri(request)",
+        "cwe_id": "CWE-471",
+        "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.8,
+            "evidence": "The code assumes that self.webhook_url is immutable and will not be modified by an attacker, but the setting can be configured via Django settings which may be controlled by an attacker in some deployment scenarios."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The webhook_url setting is used to construct the URL that is signed during HMAC validation. If an attacker controls this value, they can manipulate the signature validation process, though the exact reachability and impact depends on whether the setting is attacker-controlled."
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "If this line were reverted to only use get_request_uri(request), the vulnerability would be mitigated because the URL used for signature validation would always include request-specific information (including basic auth) and not an attacker-controlled setting."
+          },
+          "security_control": {
+            "score": 0.65,
+            "evidence": "The security control is the HMAC signature validation, which depends on a URL that may be attacker-controlled. The required control is to ensure webhook_url is not attacker-modifiable or properly validated before use.",
+            "required_control": "Validation of webhook_url setting",
+            "control_requirement_evidence": "CWE-471 requires that assumed-immutable data not be modifiable by attackers. The webhook_url setting is assumed to be immutable but can be modified by an attacker through Django settings.",
+            "existing_controls_checked": [
+              "HMAC signature validation (depends on URL)",
+              "get_request_uri(request) function (used as fallback)"
+            ],
+            "deficiency_evidence": "The code does not validate or sanitize the webhook_url setting before using it in HMAC signature computation. The setting can be modified by an attacker, violating the assumption of immutability."
+          },
+          "concrete_impact": {
+            "score": 0.4,
+            "evidence": "If an attacker controls webhook_url, they could potentially manipulate the URL used for signature validation, but concrete impact depends on whether the setting is actually attacker-controlled and whether this leads to successful signature bypass."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted to only use get_request_uri(request), then the URL used for HMAC signature validation would always be derived from the actual request URI, including any basic auth credentials. This would prevent an attacker from manipulating the signature validation by controlling a setting that could be modified externally.",
+        "supporting_evidence": [
+          "The webhook_url can be set via Django settings which may be controlled by an attacker",
+          "The URL used for HMAC signature validation includes the webhook_url value in its computation",
+          "The code explicitly states that webhook_url is optional and defaults to actual url used"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+          "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+        ],
+        "review_comment": "The webhook_url setting is assumed to be immutable but can be modified by an attacker through Django settings. This allows manipulation of HMAC signature validation since the URL used for signing includes this potentially attacker-controlled value. The fix should validate or sanitize the webhook_url setting before using it in signature computation, ensuring it's not externally modifiable.",
+        "change_type": "A",
+        "raw_score": 0.6299999999999999,
+        "score": 0.6299999999999999
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "anymail/webhooks/mandrill.py",
+        "changed_line": 49,
+        "statement": "url = self.webhook_url or get_request_uri(request)",
+        "cwe_id": "CWE-208",
+        "cwe_name": "Observable Timing Discrepancy",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The candidate line does not demonstrate a timing discrepancy mechanism. It simply assigns a URL value to be used in HMAC signature validation, without any timing-related operations or comparisons that would lead to observable timing differences."
+          },
+          "connection": {
+            "score": 0.0,
+            "evidence": "There is no demonstrated connection between externally controlled input and a timing-sensitive operation. The url variable is used for signature validation but not in a way that introduces timing discrepancies."
+          },
+          "diff_causality": {
+            "score": 0.0,
+            "evidence": "Reverting this line would not materially change the vulnerability mechanism related to observable timing discrepancies, as the line itself does not introduce timing issues; it only determines which URL is used for signature validation."
+          },
+          "security_control": {
+            "score": 0.0,
+            "evidence": "The security control in question (constant-time comparison) is present and correctly implemented with 'constant_time_compare', but this line does not relate to timing discrepancies or the mechanism of CWE-208.",
+            "required_control": "Constant-time comparison for HMAC signature validation",
+            "control_requirement_evidence": "CWE-208 relates to timing discrepancies that can leak information, and constant-time comparison is necessary to prevent such leaks in cryptographic operations like HMAC validation.",
+            "existing_controls_checked": [
+              "constant_time_compare function usage in line 57"
+            ],
+            "deficiency_evidence": "The code correctly uses constant_time_compare for signature verification, but this line does not introduce or relate to timing discrepancies."
+          },
+          "concrete_impact": {
+            "score": 0.0,
+            "evidence": "There is no demonstrated concrete security consequence related to observable timing discrepancies in the mechanism shown by this line. The vulnerability described by CWE-208 is not present in this specific code path."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the logic for determining which URL to use for signature validation would remain unchanged; the behavior of HMAC signature validation would be identical since the line only affects URL selection, not timing or comparison operations.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The statement 'url = self.webhook_url or get_request_uri(request)' does not involve any timing-sensitive operations or comparisons that could lead to observable timing discrepancies",
+          "The code correctly implements constant_time_compare for HMAC signature validation, which is the primary defense against timing attacks in this context"
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [
+          "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+          "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.0,
+        "score": 0.0
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "anymail/webhooks/mandrill.py",
+        "changed_line": 49,
+        "statement": "url = self.webhook_url or get_request_uri(request)",
+        "cwe_id": "CWE-327",
+        "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The code uses SHA1 in HMAC for signature validation, but the vulnerability mechanism is not about using a broken cryptographic algorithm directly in the vulnerable operation. The issue is with the URL used in signature computation, not the algorithm itself."
+          },
+          "connection": {
+            "score": 0.0,
+            "evidence": "There is no direct connection established between the input (webhook_url or request URI) and a cryptographic algorithm that is broken or risky. The vulnerability lies in how the URL is constructed for signature validation, not in the cryptographic algorithm itself."
+          },
+          "diff_causality": {
+            "score": 0.0,
+            "evidence": "Reverting this line would not materially change the cryptographic algorithm used (SHA1 in HMAC). The core issue of using SHA1 is not introduced or removed by this specific line."
+          },
+          "security_control": {
+            "score": 0.0,
+            "evidence": "No relevant security control deficiency is demonstrated for CWE-327. The code uses HMAC-SHA1 which is indeed a weak algorithm, but the vulnerability mechanism does not match the exact CWE definition.",
+            "required_control": "Use of strong cryptographic algorithms",
+            "control_requirement_evidence": "CWE-327 specifically requires avoiding broken or risky cryptographic algorithms, such as SHA1 in HMAC when better alternatives exist.",
+            "existing_controls_checked": [
+              "HMAC-SHA1 usage for signature validation"
+            ],
+            "deficiency_evidence": "The code uses SHA1 which is considered weak and risky, but this line itself does not introduce or remove the use of SHA1; it's about how the URL is constructed for signing."
+          },
+          "concrete_impact": {
+            "score": 0.0,
+            "evidence": "No concrete security consequence is demonstrated that relates to using a broken cryptographic algorithm in this specific context. The impact would be related to signature validation bypass, not direct cryptographic weakness."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the URL used for HMAC signature validation would still be computed using SHA1 in hmac.new(), but the method of constructing that URL would change slightly. However, this does not materially affect the use of SHA1 as a cryptographic algorithm.",
+        "supporting_evidence": [
+          "The code uses SHA1 in HMAC signature validation (line 55)",
+          "HMAC-SHA1 is considered a weak and risky cryptographic algorithm"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+          "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.0,
+        "score": 0.0
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "anymail/webhooks/mandrill.py",
+        "changed_line": 49,
+        "statement": "url = self.webhook_url or get_request_uri(request)",
+        "cwe_id": "CWE-287",
+        "cwe_name": "Improper Authentication",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.4,
+            "evidence": "The mechanism involves authentication via HMAC signature validation, but the vulnerability is not in the core authentication process itself, rather in how the URL used for signing can be manipulated."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The url variable is used in HMAC signature validation and is sourced from either self.webhook_url (potentially attacker-controlled) or get_request_uri(request). If webhook_url is set by an attacker, it can influence the signed data."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If this line were reverted to only use get_request_uri(request), the vulnerability would be mitigated because the URL used for signing would always include basic auth credentials from the request, making it harder for an attacker to manipulate the signature."
+          },
+          "security_control": {
+            "score": 0.7,
+            "evidence": "The HMAC validation is present but vulnerable due to potential manipulation of the URL used in signing. The control is weakened because self.webhook_url can be set from external configuration.",
+            "required_control": "Validation of webhook_url setting",
+            "control_requirement_evidence": "CWE-287 requires that authentication claims be properly verified. If webhook_url is attacker-controlled, it undermines the integrity of the signature validation process.",
+            "existing_controls_checked": [
+              "HMAC signature validation",
+              "get_request_uri(request) function"
+            ],
+            "deficiency_evidence": "The code allows self.webhook_url to be set from Django settings without validation, potentially allowing an attacker to control the URL used for signing."
+          },
+          "concrete_impact": {
+            "score": 0.5,
+            "evidence": "If webhook_url is attacker-controlled and differs from the actual webhook endpoint, it could allow an attacker to forge signatures for a different URL, potentially bypassing authentication checks."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the code would always use get_request_uri(request) to construct the URL for signature validation, which includes basic auth credentials from the request. This would prevent an attacker from manipulating the signed URL through a configurable webhook_url setting.",
+        "supporting_evidence": [
+          "The statement uses self.webhook_url or get_request_uri(request) to determine URL for HMAC signing",
+          "webhook_url can be set via Django settings which may be attacker-controlled",
+          "HMAC signature validation depends on the URL used in signed_data"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+          "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+        ],
+        "review_comment": "The code allows webhook_url to be set from Django settings without validation, potentially allowing an attacker to manipulate the URL used for HMAC signature validation. This creates a potential authentication bypass if the attacker can control the webhook_url setting. The fix is to validate that webhook_url is a trusted endpoint or always use get_request_uri(request) which includes basic auth credentials.",
+        "change_type": "A",
+        "raw_score": 0.6,
+        "score": 0.6
+      }
+    ],
+    "stage4_status": "completed"
+  }
+]

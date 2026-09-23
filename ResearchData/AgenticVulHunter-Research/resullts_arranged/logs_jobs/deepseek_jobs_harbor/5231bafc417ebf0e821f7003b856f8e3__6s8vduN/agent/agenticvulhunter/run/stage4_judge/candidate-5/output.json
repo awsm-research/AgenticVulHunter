@@ -1,0 +1,365 @@
+{
+  "candidate_id": "candidate-5",
+  "filepath": "tests/tests.py",
+  "changed_line": 53,
+  "statement": "request.session = SessionStore('Python/2.7', '127.0.0.1')",
+  "change_type": "A",
+  "function_name": "Client.login",
+  "operation_type": "session_store_initialization",
+  "selection_reason": "Initializes a session store with hardcoded user-agent and IP -> could mask real client attributes in tests, affecting security validation.",
+  "security_relevance_score": 0.2,
+  "code_context": "1: from datetime import timedelta\n2: import sys\n3: try:\n4:     from urllib.parse import urlencode\n5: except ImportError:\n6:     from urllib import urlencode\n7: \n8: from django.conf import settings\n9: from django.contrib.auth import SESSION_KEY, authenticate, login\n10: from django.contrib.auth.models import User\n11: from django.contrib.sessions.backends.base import CreateError\n12: from django.core.urlresolvers import reverse\n13: from django.db import IntegrityError\n14: from django.http import HttpRequest\n15: from django.test import TestCase, Client as BaseClient\n16: from django.test.utils import override_settings\n17: from django.utils.timezone import now\n18: \n19: from user_sessions.backends.db import SessionStore\n20: from user_sessions.models import Session\n21: from user_sessions.templatetags.user_sessions import location, device\n22: \n23: if sys.version_info[:2] < (2, 7):\n24:     from django.utils.unittest.case import skipUnless\n25: else:\n26:     from unittest import skipUnless\n27: \n28: try:\n29:     from django.contrib.gis.geoip import GeoIP\n30:     geoip = GeoIP()\n31:     geoip_msg = None\n32: except Exception as e:\n33:     geoip = None\n34:     geoip_msg = str(e)\n35: \n36: \n37: class Client(BaseClient):\n38:     def login(self, **credentials):\n39:         \"\"\"\n40:         Sets the Factory to appear as if it has successfully logged into a site.\n41: \n42:         Returns True if login is possible; False if the provided credentials\n43:         are incorrect, or the user is inactive, or if the sessions framework is\n44:         not available.\n45:         \"\"\"\n46:         user = authenticate(**credentials)\n47:         if user and user.is_active:\n48:             # Create a fake request to store login details.\n49:             request = HttpRequest()\n50:             if self.session:\n51:                 request.session = self.session\n52:             else:\n53:                 request.session = SessionStore('Python/2.7', '127.0.0.1')\n54:             login(request, user)\n55: \n56:             # Save the session values.\n57:             request.session.save()\n58: \n59:             # Set the cookie to represent the session.\n60:             session_cookie = settings.SESSION_COOKIE_NAME\n61:             self.cookies[session_cookie] = request.session.session_key\n62:             cookie_data = {\n63:                 'max-age': None,\n64:                 'path': '/',\n65:                 'domain': settings.SESSION_COOKIE_DOMAIN,\n66:                 'secure': settings.SESSION_COOKIE_SECURE or None,\n67:                 'expires': None,\n68:             }\n69:             self.cookies[session_cookie].update(cookie_data)\n70: \n71:             return True\n72:         else:\n73:             return False\n74: \n75: \n76: class MiddlewareTest(TestCase):\n77:     def test_unmodified_session(self):\n78:         self.client.get('/', HTTP_USER_AGENT='Python/2.7')\n79:         self.assertNotIn(settings.SESSION_COOKIE_NAME, self.client.cookies)\n80: \n81:     def test_modify_session(self):\n82:         self.client.get('/modify_session/', HTTP_USER_AGENT='Python/2.7')\n83:         self.assertIn(settings.SESSION_COOKIE_NAME, self.client.cookies)\n84:         session = Session.objects.get(\n85:             pk=self.client.cookies[settings.SESSION_COOKIE_NAME].value\n86:         )\n87:         self.assertEqual(session.user_agent, 'Python/2.7')\n88:         self.assertEqual(session.ip, '127.0.0.1')\n89: \n90:     def test_login(self):\n91:         user = User.objects.create_superuser('bouke', '', 'secret')\n92:         response = self.client.post('/admin/',\n93:                                     data={\n94:                                         'username': 'bouke',\n95:                                         'password': 'secret',\n96:                                         'this_is_the_login_form': '1',\n97:                                         'next': '/admin/'},\n98:                                     HTTP_USER_AGENT='Python/2.7')\n99:         self.assertRedirects(response, '/admin/')\n100:         session = Session.objects.get(\n101:             pk=self.client.cookies[settings.SESSION_COOKIE_NAME].value\n102:         )\n103:         self.assertEqual(user, session.user)\n104: \n105:     def test_long_ua(self):\n106:         self.client.get('/modify_session/',\n107:                         HTTP_USER_AGENT=''.join('a' for _ in range(400)))\n108: \n109: \n110: class ViewsTest(TestCase):\n111:     client_class = Client\n112: \n113:     def setUp(self):\n114:         User.objects.create_user('bouke', '', 'secret')\n115:         assert self.client.login(username='bouke', password='secret')\n116: \n117:     def test_list(self):\n118:         response = self.client.get(reverse('user_sessions:session_list'))\n119:         self.assertContains(response, 'Active Sessions')\n120:         self.assertContains(response, 'End Session', 2)\n121: \n122:     def test_delete(self):\n123:         session_key = self.client.cookies[settings.SESSION_COOKIE_NAME].value\n124:         response = self.client.post(reverse('user_sessions:session_delete',\n125:                                             args=[session_key]))\n126:         self.assertRedirects(response, reverse('user_sessions:session_list'))\n127: \n128: \n129: class SessionStoreTest(TestCase):\n130:     def setUp(self):\n131:         self.store = SessionStore('Python/2.7', '127.0.0.1', None)\n132: \n133:     def test_untouched_init(self):\n134:         self.assertFalse(self.store.modified)\n135:         self.assertFalse(self.store.accessed)\n136: \n137:     def test_auth_session_key(self):\n138:         self.assertFalse(SESSION_KEY in self.store)\n139:         self.assertFalse(self.store.modified)\n140:         self.assertTrue(self.store.accessed)\n141: \n142:         self.store.get(SESSION_KEY)\n143:         self.assertFalse(self.store.modified)\n144: \n145:         self.store[SESSION_KEY] = 1\n146:         self.assertTrue(self.store.modified)\n147: \n148:     def test_save(self):\n149:         self.store[SESSION_KEY] = 1\n150:         self.store.save()\n151: \n152:         session = Session.objects.get(pk=self.store.session_key)\n153:         self.assertEqual(session.user_agent, 'Python/2.7')\n154:         self.assertEqual(session.ip, '127.0.0.1')\n155:         self.assertEqual(session.user_id, 1)\n156:         self.assertAlmostEqual(now(), session.last_activity,\n157:                                delta=timedelta(seconds=5))\n158: \n159:     def test_load_unmodified(self):\n160:         self.store[SESSION_KEY] = 1\n161:         self.store.save()\n162:         store2 = SessionStore('Python/2.7', '127.0.0.1',\n163:                               self.store.session_key)\n164:         store2.load()\n165:         self.assertEqual(store2.user_agent, 'Python/2.7')\n166:         self.assertEqual(store2.ip, '127.0.0.1')\n167:         self.assertEqual(store2.user_id, 1)\n168:         self.assertEqual(store2.modified, False)\n169: \n170:     def test_load_modified(self):\n171:         self.store[SESSION_KEY] = 1\n172:         self.store.save()\n173:         store2 = SessionStore('Python/3.3', '8.8.8.8', self.store.session_key)\n174:         store2.load()\n175:         self.assertEqual(store2.user_agent, 'Python/3.3')\n176:         self.assertEqual(store2.ip, '8.8.8.8')\n177:         self.assertEqual(store2.user_id, 1)\n178:         self.assertEqual(store2.modified, True)\n179: \n180: \n181: @skipUnless(geoip, geoip_msg)\n182: class LocationTemplateFilterTest(TestCase):\n183:     def test_no_location(self):\n184:         self.assertEqual(location('127.0.0.1'), '<i>unknown</i>')\n185: \n186:     def test_google(self):\n187:         self.assertEqual(location('8.8.8.8'), 'United States')\n188: \n189: \n190: class DeviceTemplateFilterTest(TestCase):\n191:     def test_ie(self):\n192:         self.assertEqual(\n193:             'Internet Explorer on Windows XP',\n194:             device('Mozilla/4.0 (Windows; MSIE 6.0; Windows NT 5.1; SV1; '\n195:                    '.NET CLR 2.0.50727)')\n196:         )\n197:         self.assertEqual(\n198:             'Internet Explorer on Windows Vista',\n199:             device('Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.0; '\n200:                    'Trident/4.0; SLCC1; .NET CLR 2.0.50727; .NET CLR 1.1.4322;'\n201:                    ' InfoPath.2; .NET CLR 3.5.21022; .NET CLR 3.5.30729; '\n202:                    'MS-RTC LM 8; OfficeLiveConnector.1.4; OfficeLivePatch.1.3;'",
+  "source_summary": "Hardcoded values 'Python/2.7' (user_agent) and '127.0.0.1' (IP address) provided directly to SessionStore constructor",
+  "sink_summary": "Session data including user_agent and IP are stored in database via request.session.save() and used for session management and security controls",
+  "guard_summary": "No validation of user_agent/IP parameters; hardcoded values bypass real client attributes; SessionStore.load() compares stored vs current user_agent/IP to detect modifications",
+  "risk_pattern": "Test code initializes session with hardcoded client attributes, potentially masking real client characteristics and bypassing security controls that rely on accurate user_agent/IP tracking",
+  "used_variable_sources": [
+    "hardcoded_string_literal"
+  ],
+  "called_function_context": [
+    "SessionStore.__init__",
+    "login",
+    "request.session.save"
+  ],
+  "enclosing_conditions": [
+    "if user and user.is_active",
+    "if self.session (false branch)"
+  ],
+  "context_summary": "In test Client.login method, creates fake session with hardcoded user_agent/IP when no existing session exists, then authenticates user and saves session to database",
+  "unresolved_facts": [
+    "Whether real client attributes (HTTP_USER_AGENT, REMOTE_ADDR) are properly captured in production vs test environments",
+    "Security implications of mismatched user_agent/IP between session creation and subsequent requests"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-348",
+      "cwe_name": "Use of Less Trusted Source",
+      "fit_reason": "Hardcoded IP address '127.0.0.1' and user-agent 'Python/2.7' bypass real client validation; matches IP spoofing mechanism where test code uses less trusted hardcoded source instead of actual client attributes",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-287",
+      "cwe_name": "Improper Authentication",
+      "fit_reason": "Hardcoded session attributes in test code could lead to authentication bypass by masking real client characteristics used for session validation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "fit_reason": "SessionStore accepts hardcoded values without validating they match actual client attributes, allowing test data to contaminate security controls",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "fit_reason": "Hardcoded session attributes represent insecure credential/session management in test environment that could affect production security",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-321",
+      "cwe_name": "Use of Hard-coded Cryptographic Key",
+      "fit_reason": "Pattern matches hardcoded security attributes (though not cryptographic keys specifically) that bypass proper client validation mechanisms",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1321",
+    "CWE-20",
+    "CWE-200",
+    "CWE-208",
+    "CWE-255",
+    "CWE-264",
+    "CWE-287",
+    "CWE-321",
+    "CWE-348",
+    "CWE-502",
+    "CWE-670",
+    "CWE-685",
+    "CWE-730",
+    "CWE-74",
+    "CWE-770",
+    "CWE-863"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "tests/tests.py",
+      "changed_line": 53,
+      "statement": "request.session = SessionStore('Python/2.7', '127.0.0.1')",
+      "cwe_id": "CWE-348",
+      "cwe_name": "Use of Less Trusted Source",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-348 requires two different sources of the same data where the less trusted source is chosen. This test code uses hardcoded values but doesn't demonstrate a choice between multiple sources of the same data."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "Hardcoded values flow to session storage and are used for session management, but there's no demonstrated connection to a security decision that would be affected by source trustworthiness."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The patch adds hardcoded session initialization, but this is test code that intentionally simulates client behavior rather than weakening production security."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "Verification mechanism to ensure trusted source selection",
+          "control_requirement_evidence": "CWE-348 requires controls to ensure the more trusted source is used when multiple sources exist",
+          "existing_controls_checked": [
+            "Test environment isolation",
+            "SessionStore constructor accepts parameters"
+          ],
+          "deficiency_evidence": "No evidence of source selection mechanism being bypassed; this is test code designed to simulate specific conditions"
+        },
+        "concrete_impact": {
+          "score": 0.15,
+          "evidence": "No security impact demonstrated; this is test code that intentionally uses hardcoded values to simulate client behavior for testing purposes."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the test client would not initialize sessions with hardcoded values, potentially making tests more realistic but not affecting production security.",
+      "supporting_evidence": [
+        "Hardcoded IP '127.0.0.1' and user-agent 'Python/2.7' are used instead of real client attributes"
+      ],
+      "contradicting_evidence": [
+        "This is test code in tests/tests.py, not production code",
+        "No evidence of multiple sources for the same data being available",
+        "SessionStore constructor is designed to accept these parameters for testing"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether this test code pattern affects production session handling",
+        "If there are actual security controls that rely on accurate client attributes in tests"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.22999999999999998,
+      "score": 0.22999999999999998
+    },
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "tests/tests.py",
+      "changed_line": 53,
+      "statement": "request.session = SessionStore('Python/2.7', '127.0.0.1')",
+      "cwe_id": "CWE-287",
+      "cwe_name": "Improper Authentication",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-287 requires insufficient proof of identity claim. The candidate initializes a test session with hardcoded attributes, but does not demonstrate authentication bypass, insufficient proof of identity, or any authentication mechanism."
+        },
+        "connection": {
+          "score": 0.15,
+          "evidence": "Hardcoded values 'Python/2.7' and '127.0.0.1' are connected to SessionStore initialization for test sessions. No connection to authentication decisions, identity verification, or security-sensitive authentication state is demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "If the candidate line were reverted, test sessions would need alternative initialization. The patch creates test sessions with hardcoded attributes instead of capturing real client data, but this is a test environment setup change, not a security control modification."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "No relevant authentication control deficiency is demonstrated. The code is test infrastructure, not production authentication logic.",
+          "required_control": "Proper proof of identity claim (authentication)",
+          "control_requirement_evidence": "CWE-287 requires insufficient proof of identity during authentication. Test session initialization does not involve identity verification.",
+          "existing_controls_checked": [
+            "Test Client.login method authenticates via Django's authenticate() function",
+            "SessionStore tracks user_agent/IP for session management, not authentication"
+          ],
+          "deficiency_evidence": "No authentication control deficiency is evidenced. The hardcoded values are for test session attributes, not authentication bypass."
+        },
+        "concrete_impact": {
+          "score": 0.05,
+          "evidence": "No concrete security impact is demonstrated. This is test code that initializes sessions with predictable values for testing purposes."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, test sessions in the Client.login method would need alternative initialization when no existing session exists, potentially requiring capture of real HTTP headers or different test setup.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "The code is in a test file (tests/tests.py) and part of a test Client class",
+        "The SessionStore is initialized with hardcoded values 'Python/2.7' and '127.0.0.1' which are test constants",
+        "Authentication occurs via Django's authenticate() function (line 46), not through session attributes",
+        "Test methods verify that sessions store these hardcoded values (lines 87-88, 153-154)"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.16,
+      "score": 0.16
+    },
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "tests/tests.py",
+      "changed_line": 53,
+      "statement": "request.session = SessionStore('Python/2.7', '127.0.0.1')",
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-20 requires receiving external input that is improperly validated. This code uses hardcoded constants, not external input."
+        },
+        "connection": {
+          "score": 0.05,
+          "evidence": "No external input flows to this session initialization. The values are literal strings defined in the test code."
+        },
+        "diff_causality": {
+          "score": 0.3,
+          "evidence": "The added line creates a session with hardcoded attributes, but this is test setup code, not a security control modification."
+        },
+        "security_control": {
+          "score": 0.15,
+          "evidence": "",
+          "required_control": "input validation for external user-agent and IP data",
+          "control_requirement_evidence": "CWE-20 requires validation of external inputs to ensure they have safe properties",
+          "existing_controls_checked": [
+            "SessionStore constructor accepts parameters without validation in test context"
+          ],
+          "deficiency_evidence": "No validation deficiency exists because no external input is being processed - these are test fixture constants"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No security impact demonstrated. This is test code setting up predictable session state for testing purposes."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the test client would not initialize sessions with hardcoded user-agent and IP values, potentially affecting test reliability but not security controls.",
+      "supporting_evidence": [
+        "SessionStore constructor accepts user-agent and IP parameters",
+        "Test code creates sessions with predictable values for testing"
+      ],
+      "contradicting_evidence": [
+        "Values 'Python/2.7' and '127.0.0.1' are hardcoded literals, not external input",
+        "This occurs in test code (tests.py) for setting up test fixtures",
+        "No evidence of external data flowing to this session initialization"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether production code paths properly validate real client attributes",
+        "Security implications of test fixture design choices"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.13999999999999999,
+      "score": 0.13999999999999999
+    },
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "tests/tests.py",
+      "changed_line": 53,
+      "statement": "request.session = SessionStore('Python/2.7', '127.0.0.1')",
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-255 specifically addresses credential management weaknesses (creation, storage, transmission, validation). The code initializes test sessions with hardcoded attributes but does not demonstrate credential management errors."
+        },
+        "connection": {
+          "score": 0.1,
+          "evidence": "No connection to credential management is established. The hardcoded values are user-agent and IP address for test session initialization, not credentials."
+        },
+        "diff_causality": {
+          "score": 0.3,
+          "evidence": "The change creates test sessions with predictable attributes, but this affects test environment behavior rather than credential management mechanisms."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "No credential management controls are demonstrated or affected. The code operates in test context with hardcoded session metadata.",
+          "required_control": "none established",
+          "control_requirement_evidence": "CWE-255 requires credential management weaknesses, but no credential handling is demonstrated",
+          "existing_controls_checked": [
+            "test environment session initialization"
+          ],
+          "deficiency_evidence": "unsupported - no credential management deficiency demonstrated"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No credential compromise or authentication weakness impact is demonstrated. This is test code affecting session metadata tracking."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, test sessions would not be initialized with hardcoded user-agent and IP values, potentially allowing real client attributes to be captured in test environment.",
+      "supporting_evidence": [
+        "Test code initializes SessionStore with hardcoded 'Python/2.7' user-agent and '127.0.0.1' IP address"
+      ],
+      "contradicting_evidence": [
+        "Code operates in test environment (tests.py)",
+        "No credential handling or authentication logic is modified",
+        "SessionStore parameters are metadata attributes, not credentials"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether this test pattern affects production credential management",
+        "Security implications of test session metadata vs credential handling"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.16999999999999998,
+      "score": 0.16999999999999998
+    },
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "tests/tests.py",
+      "changed_line": 53,
+      "statement": "request.session = SessionStore('Python/2.7', '127.0.0.1')",
+      "cwe_id": "CWE-321",
+      "cwe_name": "Use of Hard-coded Cryptographic Key",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-321 specifically requires hard-coded cryptographic keys for encryption/decryption. The candidate uses hard-coded user-agent and IP address strings, which are not cryptographic keys."
+        },
+        "connection": {
+          "score": 0.15,
+          "evidence": "Hardcoded strings are passed to SessionStore constructor, but there's no demonstrated connection to cryptographic operations or key usage."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The patch adds hardcoded values for test session initialization, but this doesn't create cryptographic key usage."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "Proper cryptographic key management with secure generation/storage",
+          "control_requirement_evidence": "CWE-321 requires cryptographic keys to be properly managed rather than hardcoded",
+          "existing_controls_checked": [
+            "SessionStore initialization with user metadata"
+          ],
+          "deficiency_evidence": "No cryptographic keys are demonstrated; user-agent/IP are session metadata, not cryptographic material"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No cryptographic security impact demonstrated; these are test session attributes, not cryptographic keys affecting data confidentiality/integrity."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, test sessions would need alternative initialization, but no cryptographic key usage would change.",
+      "supporting_evidence": [
+        "Hardcoded string literals 'Python/2.7' and '127.0.0.1' used for session initialization"
+      ],
+      "contradicting_evidence": [
+        "No cryptographic operations or key usage demonstrated",
+        "SessionStore parameters are user metadata, not cryptographic keys"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether any cryptographic operations use these values as keys",
+        "If session security relies on these values for cryptographic purposes"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.16999999999999998,
+      "score": 0.16999999999999998
+    }
+  ],
+  "stage4_status": "completed"
+}

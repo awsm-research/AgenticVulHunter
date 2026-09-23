@@ -1,0 +1,259 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "change_type": "A",
+      "function_name": "validate_request",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "request -> get_request_uri (includes basic auth) -> used in signature verification",
+      "security_relevance_score": 0.7,
+      "code_context": "1: import json\n2: from datetime import datetime\n3: \n4: import hashlib\n5: import hmac\n6: from base64 import b64encode\n7: from django.utils.crypto import constant_time_compare\n8: from django.utils.timezone import utc\n9: \n10: from .base import AnymailBaseWebhookView\n11: from ..exceptions import AnymailWebhookValidationFailure, AnymailConfigurationError\n12: from ..signals import tracking, AnymailTrackingEvent, EventType\n13: from ..utils import get_anymail_setting, getfirst, get_request_uri\n14: \n15: \n16: class MandrillSignatureMixin(object):\n17:     \"\"\"Validates Mandrill webhook signature\"\"\"\n18: \n19:     # These can be set from kwargs in View.as_view, or pulled from settings in init:\n20:     webhook_key = None  # required\n21:     webhook_url = None  # optional; defaults to actual url used\n22: \n23:     def __init__(self, **kwargs):\n24:         # noinspection PyUnresolvedReferences\n25:         esp_name = self.esp_name\n26:         # webhook_key is required for POST, but not for HEAD when Mandrill validates webhook url.\n27:         # Defer \"missing setting\" error until we actually try to use it in the POST...\n28:         webhook_key = get_anymail_setting('webhook_key', esp_name=esp_name, default=None,\n29:                                           kwargs=kwargs, allow_bare=True)\n30:         if webhook_key is not None:\n31:             self.webhook_key = webhook_key.encode('ascii')  # hmac.new requires bytes key in python 3\n32:         self.webhook_url = get_anymail_setting('webhook_url', esp_name=esp_name, default=None,\n33:                                                kwargs=kwargs, allow_bare=True)\n34:         # noinspection PyArgumentList\n35:         super(MandrillSignatureMixin, self).__init__(**kwargs)\n36: \n37:     def validate_request(self, request):\n38:         if self.webhook_key is None:\n39:             # issue deferred \"missing setting\" error (re-call get-setting without a default)\n40:             # noinspection PyUnresolvedReferences\n41:             get_anymail_setting('webhook_key', esp_name=self.esp_name, allow_bare=True)\n42: \n43:         try:\n44:             signature = request.META[\"HTTP_X_MANDRILL_SIGNATURE\"]\n45:         except KeyError:\n46:             raise AnymailWebhookValidationFailure(\"X-Mandrill-Signature header missing from webhook POST\")\n47: \n48:         # Mandrill signs the exact URL (including basic auth, if used) plus the sorted POST params:\n49:         url = self.webhook_url or get_request_uri(request)\n50:         params = request.POST.dict()\n51:         signed_data = url\n52:         for key in sorted(params.keys()):\n53:             signed_data += key + params[key]\n54: \n55:         expected_signature = b64encode(hmac.new(key=self.webhook_key, msg=signed_data.encode('utf-8'),\n56:                                                 digestmod=hashlib.sha1).digest())\n57:         if not constant_time_compare(signature, expected_signature):\n58:             raise AnymailWebhookValidationFailure(\n59:                 \"Mandrill webhook called with incorrect signature (for url %r)\" % url)\n60: \n61: \n62: class MandrillBaseWebhookView(MandrillSignatureMixin, AnymailBaseWebhookView):\n63:     \"\"\"Base view class for Mandrill webhooks\"\"\"\n64: \n65:     warn_if_no_basic_auth = False  # because we validate against signature\n66: \n67:     def parse_events(self, request):\n68:         esp_events = json.loads(request.POST['mandrill_events'])\n69:         return [self.esp_to_anymail_event(esp_event) for esp_event in esp_events]\n70: \n71:     def esp_to_anymail_event(self, esp_event):\n72:         raise NotImplementedError()\n73: \n74: \n75: class MandrillTrackingWebhookView(MandrillBaseWebhookView):\n76: \n77:     signal = tracking\n78: \n79:     event_types = {\n80:         # Message events:\n81:         'send': EventType.SENT,\n82:         'deferral': EventType.DEFERRED,\n83:         'hard_bounce': EventType.BOUNCED,\n84:         'soft_bounce': EventType.DEFERRED,\n85:         'open': EventType.OPENED,\n86:         'click': EventType.CLICKED,\n87:         'spam': EventType.COMPLAINED,\n88:         'unsub': EventType.UNSUBSCRIBED,\n89:         'reject': EventType.REJECTED,\n90:         # Sync events (we don't really normalize these well):\n91:         'whitelist': EventType.UNKNOWN,\n92:         'blacklist': EventType.UNKNOWN,\n93:         # Inbound events:\n94:         'inbound': EventType.INBOUND,\n95:     }\n96: \n97:     def esp_to_anymail_event(self, esp_event):\n98:         esp_type = getfirst(esp_event, ['event', 'type'], None)\n99:         event_type = self.event_types.get(esp_type, EventType.UNKNOWN)\n100:         if event_type == EventType.INBOUND:\n101:             raise AnymailConfigurationError(\n102:                 \"You seem to have set Mandrill's *inbound* webhook URL \"\n103:                 \"to Anymail's Mandrill *tracking* webhook URL.\")\n104: \n105:         try:\n106:             timestamp = datetime.fromtimestamp(esp_event['ts'], tz=utc)\n107:         except (KeyError, ValueError):\n108:             timestamp = None\n109: \n110:         try:\n111:             recipient = esp_event['msg']['email']\n112:         except KeyError:\n113:             try:\n114:                 recipient = esp_event['reject']['email']  # sync events\n115:             except KeyError:\n116:                 recipient = None\n117: \n118:         try:\n119:             mta_response = esp_event['msg']['diag']\n120:         except KeyError:\n121:             mta_response = None\n122: \n123:         try:\n124:             description = getfirst(esp_event['reject'], ['detail', 'reason'])\n125:         except KeyError:\n126:             description = None\n127: \n128:         try:\n129:             metadata = esp_event['msg']['metadata']\n130:         except KeyError:\n131:             metadata = None\n132: \n133:         try:\n134:             tags = esp_event['msg']['tags']\n135:         except KeyError:\n136:             tags = None\n137: \n138:         return AnymailTrackingEvent(\n139:             click_url=esp_event.get('url', None),\n140:             description=description,\n141:             esp_event=esp_event,\n142:             event_type=event_type,\n143:             message_id=esp_event.get('_id', None),\n144:             metadata=metadata,\n145:             mta_response=mta_response,\n146:             recipient=recipient,\n147:             reject_reason=None,  # probably map esp_event['msg']['bounce_description'], but insufficient docs\n148:             tags=tags,\n149:             timestamp=timestamp,\n150:             user_agent=esp_event.get('user_agent', None),\n151:         )",
+      "source_summary": "URL source is either configured webhook_url setting or dynamically constructed from request using get_request_uri(), which includes HTTP basic auth credentials if present",
+      "sink_summary": "URL is used as part of signed_data for HMAC-SHA1 signature verification against X-Mandrill-Signature header",
+      "guard_summary": "Signature verification using constant_time_compare protects against timing attacks; webhook_key required for POST requests",
+      "risk_pattern": "Basic auth credentials included in signature calculation may expose credentials if signature verification fails and error message leaks URL",
+      "used_variable_sources": [
+        "self.webhook_url (configured setting)",
+        "request (HTTP request object)",
+        "get_request_uri() (constructs URL with basic auth)"
+      ],
+      "called_function_context": [
+        "get_request_uri",
+        "get_request_basic_auth",
+        "request.build_absolute_uri",
+        "base64.b64decode",
+        "urlsplit",
+        "urlunsplit"
+      ],
+      "enclosing_conditions": [
+        "if self.webhook_key is None: (deferred error)",
+        "try/except for HTTP_X_MANDRILL_SIGNATURE header"
+      ],
+      "context_summary": "Line 49 constructs URL for Mandrill webhook signature verification. When webhook_url is not configured, get_request_uri() builds URL including basic auth credentials from HTTP_AUTHORIZATION header, which becomes part of HMAC-signed data.",
+      "unresolved_facts": [
+        "Whether error messages containing URL with basic auth are logged or exposed to attackers",
+        "Whether basic auth credentials in error messages could be exploited in practice"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "authentication credentials exposed in error messages through URL containing basic auth",
+        "sensitive_operation": "error message construction with unsanitized URL",
+        "mechanism_keywords": "basic auth, credentials, authentication, information disclosure"
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/timing-attack-against-hash",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 35.0359,
+          "raw_bm25_score": 35.0359,
+          "description": "When checking a Hash over a message, a constant-time algorithm should be used. Otherwise, an attacker may be able to forge a valid Hash for an arbitrary message by running a timing attack if they can send to the validation procedure. A successful attack can result in authentication bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/unsafe-deserialization",
+          "cwe_id": "CWE-502",
+          "cwe_name": "Deserialization of Untrusted Data",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.9053,
+          "raw_bm25_score": 27.9053,
+          "description": "Deserializing user-controlled data may allow attackers to execute arbitrary code.",
+          "pattern": "Identify deserialization operations on untrusted data without proper validation",
+          "remediation": "Use safe serialization formats like JSON. If complex deserialization is needed, implement strict validation and type checking.",
+          "tags": [
+            "external/cwe/cwe-502",
+            "security",
+            "serialization"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/bind-socket-all-network-interfaces",
+          "cwe_id": "CWE-200",
+          "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.0447,
+          "raw_bm25_score": 27.0447,
+          "description": "Binding a socket to all interfaces opens it up to traffic from any IPv4 address and is therefore associated with security risks.",
+          "pattern": "Find code that may expose sensitive information in error messages, logs, or responses",
+          "remediation": "Implement proper access controls. Use generic error messages for users. Avoid exposing sensitive information in error responses, debugging output, or log files.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-200"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 20.6229,
+          "raw_bm25_score": 20.6229,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/jwt-missing-verification",
+          "cwe_id": "CWE-347",
+          "cwe_name": "Improper Verification of Cryptographic Signature",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.7432,
+          "raw_bm25_score": 19.7432,
+          "description": "The application does not verify the JWT payload with a cryptographic secret or public key.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-347"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/csv-injection",
+          "cwe_id": "CWE-1236",
+          "cwe_name": "Improper Neutralization of Formula Elements in a CSV File",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.6153,
+          "raw_bm25_score": 19.6153,
+          "description": "From user-controlled data saved in CSV files, it is easy to attempt information disclosure or other malicious activities when automated by spreadsheet software",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-1236"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/stack-trace-exposure",
+          "cwe_id": "CWE-497",
+          "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.1102,
+          "raw_bm25_score": 19.1102,
+          "description": "Leaking information about an exception, such as messages and stack traces, to an external user can expose implementation details that are useful to an attacker for developing a subsequent exploit.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-497. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-209",
+            "external/cwe/cwe-497"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 18.3754,
+          "raw_bm25_score": 18.3754,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/incomplete-hostname-regexp",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.6858,
+          "raw_bm25_score": 17.6858,
+          "description": "Matching a URL or hostname against a regular expression that contains an unescaped dot as part of the hostname might match more hostnames than expected.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/samesite-none-cookie",
+          "cwe_id": "CWE-1275",
+          "cwe_name": "Sensitive Cookie with Improper SameSite Attribute",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.5159,
+          "raw_bm25_score": 17.5159,
+          "description": "Cookies with `SameSite` set to `None` can allow for Cross-Site Request Forgery (CSRF) attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1275"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

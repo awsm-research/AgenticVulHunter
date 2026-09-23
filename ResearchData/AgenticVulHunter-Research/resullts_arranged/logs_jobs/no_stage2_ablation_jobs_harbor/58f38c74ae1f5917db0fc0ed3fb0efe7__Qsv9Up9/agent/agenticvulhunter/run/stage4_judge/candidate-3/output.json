@@ -1,0 +1,216 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "dbusmock/testcase.py",
+  "changed_line": 207,
+  "statement": "module = load_module(template)",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "code_execution",
+  "selection_reason": "observable input 'template' -> exact operation 'load_module(template)' -> security-sensitive effect of executing arbitrary Python code from a file path",
+  "security_relevance_score": 0.8,
+  "code_context": "58:     @classmethod\n59:     def tearDownClass(klass):\n60:         '''Stop private session/system buses'''\n61: \n62:         if DBusTestCase.session_bus_pid is not None:\n63:             klass.stop_dbus(DBusTestCase.session_bus_pid)\n64:             del os.environ['DBUS_SESSION_BUS_ADDRESS']\n65:             DBusTestCase.session_bus_pid = None\n66:         if DBusTestCase.system_bus_pid is not None:\n67:             klass.stop_dbus(DBusTestCase.system_bus_pid)\n68:             del os.environ['DBUS_SYSTEM_BUS_ADDRESS']\n69:             DBusTestCase.system_bus_pid = None\n70: \n71:     @classmethod\n72:     def start_dbus(klass):\n73:         '''Start a D-BUS daemon\n74: \n75:         Return (pid, address) pair.\n76: \n77:         Normally you do not need to call this directly. Use start_system_bus()\n78:         and start_session_bus() instead.\n79:         '''\n80:         out = subprocess.check_output(['dbus-launch'], universal_newlines=True)\n81:         variables = {}\n82:         for line in out.splitlines():\n83:             (k, v) = line.split('=', 1)\n84:             variables[k] = v\n85:         return (int(variables['DBUS_SESSION_BUS_PID']),\n86:                 variables['DBUS_SESSION_BUS_ADDRESS'])\n87: \n88:     @classmethod\n89:     def stop_dbus(klass, pid):\n90:         '''Stop a D-BUS daemon\n91: \n92:         Normally you do not need to call this directly. When you use\n93:         start_system_bus() and start_session_bus(), these buses are\n94:         automatically stopped in tearDownClass().\n95:         '''\n96:         signal.signal(signal.SIGTERM, signal.SIG_IGN)\n97:         timeout = 50\n98:         while timeout > 0:\n99:             try:\n100:                 os.kill(pid, signal.SIGTERM)\n101:             except OSError as e:\n102:                 if e.errno == errno.ESRCH:\n103:                     break\n104:                 else:\n105:                     raise\n106:             time.sleep(0.1)\n107:         else:\n108:             sys.stderr.write('ERROR: timed out waiting for bus process to terminate\\n')\n109:             os.kill(pid, signal.SIGKILL)\n110:             time.sleep(0.5)\n111:         signal.signal(signal.SIGTERM, signal.SIG_DFL)\n112: \n113:     @classmethod\n114:     def get_dbus(klass, system_bus=False):\n115:         '''Get dbus.bus.BusConnection() object\n116: \n117:         This is preferrable to dbus.SystemBus() and dbus.SessionBus() as those\n118:         do not get along with multiple changing local test buses.\n119:         '''\n120:         if system_bus:\n121:             if os.environ.get('DBUS_SYSTEM_BUS_ADDRESS'):\n122:                 return dbus.bus.BusConnection(os.environ['DBUS_SYSTEM_BUS_ADDRESS'])\n123:             else:\n124:                 return dbus.SystemBus()\n125:         else:\n126:             if os.environ.get('DBUS_SESSION_BUS_ADDRESS'):\n127:                 return dbus.bus.BusConnection(os.environ['DBUS_SESSION_BUS_ADDRESS'])\n128:             else:\n129:                 return dbus.SessionBus()\n130: \n131:     @classmethod\n132:     def wait_for_bus_object(klass, dest, path, system_bus=False):\n133:         '''Wait for an object to appear on D-BUS\n134: \n135:         Raise an exception if object does not appear within 5 seconds.\n136:         '''\n137:         bus = klass.get_dbus(system_bus)\n138: \n139:         timeout = 50\n140:         last_exc = None\n141:         # we check whether the name is owned first, to avoid race conditions\n142:         # with service activation; once it's owned, wait until we can actually\n143:         # call methods\n144:         while timeout > 0:\n145:             if bus.name_has_owner(dest):\n146:                 try:\n147:                     p = dbus.Interface(bus.get_object(dest, path),\n148:                                        dbus_interface=dbus.INTROSPECTABLE_IFACE)\n149:                     p.Introspect()\n150:                     break\n151:                 except dbus.exceptions.DBusException as e:\n152:                     last_exc = e\n153:                     if '.UnknownInterface' in str(e):\n154:                         break\n155:                     pass\n156: \n157:             timeout -= 1\n158:             time.sleep(0.1)\n159:         if timeout <= 0:\n160:             assert timeout > 0, 'timed out waiting for D-BUS object %s: %s' % (path, last_exc)\n161: \n162:     @classmethod\n163:     def spawn_server(klass, name, path, interface, system_bus=False, stdout=None):\n164:         '''Run a DBusMockObject instance in a separate process\n165: \n166:         The daemon will terminate automatically when the D-BUS that it connects\n167:         to goes down.  If that does not happen (e. g. you test on the actual\n168:         system/session bus), you need to kill it manually.\n169: \n170:         This function blocks until the spawned DBusMockObject is ready and\n171:         listening on the bus.\n172: \n173:         Returns the Popen object of the spawned daemon.\n174:         '''\n175:         argv = [sys.executable, '-m', 'dbusmock']\n176:         if system_bus:\n177:             argv.append('--system')\n178:         argv.append(name)\n179:         argv.append(path)\n180:         argv.append(interface)\n181: \n182:         daemon = subprocess.Popen(argv, stdout=stdout)\n183: \n184:         # wait for daemon to start up\n185:         klass.wait_for_bus_object(name, path, system_bus)\n186: \n187:         return daemon\n188: \n189:     @classmethod\n190:     def spawn_server_template(klass, template, parameters=None, stdout=None):\n191:         '''Run a D-BUS mock template instance in a separate process\n192: \n193:         This starts a D-BUS mock process and loads the given template with\n194:         (optional) parameters into it. For details about templates see\n195:         dbusmock.DBusMockObject.AddTemplate().\n196: \n197:         The daemon will terminate automatically when the D-BUS that it connects\n198:         to goes down.  If that does not happen (e. g. you test on the actual\n199:         system/session bus), you need to kill it manually.\n200: \n201:         This function blocks until the spawned DBusMockObject is ready and\n202:         listening on the bus.\n203: \n204:         Returns a pair (daemon Popen object, main dbus object).\n205:         '''\n206:         # we need the bus address from the template module\n207:         module = load_module(template)\n208:         daemon = klass.spawn_server(module.BUS_NAME, module.MAIN_OBJ,\n209:                                     module.MAIN_IFACE, module.SYSTEM_BUS, stdout)\n210: \n211:         bus = klass.get_dbus(module.SYSTEM_BUS)\n212:         obj = bus.get_object(module.BUS_NAME, module.MAIN_OBJ)\n213:         if not parameters:\n214:             parameters = dbus.Dictionary({}, signature='sv')\n215:         obj.AddTemplate(template, parameters,\n216:                         dbus_interface=MOCK_IFACE)\n217: \n218:         return (daemon, obj)\n219: \n220: # Python 2 backwards compatibility\n221: if sys.version_info[0] < 3:\n222:     import re\n223: \n224:     def assertRegex(self, value, pattern):\n225:         if not re.search(pattern, value):\n226:             raise self.failureException('%r not found in %s' % (pattern, value))\n227:     DBusTestCase.assertRegex = assertRegex",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-95",
+      "cwe_name": "Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+      "fit_reason": "The 'load_module(template)' operation directly executes code from a file path, which is a classic eval injection vulnerability when the template parameter is user-controlled.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-74",
+      "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+      "fit_reason": "Using user-controlled data (template path) to load a module can lead to remote code execution, which is a form of injection vulnerability.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "The template path can be manipulated to traverse directories and load unintended modules, leading to code execution.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-208",
+    "CWE-22",
+    "CWE-23",
+    "CWE-477",
+    "CWE-489",
+    "CWE-561",
+    "CWE-59",
+    "CWE-643",
+    "CWE-685",
+    "CWE-74",
+    "CWE-943",
+    "CWE-95"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "dbusmock/testcase.py",
+      "changed_line": 207,
+      "statement": "module = load_module(template)",
+      "cwe_id": "CWE-95",
+      "cwe_name": "Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The 'load_module(template)' call directly loads and executes Python code from a file path, which is the core mechanism of CWE-95 (eval injection). The template parameter is passed directly to load_module without sanitization or validation."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The 'template' parameter flows into 'load_module(template)' at line 207. However, the evidence does not establish whether 'template' is externally controlled input (e.g., from user or external source). The selection reason indicates it's observable input but doesn't confirm attacker control."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If line 207 were reverted, the 'load_module(template)' call would not occur, and thus no dynamic code loading from a file path would happen. This directly removes the vulnerability mechanism."
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "There is no validation or sanitization of the 'template' parameter before it's passed to 'load_module'. The required control is input validation/neutralization, which is completely absent.",
+          "required_control": "Input validation/sanitization of the template parameter",
+          "control_requirement_evidence": "CWE-95 requires that directives in dynamically evaluated code be neutralized or validated. The 'template' parameter is directly used to load a Python module without any checks.",
+          "existing_controls_checked": [
+            "No validation or sanitization of 'template' parameter",
+            "No allowlist or restriction on file paths"
+          ],
+          "deficiency_evidence": "The code directly passes the 'template' parameter to 'load_module' without any input validation, allowing arbitrary Python code execution from any file path."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "The mechanism allows for arbitrary code execution via 'load_module(template)', which can load and execute any Python module. However, the concrete impact depends on whether 'template' is attacker-controlled, which is not confirmed in the evidence."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the 'load_module(template)' call would be removed, eliminating the ability to dynamically load and execute arbitrary Python code from a file path.",
+      "supporting_evidence": [
+        "The 'template' parameter is passed directly into 'load_module(template)'",
+        "The operation 'load_module(template)' executes arbitrary Python code from a file path",
+        "Stage-2 evidence shows 'template' as observable input"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the 'template' parameter is externally controlled or attacker-controlled",
+        "Whether downstream validation prevents the vulnerability"
+      ],
+      "review_comment": "The code directly loads and executes Python modules from a file path via 'load_module(template)', which allows arbitrary code execution. The 'template' parameter is not validated, creating a CWE-95 vulnerability. If 'template' is attacker-controlled, this enables remote code execution. Ensure the template parameter is validated or sanitized before use.",
+      "change_type": "A",
+      "raw_score": 0.72,
+      "score": 0.72
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "dbusmock/testcase.py",
+      "changed_line": 207,
+      "statement": "module = load_module(template)",
+      "cwe_id": "CWE-74",
+      "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The code uses load_module(template) where 'template' is user-controlled input. This can lead to loading arbitrary Python modules, which is a form of code injection. However, it does not directly involve command/data structure construction with special elements that modify parsing or interpretation as defined by CWE-74."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The 'template' parameter is passed from upstream (user-controlled) and is used directly in load_module(). There is a clear path from input to the vulnerable operation, though the exact reachability to downstream components isn't fully demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If line 207 were reverted (i.e., if load_module(template) was removed or replaced), the code would no longer load arbitrary modules based on user input, which would prevent the potential for remote code execution via template loading."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "There is no validation or sanitization of the 'template' parameter before it's passed to load_module(). The required control here is input validation or whitelisting, which is missing.",
+          "required_control": "Input validation or whitelisting",
+          "control_requirement_evidence": "CWE-74 requires that externally-influenced input be neutralized to prevent modification of how it is parsed or interpreted by downstream components. In this case, the 'template' parameter directly influences which module gets loaded without any sanitization.",
+          "existing_controls_checked": [
+            "No validation or sanitization of 'template' parameter",
+            "No whitelisting of allowed template paths"
+          ],
+          "deficiency_evidence": "The code directly passes user-controlled input to load_module() without checking if the input is safe or valid, which allows loading of arbitrary modules."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "While the mechanism suggests potential for remote code execution via loading arbitrary Python modules, concrete impact is not demonstrated. The vulnerability could allow an attacker to execute arbitrary code if they can control the 'template' parameter, but this specific consequence isn't proven in the evidence."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would no longer load arbitrary modules based on user-controlled input, thereby eliminating the potential for remote code execution through template loading.",
+      "supporting_evidence": [
+        "The 'template' parameter is user-controlled and passed directly to load_module()",
+        "load_module() can execute arbitrary Python code from a file path",
+        "The function spawn_server_template() uses this pattern in line 207"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the 'template' parameter is actually externally controlled in all cases",
+        "Whether downstream components are vulnerable to code execution from loaded modules",
+        "Concrete demonstration of impact or exploitation path"
+      ],
+      "review_comment": "The code loads arbitrary Python modules based on user-controlled input without validation. This creates a potential for remote code execution. The 'template' parameter should be validated or whitelisted before being used in load_module().",
+      "change_type": "A",
+      "raw_score": 0.5599999999999999,
+      "score": 0.5599999999999999
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "dbusmock/testcase.py",
+      "changed_line": 207,
+      "statement": "module = load_module(template)",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The 'load_module(template)' call directly uses the 'template' input to load a Python module, which can be manipulated to traverse directories and load unintended modules if the template path is not properly validated."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "The 'template' parameter is externally controlled input passed from the calling function 'spawn_server_template'. The path traversal vulnerability occurs when this input allows directory traversal sequences like '../' to access modules outside of intended directories."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If line 207 were reverted, the module loading would not occur directly from the 'template' parameter, removing the direct path traversal vector. The patch adds a dependency on external input for module loading without validation."
+        },
+        "security_control": {
+          "score": 0.65,
+          "evidence": "There is no explicit validation or sanitization of the 'template' parameter before it is used in 'load_module(template)'. The required control is path validation/sanitization to prevent directory traversal.",
+          "required_control": "Path validation/sanitization",
+          "control_requirement_evidence": "CWE-22 requires that all file paths be validated and sanitized to prevent traversal outside of intended directories.",
+          "existing_controls_checked": [
+            "No explicit path validation or sanitization in the code",
+            "No allowlist or canonical path resolution mechanism"
+          ],
+          "deficiency_evidence": "The 'template' parameter is used directly without any checks for directory traversal sequences, allowing arbitrary module loading from paths outside intended directories."
+        },
+        "concrete_impact": {
+          "score": 0.75,
+          "evidence": "If the template path allows directory traversal, an attacker can load malicious Python modules from unintended locations, leading to code execution with the privileges of the running process."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the module loading would not occur directly from the 'template' parameter. The function would not attempt to load a module based on external input, removing the path traversal vulnerability vector.",
+      "supporting_evidence": [
+        "The 'template' parameter is externally controlled input",
+        "The 'load_module(template)' call directly uses this input without validation",
+        "The code demonstrates path traversal by allowing arbitrary module loading from file paths"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the specific 'template' parameter is actually validated or sanitized elsewhere in the call chain",
+        "The exact scope of allowed directories for template loading"
+      ],
+      "review_comment": "The code directly loads a Python module using an externally controlled path from the 'template' parameter without validation. This allows directory traversal attacks that can load arbitrary modules, leading to code execution. Add path validation to prevent traversal outside intended directories.",
+      "change_type": "A",
+      "raw_score": 0.7699999999999999,
+      "score": 0.7699999999999999
+    }
+  ],
+  "stage4_status": "completed"
+}

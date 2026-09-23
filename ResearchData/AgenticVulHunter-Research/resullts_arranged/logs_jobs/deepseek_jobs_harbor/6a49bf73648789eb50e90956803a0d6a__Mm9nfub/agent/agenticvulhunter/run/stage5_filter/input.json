@@ -1,0 +1,2148 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "lib/send.js",
+    "changed_line": 400,
+    "statement": "if (path.substr(0, root.length) !== root) {",
+    "change_type": "A",
+    "function_name": "SendStream.prototype.pipe",
+    "operation_type": "path_traversal_check",
+    "selection_reason": "Decoded path after root joining -> substring comparison -> prevents directory traversal outside root",
+    "security_relevance_score": 0.9,
+    "code_context": "251:   return this.req.headers['if-none-match']\n252:     || this.req.headers['if-modified-since'];\n253: };\n254: \n255: /**\n256:  * Strip content-* header fields.\n257:  *\n258:  * @api private\n259:  */\n260: \n261: SendStream.prototype.removeContentHeaderFields = function(){\n262:   var res = this.res;\n263:   Object.keys(res._headers).forEach(function(field){\n264:     if (0 == field.indexOf('content')) {\n265:       res.removeHeader(field);\n266:     }\n267:   });\n268: };\n269: \n270: /**\n271:  * Respond with 304 not modified.\n272:  *\n273:  * @api private\n274:  */\n275: \n276: SendStream.prototype.notModified = function(){\n277:   var res = this.res;\n278:   debug('not modified');\n279:   this.removeContentHeaderFields();\n280:   res.statusCode = 304;\n281:   res.end();\n282: };\n283: \n284: /**\n285:  * Raise error that headers already sent.\n286:  *\n287:  * @api private\n288:  */\n289: \n290: SendStream.prototype.headersAlreadySent = function headersAlreadySent(){\n291:   var err = new Error('Can\\'t set headers after they are sent.');\n292:   debug('headers already sent');\n293:   this.error(500, err);\n294: };\n295: \n296: /**\n297:  * Check if the request is cacheable, aka\n298:  * responded with 2xx or 304 (see RFC 2616 section 14.2{5,6}).\n299:  *\n300:  * @return {Boolean}\n301:  * @api private\n302:  */\n303: \n304: SendStream.prototype.isCachable = function(){\n305:   var res = this.res;\n306:   return (res.statusCode >= 200 && res.statusCode < 300) || 304 == res.statusCode;\n307: };\n308: \n309: /**\n310:  * Handle stat() error.\n311:  *\n312:  * @param {Error} err\n313:  * @api private\n314:  */\n315: \n316: SendStream.prototype.onStatError = function(err){\n317:   var notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR'];\n318:   if (~notfound.indexOf(err.code)) return this.error(404, err);\n319:   this.error(500, err);\n320: };\n321: \n322: /**\n323:  * Check if the cache is fresh.\n324:  *\n325:  * @return {Boolean}\n326:  * @api private\n327:  */\n328: \n329: SendStream.prototype.isFresh = function(){\n330:   return fresh(this.req.headers, this.res._headers);\n331: };\n332: \n333: /**\n334:  * Check if the range is fresh.\n335:  *\n336:  * @return {Boolean}\n337:  * @api private\n338:  */\n339: \n340: SendStream.prototype.isRangeFresh = function isRangeFresh(){\n341:   var ifRange = this.req.headers['if-range'];\n342: \n343:   if (!ifRange) return true;\n344: \n345:   return ~ifRange.indexOf('\"')\n346:     ? ~ifRange.indexOf(this.res._headers['etag'])\n347:     : Date.parse(this.res._headers['last-modified']) <= Date.parse(ifRange);\n348: };\n349: \n350: /**\n351:  * Redirect to `path`.\n352:  *\n353:  * @param {String} path\n354:  * @api private\n355:  */\n356: \n357: SendStream.prototype.redirect = function(path){\n358:   if (listenerCount(this, 'directory') !== 0) {\n359:     return this.emit('directory');\n360:   }\n361: \n362:   if (this.hasTrailingSlash()) return this.error(403);\n363:   var res = this.res;\n364:   path += '/';\n365:   res.statusCode = 301;\n366:   res.setHeader('Content-Type', 'text/html; charset=utf-8');\n367:   res.setHeader('Location', path);\n368:   res.end('Redirecting to <a href=\"' + escapeHtml(path) + '\">' + escapeHtml(path) + '</a>\\n');\n369: };\n370: \n371: /**\n372:  * Pipe to `res.\n373:  *\n374:  * @param {Stream} res\n375:  * @return {Stream} res\n376:  * @api public\n377:  */\n378: \n379: SendStream.prototype.pipe = function(res){\n380:   var self = this\n381:     , args = arguments\n382:     , root = this._root;\n383: \n384:   // references\n385:   this.res = res;\n386: \n387:   // decode the path\n388:   var path = utils.decode(this.path)\n389:   if (path === -1) return this.error(400)\n390: \n391:   // null byte(s)\n392:   if (~path.indexOf('\\0')) return this.error(400);\n393: \n394:   var parts\n395:   if (root !== null) {\n396:     // join / normalize from optional root dir\n397:     path = normalize(join(root, path))\n398: \n399:     // malicious path\n400:     if (path.substr(0, root.length) !== root) {\n401:       debug('malicious path \"%s\"', path)\n402:       return this.error(403)\n403:     }\n404: \n405:     // explode path parts\n406:     parts = path.substr(root.length + 1).split(sep)\n407:   } else {\n408:     // \"..\" is malicious without \"root\"\n409:     if (upPathRegexp.test(path)) {\n410:       debug('malicious path \"%s\"', path)\n411:       return this.error(403)\n412:     }\n413: \n414:     // explode path parts\n415:     parts = normalize(path).split(sep)\n416: \n417:     // resolve the path\n418:     path = resolve(path)\n419:   }\n420: \n421:   // dotfile handling\n422:   if (containsDotFile(parts)) {\n423:     var access = this._hidden\n424:       ? 'allow'\n425:       : 'ignore'\n426: \n427:     debug('%s dotfile \"%s\"', access, path)\n428:     switch (access) {\n429:       case 'allow':\n430:         break\n431:       case 'ignore':\n432:       default:\n433:         return this.error(404)\n434:     }\n435:   }\n436: \n437:   // index file support\n438:   if (this._index.length && this.hasTrailingSlash()) {\n439:     this.sendIndex(path);\n440:     return res;\n441:   }\n442: \n443:   debug('stat \"%s\"', path);\n444:   fs.stat(path, function(err, stat){\n445:     if (err) return self.onStatError(err);\n446:     if (stat.isDirectory()) return self.redirect(self.path);\n447:     self.emit('file', path, stat);\n448:     self.send(path, stat);\n449:   });\n450: \n451:   return res;\n452: };\n453: \n454: /**\n455:  * Transfer `path`.\n456:  *\n457:  * @param {String} path\n458:  * @api public\n459:  */\n460: \n461: SendStream.prototype.send = function(path, stat){\n462:   var options = this.options;\n463:   var len = stat.size;\n464:   var res = this.res;\n465:   var req = this.req;\n466:   var ranges = req.headers.range;\n467:   var offset = options.start || 0;\n468: \n469:   if (res._header) {\n470:     // impossible to send now\n471:     return this.headersAlreadySent();\n472:   }\n473: \n474:   debug('pipe \"%s\"', path)\n475: \n476:   // set header fields\n477:   this.setHeader(path, stat);\n478: \n479:   // set content-type\n480:   this.type(path);\n481: \n482:   // conditional GET support\n483:   if (this.isConditionalGET()\n484:     && this.isCachable()\n485:     && this.isFresh()) {\n486:     return this.notModified();\n487:   }\n488: \n489:   // adjust len to start/end options\n490:   len = Math.max(0, len - offset);\n491:   if (options.end !== undefined) {\n492:     var bytes = options.end - offset + 1;\n493:     if (len > bytes) len = bytes;\n494:   }\n495: \n496:   // Range support\n497:   if (ranges) {\n498:     ranges = parseRange(len, ranges);\n499: \n500:     // If-Range support\n501:     if (!this.isRangeFresh()) {\n502:       debug('range stale');\n503:       ranges = -2;\n504:     }\n505: \n506:     // unsatisfiable\n507:     if (-1 == ranges) {\n508:       debug('range unsatisfiable');\n509:       res.setHeader('Content-Range', 'bytes */' + stat.size);\n510:       return this.error(416);\n511:     }\n512: \n513:     // valid (syntactically invalid/multiple ranges are treated as a regular response)\n514:     if (-2 != ranges && ranges.length === 1) {\n515:       debug('range %j', ranges);\n516: \n517:       options.start = offset + ranges[0].start;\n518:       options.end = offset + ranges[0].end;\n519: \n520:       // Content-Range\n521:       res.statusCode = 206;\n522:       res.setHeader('Content-Range', 'bytes '\n523:         + ranges[0].start\n524:         + '-'\n525:         + ranges[0].end\n526:         + '/'\n527:         + len);\n528:       len = options.end - options.start + 1;\n529:     }\n530:   }\n531: \n532:   // content-length\n533:   res.setHeader('Content-Length', len);\n534: \n535:   // HEAD support\n536:   if ('HEAD' == req.method) return res.end();\n537: \n538:   this.stream(path, options);\n539: };\n540: \n541: /**\n542:  * Transfer index for `path`.\n543:  *\n544:  * @param {String} path\n545:  * @api private\n546:  */\n547: SendStream.prototype.sendIndex = function sendIndex(path){\n548:   var i = -1;\n549:   var self = this;",
+    "source_summary": "this.path comes from constructor parameter, likely user-controlled request path. root comes from options.root or from() method, resolved to absolute path.",
+    "sink_summary": "fs.stat(path, ...) and file operations that could expose files outside root directory if path traversal succeeds.",
+    "guard_summary": "Path normalization and joining with root, null byte check, '..' pattern check when no root, dotfile handling. The changed line is a root prefix check to prevent escaping root directory.",
+    "risk_pattern": "User-supplied path is normalized and joined with root directory, then checked to ensure it remains within root before file system access.",
+    "used_variable_sources": [
+      "this.path (constructor parameter)",
+      "options.root (constructor option)",
+      "this._root (resolved root path)"
+    ],
+    "called_function_context": [
+      "utils.decode",
+      "normalize",
+      "join",
+      "resolve",
+      "fs.stat"
+    ],
+    "enclosing_conditions": [
+      "root !== null",
+      "path normalization and joining logic"
+    ],
+    "context_summary": "Security check in file serving pipeline to prevent directory traversal by ensuring normalized path starts with root directory prefix after joining.",
+    "unresolved_facts": [
+      "Exact source of this.path initialization",
+      "Whether options.root is always properly validated",
+      "Specific attack scenarios that could bypass the check"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "Root prefix check after normalization/joining matches path traversal prevention mechanism - user input path joined with root then validated to prevent directory escape",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "Code handles relative paths with '..' patterns and root directory containment - specific relative path traversal prevention",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "fit_reason": "Path validation occurs before fs.stat but symlink resolution happens at filesystem level - potential TOCTOU/symlink bypass",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-367",
+        "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+        "fit_reason": "Path validation check separated from actual file operations - race condition between check and fs.stat usage",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-119",
+      "CWE-125",
+      "CWE-193",
+      "CWE-200",
+      "CWE-22",
+      "CWE-23",
+      "CWE-367",
+      "CWE-59",
+      "CWE-643",
+      "CWE-754",
+      "CWE-807",
+      "CWE-843"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/send.js",
+        "changed_line": 400,
+        "statement": "if (path.substr(0, root.length) !== root) {",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.95,
+            "evidence": "The code implements a root directory boundary check that directly addresses CWE-22's core mechanism: ensuring a pathname constructed from external input remains within a restricted directory after normalization and joining operations."
+          },
+          "connection": {
+            "score": 0.85,
+            "evidence": "User-controlled `this.path` is decoded, joined with `root`, normalized, then checked against the root prefix before being passed to `fs.stat()` for file system access, creating a clear input-to-sink path."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If this candidate line were reverted, the root prefix validation would be removed, allowing paths that escape the restricted directory after normalization/joining operations to proceed to file system access."
+          },
+          "security_control": {
+            "score": 0.88,
+            "evidence": "The check directly prevents path traversal by validating the normalized path remains within the root boundary.",
+            "required_control": "Path boundary validation after normalization and joining operations",
+            "control_requirement_evidence": "CWE-22 requires validation that paths constructed from user input remain within restricted directories, especially after normalization which can alter path semantics",
+            "existing_controls_checked": [
+              "null byte check at line 392",
+              "'..' pattern check when no root at line 409",
+              "path normalization at line 397"
+            ],
+            "deficiency_evidence": "Without this check, the combination of join(root, path) and normalize() operations could produce paths that appear valid but escape the root directory boundary"
+          },
+          "concrete_impact": {
+            "score": 0.8,
+            "evidence": "The demonstrated path leads to file system access via fs.stat(), allowing unauthorized access to files outside the restricted directory if the check is bypassed or removed."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the root prefix validation would be removed, allowing paths that escape the restricted directory after normalization and joining operations to proceed to file system access, potentially exposing files outside the intended root directory.",
+        "supporting_evidence": [
+          "User-controlled this.path is decoded and processed through normalization and root joining",
+          "The check occurs immediately before path is used in fs.stat() for file system operations",
+          "The code explicitly labels this as 'malicious path' detection with debug logging",
+          "Alternative path traversal protection exists for when root is null, showing consistent security concern"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Specific normalization edge cases that could bypass substring comparison",
+          "Whether root path always ends with directory separator for consistent comparison"
+        ],
+        "review_comment": "This change adds critical path traversal protection by validating that normalized paths remain within the root directory boundary. User-supplied paths are joined with the root directory and normalized, then checked to ensure they don't escape the restricted area before file system access. The root prefix comparison prevents directory traversal attacks that could bypass other checks. Maintain this validation to ensure file access remains confined to the intended directory.",
+        "change_type": "A",
+        "raw_score": 0.876,
+        "score": 0.876
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/send.js",
+        "changed_line": 400,
+        "statement": "if (path.substr(0, root.length) !== root) {",
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.95,
+            "evidence": "The code explicitly implements a relative path traversal prevention mechanism by checking if the normalized path starts with the root directory after joining operations."
+          },
+          "connection": {
+            "score": 0.85,
+            "evidence": "User-controlled `this.path` is decoded, joined with `root`, normalized, then checked before being passed to `fs.stat()` for file system access."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "This check was added to prevent directory traversal when a root directory is specified, replacing the previous reliance only on '..' pattern matching."
+          },
+          "security_control": {
+            "score": 0.88,
+            "evidence": "The root prefix check is a direct security control that prevents escaping the restricted directory boundary.",
+            "required_control": "Path containment validation after normalization",
+            "control_requirement_evidence": "CWE-23 requires ensuring normalized paths remain within restricted directories after joining operations",
+            "existing_controls_checked": [
+              "null byte check",
+              "'..' pattern check when no root",
+              "path normalization"
+            ],
+            "deficiency_evidence": "Without this check, path normalization could allow traversal via symlinks, UNC paths, or other bypasses of simple '..' pattern matching"
+          },
+          "concrete_impact": {
+            "score": 0.82,
+            "evidence": "Demonstrated path leads to file system access via fs.stat(), allowing unauthorized file access if traversal succeeds."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the path containment check would be removed, allowing potentially normalized paths that escape the root directory to proceed to file system operations.",
+        "supporting_evidence": [
+          "User-controlled `this.path` is decoded and joined with root directory",
+          "Path is normalized before the containment check",
+          "Check prevents access if path doesn't start with root prefix",
+          "Failed check returns 403 error before file system access"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Specific normalization behavior that could bypass simple prefix checking",
+          "Whether symlink resolution could affect path containment"
+        ],
+        "review_comment": "Added root prefix check prevents directory traversal by ensuring normalized paths remain within the restricted directory after joining operations. The check validates that user-supplied paths cannot escape the configured root directory before file system access. This addresses relative path traversal vulnerabilities that could bypass simple '..' pattern matching. Ensure the root directory is always properly validated and consider using absolute path resolution for additional protection.",
+        "change_type": "A",
+        "raw_score": 0.8799999999999999,
+        "score": 0.8799999999999999
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/send.js",
+        "changed_line": 400,
+        "statement": "if (path.substr(0, root.length) !== root) {",
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "The demonstrated check validates that a normalized path string starts with a root directory prefix. CWE-59 requires improper resolution of symbolic links, hard links, or shortcuts before file access. No evidence shows link resolution, symlink handling, or TOCTOU issues."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "User-supplied this.path is decoded, normalized, and joined with root. The resulting path is used in fs.stat() at line 444. The check at line 400 validates the path string prefix before stat()."
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "If this candidate line were removed, the malicious path check would be absent when root !== null. The patch adds a string prefix validation after normalization and before file system access."
+          },
+          "security_control": {
+            "score": 0.3,
+            "evidence": "",
+            "required_control": "Proper resolution of symbolic links, hard links, or shortcuts before file access",
+            "control_requirement_evidence": "CWE-59 requires that the product resolves links to their canonical targets before access decisions. The demonstrated mechanism validates path string prefixes, not link resolution.",
+            "existing_controls_checked": [
+              "Path normalization (normalize, join), null byte check, '..' pattern check when no root, dotfile handling"
+            ],
+            "deficiency_evidence": "No evidence demonstrates improper link resolution. The check validates normalized path strings, not resolved file system objects. Link following vulnerabilities require symlink creation/exploitation evidence."
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "No demonstrated link following or symlink bypass. The check prevents directory traversal via path string manipulation, not via symlink resolution."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the malicious path check after root joining would be absent, allowing path strings that don't start with the root prefix to proceed to fs.stat().",
+        "supporting_evidence": [
+          "Line 400 adds a string prefix check: if (path.substr(0, root.length) !== root)",
+          "The check occurs after path normalization and joining with root directory",
+          "If check fails, returns 403 error preventing file access"
+        ],
+        "contradicting_evidence": [
+          "CWE-59 requires improper link resolution; the demonstrated check validates path string prefixes, not symlink resolution",
+          "No evidence of symbolic links, hard links, shortcuts, or TOCTOU race conditions",
+          "The check occurs before fs.stat(), but stat() follows symlinks by default - no demonstrated improper resolution"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether fs.stat() follows symlinks (default behavior)",
+          "Whether attacker can create symlinks in controlled directories",
+          "Whether TOCTOU exists between check and stat()"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.32,
+        "score": 0.32
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/send.js",
+        "changed_line": 400,
+        "statement": "if (path.substr(0, root.length) !== root) {",
+        "cwe_id": "CWE-367",
+        "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "The code performs a path validation check before file operations, but there is no evidence of concurrent access or race conditions. The check and use occur in the same synchronous function call without asynchronous boundaries that would allow state changes."
+          },
+          "connection": {
+            "score": 0.15,
+            "evidence": "The path validation check at line 400 is immediately followed by file operations (fs.stat at line 444), but this is a synchronous flow within a single request handler without demonstrated concurrent access patterns."
+          },
+          "diff_causality": {
+            "score": 0.2,
+            "evidence": "The added check strengthens path validation but does not introduce or modify timing-related vulnerabilities. It adds a security control rather than creating race conditions."
+          },
+          "security_control": {
+            "score": 0.1,
+            "evidence": "",
+            "required_control": "Atomic operations or synchronization to prevent state changes between check and use",
+            "control_requirement_evidence": "CWE-367 requires protection against concurrent modifications between validation and use",
+            "existing_controls_checked": [
+              "Synchronous execution within single request handler"
+            ],
+            "deficiency_evidence": "No evidence of concurrent access patterns or asynchronous boundaries that would create a TOCTOU vulnerability. The code operates synchronously per request."
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No evidence of race condition exploitation or concurrent file system modifications that could bypass the path validation."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the path validation check would be removed, potentially allowing directory traversal attacks, but this does not relate to timing or concurrency vulnerabilities.",
+        "supporting_evidence": [
+          "Path validation check occurs before file operations (fs.stat)"
+        ],
+        "contradicting_evidence": [
+          "Synchronous execution within single request handler",
+          "No asynchronous boundaries between check and use",
+          "No evidence of concurrent access patterns"
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [
+          "Whether the application handles concurrent requests that could access the same files",
+          "File system behavior under concurrent access scenarios"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.13,
+        "score": 0.13
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "lib/send.js",
+    "changed_line": 409,
+    "statement": "if (upPathRegexp.test(path)) {",
+    "change_type": "A",
+    "function_name": "SendStream.prototype.pipe",
+    "operation_type": "path_traversal_check",
+    "selection_reason": "User-controlled path without root -> regex test for '..' patterns -> prevents directory traversal",
+    "security_relevance_score": 0.9,
+    "code_context": "260: \n261: SendStream.prototype.removeContentHeaderFields = function(){\n262:   var res = this.res;\n263:   Object.keys(res._headers).forEach(function(field){\n264:     if (0 == field.indexOf('content')) {\n265:       res.removeHeader(field);\n266:     }\n267:   });\n268: };\n269: \n270: /**\n271:  * Respond with 304 not modified.\n272:  *\n273:  * @api private\n274:  */\n275: \n276: SendStream.prototype.notModified = function(){\n277:   var res = this.res;\n278:   debug('not modified');\n279:   this.removeContentHeaderFields();\n280:   res.statusCode = 304;\n281:   res.end();\n282: };\n283: \n284: /**\n285:  * Raise error that headers already sent.\n286:  *\n287:  * @api private\n288:  */\n289: \n290: SendStream.prototype.headersAlreadySent = function headersAlreadySent(){\n291:   var err = new Error('Can\\'t set headers after they are sent.');\n292:   debug('headers already sent');\n293:   this.error(500, err);\n294: };\n295: \n296: /**\n297:  * Check if the request is cacheable, aka\n298:  * responded with 2xx or 304 (see RFC 2616 section 14.2{5,6}).\n299:  *\n300:  * @return {Boolean}\n301:  * @api private\n302:  */\n303: \n304: SendStream.prototype.isCachable = function(){\n305:   var res = this.res;\n306:   return (res.statusCode >= 200 && res.statusCode < 300) || 304 == res.statusCode;\n307: };\n308: \n309: /**\n310:  * Handle stat() error.\n311:  *\n312:  * @param {Error} err\n313:  * @api private\n314:  */\n315: \n316: SendStream.prototype.onStatError = function(err){\n317:   var notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR'];\n318:   if (~notfound.indexOf(err.code)) return this.error(404, err);\n319:   this.error(500, err);\n320: };\n321: \n322: /**\n323:  * Check if the cache is fresh.\n324:  *\n325:  * @return {Boolean}\n326:  * @api private\n327:  */\n328: \n329: SendStream.prototype.isFresh = function(){\n330:   return fresh(this.req.headers, this.res._headers);\n331: };\n332: \n333: /**\n334:  * Check if the range is fresh.\n335:  *\n336:  * @return {Boolean}\n337:  * @api private\n338:  */\n339: \n340: SendStream.prototype.isRangeFresh = function isRangeFresh(){\n341:   var ifRange = this.req.headers['if-range'];\n342: \n343:   if (!ifRange) return true;\n344: \n345:   return ~ifRange.indexOf('\"')\n346:     ? ~ifRange.indexOf(this.res._headers['etag'])\n347:     : Date.parse(this.res._headers['last-modified']) <= Date.parse(ifRange);\n348: };\n349: \n350: /**\n351:  * Redirect to `path`.\n352:  *\n353:  * @param {String} path\n354:  * @api private\n355:  */\n356: \n357: SendStream.prototype.redirect = function(path){\n358:   if (listenerCount(this, 'directory') !== 0) {\n359:     return this.emit('directory');\n360:   }\n361: \n362:   if (this.hasTrailingSlash()) return this.error(403);\n363:   var res = this.res;\n364:   path += '/';\n365:   res.statusCode = 301;\n366:   res.setHeader('Content-Type', 'text/html; charset=utf-8');\n367:   res.setHeader('Location', path);\n368:   res.end('Redirecting to <a href=\"' + escapeHtml(path) + '\">' + escapeHtml(path) + '</a>\\n');\n369: };\n370: \n371: /**\n372:  * Pipe to `res.\n373:  *\n374:  * @param {Stream} res\n375:  * @return {Stream} res\n376:  * @api public\n377:  */\n378: \n379: SendStream.prototype.pipe = function(res){\n380:   var self = this\n381:     , args = arguments\n382:     , root = this._root;\n383: \n384:   // references\n385:   this.res = res;\n386: \n387:   // decode the path\n388:   var path = utils.decode(this.path)\n389:   if (path === -1) return this.error(400)\n390: \n391:   // null byte(s)\n392:   if (~path.indexOf('\\0')) return this.error(400);\n393: \n394:   var parts\n395:   if (root !== null) {\n396:     // join / normalize from optional root dir\n397:     path = normalize(join(root, path))\n398: \n399:     // malicious path\n400:     if (path.substr(0, root.length) !== root) {\n401:       debug('malicious path \"%s\"', path)\n402:       return this.error(403)\n403:     }\n404: \n405:     // explode path parts\n406:     parts = path.substr(root.length + 1).split(sep)\n407:   } else {\n408:     // \"..\" is malicious without \"root\"\n409:     if (upPathRegexp.test(path)) {\n410:       debug('malicious path \"%s\"', path)\n411:       return this.error(403)\n412:     }\n413: \n414:     // explode path parts\n415:     parts = normalize(path).split(sep)\n416: \n417:     // resolve the path\n418:     path = resolve(path)\n419:   }\n420: \n421:   // dotfile handling\n422:   if (containsDotFile(parts)) {\n423:     var access = this._hidden\n424:       ? 'allow'\n425:       : 'ignore'\n426: \n427:     debug('%s dotfile \"%s\"', access, path)\n428:     switch (access) {\n429:       case 'allow':\n430:         break\n431:       case 'ignore':\n432:       default:\n433:         return this.error(404)\n434:     }\n435:   }\n436: \n437:   // index file support\n438:   if (this._index.length && this.hasTrailingSlash()) {\n439:     this.sendIndex(path);\n440:     return res;\n441:   }\n442: \n443:   debug('stat \"%s\"', path);\n444:   fs.stat(path, function(err, stat){\n445:     if (err) return self.onStatError(err);\n446:     if (stat.isDirectory()) return self.redirect(self.path);\n447:     self.emit('file', path, stat);\n448:     self.send(path, stat);\n449:   });\n450: \n451:   return res;\n452: };\n453: \n454: /**\n455:  * Transfer `path`.\n456:  *\n457:  * @param {String} path\n458:  * @api public\n459:  */\n460: \n461: SendStream.prototype.send = function(path, stat){\n462:   var options = this.options;\n463:   var len = stat.size;\n464:   var res = this.res;\n465:   var req = this.req;\n466:   var ranges = req.headers.range;\n467:   var offset = options.start || 0;\n468: \n469:   if (res._header) {\n470:     // impossible to send now\n471:     return this.headersAlreadySent();\n472:   }\n473: \n474:   debug('pipe \"%s\"', path)\n475: \n476:   // set header fields\n477:   this.setHeader(path, stat);\n478: \n479:   // set content-type\n480:   this.type(path);\n481: \n482:   // conditional GET support\n483:   if (this.isConditionalGET()\n484:     && this.isCachable()\n485:     && this.isFresh()) {\n486:     return this.notModified();\n487:   }\n488: \n489:   // adjust len to start/end options\n490:   len = Math.max(0, len - offset);\n491:   if (options.end !== undefined) {\n492:     var bytes = options.end - offset + 1;\n493:     if (len > bytes) len = bytes;\n494:   }\n495: \n496:   // Range support\n497:   if (ranges) {\n498:     ranges = parseRange(len, ranges);\n499: \n500:     // If-Range support\n501:     if (!this.isRangeFresh()) {\n502:       debug('range stale');\n503:       ranges = -2;\n504:     }\n505: \n506:     // unsatisfiable\n507:     if (-1 == ranges) {\n508:       debug('range unsatisfiable');\n509:       res.setHeader('Content-Range', 'bytes */' + stat.size);\n510:       return this.error(416);\n511:     }\n512: \n513:     // valid (syntactically invalid/multiple ranges are treated as a regular response)\n514:     if (-2 != ranges && ranges.length === 1) {\n515:       debug('range %j', ranges);\n516: \n517:       options.start = offset + ranges[0].start;\n518:       options.end = offset + ranges[0].end;\n519: \n520:       // Content-Range\n521:       res.statusCode = 206;\n522:       res.setHeader('Content-Range', 'bytes '\n523:         + ranges[0].start\n524:         + '-'\n525:         + ranges[0].end\n526:         + '/'\n527:         + len);\n528:       len = options.end - options.start + 1;\n529:     }\n530:   }\n531: \n532:   // content-length\n533:   res.setHeader('Content-Length', len);\n534: \n535:   // HEAD support\n536:   if ('HEAD' == req.method) return res.end();\n537: \n538:   this.stream(path, options);\n539: };\n540: \n541: /**\n542:  * Transfer index for `path`.\n543:  *\n544:  * @param {String} path\n545:  * @api private\n546:  */\n547: SendStream.prototype.sendIndex = function sendIndex(path){\n548:   var i = -1;\n549:   var self = this;\n550: \n551:   function next(err){\n552:     if (++i >= self._index.length) {\n553:       if (err) return self.onStatError(err);\n554:       return self.error(404);\n555:     }\n556: \n557:     var p = path + self._index[i];\n558: ",
+    "source_summary": "path comes from this.path set in SendStream constructor, which receives it from user-provided path parameter in send(req, path, options) function",
+    "sink_summary": "If check fails, returns 403 error preventing file access; if passes, continues to fs.stat() and file streaming operations",
+    "guard_summary": "Regex test for '..' patterns when no root directory is configured; prevents directory traversal by blocking paths containing '..' sequences",
+    "risk_pattern": "User-controlled file path without root directory constraint checked for directory traversal patterns using regex before file system access",
+    "used_variable_sources": [
+      "this.path (user-provided)",
+      "upPathRegexp (/(?:^|[\\\\\\/])\\.\\.(?:[\\\\\\/]|$)/)",
+      "this._root (optional root directory constraint)"
+    ],
+    "called_function_context": [
+      "utils.decode()",
+      "normalize()",
+      "resolve()",
+      "fs.stat()",
+      "this.error()"
+    ],
+    "enclosing_conditions": [
+      "root === null (no root directory configured)"
+    ],
+    "context_summary": "Security check added to prevent directory traversal when serving files without a root directory constraint. The regex detects '..' patterns in the path and blocks access with 403 error.",
+    "unresolved_facts": [
+      "How this.path is initially validated/sanitized before reaching SendStream",
+      "Whether there are other path validation mechanisms in the calling code",
+      "Specific attack scenarios this check is designed to prevent beyond basic directory traversal"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "Stage-2 evidence shows user-controlled path checked with regex for '..' patterns to prevent directory traversal when no root directory is configured. This matches CWE-22 mechanism of improper path restriction.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "Evidence shows regex detection of '..' sequences in relative paths to prevent traversal attacks. CWE-23 specifically addresses relative path traversal vulnerabilities.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-119",
+      "CWE-200",
+      "CWE-219",
+      "CWE-22",
+      "CWE-23",
+      "CWE-367",
+      "CWE-59",
+      "CWE-643",
+      "CWE-676",
+      "CWE-693",
+      "CWE-754",
+      "CWE-829",
+      "CWE-843"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "lib/send.js",
+        "changed_line": 409,
+        "statement": "if (upPathRegexp.test(path)) {",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code demonstrates path traversal prevention by checking for '..' patterns using regex when no root directory is configured, directly addressing CWE-22's core mechanism of restricting pathnames to prevent directory traversal."
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "User-controlled path (this.path) is decoded and checked for '..' patterns before being used in file system operations (fs.stat, file streaming). The path flows directly from input to file access decision."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "The added check creates the path traversal protection. Without this line, paths containing '..' would proceed to file system operations when no root directory is configured."
+          },
+          "security_control": {
+            "score": 0.8,
+            "evidence": "The check adds proper path validation that was previously missing for the no-root-directory case.",
+            "required_control": "Path validation to prevent directory traversal sequences",
+            "control_requirement_evidence": "CWE-22 requires validation to prevent path traversal using special elements like '..' sequences",
+            "existing_controls_checked": [
+              "Root directory boundary check (lines 400-403) only applies when root is configured",
+              "Null byte check (line 392) prevents null byte injection but not '..' traversal"
+            ],
+            "deficiency_evidence": "Without this check, paths with '..' sequences would bypass existing controls when no root directory is configured, allowing directory traversal"
+          },
+          "concrete_impact": {
+            "score": 0.7,
+            "evidence": "The check prevents unauthorized file access by blocking directory traversal attempts, though specific exploit scenarios depend on server configuration and file system layout."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, paths containing '..' sequences would not be blocked when no root directory is configured, allowing potential directory traversal attacks.",
+        "supporting_evidence": [
+          "User-controlled path flows directly to file system operations",
+          "Regex pattern /(?:^|[\\\\\\/])\\.\\.(?:[\\\\\\/]|$)/ specifically detects directory traversal sequences",
+          "Check returns 403 error preventing file access when traversal detected",
+          "Code comment explicitly states '\"..\" is malicious without \"root\"'"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "How this.path is initially validated before reaching SendStream",
+          "Whether there are other path validation mechanisms in calling code",
+          "Specific server configurations that would make this vulnerability exploitable"
+        ],
+        "review_comment": "Added path traversal check prevents directory traversal when serving files without a root directory constraint. The regex detects '..' patterns in user-controlled paths and blocks access with a 403 error before file system operations. This addresses a security gap where paths containing directory traversal sequences could bypass existing controls when no root directory is configured. Ensure all file serving paths undergo similar validation regardless of root directory configuration.",
+        "change_type": "A",
+        "raw_score": 0.8,
+        "score": 0.8
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "lib/send.js",
+        "changed_line": 409,
+        "statement": "if (upPathRegexp.test(path)) {",
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.95,
+            "evidence": "The added line tests the user-provided path with a regex (/(?:^|[\\\\\\/])\\.\\.(?:[\\\\\\/]|$)/) to detect '..' sequences. This is a direct, explicit check for the defining mechanism of CWE-23: preventing relative path traversal by neutralizing '..' sequences before constructing a pathname for file system access."
+          },
+          "connection": {
+            "score": 0.85,
+            "evidence": "The path variable is derived from `this.path`, which is set from a user-provided parameter. This path is decoded and, when `root` is null, directly tested by the regex. If the test passes, the path proceeds to `fs.stat(path, ...)` and subsequent file streaming operations. The evidence shows a direct data flow from user input to the file system operation, with the check as the only intervening control."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "The candidate line is an addition (`change_type: A`). If this line were reverted, the conditional block (lines 409-412) would be removed. This would eliminate the regex check for '..' sequences when `root === null`, allowing paths containing '..' to proceed to `normalize(path).split(sep)` and `resolve(path)`, and ultimately to `fs.stat`. The patch materially creates a protection against the traversal mechanism."
+          },
+          "security_control": {
+            "score": 0.8,
+            "evidence": "The required control for CWE-23 is proper neutralization of '..' sequences in relative paths before they are used to access the file system. The evidence demonstrates this control was added. The deficiency existed because, when `root` is null, the previous code path (lines 414-419) would normalize and resolve the path without first checking for '..'. The patch adds the missing validation. Downstream, `normalize()` and `resolve()` are called, but they are not sufficient security controls on their own for preventing traversal from the current working directory.",
+            "required_control": "Validation to detect and block pathnames containing '..' sequences before file system resolution.",
+            "control_requirement_evidence": "CWE-23 is defined by the failure to neutralize '..' sequences. When serving files without a chroot-like root (`root === null`), the path is resolved relative to the process's current directory. '..' sequences must be blocked to prevent escape.",
+            "existing_controls_checked": [
+              "`root` path prefix check (lines 400-403)",
+              "`normalize()` and `resolve()` functions",
+              "Null byte check (line 392)"
+            ],
+            "deficiency_evidence": "When `root` is null, the previous code path had no check for '..'. The `normalize()` and `resolve()` functions process the path but do not inherently block traversal from the current directory; they resolve '..' sequences to produce an absolute path, which could point outside the intended serving scope. The patch adds the explicit check that was missing."
+          },
+          "concrete_impact": {
+            "score": 0.75,
+            "evidence": "If the check is absent and a path with '..' is provided, the file system operation (`fs.stat`) will receive a resolved path that could point outside the application's intended directory. This could lead to unauthorized read access to arbitrary files on the server (data access). The evidence shows the code serves files, making read access a direct consequence."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the regex check for '..' sequences would be removed. When `root` is null, a user-provided path containing '..' would not be blocked, would be normalized and resolved, and would proceed to `fs.stat`, potentially allowing access to files outside the intended directory.",
+        "supporting_evidence": [
+          "Line 409: Direct regex test `upPathRegexp.test(path)` for '..' patterns.",
+          "Line 408: Comment '\"..\" is malicious without \"root\"' explicitly states the threat.",
+          "Line 387-389: `path` is decoded from `this.path`, which is user-provided.",
+          "Line 444: `fs.stat(path, ...)` is the sink operation.",
+          "Line 395-403: Shows the alternative security path when `root` is not null, confirming the need for a different control when root is absent."
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "The exact initial validation/sanitization of `this.path` before it reaches `SendStream.pipe` is not shown in the provided context.",
+          "Whether the `resolve()` function, when combined with the process's current working directory, could still permit some traversal even after normalization is not fully analyzed."
+        ],
+        "review_comment": "Added a regex check to detect '..' sequences in user-provided file paths when no root directory is configured, blocking them with a 403 error. This prevents relative path traversal attacks that could allow reading arbitrary files from the server's filesystem. Ensure the `upPathRegexp` robustly matches all dangerous '..' patterns across different platforms and path separators.",
+        "change_type": "A",
+        "raw_score": 0.85,
+        "score": 0.85
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "lib/send.js",
+    "changed_line": 107,
+    "statement": "? resolve(options.root)",
+    "change_type": "A",
+    "function_name": "SendStream",
+    "operation_type": "path_resolution",
+    "selection_reason": "User-controlled root option -> resolve() instead of normalize() -> changes path resolution security behavior",
+    "security_relevance_score": 0.8,
+    "code_context": "1: \n2: /**\n3:  * Module dependencies.\n4:  */\n5: \n6: var debug = require('debug')('send')\n7: var deprecate = require('depd')('send')\n8: var escapeHtml = require('escape-html')\n9:   , parseRange = require('range-parser')\n10:   , Stream = require('stream')\n11:   , mime = require('mime')\n12:   , fresh = require('fresh')\n13:   , path = require('path')\n14:   , http = require('http')\n15:   , onFinished = require('finished')\n16:   , fs = require('fs')\n17:   , normalize = path.normalize\n18:   , join = path.join\n19:   , utils = require('./utils');\n20: var EventEmitter = require('events').EventEmitter;\n21: var ms = require('ms');\n22: \n23: /**\n24:  * Variables.\n25:  */\n26: var maxMaxAge = 60 * 60 * 24 * 365 * 1000; // 1 year\n27: var resolve = path.resolve\n28: var sep = path.sep\n29: var upPathRegexp = /(?:^|[\\\\\\/])\\.\\.(?:[\\\\\\/]|$)/;\n30: \n31: /**\n32:  * Expose `send`.\n33:  */\n34: \n35: exports = module.exports = send;\n36: \n37: /**\n38:  * Expose mime module.\n39:  */\n40: \n41: exports.mime = mime;\n42: \n43: /**\n44:  * Shim EventEmitter.listenerCount for node.js < 0.10\n45:  */\n46: \n47: /* istanbul ignore next */\n48: var listenerCount = EventEmitter.listenerCount\n49:   || function(emitter, type){ return emitter.listeners(type).length; };\n50: \n51: /**\n52:  * Return a `SendStream` for `req` and `path`.\n53:  *\n54:  * @param {Request} req\n55:  * @param {String} path\n56:  * @param {Object} options\n57:  * @return {SendStream}\n58:  * @api public\n59:  */\n60: \n61: function send(req, path, options) {\n62:   return new SendStream(req, path, options);\n63: }\n64: \n65: /**\n66:  * Initialize a `SendStream` with the given `path`.\n67:  *\n68:  * Events:\n69:  *\n70:  *  - `error` an error occurred\n71:  *  - `stream` file streaming has started\n72:  *  - `end` streaming has completed\n73:  *  - `directory` a directory was requested\n74:  *\n75:  * @param {Request} req\n76:  * @param {String} path\n77:  * @param {Object} options\n78:  * @api private\n79:  */\n80: \n81: function SendStream(req, path, options) {\n82:   var self = this;\n83:   options = options || {};\n84:   this.req = req;\n85:   this.path = path;\n86:   this.options = options;\n87: \n88:   this._etag = options.etag !== undefined\n89:     ? Boolean(options.etag)\n90:     : true\n91: \n92:   this._hidden = Boolean(options.hidden)\n93: \n94:   this._index = options.index !== undefined\n95:     ? normalizeIndex(options.index)\n96:     : ['index.html']\n97: \n98:   this._maxage = options.maxAge || options.maxage\n99:   this._maxage = typeof this._maxage === 'string'\n100:     ? ms(this._maxage)\n101:     : Number(this._maxage)\n102:   this._maxage = !isNaN(this._maxage)\n103:     ? Math.min(Math.max(0, this._maxage), maxMaxAge)\n104:     : 0\n105: \n106:   this._root = options.root\n107:     ? resolve(options.root)\n108:     : null\n109: \n110:   if (!this._root && options.from) {\n111:     this.from(options.from);\n112:   }\n113: }\n114: \n115: /**\n116:  * Inherits from `Stream.prototype`.\n117:  */\n118: \n119: SendStream.prototype.__proto__ = Stream.prototype;\n120: \n121: /**\n122:  * Enable or disable etag generation.\n123:  *\n124:  * @param {Boolean} val\n125:  * @return {SendStream}\n126:  * @api public\n127:  */\n128: \n129: SendStream.prototype.etag = deprecate.function(function etag(val) {\n130:   val = Boolean(val);\n131:   debug('etag %s', val);\n132:   this._etag = val;\n133:   return this;\n134: }, 'send.etag: pass etag as option');\n135: \n136: /**\n137:  * Enable or disable \"hidden\" (dot) files.\n138:  *\n139:  * @param {Boolean} path\n140:  * @return {SendStream}\n141:  * @api public\n142:  */\n143: \n144: SendStream.prototype.hidden = deprecate.function(function hidden(val) {\n145:   val = Boolean(val);\n146:   debug('hidden %s', val);\n147:   this._hidden = val;\n148:   return this;\n149: }, 'send.hidden: pass hidden as option');\n150: \n151: /**\n152:  * Set index `paths`, set to a falsy\n153:  * value to disable index support.\n154:  *\n155:  * @param {String|Boolean|Array} paths\n156:  * @return {SendStream}\n157:  * @api public\n158:  */\n159: \n160: SendStream.prototype.index = deprecate.function(function index(paths) {\n161:   var index = !paths ? [] : normalizeIndex(paths);\n162:   debug('index %o', paths);\n163:   this._index = index;\n164:   return this;\n165: }, 'send.index: pass index as option');\n166: \n167: /**\n168:  * Set root `path`.\n169:  *\n170:  * @param {String} path\n171:  * @return {SendStream}\n172:  * @api public\n173:  */\n174: \n175: SendStream.prototype.root = function(path){\n176:   path = String(path);\n177:   this._root = resolve(path)\n178:   return this;\n179: };\n180: \n181: SendStream.prototype.from = deprecate.function(SendStream.prototype.root,\n182:   'send.from: pass root as option');\n183: \n184: SendStream.prototype.root = deprecate.function(SendStream.prototype.root,\n185:   'send.root: pass root as option');\n186: \n187: /**\n188:  * Set max-age to `maxAge`.\n189:  *\n190:  * @param {Number} maxAge\n191:  * @return {SendStream}\n192:  * @api public\n193:  */\n194: \n195: SendStream.prototype.maxage = deprecate.function(function maxage(maxAge) {\n196:   maxAge = typeof maxAge === 'string'\n197:     ? ms(maxAge)\n198:     : Number(maxAge);\n199:   if (isNaN(maxAge)) maxAge = 0;\n200:   if (Infinity == maxAge) maxAge = 60 * 60 * 24 * 365 * 1000;\n201:   debug('max-age %d', maxAge);\n202:   this._maxage = maxAge;\n203:   return this;\n204: }, 'send.maxage: pass maxAge as option');\n205: \n206: /**\n207:  * Emit error with `status`.\n208:  *\n209:  * @param {Number} status\n210:  * @api private\n211:  */\n212: \n213: SendStream.prototype.error = function(status, err){\n214:   var res = this.res;\n215:   var msg = http.STATUS_CODES[status];\n216: \n217:   err = err || new Error(msg);\n218:   err.status = status;\n219: \n220:   // emit if listeners instead of responding\n221:   if (listenerCount(this, 'error') !== 0) {\n222:     return this.emit('error', err);\n223:   }\n224: \n225:   // wipe all existing headers\n226:   res._headers = undefined;\n227: \n228:   res.statusCode = err.status;\n229:   res.end(msg);\n230: };\n231: \n232: /**\n233:  * Check if the pathname ends with \"/\".\n234:  *\n235:  * @return {Boolean}\n236:  * @api private\n237:  */\n238: \n239: SendStream.prototype.hasTrailingSlash = function(){\n240:   return '/' == this.path[this.path.length - 1];\n241: };\n242: \n243: /**\n244:  * Check if this is a conditional GET request.\n245:  *\n246:  * @return {Boolean}\n247:  * @api private\n248:  */\n249: \n250: SendStream.prototype.isConditionalGET = function(){\n251:   return this.req.headers['if-none-match']\n252:     || this.req.headers['if-modified-since'];\n253: };\n254: \n255: /**\n256:  * Strip content-* header fields.",
+    "source_summary": "options.root comes from user-provided configuration when creating SendStream instance",
+    "sink_summary": "File system access via fs.stat() and file serving operations using the resolved root path",
+    "guard_summary": "Path traversal checks using substring comparison (path.substr(0, root.length) !== root) and regex pattern (upPathRegexp) for '..' sequences",
+    "risk_pattern": "User-controlled root path resolved to absolute path, then used as base directory for file serving with path joining and normalization",
+    "used_variable_sources": [
+      "options.root"
+    ],
+    "called_function_context": [
+      "path.resolve",
+      "path.normalize",
+      "path.join",
+      "fs.stat"
+    ],
+    "enclosing_conditions": [
+      "if (root !== null)"
+    ],
+    "context_summary": "The resolved root path is used as the base directory for serving static files. When a root is set, user-provided paths are joined with this root, normalized, and checked to ensure they don't escape the root directory before file access.",
+    "unresolved_facts": [
+      "Whether options.root can be attacker-controlled in typical usage scenarios",
+      "The exact security difference between path.resolve and path.normalize for the root path resolution"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "User-controlled root path resolved with path.resolve used as base for file serving - matches path traversal mechanism where improper path resolution allows directory escape",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "Path resolution change affects how relative paths are handled in file serving context, potentially allowing traversal via relative path manipulation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "fit_reason": "Path resolution function change could affect symlink handling in the file serving mechanism",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-697",
+        "cwe_name": "Incorrect Comparison",
+        "fit_reason": "Security checks using substring comparison (path.substr(0, root.length) !== root) may fail if path resolution behavior differs between normalize and resolve",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-20",
+      "CWE-219",
+      "CWE-22",
+      "CWE-23",
+      "CWE-260",
+      "CWE-367",
+      "CWE-561",
+      "CWE-563",
+      "CWE-59",
+      "CWE-676",
+      "CWE-693",
+      "CWE-697",
+      "CWE-829",
+      "CWE-912",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "lib/send.js",
+        "changed_line": 107,
+        "statement": "? resolve(options.root)",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.25,
+            "evidence": "The candidate uses path.resolve() on user-provided options.root. CWE-22 requires improper limitation of a pathname to a restricted directory, typically involving user input in path construction that allows escape. This change affects root path resolution but doesn't demonstrate the full path traversal mechanism where user input directly constructs the final file access path."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "options.root is user-controlled configuration input. The resolved root is stored in this._root and used in path.join() operations for file serving. The connection exists: user input → path.resolve() → stored root → used in file path construction. However, the evidence doesn't show the specific path joining operation that would allow traversal."
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "If the candidate line were reverted, options.root would not be resolved with path.resolve(). The patch changes how the root directory is determined from user input, potentially affecting path normalization behavior and the security of subsequent path joining operations."
+          },
+          "security_control": {
+            "score": 0.3,
+            "evidence": "",
+            "required_control": "Proper path resolution and containment validation to ensure user-provided paths don't escape restricted directories",
+            "control_requirement_evidence": "CWE-22 requires that pathnames constructed from user input are properly contained within a restricted parent directory. The root path serves as the base directory for all file operations.",
+            "existing_controls_checked": [
+              "path.substr(0, root.length) !== root check for containment",
+              "upPathRegexp for '..' sequence detection",
+              "path.normalize() on joined paths"
+            ],
+            "deficiency_evidence": "The evidence doesn't demonstrate that path.resolve() introduces a deficiency compared to alternative resolution methods. The existing controls (substring comparison, regex pattern) appear to operate on the final joined path, not the root resolution itself. No bypass of these controls is shown."
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "No concrete security consequence is demonstrated. The change from no resolution to path.resolve() could affect path normalization behavior, but no evidence shows this enables directory escape or file access outside intended boundaries."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, options.root would not be resolved with path.resolve(), potentially leaving the root path in a different form (relative vs absolute) that might affect subsequent path joining and containment checks.",
+        "supporting_evidence": [
+          "options.root is user-provided configuration input",
+          "path.resolve() is applied to options.root and stored in this._root",
+          "this._root is used as base directory for file serving operations"
+        ],
+        "contradicting_evidence": [
+          "The code includes multiple containment checks: path.substr(0, root.length) !== root and upPathRegexp for '..' sequences",
+          "Path joining uses path.normalize() which should handle relative components",
+          "No evidence shows that path.resolve() weakens these existing controls"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether options.root can be attacker-controlled in typical usage scenarios",
+          "The exact security difference between path.resolve() and alternative resolution methods for the root path",
+          "Whether the existing containment checks are sufficient regardless of root resolution method",
+          "If path.resolve() introduces any normalization behavior that bypasses existing controls"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.37,
+        "score": 0.37
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "lib/send.js",
+        "changed_line": 107,
+        "statement": "? resolve(options.root)",
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The change from normalize() to resolve() affects path resolution behavior, but CWE-23 specifically requires external input constructing paths that traverse outside restricted directories. The evidence shows root path resolution, not user path construction with traversal sequences."
+          },
+          "connection": {
+            "score": 0.45,
+            "evidence": "User-provided options.root is connected to file serving operations via this._root assignment, which is later used in path.join(this._root, path) for file access. The path parameter comes from HTTP request paths."
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "If reverted to normalize(), relative root paths would remain relative instead of being resolved to absolute paths, potentially affecting how subsequent path joining and traversal checks behave."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "",
+            "required_control": "Proper path validation and canonicalization to prevent directory traversal",
+            "control_requirement_evidence": "CWE-23 requires ensuring user input cannot resolve outside restricted directories",
+            "existing_controls_checked": [
+              "substring comparison (path.substr(0, root.length) !== root)",
+              "regex pattern for '..' sequences (upPathRegexp)"
+            ],
+            "deficiency_evidence": "The change affects how the base path is established but doesn't demonstrate bypass of existing traversal checks. The control deficiency is speculative."
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "No concrete evidence shows how this specific change enables path traversal. The existing controls (substring comparison and regex) appear to remain in place regardless of root resolution method."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted to use normalize() instead of resolve(), relative root paths would not be converted to absolute paths, potentially affecting the behavior of subsequent path joining operations and traversal checks that depend on absolute path comparisons.",
+        "supporting_evidence": [
+          "User-controlled options.root is resolved to absolute path and stored as this._root",
+          "this._root is used as base directory for file serving operations with path.join()",
+          "Path traversal checks exist but depend on the resolved root path"
+        ],
+        "contradicting_evidence": [
+          "Existing path traversal controls (substring comparison and regex pattern) appear to function regardless of root resolution method",
+          "No evidence shows how resolve() vs normalize() specifically enables bypass of traversal protections"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether the change from normalize() to resolve() actually weakens existing path traversal protections",
+          "How relative root paths combined with user paths could bypass substring comparison checks",
+          "Whether downstream path joining and normalization properly handles the resolved root"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.41999999999999993,
+        "score": 0.41999999999999993
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "lib/send.js",
+        "changed_line": 107,
+        "statement": "? resolve(options.root)",
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-59 specifically addresses following symbolic links or shortcuts. The change from normalize() to resolve() for root path processing does not demonstrate link following behavior - it's about converting a relative path to absolute, not about resolving symbolic links."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "The resolved root path is connected to file serving operations via fs.stat() and file access, but there's no demonstrated connection to symbolic link resolution or following."
+          },
+          "diff_causality": {
+            "score": 0.35,
+            "evidence": "The change from normalize() to resolve() affects how the root path is processed, but doesn't materially create or modify link-following behavior. Both functions handle path normalization differently but neither specifically enables or disables symlink following."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Proper symlink resolution controls to prevent following unauthorized links",
+            "control_requirement_evidence": "CWE-59 requires controls to prevent following symlinks to unintended resources",
+            "existing_controls_checked": [
+              "Path containment checks using substring comparison and regex patterns for '..' sequences"
+            ],
+            "deficiency_evidence": "No evidence demonstrates that the resolve() vs normalize() change affects symlink handling or creates a symlink-following vulnerability"
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No demonstrated impact related to symbolic link following. The change affects absolute path resolution but doesn't show how it enables accessing unintended resources via symlinks."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted to use normalize() instead of resolve(), the root path would be normalized differently but there's no evidence this would materially change symlink handling or create a link-following vulnerability.",
+        "supporting_evidence": [
+          "Path resolution function changed from normalize() to resolve()",
+          "Resolved root path is used as base for file serving operations"
+        ],
+        "contradicting_evidence": [
+          "No evidence of symbolic link handling or following behavior",
+          "Both normalize() and resolve() are path normalization functions, not symlink resolution functions",
+          "Existing path containment checks remain unchanged"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether the path resolution change affects symlink behavior in the underlying filesystem",
+          "How normalize() vs resolve() differ in symlink handling if at all",
+          "Whether symlink following is even relevant to root directory resolution"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.24000000000000005,
+        "score": 0.24000000000000005
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "lib/send.js",
+        "changed_line": 107,
+        "statement": "? resolve(options.root)",
+        "cwe_id": "CWE-697",
+        "cwe_name": "Incorrect Comparison",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "CWE-697 requires an incorrect comparison in a security context. The change from normalize() to resolve() is a path resolution operation, not a comparison operation. No comparison logic is demonstrated in this change."
+          },
+          "connection": {
+            "score": 0.3,
+            "evidence": "User-controlled options.root is connected to file system operations through path resolution, but the connection to any comparison operation is speculative."
+          },
+          "diff_causality": {
+            "score": 0.4,
+            "evidence": "The change from normalize() to resolve() affects how the root path is resolved, which could potentially affect downstream path traversal checks, but no specific comparison logic is modified by this change."
+          },
+          "security_control": {
+            "score": 0.15,
+            "evidence": "",
+            "required_control": "Correct comparison logic for path traversal prevention",
+            "control_requirement_evidence": "CWE-697 requires that comparisons used in security decisions (like path traversal checks) are correctly implemented",
+            "existing_controls_checked": [
+              "Substring comparison (path.substr(0, root.length) !== root)",
+              "Regex pattern (upPathRegexp) for '..' sequences"
+            ],
+            "deficiency_evidence": "No evidence that the resolve() vs normalize() change affects the correctness of existing comparison controls. The comparison logic remains unchanged."
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "No concrete security impact is demonstrated. The change affects path resolution behavior but no evidence shows how this leads to incorrect comparisons or security bypass."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted to use normalize() instead of resolve(), the root path resolution behavior would differ, but the downstream comparison logic for path traversal checks would remain unchanged.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The change involves path resolution (resolve() vs normalize()), not comparison operations",
+          "Existing path traversal checks use substring comparison and regex patterns that are not modified by this change",
+          "No comparison logic is demonstrated to be incorrect or modified"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether the difference between resolve() and normalize() affects the correctness of downstream path traversal comparisons",
+          "Whether any security-relevant comparison actually depends on the specific resolution behavior of the root path"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.23000000000000004,
+        "score": 0.23000000000000004
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-4",
+    "filepath": "lib/send.js",
+    "changed_line": 177,
+    "statement": "this._root = resolve(path)",
+    "change_type": "A",
+    "function_name": "SendStream.prototype.root",
+    "operation_type": "path_resolution",
+    "selection_reason": "User-controlled path input -> resolve() instead of normalize() -> changes path resolution security behavior",
+    "security_relevance_score": 0.8,
+    "code_context": "28: var sep = path.sep\n29: var upPathRegexp = /(?:^|[\\\\\\/])\\.\\.(?:[\\\\\\/]|$)/;\n30: \n31: /**\n32:  * Expose `send`.\n33:  */\n34: \n35: exports = module.exports = send;\n36: \n37: /**\n38:  * Expose mime module.\n39:  */\n40: \n41: exports.mime = mime;\n42: \n43: /**\n44:  * Shim EventEmitter.listenerCount for node.js < 0.10\n45:  */\n46: \n47: /* istanbul ignore next */\n48: var listenerCount = EventEmitter.listenerCount\n49:   || function(emitter, type){ return emitter.listeners(type).length; };\n50: \n51: /**\n52:  * Return a `SendStream` for `req` and `path`.\n53:  *\n54:  * @param {Request} req\n55:  * @param {String} path\n56:  * @param {Object} options\n57:  * @return {SendStream}\n58:  * @api public\n59:  */\n60: \n61: function send(req, path, options) {\n62:   return new SendStream(req, path, options);\n63: }\n64: \n65: /**\n66:  * Initialize a `SendStream` with the given `path`.\n67:  *\n68:  * Events:\n69:  *\n70:  *  - `error` an error occurred\n71:  *  - `stream` file streaming has started\n72:  *  - `end` streaming has completed\n73:  *  - `directory` a directory was requested\n74:  *\n75:  * @param {Request} req\n76:  * @param {String} path\n77:  * @param {Object} options\n78:  * @api private\n79:  */\n80: \n81: function SendStream(req, path, options) {\n82:   var self = this;\n83:   options = options || {};\n84:   this.req = req;\n85:   this.path = path;\n86:   this.options = options;\n87: \n88:   this._etag = options.etag !== undefined\n89:     ? Boolean(options.etag)\n90:     : true\n91: \n92:   this._hidden = Boolean(options.hidden)\n93: \n94:   this._index = options.index !== undefined\n95:     ? normalizeIndex(options.index)\n96:     : ['index.html']\n97: \n98:   this._maxage = options.maxAge || options.maxage\n99:   this._maxage = typeof this._maxage === 'string'\n100:     ? ms(this._maxage)\n101:     : Number(this._maxage)\n102:   this._maxage = !isNaN(this._maxage)\n103:     ? Math.min(Math.max(0, this._maxage), maxMaxAge)\n104:     : 0\n105: \n106:   this._root = options.root\n107:     ? resolve(options.root)\n108:     : null\n109: \n110:   if (!this._root && options.from) {\n111:     this.from(options.from);\n112:   }\n113: }\n114: \n115: /**\n116:  * Inherits from `Stream.prototype`.\n117:  */\n118: \n119: SendStream.prototype.__proto__ = Stream.prototype;\n120: \n121: /**\n122:  * Enable or disable etag generation.\n123:  *\n124:  * @param {Boolean} val\n125:  * @return {SendStream}\n126:  * @api public\n127:  */\n128: \n129: SendStream.prototype.etag = deprecate.function(function etag(val) {\n130:   val = Boolean(val);\n131:   debug('etag %s', val);\n132:   this._etag = val;\n133:   return this;\n134: }, 'send.etag: pass etag as option');\n135: \n136: /**\n137:  * Enable or disable \"hidden\" (dot) files.\n138:  *\n139:  * @param {Boolean} path\n140:  * @return {SendStream}\n141:  * @api public\n142:  */\n143: \n144: SendStream.prototype.hidden = deprecate.function(function hidden(val) {\n145:   val = Boolean(val);\n146:   debug('hidden %s', val);\n147:   this._hidden = val;\n148:   return this;\n149: }, 'send.hidden: pass hidden as option');\n150: \n151: /**\n152:  * Set index `paths`, set to a falsy\n153:  * value to disable index support.\n154:  *\n155:  * @param {String|Boolean|Array} paths\n156:  * @return {SendStream}\n157:  * @api public\n158:  */\n159: \n160: SendStream.prototype.index = deprecate.function(function index(paths) {\n161:   var index = !paths ? [] : normalizeIndex(paths);\n162:   debug('index %o', paths);\n163:   this._index = index;\n164:   return this;\n165: }, 'send.index: pass index as option');\n166: \n167: /**\n168:  * Set root `path`.\n169:  *\n170:  * @param {String} path\n171:  * @return {SendStream}\n172:  * @api public\n173:  */\n174: \n175: SendStream.prototype.root = function(path){\n176:   path = String(path);\n177:   this._root = resolve(path)\n178:   return this;\n179: };\n180: \n181: SendStream.prototype.from = deprecate.function(SendStream.prototype.root,\n182:   'send.from: pass root as option');\n183: \n184: SendStream.prototype.root = deprecate.function(SendStream.prototype.root,\n185:   'send.root: pass root as option');\n186: \n187: /**\n188:  * Set max-age to `maxAge`.\n189:  *\n190:  * @param {Number} maxAge\n191:  * @return {SendStream}\n192:  * @api public\n193:  */\n194: \n195: SendStream.prototype.maxage = deprecate.function(function maxage(maxAge) {\n196:   maxAge = typeof maxAge === 'string'\n197:     ? ms(maxAge)\n198:     : Number(maxAge);\n199:   if (isNaN(maxAge)) maxAge = 0;\n200:   if (Infinity == maxAge) maxAge = 60 * 60 * 24 * 365 * 1000;\n201:   debug('max-age %d', maxAge);\n202:   this._maxage = maxAge;\n203:   return this;\n204: }, 'send.maxage: pass maxAge as option');\n205: \n206: /**\n207:  * Emit error with `status`.\n208:  *\n209:  * @param {Number} status\n210:  * @api private\n211:  */\n212: \n213: SendStream.prototype.error = function(status, err){\n214:   var res = this.res;\n215:   var msg = http.STATUS_CODES[status];\n216: \n217:   err = err || new Error(msg);\n218:   err.status = status;\n219: \n220:   // emit if listeners instead of responding\n221:   if (listenerCount(this, 'error') !== 0) {\n222:     return this.emit('error', err);\n223:   }\n224: \n225:   // wipe all existing headers\n226:   res._headers = undefined;\n227: \n228:   res.statusCode = err.status;\n229:   res.end(msg);\n230: };\n231: \n232: /**\n233:  * Check if the pathname ends with \"/\".\n234:  *\n235:  * @return {Boolean}\n236:  * @api private\n237:  */\n238: \n239: SendStream.prototype.hasTrailingSlash = function(){\n240:   return '/' == this.path[this.path.length - 1];\n241: };\n242: \n243: /**\n244:  * Check if this is a conditional GET request.\n245:  *\n246:  * @return {Boolean}\n247:  * @api private\n248:  */\n249: \n250: SendStream.prototype.isConditionalGET = function(){\n251:   return this.req.headers['if-none-match']\n252:     || this.req.headers['if-modified-since'];\n253: };\n254: \n255: /**\n256:  * Strip content-* header fields.\n257:  *\n258:  * @api private\n259:  */\n260: \n261: SendStream.prototype.removeContentHeaderFields = function(){\n262:   var res = this.res;\n263:   Object.keys(res._headers).forEach(function(field){\n264:     if (0 == field.indexOf('content')) {\n265:       res.removeHeader(field);\n266:     }\n267:   });\n268: };\n269: \n270: /**\n271:  * Respond with 304 not modified.\n272:  *\n273:  * @api private\n274:  */\n275: \n276: SendStream.prototype.notModified = function(){\n277:   var res = this.res;\n278:   debug('not modified');\n279:   this.removeContentHeaderFields();\n280:   res.statusCode = 304;\n281:   res.end();\n282: };\n283: \n284: /**\n285:  * Raise error that headers already sent.\n286:  *\n287:  * @api private\n288:  */\n289: \n290: SendStream.prototype.headersAlreadySent = function headersAlreadySent(){\n291:   var err = new Error('Can\\'t set headers after they are sent.');\n292:   debug('headers already sent');\n293:   this.error(500, err);\n294: };\n295: \n296: /**\n297:  * Check if the request is cacheable, aka\n298:  * responded with 2xx or 304 (see RFC 2616 section 14.2{5,6}).\n299:  *\n300:  * @return {Boolean}\n301:  * @api private\n302:  */\n303: \n304: SendStream.prototype.isCachable = function(){\n305:   var res = this.res;\n306:   return (res.statusCode >= 200 && res.statusCode < 300) || 304 == res.statusCode;\n307: };\n308: \n309: /**\n310:  * Handle stat() error.\n311:  *\n312:  * @param {Error} err\n313:  * @api private\n314:  */\n315: \n316: SendStream.prototype.onStatError = function(err){\n317:   var notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR'];\n318:   if (~notfound.indexOf(err.code)) return this.error(404, err);\n319:   this.error(500, err);\n320: };\n321: \n322: /**\n323:  * Check if the cache is fresh.\n324:  *\n325:  * @return {Boolean}\n326:  * @api private",
+    "source_summary": "User-provided path parameter passed to root() method",
+    "sink_summary": "File system operations via path.join(root, path) and path.normalize() in pipe() method",
+    "guard_summary": "Path validation: null byte check, malicious path check (path.substr(0, root.length) !== root), dotfile handling, upPathRegexp for '..' detection",
+    "risk_pattern": "User-controlled path resolved to absolute path then joined with user-controlled path parameter, with boundary checks that may be bypassed through path traversal sequences",
+    "used_variable_sources": [
+      "path parameter to root() method"
+    ],
+    "called_function_context": [
+      "path.resolve",
+      "path.join",
+      "path.normalize"
+    ],
+    "enclosing_conditions": [
+      "if (root !== null) branch in pipe() method"
+    ],
+    "context_summary": "The root() method sets _root using path.resolve(), which converts relative paths to absolute. In pipe(), this resolved root is joined with user-controlled path and normalized, with security checks for path traversal.",
+    "unresolved_facts": [
+      "Whether path.resolve() behavior differs significantly from path.normalize() in security context",
+      "Specific attack scenarios that could bypass the existing path validation checks"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "User-controlled path resolved to absolute path then used in file operations with potential traversal validation bypass",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "Path resolution from user input enables relative path traversal attacks",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "fit_reason": "Path resolution may follow symlinks to unintended resources",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "Insufficient validation of user-provided path before file system operations",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-754",
+        "cwe_name": "Improper Check for Unusual or Exceptional Conditions",
+        "fit_reason": "Potential failure to handle edge cases in path resolution and validation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-119",
+      "CWE-178",
+      "CWE-193",
+      "CWE-20",
+      "CWE-22",
+      "CWE-23",
+      "CWE-367",
+      "CWE-563",
+      "CWE-59",
+      "CWE-754",
+      "CWE-758",
+      "CWE-829",
+      "CWE-843",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "lib/send.js",
+        "changed_line": 177,
+        "statement": "this._root = resolve(path)",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The code resolves user-controlled path input to an absolute path that is later used in file operations. However, this is only part of the path traversal mechanism - it sets up the root directory but doesn't directly demonstrate the traversal vulnerability."
+          },
+          "connection": {
+            "score": 0.45,
+            "evidence": "User-provided path parameter flows to resolve() function, and the resolved _root is used in pipe() method with path.join(root, path) for file operations. The connection exists but the actual traversal bypass is not demonstrated."
+          },
+          "diff_causality": {
+            "score": 0.25,
+            "evidence": "The change adds path resolution but doesn't materially create or expose a path traversal vulnerability. The existing code already had similar path resolution logic at lines 106-108 for options.root."
+          },
+          "security_control": {
+            "score": 0.3,
+            "evidence": "Weak evidence for control deficiency",
+            "required_control": "Proper path validation and canonicalization to prevent directory traversal",
+            "control_requirement_evidence": "CWE-22 requires ensuring user input cannot escape restricted directories through path manipulation",
+            "existing_controls_checked": [
+              "path.substr(0, root.length) !== root boundary check",
+              "upPathRegexp for '..' detection",
+              "dotfile handling"
+            ],
+            "deficiency_evidence": "No evidence that resolve() introduces new bypass opportunities or weakens existing controls. The existing validation appears to handle traversal attempts."
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "No concrete impact demonstrated. The code sets a root directory but doesn't show how this leads to unauthorized file access."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the root() method would not set _root using resolve(), but similar path resolution already exists elsewhere in the constructor for options.root, so the security behavior would remain largely unchanged.",
+        "supporting_evidence": [
+          "User-controlled path parameter flows to resolve() function",
+          "Resolved _root is used in file operations via path.join() in pipe() method",
+          "Path traversal validation checks exist but their effectiveness is not demonstrated"
+        ],
+        "contradicting_evidence": [
+          "Similar path resolution logic already exists in constructor (lines 106-108)",
+          "Existing path validation includes boundary checks and '..' detection",
+          "No evidence that resolve() introduces new bypass vectors compared to existing code"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether path.resolve() behavior differs significantly from existing path normalization in security context",
+          "Specific scenarios where resolve() could bypass existing path validation",
+          "Downstream path validation effectiveness in pipe() method"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.31,
+        "score": 0.31
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "lib/send.js",
+        "changed_line": 177,
+        "statement": "this._root = resolve(path)",
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.3,
+            "evidence": "CWE-23 requires constructing a pathname that should be within a restricted directory but not neutralizing '..' sequences. The candidate line uses resolve() which converts relative paths to absolute, potentially changing how '..' sequences are interpreted compared to normalize(). However, the exact mechanism of bypassing directory restrictions is not demonstrated."
+          },
+          "connection": {
+            "score": 0.5,
+            "evidence": "User-controlled 'path' parameter to root() method is directly passed to resolve(). This resolved root is later used in pipe() method where it's joined with user-controlled path parameter: path.join(root, path). The connection from user input to file system operations is established via the path.join() call in pipe()."
+          },
+          "diff_causality": {
+            "score": 0.4,
+            "evidence": "If the candidate line were reverted, the root would not be resolved to an absolute path. The change from not resolving to resolving could affect how path traversal checks work, particularly the malicious path check (path.substr(0, root.length) !== root) which compares the normalized path against the root. However, the exact security impact of this change is not demonstrated."
+          },
+          "security_control": {
+            "score": 0.35,
+            "evidence": "The required control for CWE-23 is proper neutralization of '..' sequences and validation that resolved paths remain within the restricted directory. The existing controls checked include: malicious path check (path.substr(0, root.length) !== root), dotfile handling, and upPathRegexp for '..' detection. The deficiency evidence is weak - it's unclear if resolve() vs normalize() materially affects these controls. The control requirement is established for CWE-23, but the demonstrated deficiency is speculative.",
+            "required_control": "Proper neutralization of '..' sequences and validation that resolved paths remain within restricted directory",
+            "control_requirement_evidence": "CWE-23 requires preventing path traversal outside restricted directories by neutralizing '..' sequences",
+            "existing_controls_checked": [
+              "malicious path check (path.substr(0, root.length) !== root)",
+              "dotfile handling",
+              "upPathRegexp for '..' detection in normalized paths"
+            ],
+            "deficiency_evidence": "Unclear if resolve() vs normalize() affects the existing path validation checks; no demonstrated bypass of controls"
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "No concrete security consequence is demonstrated. While path traversal could theoretically lead to data access/modification, the evidence doesn't show how the change from not resolving to resolving enables actual traversal bypassing existing controls."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the root would remain as the user-provided string without resolution to absolute path. This could affect the malicious path check in pipe() which compares normalized path against root string, potentially changing the security boundary behavior.",
+        "supporting_evidence": [
+          "User-controlled 'path' parameter flows to resolve() function",
+          "Resolved root is used in path.join(root, path) in pipe() method",
+          "Path traversal checks exist but their interaction with resolve() vs normalize() is unclear"
+        ],
+        "contradicting_evidence": [
+          "Existing path validation includes malicious path check, dotfile handling, and '..' detection",
+          "No evidence shows these controls are bypassed by using resolve() instead of normalize()"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "Whether path.resolve() behavior differs significantly from path.normalize() in security context",
+          "Specific attack scenarios that could bypass existing path validation checks",
+          "How the malicious path check (path.substr(0, root.length) !== root) interacts with resolved vs unresolved roots",
+          "Whether attacker control over root path enables traversal when combined with path parameter"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.36000000000000004,
+        "score": 0.36000000000000004
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "lib/send.js",
+        "changed_line": 177,
+        "statement": "this._root = resolve(path)",
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "CWE-59 requires following symbolic links or shortcuts to unintended resources. The candidate line uses path.resolve() which resolves relative paths to absolute paths but does not inherently follow symbolic links. The actual file access occurs later in pipe() via path.join() and path.normalize(), but there is no evidence that symbolic link resolution occurs at this boundary or that the patch changes link-following behavior."
+          },
+          "connection": {
+            "score": 0.3,
+            "evidence": "User-controlled 'path' parameter is passed to root() method and stored in this._root via resolve(). This _root is later used in pipe() for path.join(root, path) operations. However, the connection to actual file access that follows symbolic links is not demonstrated in the provided evidence."
+          },
+          "diff_causality": {
+            "score": 0.15,
+            "evidence": "The patch changes from no root setting (or previous behavior) to setting _root via resolve(). If reverted, _root would remain null or previous value, affecting path joining but not demonstrably affecting symbolic link resolution. The counterfactual shows path resolution changes, not link-following changes."
+          },
+          "security_control": {
+            "score": 0.1,
+            "evidence": "",
+            "required_control": "Canonical path resolution or symlink validation before file access",
+            "control_requirement_evidence": "CWE-59 requires preventing unintended resource access via symbolic links, typically through canonicalization or access controls.",
+            "existing_controls_checked": [
+              "path.normalize() in pipe() for traversal prevention",
+              "malicious path check comparing path.substr(0, root.length) !== root",
+              "dotfile handling",
+              "upPathRegexp for '..' detection"
+            ],
+            "deficiency_evidence": "No evidence demonstrates that symbolic link validation is missing, weakened, or bypassed by this change. The existing controls focus on path traversal, not symbolic link resolution. The patch does not add or remove symlink-related controls."
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No concrete security consequence related to symbolic link following is demonstrated. The evidence shows path resolution changes but not actual file access via symbolic links."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, this._root would not be set via resolve() in the root() method, potentially affecting absolute path resolution for subsequent file operations, but there is no evidence this materially changes symbolic link following behavior.",
+        "supporting_evidence": [
+          "User-controlled path parameter flows to resolve()",
+          "Resolved root is used in pipe() for path.join operations"
+        ],
+        "contradicting_evidence": [
+          "CWE-59 requires symbolic link following; no evidence shows symbolic links are involved or that resolve() follows links",
+          "The actual file access occurs later with path.normalize() which doesn't inherently follow symbolic links",
+          "Existing security checks focus on path traversal, not link resolution"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether path.resolve() follows symbolic links in this Node.js version",
+          "Whether downstream file operations (fs.stat, fs.createReadStream) follow symbolic links",
+          "If symbolic links exist in the directory structure and are accessible",
+          "Whether the patch changes symlink resolution behavior compared to previous implementation"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.15,
+        "score": 0.15
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "lib/send.js",
+        "changed_line": 177,
+        "statement": "this._root = resolve(path)",
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The code receives user input (path parameter) but the evidence does not demonstrate validation failure for required properties. CWE-20 requires showing that input validation is missing or incorrect for specific safety properties."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "User-provided path parameter is directly connected to path.resolve() which sets _root, then used in path.join() with another user-controlled path in pipe() method for file system operations."
+          },
+          "diff_causality": {
+            "score": 0.45,
+            "evidence": "If this line were reverted, the _root property would not be set from user input, preventing any path resolution behavior changes. However, the change adds functionality rather than weakening existing validation."
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "",
+            "required_control": "Input validation for path parameters to prevent directory traversal or unsafe path resolution",
+            "control_requirement_evidence": "CWE-20 requires validation that input has properties needed for safe processing. For file paths, this includes preventing traversal outside intended directories.",
+            "existing_controls_checked": [
+              "path.substr(0, root.length) !== root boundary check",
+              "upPathRegexp for '..' detection",
+              "dotfile handling"
+            ],
+            "deficiency_evidence": "The evidence does not demonstrate that these existing controls are insufficient or bypassable. The change adds path resolution but doesn't weaken validation."
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "No concrete security impact is demonstrated. The code has existing path traversal protections, and the change adds functionality without showing how it enables bypassing these controls."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the _root property would not be set from the user-provided path parameter, preventing any path resolution behavior that depends on this user-controlled input.",
+        "supporting_evidence": [
+          "User-provided path parameter passed directly to path.resolve()",
+          "Resolved root is used in file system operations via path.join()"
+        ],
+        "contradicting_evidence": [
+          "Existing path validation controls: boundary checks, '..' detection, dotfile handling",
+          "No evidence these controls are bypassed by the path resolution change"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether path.resolve() introduces new attack vectors not covered by existing validation",
+          "Specific scenarios where the existing path traversal protections would fail",
+          "Whether the resolved path enables bypassing the root boundary check"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.39,
+        "score": 0.39
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "lib/send.js",
+        "changed_line": 177,
+        "statement": "this._root = resolve(path)",
+        "cwe_id": "CWE-754",
+        "cwe_name": "Improper Check for Unusual or Exceptional Conditions",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-754 requires failure to check for exceptional conditions, but the code shows path resolution without demonstrated exceptional condition handling deficiency. The change uses resolve() instead of normalize(), which is a path resolution method change, not an error checking deficiency."
+          },
+          "connection": {
+            "score": 0.1,
+            "evidence": "No connection established between user input and exceptional condition checking. The path resolution occurs, but no exceptional conditions (like invalid paths, permissions, or edge cases) are demonstrated as being improperly handled."
+          },
+          "diff_causality": {
+            "score": 0.2,
+            "evidence": "The change from normalize() to resolve() changes path resolution behavior but doesn't materially affect exceptional condition checking. Both functions handle path normalization with similar error characteristics."
+          },
+          "security_control": {
+            "score": 0.15,
+            "evidence": "",
+            "required_control": "Proper checking for exceptional conditions during path resolution",
+            "control_requirement_evidence": "CWE-754 requires validation of unusual conditions that could cause errors",
+            "existing_controls_checked": [
+              "path resolution functions resolve() and normalize() both handle basic path validation"
+            ],
+            "deficiency_evidence": "No evidence that exceptional conditions like invalid paths, symlink issues, or permission errors are improperly handled. The change is between two similar path resolution methods."
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No concrete security impact demonstrated from improper exceptional condition checking. The change affects path resolution behavior but doesn't show how it leads to security-relevant error conditions."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the path resolution method would change from resolve() back to normalize(), but both functions perform similar path normalization with comparable error handling characteristics.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The code uses standard Node.js path.resolve() which handles basic path validation",
+          "No exceptional conditions are demonstrated as being improperly checked or ignored",
+          "The change is between two similar path resolution methods, not an error checking deficiency"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "What specific exceptional conditions should be checked during path resolution",
+          "How resolve() vs normalize() differs in exceptional condition handling",
+          "Whether the existing path validation checks adequately handle edge cases"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.13999999999999999,
+        "score": 0.13999999999999999
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-5",
+    "filepath": "lib/send.js",
+    "changed_line": 422,
+    "statement": "if (containsDotFile(parts)) {",
+    "change_type": "A",
+    "function_name": "SendStream.prototype.pipe",
+    "operation_type": "dotfile_security_check",
+    "selection_reason": "Path parts array -> dotfile detection -> controls access to hidden files based on configuration",
+    "security_relevance_score": 0.8,
+    "code_context": "273:  * @api private\n274:  */\n275: \n276: SendStream.prototype.notModified = function(){\n277:   var res = this.res;\n278:   debug('not modified');\n279:   this.removeContentHeaderFields();\n280:   res.statusCode = 304;\n281:   res.end();\n282: };\n283: \n284: /**\n285:  * Raise error that headers already sent.\n286:  *\n287:  * @api private\n288:  */\n289: \n290: SendStream.prototype.headersAlreadySent = function headersAlreadySent(){\n291:   var err = new Error('Can\\'t set headers after they are sent.');\n292:   debug('headers already sent');\n293:   this.error(500, err);\n294: };\n295: \n296: /**\n297:  * Check if the request is cacheable, aka\n298:  * responded with 2xx or 304 (see RFC 2616 section 14.2{5,6}).\n299:  *\n300:  * @return {Boolean}\n301:  * @api private\n302:  */\n303: \n304: SendStream.prototype.isCachable = function(){\n305:   var res = this.res;\n306:   return (res.statusCode >= 200 && res.statusCode < 300) || 304 == res.statusCode;\n307: };\n308: \n309: /**\n310:  * Handle stat() error.\n311:  *\n312:  * @param {Error} err\n313:  * @api private\n314:  */\n315: \n316: SendStream.prototype.onStatError = function(err){\n317:   var notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR'];\n318:   if (~notfound.indexOf(err.code)) return this.error(404, err);\n319:   this.error(500, err);\n320: };\n321: \n322: /**\n323:  * Check if the cache is fresh.\n324:  *\n325:  * @return {Boolean}\n326:  * @api private\n327:  */\n328: \n329: SendStream.prototype.isFresh = function(){\n330:   return fresh(this.req.headers, this.res._headers);\n331: };\n332: \n333: /**\n334:  * Check if the range is fresh.\n335:  *\n336:  * @return {Boolean}\n337:  * @api private\n338:  */\n339: \n340: SendStream.prototype.isRangeFresh = function isRangeFresh(){\n341:   var ifRange = this.req.headers['if-range'];\n342: \n343:   if (!ifRange) return true;\n344: \n345:   return ~ifRange.indexOf('\"')\n346:     ? ~ifRange.indexOf(this.res._headers['etag'])\n347:     : Date.parse(this.res._headers['last-modified']) <= Date.parse(ifRange);\n348: };\n349: \n350: /**\n351:  * Redirect to `path`.\n352:  *\n353:  * @param {String} path\n354:  * @api private\n355:  */\n356: \n357: SendStream.prototype.redirect = function(path){\n358:   if (listenerCount(this, 'directory') !== 0) {\n359:     return this.emit('directory');\n360:   }\n361: \n362:   if (this.hasTrailingSlash()) return this.error(403);\n363:   var res = this.res;\n364:   path += '/';\n365:   res.statusCode = 301;\n366:   res.setHeader('Content-Type', 'text/html; charset=utf-8');\n367:   res.setHeader('Location', path);\n368:   res.end('Redirecting to <a href=\"' + escapeHtml(path) + '\">' + escapeHtml(path) + '</a>\\n');\n369: };\n370: \n371: /**\n372:  * Pipe to `res.\n373:  *\n374:  * @param {Stream} res\n375:  * @return {Stream} res\n376:  * @api public\n377:  */\n378: \n379: SendStream.prototype.pipe = function(res){\n380:   var self = this\n381:     , args = arguments\n382:     , root = this._root;\n383: \n384:   // references\n385:   this.res = res;\n386: \n387:   // decode the path\n388:   var path = utils.decode(this.path)\n389:   if (path === -1) return this.error(400)\n390: \n391:   // null byte(s)\n392:   if (~path.indexOf('\\0')) return this.error(400);\n393: \n394:   var parts\n395:   if (root !== null) {\n396:     // join / normalize from optional root dir\n397:     path = normalize(join(root, path))\n398: \n399:     // malicious path\n400:     if (path.substr(0, root.length) !== root) {\n401:       debug('malicious path \"%s\"', path)\n402:       return this.error(403)\n403:     }\n404: \n405:     // explode path parts\n406:     parts = path.substr(root.length + 1).split(sep)\n407:   } else {\n408:     // \"..\" is malicious without \"root\"\n409:     if (upPathRegexp.test(path)) {\n410:       debug('malicious path \"%s\"', path)\n411:       return this.error(403)\n412:     }\n413: \n414:     // explode path parts\n415:     parts = normalize(path).split(sep)\n416: \n417:     // resolve the path\n418:     path = resolve(path)\n419:   }\n420: \n421:   // dotfile handling\n422:   if (containsDotFile(parts)) {\n423:     var access = this._hidden\n424:       ? 'allow'\n425:       : 'ignore'\n426: \n427:     debug('%s dotfile \"%s\"', access, path)\n428:     switch (access) {\n429:       case 'allow':\n430:         break\n431:       case 'ignore':\n432:       default:\n433:         return this.error(404)\n434:     }\n435:   }\n436: \n437:   // index file support\n438:   if (this._index.length && this.hasTrailingSlash()) {\n439:     this.sendIndex(path);\n440:     return res;\n441:   }\n442: \n443:   debug('stat \"%s\"', path);\n444:   fs.stat(path, function(err, stat){\n445:     if (err) return self.onStatError(err);\n446:     if (stat.isDirectory()) return self.redirect(self.path);\n447:     self.emit('file', path, stat);\n448:     self.send(path, stat);\n449:   });\n450: \n451:   return res;\n452: };\n453: \n454: /**\n455:  * Transfer `path`.\n456:  *\n457:  * @param {String} path\n458:  * @api public\n459:  */\n460: \n461: SendStream.prototype.send = function(path, stat){\n462:   var options = this.options;\n463:   var len = stat.size;\n464:   var res = this.res;\n465:   var req = this.req;\n466:   var ranges = req.headers.range;\n467:   var offset = options.start || 0;\n468: \n469:   if (res._header) {\n470:     // impossible to send now\n471:     return this.headersAlreadySent();\n472:   }\n473: \n474:   debug('pipe \"%s\"', path)\n475: \n476:   // set header fields\n477:   this.setHeader(path, stat);\n478: \n479:   // set content-type\n480:   this.type(path);\n481: \n482:   // conditional GET support\n483:   if (this.isConditionalGET()\n484:     && this.isCachable()\n485:     && this.isFresh()) {\n486:     return this.notModified();\n487:   }\n488: \n489:   // adjust len to start/end options\n490:   len = Math.max(0, len - offset);\n491:   if (options.end !== undefined) {\n492:     var bytes = options.end - offset + 1;\n493:     if (len > bytes) len = bytes;\n494:   }\n495: \n496:   // Range support\n497:   if (ranges) {\n498:     ranges = parseRange(len, ranges);\n499: \n500:     // If-Range support\n501:     if (!this.isRangeFresh()) {\n502:       debug('range stale');\n503:       ranges = -2;\n504:     }\n505: \n506:     // unsatisfiable\n507:     if (-1 == ranges) {\n508:       debug('range unsatisfiable');\n509:       res.setHeader('Content-Range', 'bytes */' + stat.size);\n510:       return this.error(416);\n511:     }\n512: \n513:     // valid (syntactically invalid/multiple ranges are treated as a regular response)\n514:     if (-2 != ranges && ranges.length === 1) {\n515:       debug('range %j', ranges);\n516: \n517:       options.start = offset + ranges[0].start;\n518:       options.end = offset + ranges[0].end;\n519: \n520:       // Content-Range\n521:       res.statusCode = 206;\n522:       res.setHeader('Content-Range', 'bytes '\n523:         + ranges[0].start\n524:         + '-'\n525:         + ranges[0].end\n526:         + '/'\n527:         + len);\n528:       len = options.end - options.start + 1;\n529:     }\n530:   }\n531: \n532:   // content-length\n533:   res.setHeader('Content-Length', len);\n534: \n535:   // HEAD support\n536:   if ('HEAD' == req.method) return res.end();\n537: \n538:   this.stream(path, options);\n539: };\n540: \n541: /**\n542:  * Transfer index for `path`.\n543:  *\n544:  * @param {String} path\n545:  * @api private\n546:  */\n547: SendStream.prototype.sendIndex = function sendIndex(path){\n548:   var i = -1;\n549:   var self = this;\n550: \n551:   function next(err){\n552:     if (++i >= self._index.length) {\n553:       if (err) return self.onStatError(err);\n554:       return self.error(404);\n555:     }\n556: \n557:     var p = path + self._index[i];\n558: \n559:     debug('stat \"%s\"', p);\n560:     fs.stat(p, function(err, stat){\n561:       if (err) return next(err);\n562:       if (stat.isDirectory()) return next();\n563:       self.emit('file', p, stat);\n564:       self.send(p, stat);\n565:     });\n566:   }\n567: \n568:   if (!this.hasTrailingSlash()) path += '/';\n569: \n570:   next();\n571: };",
+    "source_summary": "Path parts array derived from user-provided path parameter, normalized and split by separator",
+    "sink_summary": "File system access via fs.stat() and subsequent file serving operations",
+    "guard_summary": "Dotfile detection checks if any path component starts with '.'; when _hidden=false (default), returns 404 error preventing access; when _hidden=true, allows access",
+    "risk_pattern": "User-controlled file paths are checked for dotfiles; default configuration blocks access to hidden files, preventing unauthorized access to sensitive system files",
+    "used_variable_sources": [
+      "this.path (user input)",
+      "parts (normalized path components)",
+      "this._hidden (configuration)"
+    ],
+    "called_function_context": [
+      "containsDotFile(parts) - checks if any path component starts with '.'",
+      "this.error(404) - returns 404 when dotfiles detected and _hidden=false"
+    ],
+    "enclosing_conditions": [
+      "Root path validation checks",
+      "Null byte detection",
+      "Path traversal checks"
+    ],
+    "context_summary": "Security check added to file serving pipeline to prevent access to hidden files (dotfiles) based on configuration",
+    "unresolved_facts": [
+      "Exact implementation details of this.error() method",
+      "Full call graph of file serving operations after successful path validation"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "Path traversal mechanism with dotfile filtering as security control - user input path -> file system access",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "User-controlled path components checked for dotfiles before file access - relative path validation mechanism",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "Dotfile filtering prevents unauthorized access to hidden files containing sensitive information",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-497",
+        "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+        "fit_reason": "Security check prevents disclosure of hidden system files through file serving mechanism",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-219",
+        "cwe_name": "Storage of File with Sensitive Data Under Web Root",
+        "fit_reason": "Dotfile protection prevents access to sensitive files that might be stored in web-accessible directories",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-20",
+      "CWE-200",
+      "CWE-219",
+      "CWE-22",
+      "CWE-23",
+      "CWE-260",
+      "CWE-378",
+      "CWE-400",
+      "CWE-497",
+      "CWE-571",
+      "CWE-829",
+      "CWE-843",
+      "CWE-912"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "lib/send.js",
+        "changed_line": 422,
+        "statement": "if (containsDotFile(parts)) {",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.3,
+            "evidence": "The demonstrated mechanism is a dotfile detection check that blocks or allows access based on configuration. CWE-22's defining mechanism is improper neutralization of path traversal sequences (e.g., '../') that allow escape from a restricted directory. The dotfile check is a related but distinct security control for hidden files, not a primary defense against directory traversal."
+          },
+          "connection": {
+            "score": 0.8,
+            "evidence": "User-controlled `this.path` is decoded, normalized, split into `parts`, and passed to `containsDotFile`. The result directly controls whether the function proceeds to `fs.stat` and file serving (`access='allow'`) or returns a 404 error (`access='ignore'`). The path is concretely connected to the file system access sink."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "The added line introduces a dotfile security check where none existed before. If this line were reverted, the dotfile detection would be removed, allowing access to hidden files when `_hidden=false` (default). The patch materially adds protection against unauthorized access to dotfiles."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "The required control for CWE-22 is proper neutralization of path traversal sequences to restrict access to a designated directory. The demonstrated control is dotfile filtering, which is a different security mechanism. Existing controls checked include root path validation (lines 400-403, 409-412) that prevent escape from `root` directory. The deficiency evidence for CWE-22 is unsupported; the patch adds a dotfile control, not a path traversal control.",
+            "required_control": "Proper neutralization of path traversal sequences (e.g., '../', symlinks) to restrict file access to a designated parent directory.",
+            "control_requirement_evidence": "CWE-22 requires preventing escape from a restricted directory via special path elements. The demonstrated mechanism filters dotfiles, which are not traversal sequences.",
+            "existing_controls_checked": [
+              "Root path validation (malicious path check) prevents path from starting outside root directory",
+              "Up-path regex check prevents '..' sequences when root is null",
+              "Path normalization via `normalize()` and `resolve()`"
+            ],
+            "deficiency_evidence": "No deficiency in path traversal controls is demonstrated. The patch adds a dotfile control, which is orthogonal to directory escape prevention."
+          },
+          "concrete_impact": {
+            "score": 0.5,
+            "evidence": "The concrete consequence demonstrated is that without the check, hidden files (starting with '.') could be accessed when `_hidden=false`. This could lead to unauthorized disclosure of sensitive configuration files (e.g., `.env`, `.gitignore`). However, this is not the directory escape impact defined by CWE-22."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the dotfile detection check would be removed, allowing requests for hidden files (starting with '.') to proceed to `fs.stat` and potentially be served when `_hidden=false` (default configuration).",
+        "supporting_evidence": [
+          "User-controlled `this.path` is decoded, normalized, and split into `parts` array",
+          "The `containsDotFile(parts)` check determines whether to allow or block access based on `this._hidden` configuration",
+          "When `_hidden=false` (default), detection leads to `this.error(404)`, preventing file access",
+          "The check is placed directly before `fs.stat` and file serving operations"
+        ],
+        "contradicting_evidence": [
+          "CWE-22 specifically addresses improper limitation to a restricted directory via path traversal sequences like '../'",
+          "The demonstrated check filters dotfiles (files starting with '.'), which are not path traversal sequences",
+          "Existing root path validation and '..' checks appear to handle directory escape prevention separately"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether downstream validation sufficiently prevents all path traversal sequences",
+          "Whether symlinks or other bypasses could circumvent the root path validation",
+          "Exact behavior of `normalize()` and `resolve()` functions with malicious inputs"
+        ],
+        "review_comment": "Added dotfile detection prevents access to hidden files (e.g., .env, .git) based on configuration. User-provided paths are normalized, split, and checked for components starting with '.'; when `_hidden=false` (default), such requests return 404. This addresses unauthorized disclosure of hidden files but is distinct from path traversal protection. Ensure dotfile filtering is enabled in production configurations.",
+        "change_type": "A",
+        "raw_score": 0.58,
+        "score": 0.58
+      },
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "lib/send.js",
+        "changed_line": 422,
+        "statement": "if (containsDotFile(parts)) {",
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "CWE-23 requires sequences like '..' to traverse outside restricted directories. The demonstrated mechanism checks for dotfiles (files starting with '.') which are hidden files within the same directory, not path traversal sequences."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "User-controlled path (this.path) is decoded, normalized, split into parts, and checked for dotfiles. When dotfiles are detected and _hidden=false, the function returns 404 error, preventing fs.stat() and file serving."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If this candidate line were reverted, the dotfile check would be removed, allowing access to hidden files when _hidden=false. The patch adds a security control for dotfile access."
+          },
+          "security_control": {
+            "score": 0.3,
+            "evidence": "The demonstrated control validates dotfile access, not path traversal. CWE-23 requires validation of '..' sequences to prevent directory escape.",
+            "required_control": "Validation of '..' sequences to prevent traversal outside restricted directory",
+            "control_requirement_evidence": "CWE-23 definition: 'does not properly neutralize sequences such as .. that can resolve to a location that is outside of that directory'",
+            "existing_controls_checked": [
+              "upPathRegexp.test(path) at line 409 checks for '..' sequences when root=null",
+              "root path validation at lines 400-403 prevents escaping root directory"
+            ],
+            "deficiency_evidence": "The demonstrated dotfile check does not address '..' sequences; path traversal controls exist elsewhere in the code. No deficiency in CWE-23 mechanism is shown."
+          },
+          "concrete_impact": {
+            "score": 0.4,
+            "evidence": "Access to hidden files (dotfiles) could expose sensitive configuration files, but this is not path traversal. The impact is limited to files within the already accessible directory."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the dotfile check would be removed, allowing access to hidden files (starting with '.') when _hidden=false, regardless of configuration.",
+        "supporting_evidence": [
+          "User-controlled path is decoded and normalized",
+          "Path parts are checked for dotfiles",
+          "When dotfiles detected and _hidden=false, returns 404 error preventing file access"
+        ],
+        "contradicting_evidence": [
+          "CWE-23 requires '..' sequence validation; the demonstrated check is for dotfiles, not traversal sequences",
+          "Path traversal controls exist elsewhere in the same function (lines 409-412 for '..', lines 400-403 for root escape)"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether dotfile access alone constitutes a security vulnerability without additional context",
+          "Specific sensitive files that might be exposed via dotfile access"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.48,
+        "score": 0.48
+      },
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "lib/send.js",
+        "changed_line": 422,
+        "statement": "if (containsDotFile(parts)) {",
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.3,
+            "evidence": "The added check prevents access to dotfiles, which could contain sensitive information. However, CWE-200 is a broad category about information exposure, not specifically about dotfile access control. The demonstrated mechanism is access control for hidden files, not a direct information leak."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "User-controlled `this.path` is decoded, normalized, split into `parts`, and checked by `containsDotFile`. When dotfiles are detected and `this._hidden` is false (default), the function returns a 404 error, preventing the file system access at `fs.stat(path, ...)` and subsequent file serving."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "The candidate line introduces the dotfile check. If reverted, dotfile detection would be absent, allowing requests for hidden files to proceed to `fs.stat` and potentially be served if they exist and pass other checks."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "The check adds an authorization control for hidden files based on configuration. However, the evidence doesn't establish that dotfiles necessarily contain sensitive information or that access to them was previously unauthorized. The control prevents access but doesn't demonstrate a prior deficiency.",
+            "required_control": "Access control to prevent unauthorized actors from reading sensitive files",
+            "control_requirement_evidence": "CWE-200 requires preventing unauthorized access to sensitive information. If dotfiles contain sensitive data, access control is required.",
+            "existing_controls_checked": [
+              "Root path validation (lines 400-403)",
+              "Path traversal checks (lines 409-412)",
+              "Null byte detection (line 392)"
+            ],
+            "deficiency_evidence": "No evidence demonstrates that dotfiles were previously accessible without authorization or contain sensitive information. The patch adds a preventive control but doesn't show a prior vulnerability."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "Potential exposure of hidden file contents if dotfiles contain sensitive information. However, no evidence establishes what specific sensitive information might be in dotfiles, whether such files exist in deployment, or that unauthorized actors could access them without this check."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the dotfile check would be removed. Requests for paths containing dotfile components (like `.env`, `.git/config`) would bypass this specific check and proceed to file system access, potentially being served if they exist and pass other validation checks.",
+        "supporting_evidence": [
+          "The check uses user-controlled `parts` derived from `this.path`",
+          "When `containsDotFile(parts)` returns true and `this._hidden` is false, the function returns `this.error(404)`, preventing file access",
+          "The check is placed before `fs.stat` and file serving operations"
+        ],
+        "contradicting_evidence": [
+          "CWE-200 is about information exposure, but the demonstrated mechanism is access control/prevention",
+          "No evidence shows that dotfiles actually contain sensitive information or were previously accessible"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether dotfiles in typical deployments contain sensitive information",
+          "Whether unauthorized actors could access dotfiles without this check",
+          "What specific sensitive information might be exposed"
+        ],
+        "review_comment": "The added dotfile check prevents access to hidden files based on configuration. User-controlled paths are checked for components starting with '.'; when `_hidden` is false (default), a 404 error is returned, blocking file system access. This adds a security control but doesn't demonstrate a prior information exposure vulnerability. Ensure the `_hidden` configuration defaults to a secure value and consider if additional file types (like backup files with specific extensions) should also be restricted.",
+        "change_type": "A",
+        "raw_score": 0.51,
+        "score": 0.51
+      },
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "lib/send.js",
+        "changed_line": 422,
+        "statement": "if (containsDotFile(parts)) {",
+        "cwe_id": "CWE-497",
+        "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-497 involves exposing system-level information to unauthorized parties. The candidate adds a security control to prevent access to hidden files, which is the opposite of exposing information."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "User-controlled path input flows through normalization and splitting, then to dotfile detection that controls file access. When _hidden=false, access to dotfiles returns 404 error."
+          },
+          "diff_causality": {
+            "score": 0.85,
+            "evidence": "The added check creates a new security boundary that prevents access to hidden files when _hidden=false. Reverting would remove this protection."
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "",
+            "required_control": "Information disclosure prevention through access controls",
+            "control_requirement_evidence": "CWE-497 requires preventing unauthorized access to sensitive system information",
+            "existing_controls_checked": [
+              "Path normalization, null byte detection, path traversal checks"
+            ],
+            "deficiency_evidence": "The candidate adds a control rather than demonstrating a deficiency. It prevents access to hidden files, which is protective behavior."
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "The candidate prevents impact by blocking access to hidden files. No evidence of actual information disclosure exists."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the dotfile security check would be removed, allowing access to hidden files when _hidden=false, potentially exposing sensitive system files.",
+        "supporting_evidence": [
+          "Path parts derived from user-controlled input via this.path",
+          "Dotfile detection function checks if any path component starts with '.'",
+          "When _hidden=false, returns 404 error preventing file access",
+          "File serving operations (fs.stat, file streaming) occur after successful validation"
+        ],
+        "contradicting_evidence": [
+          "The candidate adds a security control rather than demonstrating a vulnerability",
+          "CWE-497 describes information exposure, but this code prevents exposure",
+          "The mechanism blocks access rather than exposing information"
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [
+          "Whether hidden files contain sensitive system information in this context",
+          "Default value and configuration mechanism for this._hidden"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.37,
+        "score": 0.37
+      },
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "lib/send.js",
+        "changed_line": 422,
+        "statement": "if (containsDotFile(parts)) {",
+        "cwe_id": "CWE-219",
+        "cwe_name": "Storage of File with Sensitive Data Under Web Root",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-219 concerns storage location of sensitive files under web root, not access control mechanisms. The candidate implements access control for existing files, not storage location decisions."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "User-controlled path input connects to file access operations, but this is about controlling access to existing files, not about where files are stored."
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "The patch adds dotfile detection that prevents access to hidden files when _hidden=false, materially changing file access behavior."
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "The control added is access control for existing files, not related to storage location decisions required by CWE-219.",
+            "required_control": "Proper storage location decisions for sensitive files (not under web root)",
+            "control_requirement_evidence": "CWE-219 requires that sensitive files not be stored in web-accessible locations, not access controls for files already stored there",
+            "existing_controls_checked": [
+              "Path validation, null byte detection, traversal checks - all access controls for existing files"
+            ],
+            "deficiency_evidence": "No evidence about where files are stored; this is an access control mechanism, not a storage location control"
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "Impact is access control for existing files, not exposure due to improper storage location."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the dotfile detection check would be removed, allowing access to hidden files when _hidden=false, weakening access controls but not affecting file storage decisions.",
+        "supporting_evidence": [
+          "Added dotfile detection prevents access to hidden files based on configuration",
+          "Path validation and normalization occurs before the check"
+        ],
+        "contradicting_evidence": [
+          "CWE-219 specifically addresses storage location decisions, not access control mechanisms",
+          "The code handles access to existing files, not decisions about where to store files"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether sensitive files are actually stored under web root",
+          "Storage location decisions made elsewhere in the application"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.33999999999999997,
+        "score": 0.33999999999999997
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-6",
+    "filepath": "lib/send.js",
+    "changed_line": 418,
+    "statement": "path = resolve(path)",
+    "change_type": "A",
+    "function_name": "SendStream.prototype.pipe",
+    "operation_type": "path_resolution",
+    "selection_reason": "User-controlled path without root -> resolve() -> ensures absolute path resolution for security",
+    "security_relevance_score": 0.7,
+    "code_context": "269: \n270: /**\n271:  * Respond with 304 not modified.\n272:  *\n273:  * @api private\n274:  */\n275: \n276: SendStream.prototype.notModified = function(){\n277:   var res = this.res;\n278:   debug('not modified');\n279:   this.removeContentHeaderFields();\n280:   res.statusCode = 304;\n281:   res.end();\n282: };\n283: \n284: /**\n285:  * Raise error that headers already sent.\n286:  *\n287:  * @api private\n288:  */\n289: \n290: SendStream.prototype.headersAlreadySent = function headersAlreadySent(){\n291:   var err = new Error('Can\\'t set headers after they are sent.');\n292:   debug('headers already sent');\n293:   this.error(500, err);\n294: };\n295: \n296: /**\n297:  * Check if the request is cacheable, aka\n298:  * responded with 2xx or 304 (see RFC 2616 section 14.2{5,6}).\n299:  *\n300:  * @return {Boolean}\n301:  * @api private\n302:  */\n303: \n304: SendStream.prototype.isCachable = function(){\n305:   var res = this.res;\n306:   return (res.statusCode >= 200 && res.statusCode < 300) || 304 == res.statusCode;\n307: };\n308: \n309: /**\n310:  * Handle stat() error.\n311:  *\n312:  * @param {Error} err\n313:  * @api private\n314:  */\n315: \n316: SendStream.prototype.onStatError = function(err){\n317:   var notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR'];\n318:   if (~notfound.indexOf(err.code)) return this.error(404, err);\n319:   this.error(500, err);\n320: };\n321: \n322: /**\n323:  * Check if the cache is fresh.\n324:  *\n325:  * @return {Boolean}\n326:  * @api private\n327:  */\n328: \n329: SendStream.prototype.isFresh = function(){\n330:   return fresh(this.req.headers, this.res._headers);\n331: };\n332: \n333: /**\n334:  * Check if the range is fresh.\n335:  *\n336:  * @return {Boolean}\n337:  * @api private\n338:  */\n339: \n340: SendStream.prototype.isRangeFresh = function isRangeFresh(){\n341:   var ifRange = this.req.headers['if-range'];\n342: \n343:   if (!ifRange) return true;\n344: \n345:   return ~ifRange.indexOf('\"')\n346:     ? ~ifRange.indexOf(this.res._headers['etag'])\n347:     : Date.parse(this.res._headers['last-modified']) <= Date.parse(ifRange);\n348: };\n349: \n350: /**\n351:  * Redirect to `path`.\n352:  *\n353:  * @param {String} path\n354:  * @api private\n355:  */\n356: \n357: SendStream.prototype.redirect = function(path){\n358:   if (listenerCount(this, 'directory') !== 0) {\n359:     return this.emit('directory');\n360:   }\n361: \n362:   if (this.hasTrailingSlash()) return this.error(403);\n363:   var res = this.res;\n364:   path += '/';\n365:   res.statusCode = 301;\n366:   res.setHeader('Content-Type', 'text/html; charset=utf-8');\n367:   res.setHeader('Location', path);\n368:   res.end('Redirecting to <a href=\"' + escapeHtml(path) + '\">' + escapeHtml(path) + '</a>\\n');\n369: };\n370: \n371: /**\n372:  * Pipe to `res.\n373:  *\n374:  * @param {Stream} res\n375:  * @return {Stream} res\n376:  * @api public\n377:  */\n378: \n379: SendStream.prototype.pipe = function(res){\n380:   var self = this\n381:     , args = arguments\n382:     , root = this._root;\n383: \n384:   // references\n385:   this.res = res;\n386: \n387:   // decode the path\n388:   var path = utils.decode(this.path)\n389:   if (path === -1) return this.error(400)\n390: \n391:   // null byte(s)\n392:   if (~path.indexOf('\\0')) return this.error(400);\n393: \n394:   var parts\n395:   if (root !== null) {\n396:     // join / normalize from optional root dir\n397:     path = normalize(join(root, path))\n398: \n399:     // malicious path\n400:     if (path.substr(0, root.length) !== root) {\n401:       debug('malicious path \"%s\"', path)\n402:       return this.error(403)\n403:     }\n404: \n405:     // explode path parts\n406:     parts = path.substr(root.length + 1).split(sep)\n407:   } else {\n408:     // \"..\" is malicious without \"root\"\n409:     if (upPathRegexp.test(path)) {\n410:       debug('malicious path \"%s\"', path)\n411:       return this.error(403)\n412:     }\n413: \n414:     // explode path parts\n415:     parts = normalize(path).split(sep)\n416: \n417:     // resolve the path\n418:     path = resolve(path)\n419:   }\n420: \n421:   // dotfile handling\n422:   if (containsDotFile(parts)) {\n423:     var access = this._hidden\n424:       ? 'allow'\n425:       : 'ignore'\n426: \n427:     debug('%s dotfile \"%s\"', access, path)\n428:     switch (access) {\n429:       case 'allow':\n430:         break\n431:       case 'ignore':\n432:       default:\n433:         return this.error(404)\n434:     }\n435:   }\n436: \n437:   // index file support\n438:   if (this._index.length && this.hasTrailingSlash()) {\n439:     this.sendIndex(path);\n440:     return res;\n441:   }\n442: \n443:   debug('stat \"%s\"', path);\n444:   fs.stat(path, function(err, stat){\n445:     if (err) return self.onStatError(err);\n446:     if (stat.isDirectory()) return self.redirect(self.path);\n447:     self.emit('file', path, stat);\n448:     self.send(path, stat);\n449:   });\n450: \n451:   return res;\n452: };\n453: \n454: /**\n455:  * Transfer `path`.\n456:  *\n457:  * @param {String} path\n458:  * @api public\n459:  */\n460: \n461: SendStream.prototype.send = function(path, stat){\n462:   var options = this.options;\n463:   var len = stat.size;\n464:   var res = this.res;\n465:   var req = this.req;\n466:   var ranges = req.headers.range;\n467:   var offset = options.start || 0;\n468: \n469:   if (res._header) {\n470:     // impossible to send now\n471:     return this.headersAlreadySent();\n472:   }\n473: \n474:   debug('pipe \"%s\"', path)\n475: \n476:   // set header fields\n477:   this.setHeader(path, stat);\n478: \n479:   // set content-type\n480:   this.type(path);\n481: \n482:   // conditional GET support\n483:   if (this.isConditionalGET()\n484:     && this.isCachable()\n485:     && this.isFresh()) {\n486:     return this.notModified();\n487:   }\n488: \n489:   // adjust len to start/end options\n490:   len = Math.max(0, len - offset);\n491:   if (options.end !== undefined) {\n492:     var bytes = options.end - offset + 1;\n493:     if (len > bytes) len = bytes;\n494:   }\n495: \n496:   // Range support\n497:   if (ranges) {\n498:     ranges = parseRange(len, ranges);\n499: \n500:     // If-Range support\n501:     if (!this.isRangeFresh()) {\n502:       debug('range stale');\n503:       ranges = -2;\n504:     }\n505: \n506:     // unsatisfiable\n507:     if (-1 == ranges) {\n508:       debug('range unsatisfiable');\n509:       res.setHeader('Content-Range', 'bytes */' + stat.size);\n510:       return this.error(416);\n511:     }\n512: \n513:     // valid (syntactically invalid/multiple ranges are treated as a regular response)\n514:     if (-2 != ranges && ranges.length === 1) {\n515:       debug('range %j', ranges);\n516: \n517:       options.start = offset + ranges[0].start;\n518:       options.end = offset + ranges[0].end;\n519: \n520:       // Content-Range\n521:       res.statusCode = 206;\n522:       res.setHeader('Content-Range', 'bytes '\n523:         + ranges[0].start\n524:         + '-'\n525:         + ranges[0].end\n526:         + '/'\n527:         + len);\n528:       len = options.end - options.start + 1;\n529:     }\n530:   }\n531: \n532:   // content-length\n533:   res.setHeader('Content-Length', len);\n534: \n535:   // HEAD support\n536:   if ('HEAD' == req.method) return res.end();\n537: \n538:   this.stream(path, options);\n539: };\n540: \n541: /**\n542:  * Transfer index for `path`.\n543:  *\n544:  * @param {String} path\n545:  * @api private\n546:  */\n547: SendStream.prototype.sendIndex = function sendIndex(path){\n548:   var i = -1;\n549:   var self = this;\n550: \n551:   function next(err){\n552:     if (++i >= self._index.length) {\n553:       if (err) return self.onStatError(err);\n554:       return self.error(404);\n555:     }\n556: \n557:     var p = path + self._index[i];\n558: \n559:     debug('stat \"%s\"', p);\n560:     fs.stat(p, function(err, stat){\n561:       if (err) return next(err);\n562:       if (stat.isDirectory()) return next();\n563:       self.emit('file', p, stat);\n564:       self.send(p, stat);\n565:     });\n566:   }\n567: ",
+    "source_summary": "this.path comes from SendStream constructor parameter, which is typically user-controlled request path",
+    "sink_summary": "fs.stat(path) and this.send(path, stat) for file system operations",
+    "guard_summary": "Null byte check, '..' path traversal check via upPathRegexp, dotfile handling with _hidden option, root directory confinement when root is set",
+    "risk_pattern": "User-controlled path resolved to absolute path without root confinement, then used in file system operations",
+    "used_variable_sources": [
+      "this.path (constructor parameter)",
+      "path (resolved absolute path)"
+    ],
+    "called_function_context": [
+      "utils.decode",
+      "normalize",
+      "resolve (path.resolve)",
+      "containsDotFile",
+      "fs.stat",
+      "this.send"
+    ],
+    "enclosing_conditions": [
+      "root === null (no root directory set)",
+      "!upPathRegexp.test(path) (no parent directory traversal)"
+    ],
+    "context_summary": "When no root directory is configured, user path is normalized, checked for '..' patterns, then resolved to absolute path before file operations",
+    "unresolved_facts": [
+      "Specific validation in utils.decode function",
+      "Exact behavior of upPathRegexp pattern matching",
+      "Whether path.resolve provides any security benefits over normalization alone"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "User-controlled path resolved to absolute path without root confinement; path used in fs.stat and file operations; matches path traversal mechanism",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "Path resolution when root is null uses relative path checks; '..' detection but absolute path resolution may bypass; relative traversal risk",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "fit_reason": "Resolved absolute path may contain symlinks; fs.stat follows symlinks; link following could lead to unintended file access",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-119",
+      "CWE-178",
+      "CWE-20",
+      "CWE-200",
+      "CWE-22",
+      "CWE-23",
+      "CWE-367",
+      "CWE-425",
+      "CWE-561",
+      "CWE-59",
+      "CWE-676",
+      "CWE-693",
+      "CWE-754",
+      "CWE-829",
+      "CWE-843",
+      "CWE-863",
+      "CWE-912"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-6",
+        "filepath": "lib/send.js",
+        "changed_line": 418,
+        "statement": "path = resolve(path)",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.4,
+            "evidence": "The CWE-22 mechanism requires constructing a pathname intended for a restricted directory but failing to neutralize special elements, allowing escape. The candidate adds `resolve(path)` which converts a relative path to absolute but does not itself restrict the resolved location. The existing guard `upPathRegexp.test(path)` blocks '..' sequences in the *input* path, but `resolve()` could still produce an absolute path outside any intended root when `root === null`. The exact CWE mechanism of escaping a *restricted directory* is not fully demonstrated because no parent directory restriction is established when `root === null`."
+          },
+          "connection": {
+            "score": 0.8,
+            "evidence": "`this.path` is user-controlled request path (source summary). It is decoded, checked for null bytes, and when `root === null`, normalized and passed to `resolve(path)`. The resulting `path` variable is used directly in `fs.stat(path, ...)` and later `this.send(path, stat)` (sink). The connection from external input to file operation sink is concrete and demonstrated in the code flow."
+          },
+          "diff_causality": {
+            "score": 0.3,
+            "evidence": "The added line `path = resolve(path)` converts a normalized relative path to an absolute path. If reverted, `path` would remain the normalized relative path (from `normalize(path)`). The absolute vs. relative difference could affect how `fs.stat` interprets the path relative to the current working directory, but the existing guard `upPathRegexp.test(path)` already blocks '..' in the input. The change does not materially create, expose, or weaken a path traversal mechanism; it changes path representation but not the security boundary. The patch may be intended to ensure absolute resolution, but the causal link to a new or modified vulnerability is weak."
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "The required control for CWE-22 is proper limitation of the pathname to a restricted directory (e.g., chroot, root directory, access control). The evidence shows that when `root !== null`, a root confinement check (`path.substr(0, root.length) !== root`) exists. When `root === null`, the only control is the `upPathRegexp` check blocking '..' in the input path. No restriction to a specific parent directory is demonstrated for the `root === null` case. The `resolve()` call does not add a restriction; it only makes the path absolute. The deficiency is that without a `root`, there is no restricted directory boundary, but that is a design choice, not a demonstrated bypass of an intended restriction. The control requirement for CWE-22 assumes an intended restricted directory; if none is intended, the CWE may not apply.",
+            "required_control": "Restriction of resolved path to a specific parent directory (e.g., chroot, root directory, sandbox).",
+            "control_requirement_evidence": "CWE-22 defines the weakness as improper limitation to a restricted directory. The mechanism requires an intended restricted parent directory that is bypassed.",
+            "existing_controls_checked": [
+              "`upPathRegexp` blocks '..' sequences in input path when `root === null`.",
+              "`root` confinement check (`path.substr(0, root.length) !== root`) when `root !== null`."
+            ],
+            "deficiency_evidence": "When `root === null`, there is no demonstrated restricted directory boundary to bypass. The `upPathRegexp` prevents directory traversal via '..' but does not define a restricted parent. The `resolve()` call does not introduce a restriction. Therefore, the required control (limitation to a restricted directory) is not present, but its absence is not a deficiency because no such restriction is evidenced as intended."
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "A concrete security consequence (e.g., reading files outside intended directory) is not demonstrated because the intended restricted directory is not established. When `root === null`, the allowed file set is not defined. The `upPathRegexp` prevents '..' but the absolute path after `resolve()` could still point anywhere the process has permissions. Impact is speculative without evidence of an intended confinement boundary being bypassed."
+          }
+        },
+        "diff_counterfactual": "If the candidate line `path = resolve(path)` were reverted, `path` would remain the normalized relative path (`normalize(path)`). `fs.stat` would then interpret that path relative to the current working directory instead of as an absolute path. This might affect behavior if the working directory changes, but does not materially alter the security controls: the `upPathRegexp` still blocks '..' in input, and no root confinement exists when `root === null`.",
+        "supporting_evidence": [
+          "User-controlled `this.path` flows to `fs.stat(path, ...)` and `this.send(path, stat)`.",
+          "When `root === null`, the code path includes the candidate line `path = resolve(path)`.",
+          "The `upPathRegexp` check blocks '..' sequences in the input path, indicating path traversal is a concern."
+        ],
+        "contradicting_evidence": [
+          "The `upPathRegexp` check prevents directory traversal via '..' in the input path before `resolve()` is called.",
+          "When `root !== null`, a separate root confinement check exists; the candidate line is not executed in that branch.",
+          "No evidence shows an intended restricted directory when `root === null`; thus, the CWE-22 premise of escaping a restricted directory is not established."
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether there is an implicit intended restricted directory (e.g., current working directory or a document root) when `root === null`.",
+          "Whether `resolve()` introduces any security benefit or risk relative to the normalized relative path.",
+          "Whether downstream code or deployment expects a restricted directory that is not evidenced in this file."
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.41000000000000003,
+        "score": 0.41000000000000003
+      },
+      {
+        "candidate_id": "candidate-6",
+        "filepath": "lib/send.js",
+        "changed_line": 418,
+        "statement": "path = resolve(path)",
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-23 requires improper neutralization of '..' sequences that allow escaping restricted directories. The code has explicit '..' detection via upPathRegexp.test(path) that returns 403 error, which prevents the CWE-23 mechanism."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "User-controlled this.path is decoded, checked for null bytes, then when root is null, checked for '..' patterns, normalized, resolved to absolute path, and passed to fs.stat() and this.send() for file operations."
+          },
+          "diff_causality": {
+            "score": 0.1,
+            "evidence": "The path resolution occurs after the '..' detection that would block traversal attempts. If the candidate line were removed, the path would remain normalized but not resolved to absolute, which doesn't materially affect the security mechanism since traversal is already blocked."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Proper neutralization of '..' sequences to prevent directory traversal",
+            "control_requirement_evidence": "CWE-23 requires that '..' sequences are not properly handled, allowing escape from restricted directories",
+            "existing_controls_checked": [
+              "upPathRegexp.test(path) that detects and blocks paths containing '..' patterns with 403 error"
+            ],
+            "deficiency_evidence": "The control is present and effective - paths with '..' are explicitly blocked before reaching the path resolution"
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No concrete impact is demonstrated because the '..' detection control prevents the traversal mechanism from being triggered."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the path would remain normalized but not resolved to absolute path. Since the '..' detection occurs before resolution and blocks traversal attempts, the security posture would not materially change.",
+        "supporting_evidence": [
+          "User-controlled this.path flows through path processing to file system operations",
+          "Path resolution occurs in the code path when no root directory is configured"
+        ],
+        "contradicting_evidence": [
+          "Explicit '..' detection via upPathRegexp.test(path) returns 403 error before path resolution",
+          "The path resolution occurs after the traversal protection, so it cannot bypass the existing control"
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [
+          "Exact pattern matching behavior of upPathRegexp",
+          "Whether path resolution provides any security benefits in this context"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.25,
+        "score": 0.25
+      },
+      {
+        "candidate_id": "candidate-6",
+        "filepath": "lib/send.js",
+        "changed_line": 418,
+        "statement": "path = resolve(path)",
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-59 requires improper resolution of links/symlinks before file access. The code uses fs.stat which follows symlinks by default, but the patch adds path.resolve() which normalizes paths but does not inherently create or worsen link following behavior."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "User-controlled this.path is decoded, normalized, checked for '..' patterns, then resolved to absolute path before being passed to fs.stat() which follows symlinks."
+          },
+          "diff_causality": {
+            "score": 0.1,
+            "evidence": "The patch adds path.resolve() call. If reverted, the code would use normalized relative path instead of absolute path, but both paths would still be subject to symlink following by fs.stat()."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "symlink validation or non-following file operations",
+            "control_requirement_evidence": "CWE-59 requires preventing unintended resource access through symlinks",
+            "existing_controls_checked": [
+              "fs.stat follows symlinks by default",
+              "No symlink validation is present"
+            ],
+            "deficiency_evidence": "The code lacks symlink validation, but the patch does not create or worsen this deficiency"
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "Potential unauthorized file access if symlinks point outside intended directory, but impact depends on server configuration and symlink presence"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the code would use normalized relative paths instead of absolute paths, but both would still be processed by fs.stat() which follows symlinks, so the link following behavior would remain unchanged.",
+        "supporting_evidence": [
+          "fs.stat() follows symlinks by default",
+          "User-controlled path flows to file operations"
+        ],
+        "contradicting_evidence": [
+          "The patch adds path resolution but doesn't introduce symlink following - it was already present",
+          "CWE-59 requires improper resolution, but the resolution added is standard path normalization"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether symlinks exist in the deployment environment",
+          "Whether root directory confinement is properly configured",
+          "Specific behavior of fs.stat with different path formats"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.22000000000000003,
+        "score": 0.22000000000000003
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-7",
+    "filepath": "lib/send.js",
+    "changed_line": 674,
+    "statement": "function containsDotFile(parts) {",
+    "change_type": "A",
+    "function_name": "containsDotFile",
+    "operation_type": "dotfile_detection",
+    "selection_reason": "Path parts array -> iterates and checks for leading dots -> implements dotfile security logic",
+    "security_relevance_score": 0.7,
+    "code_context": "525:         + ranges[0].end\n526:         + '/'\n527:         + len);\n528:       len = options.end - options.start + 1;\n529:     }\n530:   }\n531: \n532:   // content-length\n533:   res.setHeader('Content-Length', len);\n534: \n535:   // HEAD support\n536:   if ('HEAD' == req.method) return res.end();\n537: \n538:   this.stream(path, options);\n539: };\n540: \n541: /**\n542:  * Transfer index for `path`.\n543:  *\n544:  * @param {String} path\n545:  * @api private\n546:  */\n547: SendStream.prototype.sendIndex = function sendIndex(path){\n548:   var i = -1;\n549:   var self = this;\n550: \n551:   function next(err){\n552:     if (++i >= self._index.length) {\n553:       if (err) return self.onStatError(err);\n554:       return self.error(404);\n555:     }\n556: \n557:     var p = path + self._index[i];\n558: \n559:     debug('stat \"%s\"', p);\n560:     fs.stat(p, function(err, stat){\n561:       if (err) return next(err);\n562:       if (stat.isDirectory()) return next();\n563:       self.emit('file', p, stat);\n564:       self.send(p, stat);\n565:     });\n566:   }\n567: \n568:   if (!this.hasTrailingSlash()) path += '/';\n569: \n570:   next();\n571: };\n572: \n573: /**\n574:  * Stream `path` to the response.\n575:  *\n576:  * @param {String} path\n577:  * @param {Object} options\n578:  * @api private\n579:  */\n580: \n581: SendStream.prototype.stream = function(path, options){\n582:   // TODO: this is all lame, refactor meeee\n583:   var finished = false;\n584:   var self = this;\n585:   var res = this.res;\n586:   var req = this.req;\n587: \n588:   // pipe\n589:   var stream = fs.createReadStream(path, options);\n590:   this.emit('stream', stream);\n591:   stream.pipe(res);\n592: \n593:   // response finished, done with the fd\n594:   onFinished(res, function onfinished(){\n595:     finished = true;\n596:     stream.destroy();\n597:   });\n598: \n599:   // error handling code-smell\n600:   stream.on('error', function onerror(err){\n601:     // request already finished\n602:     if (finished) return;\n603: \n604:     // clean up stream\n605:     finished = true;\n606:     stream.destroy();\n607: \n608:     // no hope in responding\n609:     if (res._header) {\n610:       console.error(err.stack);\n611:       req.destroy();\n612:       return;\n613:     }\n614: \n615:     // error\n616:     self.onStatError(err);\n617:   });\n618: \n619:   // end\n620:   stream.on('end', function onend(){\n621:     self.emit('end');\n622:   });\n623: };\n624: \n625: /**\n626:  * Set content-type based on `path`\n627:  * if it hasn't been explicitly set.\n628:  *\n629:  * @param {String} path\n630:  * @api private\n631:  */\n632: \n633: SendStream.prototype.type = function(path){\n634:   var res = this.res;\n635:   if (res.getHeader('Content-Type')) return;\n636:   var type = mime.lookup(path);\n637:   var charset = mime.charsets.lookup(type);\n638:   debug('content-type %s', type);\n639:   res.setHeader('Content-Type', type + (charset ? '; charset=' + charset : ''));\n640: };\n641: \n642: /**\n643:  * Set response header fields, most\n644:  * fields may be pre-defined.\n645:  *\n646:  * @param {String} path\n647:  * @param {Object} stat\n648:  * @api private\n649:  */\n650: \n651: SendStream.prototype.setHeader = function setHeader(path, stat){\n652:   var res = this.res;\n653: \n654:   this.emit('headers', res, path, stat);\n655: \n656:   if (!res.getHeader('Accept-Ranges')) res.setHeader('Accept-Ranges', 'bytes');\n657:   if (!res.getHeader('Date')) res.setHeader('Date', new Date().toUTCString());\n658:   if (!res.getHeader('Cache-Control')) res.setHeader('Cache-Control', 'public, max-age=' + Math.floor(this._maxage / 1000));\n659:   if (!res.getHeader('Last-Modified')) res.setHeader('Last-Modified', stat.mtime.toUTCString());\n660: \n661:   if (this._etag && !res.getHeader('ETag')) {\n662:     var etag = utils.etag(path, stat);\n663:     debug('etag %s', etag);\n664:     res.setHeader('ETag', etag);\n665:   }\n666: };\n667: \n668: /**\n669:  * Determine if path parts contain a dotfile.\n670:  *\n671:  * @api private\n672:  */\n673: \n674: function containsDotFile(parts) {\n675:   for (var i = 0; i < parts.length; i++) {\n676:     if (parts[i][0] === '.') {\n677:       return true\n678:     }\n679:   }\n680: \n681:   return false\n682: }\n683: \n684: /**\n685:  * Normalize the index option into an array.\n686:  *\n687:  * @param {boolean|string|array} val\n688:  * @api private\n689:  */\n690: \n691: function normalizeIndex(val){\n692:   return [].concat(val || [])\n693: }",
+    "source_summary": "Path comes from this.path, decoded from request, potentially user-controlled via HTTP request path",
+    "sink_summary": "File system access via fs.stat() and fs.createReadStream() for serving static files",
+    "guard_summary": "Multiple security controls: null byte check, path traversal prevention, dotfile detection with configurable handling (allow/ignore via this._hidden)",
+    "risk_pattern": "User-supplied file paths are checked for dotfiles before file system access; dotfiles are blocked by default unless explicitly allowed",
+    "used_variable_sources": [
+      "this.path",
+      "req.headers",
+      "root directory configuration"
+    ],
+    "called_function_context": [
+      "normalize",
+      "join",
+      "split",
+      "this.error",
+      "fs.stat",
+      "fs.createReadStream"
+    ],
+    "enclosing_conditions": [
+      "if (containsDotFile(parts)) with switch on this._hidden setting"
+    ],
+    "context_summary": "Security function added to static file server to prevent access to hidden dotfiles by default",
+    "unresolved_facts": [
+      "Exact source of this.path initialization",
+      "How this._hidden configuration is set",
+      "Full request flow from HTTP handler to SendStream"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "Dotfile detection function implements path traversal prevention control for user-supplied paths",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "Security function checks path parts for leading dots to prevent relative path traversal to hidden files",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "Dotfile control prevents information disclosure of hidden files through file serving",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-367",
+        "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+        "fit_reason": "Separate dotfile check before file operations could potentially be bypassed via race condition",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1004",
+      "CWE-178",
+      "CWE-193",
+      "CWE-200",
+      "CWE-22",
+      "CWE-23",
+      "CWE-367",
+      "CWE-378",
+      "CWE-563",
+      "CWE-59",
+      "CWE-639",
+      "CWE-783",
+      "CWE-829",
+      "CWE-843",
+      "CWE-912"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-7",
+        "filepath": "lib/send.js",
+        "changed_line": 674,
+        "statement": "function containsDotFile(parts) {",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.25,
+            "evidence": "The function checks for dotfiles but CWE-22 specifically addresses directory traversal outside restricted boundaries, not just hidden file access"
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "User-supplied path (this.path) is split into parts and checked by this function before file system operations"
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "Adding this function creates a new security control that prevents access to dotfiles when this._hidden is not explicitly enabled"
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "",
+            "required_control": "Path validation to prevent traversal outside restricted directory",
+            "control_requirement_evidence": "CWE-22 requires preventing access outside restricted directories via path manipulation",
+            "existing_controls_checked": [
+              "dotfile detection via containsDotFile",
+              "null byte check",
+              "path traversal prevention logic"
+            ],
+            "deficiency_evidence": "The function only addresses dotfiles, not full path traversal vectors like '../' sequences"
+          },
+          "concrete_impact": {
+            "score": 0.35,
+            "evidence": "Potential unauthorized access to hidden files if dotfile protection is the primary control, but CWE-22's directory escape impact is not demonstrated"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the containsDotFile function would not exist, removing dotfile detection as a security control for static file serving",
+        "supporting_evidence": [
+          "Function implements security logic for path validation",
+          "Called in context of user-supplied path processing before file access",
+          "Prevents access to dotfiles by default unless explicitly allowed"
+        ],
+        "contradicting_evidence": [
+          "CWE-22 focuses on directory traversal outside restricted boundaries, not hidden file access",
+          "Other path traversal controls exist in the codebase"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether this is the primary path traversal control or supplementary",
+          "How this._hidden configuration affects security posture",
+          "Presence and effectiveness of other path validation mechanisms"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.48,
+        "score": 0.48
+      },
+      {
+        "candidate_id": "candidate-7",
+        "filepath": "lib/send.js",
+        "changed_line": 674,
+        "statement": "function containsDotFile(parts) {",
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The function detects dotfiles but CWE-23 specifically requires improper neutralization of '..' sequences that traverse directories. Dotfile detection is related but distinct from directory traversal prevention."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "Path parts come from user-controlled input (this.path from HTTP request) and are checked before file system operations like fs.stat() and fs.createReadStream()"
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "Adding this function creates new security control for dotfile detection. Reverting would remove this specific protection mechanism."
+          },
+          "security_control": {
+            "score": 0.45,
+            "evidence": "The function implements a security control but addresses dotfiles rather than directory traversal sequences",
+            "required_control": "Proper neutralization of '..' sequences and path traversal patterns",
+            "control_requirement_evidence": "CWE-23 requires preventing directory traversal via sequences like '../' that escape restricted directories",
+            "existing_controls_checked": [
+              "dotfile detection function checks for leading dots in path parts"
+            ],
+            "deficiency_evidence": "The control only addresses dotfiles, not directory traversal sequences like '../' or absolute path resolution"
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "Impact is speculative - prevents access to hidden files but CWE-23's directory traversal impact (file system escape) is not directly addressed"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the containsDotFile function would be removed, eliminating dotfile detection protection but leaving directory traversal prevention mechanisms unchanged.",
+        "supporting_evidence": [
+          "Function checks path parts for leading dots before file system operations",
+          "Path originates from user-controlled HTTP request input",
+          "Function is called in security-critical context before file serving"
+        ],
+        "contradicting_evidence": [
+          "CWE-23 specifically targets '../' sequences and directory traversal, not dotfile access",
+          "The function implements dotfile protection, which is a different security concern"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether other path traversal controls exist elsewhere in the codebase",
+          "How this._hidden configuration affects dotfile handling",
+          "Presence of '../' sequence validation in the path normalization process"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.5,
+        "score": 0.5
+      },
+      {
+        "candidate_id": "candidate-7",
+        "filepath": "lib/send.js",
+        "changed_line": 674,
+        "statement": "function containsDotFile(parts) {",
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The function implements dotfile detection to prevent serving hidden files, which could contain sensitive information. However, CWE-200 is a broad category and this addresses only one specific prevention mechanism rather than the full scope of information exposure vulnerabilities."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "User-controlled path input (this.path from HTTP request) flows to file system operations (fs.stat, fs.createReadStream). The containsDotFile function is called on path parts before file access, establishing a security boundary."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If this function were removed, dotfile detection would be absent, allowing access to hidden files that may contain sensitive information. The function is newly added (change_type: 'A'), creating the security control."
+          },
+          "security_control": {
+            "score": 0.75,
+            "evidence": "The function implements a missing access control for dotfiles. It checks each path part for leading dots and returns true if any are found, enabling the calling code to block access based on this._hidden configuration.",
+            "required_control": "Access control to prevent unauthorized viewing of hidden/dot files",
+            "control_requirement_evidence": "CWE-200 requires preventing unauthorized access to sensitive information; hidden files often contain configuration, credentials, or other sensitive data",
+            "existing_controls_checked": [
+              "Path normalization and traversal prevention exist, but dotfile-specific control was missing"
+            ],
+            "deficiency_evidence": "Before this addition, dotfiles were accessible; the function provides the missing control to detect and potentially block access to hidden files"
+          },
+          "concrete_impact": {
+            "score": 0.45,
+            "evidence": "Potential exposure of hidden file contents if dotfiles are served. However, the actual impact depends on what sensitive information exists in dotfiles and whether this._hidden configuration properly blocks access."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the containsDotFile function would be removed, eliminating dotfile detection and potentially allowing unauthorized access to hidden files containing sensitive information.",
+        "supporting_evidence": [
+          "Function implements security logic to detect dotfiles in path parts",
+          "Called before file system operations in enclosing conditions with this._hidden configuration",
+          "Prevents serving of hidden files that may contain sensitive configuration or credentials"
+        ],
+        "contradicting_evidence": [
+          "CWE-200 is a broad category; this addresses only dotfile-specific information exposure",
+          "The function itself doesn't directly expose information - it's a prevention mechanism"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "How this._hidden configuration is set and whether it defaults to blocking dotfiles",
+          "Whether dotfiles in the served directory actually contain sensitive information",
+          "Complete request flow validation from HTTP handler to SendStream initialization"
+        ],
+        "review_comment": "Added dotfile detection function prevents unauthorized access to hidden files that may contain sensitive configuration or credentials. The function checks each path component for leading dots and integrates with the existing _hidden configuration to control access. Ensure the _hidden setting defaults to blocking dotfile access and consider documenting this security control in the configuration options.",
+        "change_type": "A",
+        "raw_score": 0.6100000000000001,
+        "score": 0.6100000000000001
+      },
+      {
+        "candidate_id": "candidate-7",
+        "filepath": "lib/send.js",
+        "changed_line": 674,
+        "statement": "function containsDotFile(parts) {",
+        "cwe_id": "CWE-367",
+        "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "The code implements a security check for dotfiles but shows no evidence of concurrent access, race conditions, or time-of-check vs time-of-use vulnerabilities. CWE-367 requires demonstrable concurrent access patterns."
+          },
+          "connection": {
+            "score": 0.2,
+            "evidence": "Path parts are checked for dotfiles before file operations, but no evidence shows concurrent modification between check and use. The code appears sequential in nature."
+          },
+          "diff_causality": {
+            "score": 0.3,
+            "evidence": "Adding this function introduces a security check, but doesn't create or expose race conditions. If reverted, the dotfile check would be removed, but no race condition mechanism would change."
+          },
+          "security_control": {
+            "score": 0.15,
+            "evidence": "",
+            "required_control": "Atomic operations or synchronization to prevent concurrent modification between check and use",
+            "control_requirement_evidence": "CWE-367 requires protection against concurrent modification between state check and resource use",
+            "existing_controls_checked": [
+              "Sequential file operations without concurrency mechanisms"
+            ],
+            "deficiency_evidence": "No evidence of concurrent access patterns exists; the code appears to operate in a single-threaded Node.js context without shared state modification"
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No evidence supports that a race condition could be exploited. The code shows sequential file operations without concurrent access patterns."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the dotfile detection function would be removed, potentially allowing access to hidden files, but no race condition mechanism would be introduced or removed.",
+        "supporting_evidence": [
+          "Function checks path parts before file operations"
+        ],
+        "contradicting_evidence": [
+          "No evidence of concurrent access patterns",
+          "Sequential file operations without shared state modification",
+          "Node.js single-threaded event loop context"
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [
+          "Whether concurrent file system access is possible in this context",
+          "How this function is called and whether multiple requests could interleave"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.17,
+        "score": 0.17
+      }
+    ],
+    "stage4_status": "completed"
+  }
+]

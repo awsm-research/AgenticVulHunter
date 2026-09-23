@@ -1,0 +1,271 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "tests/test_mandrill_webhooks.py",
+      "changed_line": 37,
+      "statement": "full_url = test_client_path.replace(\"://\", \"://\" + auth + \"@\")",
+      "change_type": "A",
+      "function_name": "mandrill_args",
+      "operation_type": "URL construction with embedded credentials",
+      "selection_reason": "auth credentials -> embed into URL -> test signature construction",
+      "security_relevance_score": 0.4,
+      "code_context": "1: import json\n2: from datetime import datetime\n3: # noinspection PyUnresolvedReferences\n4: from six.moves.urllib.parse import urljoin\n5: \n6: import hashlib\n7: import hmac\n8: from base64 import b64encode\n9: from django.core.exceptions import ImproperlyConfigured\n10: from django.test import override_settings\n11: from django.utils.timezone import utc\n12: from mock import ANY\n13: \n14: from anymail.signals import AnymailTrackingEvent\n15: from anymail.webhooks.mandrill import MandrillTrackingWebhookView\n16: \n17: from .webhook_cases import WebhookTestCase, WebhookBasicAuthTestsMixin\n18: \n19: TEST_WEBHOOK_KEY = 'TEST_WEBHOOK_KEY'\n20: \n21: \n22: def mandrill_args(events=None,\n23:                   host=\"http://testserver/\",  # Django test-client default\n24:                   path='/anymail/mandrill/tracking/',  # Anymail urlconf default\n25:                   auth=\"username:password\",  # WebhookTestCase default\n26:                   key=TEST_WEBHOOK_KEY):\n27:     \"\"\"Returns TestClient.post kwargs for Mandrill webhook call with events\n28: \n29:     Computes correct signature.\n30:     \"\"\"\n31:     if events is None:\n32:         events = []\n33:     test_client_path = urljoin(host, path)  # https://testserver/anymail/mandrill/tracking/\n34:     if auth:\n35:         # we can get away with this simplification in these controlled tests,\n36:         # but don't ever construct urls like this in production code -- it's not safe!\n37:         full_url = test_client_path.replace(\"://\", \"://\" + auth + \"@\")\n38:     else:\n39:         full_url = test_client_path\n40:     mandrill_events = json.dumps(events)\n41:     signed_data = full_url + 'mandrill_events' + mandrill_events\n42:     signature = b64encode(hmac.new(key=key.encode('ascii'),\n43:                                    msg=signed_data.encode('utf-8'),\n44:                                    digestmod=hashlib.sha1).digest())\n45:     return {\n46:         'path': test_client_path,\n47:         'data': {'mandrill_events': mandrill_events},\n48:         'HTTP_X_MANDRILL_SIGNATURE': signature,\n49:     }\n50: \n51: \n52: class MandrillWebhookSettingsTestCase(WebhookTestCase):\n53:     def test_requires_webhook_key(self):\n54:         with self.assertRaisesRegex(ImproperlyConfigured, r'MANDRILL_WEBHOOK_KEY'):\n55:             self.client.post('/anymail/mandrill/tracking/',\n56:                              data={'mandrill_events': '[]'})\n57: \n58:     def test_head_does_not_require_webhook_key(self):\n59:         # Mandrill issues an unsigned HEAD request to verify the wehbook url.\n60:         # Only *after* that succeeds will Mandrill will tell you the webhook key.\n61:         # So make sure that HEAD request will go through without any key set:\n62:         response = self.client.head('/anymail/mandrill/tracking/')\n63:         self.assertEqual(response.status_code, 200)\n64: \n65: \n66: @override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)\n67: class MandrillWebhookSecurityTestCase(WebhookTestCase, WebhookBasicAuthTestsMixin):\n68:     should_warn_if_no_auth = False  # because we check webhook signature\n69: \n70:     def call_webhook(self):\n71:         kwargs = mandrill_args([{'event': 'send'}])\n72:         return self.client.post(**kwargs)\n73: \n74:     # Additional tests are in WebhookBasicAuthTestsMixin\n75: \n76:     def test_verifies_correct_signature(self):\n77:         kwargs = mandrill_args([{'event': 'send'}])\n78:         response = self.client.post(**kwargs)\n79:         self.assertEqual(response.status_code, 200)\n80: \n81:     def test_verifies_missing_signature(self):\n82:         response = self.client.post('/anymail/mandrill/tracking/',\n83:                                     data={'mandrill_events': '[{\"event\":\"send\"}]'})\n84:         self.assertEqual(response.status_code, 400)\n85: \n86:     def test_verifies_bad_signature(self):\n87:         kwargs = mandrill_args([{'event': 'send'}], key=\"wrong API key\")\n88:         response = self.client.post(**kwargs)\n89:         self.assertEqual(response.status_code, 400)\n90: \n91:     @override_settings(ANYMAIL={})  # clear WEBHOOK_AUTHORIZATION from WebhookTestCase\n92:     def test_no_basic_auth(self):\n93:         # Signature validation should work properly if you're not using basic auth\n94:         self.clear_basic_auth()\n95:         kwargs = mandrill_args([{'event': 'send'}], auth=\"\")\n96:         response = self.client.post(**kwargs)\n97:         self.assertEqual(response.status_code, 200)\n98: \n99:     @override_settings(ANYMAIL={\n100:         \"MANDRILL_WEBHOOK_URL\": \"https://abcde:12345@example.com/anymail/mandrill/tracking/\",\n101:         \"WEBHOOK_AUTHORIZATION\": \"abcde:12345\",\n102:     })\n103:     def test_webhook_url_setting(self):\n104:         # If Django can't build_absolute_uri correctly (e.g., because your proxy\n105:         # frontend isn't setting the proxy headers correctly), you must set\n106:         # MANDRILL_WEBHOOK_URL to the actual public url where Mandrill calls the webhook.\n107:         self.set_basic_auth(\"abcde\", \"12345\")\n108:         kwargs = mandrill_args([{'event': 'send'}], host=\"https://example.com/\", auth=\"abcde:12345\")\n109:         response = self.client.post(SERVER_NAME=\"127.0.0.1\", **kwargs)\n110:         self.assertEqual(response.status_code, 200)\n111: \n112:     # override WebhookBasicAuthTestsMixin version of this test\n113:     @override_settings(ANYMAIL={'WEBHOOK_AUTHORIZATION': ['cred1:pass1', 'cred2:pass2']})\n114:     def test_supports_credential_rotation(self):\n115:         \"\"\"You can supply a list of basic auth credentials, and any is allowed\"\"\"\n116:         self.set_basic_auth('cred1', 'pass1')\n117:         response = self.client.post(**mandrill_args(auth=\"cred1:pass1\"))\n118:         self.assertEqual(response.status_code, 200)\n119: \n120:         self.set_basic_auth('cred2', 'pass2')\n121:         response = self.client.post(**mandrill_args(auth=\"cred2:pass2\"))\n122:         self.assertEqual(response.status_code, 200)\n123: \n124:         self.set_basic_auth('baduser', 'wrongpassword')\n125:         response = self.client.post(**mandrill_args(auth=\"baduser:wrongpassword\"))\n126:         self.assertEqual(response.status_code, 400)\n127: \n128: \n129: @override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)\n130: class MandrillTrackingTestCase(WebhookTestCase):\n131: \n132:     def test_head_request(self):\n133:         # Mandrill verifies webhooks at config time with a HEAD request\n134:         response = self.client.head('/anymail/mandrill/tracking/')\n135:         self.assertEqual(response.status_code, 200)\n136: \n137:     def test_post_request_invalid_json(self):\n138:         kwargs = mandrill_args()\n139:         kwargs['data'] = {'mandrill_events': \"GARBAGE DATA\"}\n140:         response = self.client.post(**kwargs)\n141:         self.assertEqual(response.status_code, 400)\n142: \n143:     def test_send_event(self):\n144:         raw_events = [{\n145:             \"event\": \"send\",\n146:             \"msg\": {\n147:                 \"ts\": 1461095211,  # time send called\n148:                 \"subject\": \"Webhook Test\",\n149:                 \"email\": \"recipient@example.com\",\n150:                 \"sender\": \"sender@example.com\",\n151:                 \"tags\": [\"tag1\", \"tag2\"],\n152:                 \"metadata\": {\"custom1\": \"value1\", \"custom2\": \"value2\"},\n153:                 \"_id\": \"abcdef012345789abcdef012345789\"\n154:             },\n155:             \"_id\": \"abcdef012345789abcdef012345789\",\n156:             \"ts\": 1461095246  # time of event\n157:         }]\n158:         response = self.client.post(**mandrill_args(events=raw_events))\n159:         self.assertEqual(response.status_code, 200)\n160:         kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillTrackingWebhookView,\n161:                                                       event=ANY, esp_name='Mandrill')\n162:         event = kwargs['event']\n163:         self.assertIsInstance(event, AnymailTrackingEvent)\n164:         self.assertEqual(event.event_type, \"sent\")\n165:         self.assertEqual(event.timestamp, datetime(2016, 4, 19, 19, 47, 26, tzinfo=utc))\n166:         self.assertEqual(event.esp_event, raw_events[0])\n167:         self.assertEqual(event.message_id, \"abcdef012345789abcdef012345789\")\n168:         self.assertEqual(event.recipient, \"recipient@example.com\")\n169:         self.assertEqual(event.tags, [\"tag1\", \"tag2\"])\n170:         self.assertEqual(event.metadata, {\"custom1\": \"value1\", \"custom2\": \"value2\"})\n171: \n172:     def test_hard_bounce_event(self):\n173:         raw_events = [{\n174:             \"event\": \"hard_bounce\",\n175:             \"msg\": {\n176:                 \"ts\": 1461095211,  # time send called\n177:                 \"subject\": \"Webhook Test\",\n178:                 \"email\": \"bounce@example.com\",\n179:                 \"sender\": \"sender@example.com\",\n180:                 \"bounce_description\": \"bad_mailbox\",\n181:                 \"bgtools_code\": 10,\n182:                 \"diag\": \"smtp;550 5.1.1 The email account that you tried to reach does not exist.\",\n183:                 \"_id\": \"abcdef012345789abcdef012345789\"\n184:             },\n185:             \"_id\": \"abcdef012345789abcdef012345789\",\n186:             \"ts\": 1461095246  # time of event",
+      "source_summary": "auth parameter (default 'username:password') is passed to function; test_client_path is constructed from host and path parameters using urljoin",
+      "sink_summary": "full_url is used in HMAC signature computation for Mandrill webhook verification; signature is included in HTTP_X_MANDRILL_SIGNATURE header",
+      "guard_summary": "Comment explicitly warns 'don't ever construct urls like this in production code -- it's not safe!'; Production code uses proper URL parsing with urlsplit/urlunsplit in get_request_uri",
+      "risk_pattern": "Test code constructs URLs by string replacement to embed credentials for signature verification, mimicking production behavior but with unsafe string manipulation",
+      "used_variable_sources": [
+        "auth function parameter (default 'username:password')",
+        "test_client_path from urljoin(host, path)",
+        "host parameter (default 'http://testserver/')",
+        "path parameter (default '/anymail/mandrill/tracking/')"
+      ],
+      "called_function_context": [
+        "urljoin from six.moves.urllib.parse",
+        "json.dumps for events serialization",
+        "hmac.new with SHA1 for signature generation",
+        "b64encode for signature encoding"
+      ],
+      "enclosing_conditions": [
+        "if auth: condition (line 34)",
+        "else branch provides fallback without auth (line 39)"
+      ],
+      "context_summary": "Test helper function constructs webhook call parameters including signature; mimics production signature verification which includes basic auth in URL for HMAC computation",
+      "unresolved_facts": [],
+      "retrieval_query": {
+        "mechanism_summary": "URL construction with string replacement to embed credentials for HMAC signature verification",
+        "source": "auth parameter containing credentials",
+        "sensitive_operation": "HMAC signature computation for webhook security",
+        "missing_control": "proper URL parsing and construction",
+        "impact": "signature verification bypass, authentication bypass",
+        "mechanism_keywords": [
+          "URL manipulation",
+          "credential embedding",
+          "string replacement",
+          "HMAC",
+          "webhook"
+        ]
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-255-credentials-management-errors",
+          "cwe_id": "CWE-255",
+          "cwe_name": "Credentials Management Errors",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 26.1352,
+          "raw_bm25_score": 26.1352,
+          "description": "Legacy category for insecure credential creation, storage, validation, or handling.",
+          "pattern": "cwe-255 credential-management password token secret credential storage rotation validation authentication-secret",
+          "remediation": "Protect credentials throughout storage, validation, transport, and rotation.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-255"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.9508,
+          "raw_bm25_score": 23.9508,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/call/wrong-named-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.1002,
+          "raw_bm25_score": 23.1002,
+          "description": "Using a named argument whose name does not correspond to a parameter of the called function or method, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/timing-attack-against-header-value",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.7729,
+          "raw_bm25_score": 22.7729,
+          "description": "Use of a non-constant-time verification routine to check the value of an HTTP header, possibly allowing a timing attack to infer the header's expected value.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208",
+            "experimental"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/empty-except",
+          "cwe_id": "CWE-390",
+          "cwe_name": "Detection of Error Condition Without Action",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.4122,
+          "raw_bm25_score": 21.4122,
+          "description": "Except doesn't do anything and has no comment",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-390. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "error-handling",
+            "external/cwe/cwe-390"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 21.2511,
+          "raw_bm25_score": 21.2511,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/jwt-empty-secret-or-algorithm",
+          "cwe_id": "CWE-347",
+          "cwe_name": "Improper Verification of Cryptographic Signature",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.0633,
+          "raw_bm25_score": 20.0633,
+          "description": "The application uses an empty secret or algorithm while encoding a JWT Token.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/http-response-splitting",
+          "cwe_id": "CWE-113",
+          "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.7824,
+          "raw_bm25_score": 19.7824,
+          "description": "Writing user input directly to an HTTP header makes code vulnerable to attack by header splitting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-113",
+            "external/cwe/cwe-079"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/predictable-token",
+          "cwe_id": "CWE-340",
+          "cwe_name": "Generation of Predictable Numbers or Identifiers",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.0812,
+          "raw_bm25_score": 19.0812,
+          "description": "Tokens used for sensitive tasks, such as, password recovery, and email confirmation, should not use predictable values.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-340"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/shell-command-constructed-from-input",
+          "cwe_id": "CWE-78",
+          "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 18.4774,
+          "raw_bm25_score": 18.4774,
+          "description": "Using externally controlled strings in a command line may allow a malicious user to change the meaning of the command.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use safe command execution APIs with parameter arrays. Validate and sanitize command arguments against strict allowlists.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-088",
+            "external/cwe/cwe-073"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,268 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-9",
+      "filepath": "lib/expression/node/FunctionNode.js",
+      "changed_line": 225,
+      "statement": "if (options && (typeof options.handler === 'object') && hasOwnProperty(options.handler, name)) {",
+      "change_type": "A",
+      "function_name": "FunctionNode.prototype.toString",
+      "operation_type": "safe_property_access",
+      "selection_reason": "Handler object -> hasOwnProperty check -> prevents prototype pollution",
+      "security_relevance_score": 0.6,
+      "code_context": "76:    *                          The object may not be mutated, but must be\n77:    *                          extended instead.\n78:    * @return {string} js\n79:    * @private\n80:    */\n81:   function compileFunctionNode(node, defs, args) {\n82:     // compile fn and arguments\n83:     var jsFn = compile(node.fn, defs, args);\n84:     var jsArgs = map(node.args, function (arg) {\n85:       return compile(arg, defs, args);\n86:     });\n87:     var jsScope = compileScope(defs, args);\n88:     var argsName;\n89: \n90:     if (node.fn.isSymbolNode) {\n91:       // we can statically determine whether the function has an rawArgs property\n92:       var name = node.fn.name;\n93:       var fn = defs.math[name];\n94:       var isRaw = (typeof fn === 'function') && (fn.rawArgs == true);\n95: \n96:       if (isRaw) {\n97:         // pass unevaluated parameters (nodes) to the function\n98:         argsName = getUniqueArgumentsName(defs);\n99:         defs[argsName] = node.args;\n100: \n101:         return jsFn + '(' + argsName + ', math, ' + jsScope + ')'; // \"raw\" evaluation\n102:       }\n103:       else {\n104:         return jsFn + '(' + join(jsArgs, ', ') + ')';              // \"regular\" evaluation\n105:       }\n106:     }\n107:     else if (node.fn.isAccessorNode && node.fn.index.isObjectProperty()) {\n108:       // execute the function with the right context: the object of the AccessorNode\n109:       argsName = getUniqueArgumentsName(defs);\n110:       defs[argsName] = node.args;\n111:       defs.validateSafeMethod = validateSafeMethod\n112: \n113:       var jsObject = compile(node.fn.object, defs, args);\n114:       var jsProp = stringify(node.fn.index.getObjectProperty());\n115: \n116:       return '(function () {' +\n117:           'var object = ' + jsObject + ';' +\n118:           'validateSafeMethod(object, ' + jsProp + ');' +\n119:           'return (object[' + jsProp + '] && object[' + jsProp + '].rawArgs) ' +\n120:           ' ? object[' + jsProp + '](' + argsName + ', math, ' + jsScope + ')' + // \"raw\" evaluation\n121:           ' : object[' + jsProp + '](' + join(jsArgs, ', ') + ')' +              // \"regular\" evaluation\n122:           '})()';\n123:     }\n124:     else { // node.fn.isAccessorNode && !node.fn.index.isObjectProperty()\n125:       // we have to dynamically determine whether the function has a rawArgs property\n126:       argsName = getUniqueArgumentsName(defs);\n127:       defs[argsName] = node.args;\n128: \n129:       return '(function () {' +\n130:           'var fn = ' + jsFn + ';' +\n131:           'return (fn && fn.rawArgs) ' +\n132:           ' ? fn(' + argsName + ', math, ' + jsScope + ')' +  // \"raw\" evaluation\n133:           ' : fn(' + join(jsArgs, ', ') + ')' +               // \"regular\" evaluation\n134:           '})()';\n135:     }\n136:   }\n137: \n138:   // register the compile function\n139:   register(FunctionNode.prototype.type, compileFunctionNode);\n140: \n141:   /**\n142:    * Merge function arguments into scope before passing to the actual function.\n143:    * This is needed when the function has `rawArgs=true`. In that case we have\n144:    * to pass the `scope` as third argument, including any variables of\n145:    * enclosing functions.\n146:    * @param {Object} defs     Object which can be used to define functions\n147:    *                          or constants globally available for the compiled\n148:    *                          expression\n149:    * @param {Object} args     Object with local function arguments, the key is\n150:    *                          the name of the argument, and the value is `true`.\n151:    *                          The object may not be mutated, but must be\n152:    *                          extended instead.\n153:    * @return {string} js\n154:    * @private\n155:    */\n156:   function compileScope (defs, args) {\n157:     var names = Object.keys(args);\n158:     if (names.length === 0) {\n159:       return 'scope';\n160:     }\n161:     else {\n162:       // merge arguments into scope\n163:       defs.extend = extend;\n164: \n165:       var jsArgs = map(names, function (arg) {\n166:           return stringify(arg) + ': ' + arg;\n167:         });\n168: \n169:       return 'extend(extend({}, scope), {' + join(jsArgs, ', ') + '})';\n170:     }\n171:   }\n172: \n173:   /**\n174:    * Execute a callback for each of the child nodes of this node\n175:    * @param {function(child: Node, path: string, parent: Node)} callback\n176:    */\n177:   FunctionNode.prototype.forEach = function (callback) {\n178:     for (var i = 0; i < this.args.length; i++) {\n179:       callback(this.args[i], 'args[' + i + ']', this);\n180:     }\n181:   };\n182: \n183:   /**\n184:    * Create a new FunctionNode having it's childs be the results of calling\n185:    * the provided callback function for each of the childs of the original node.\n186:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n187:    * @returns {FunctionNode} Returns a transformed copy of the node\n188:    */\n189:   FunctionNode.prototype.map = function (callback) {\n190:     var fn = this.fn.map(callback);\n191:     var args = [];\n192:     for (var i = 0; i < this.args.length; i++) {\n193:       args[i] = this._ifNode(callback(this.args[i], 'args[' + i + ']', this));\n194:     }\n195:     return new FunctionNode(fn, args);\n196:   };\n197: \n198:   /**\n199:    * Create a clone of this node, a shallow copy\n200:    * @return {FunctionNode}\n201:    */\n202:   FunctionNode.prototype.clone = function () {\n203:     return new FunctionNode(this.fn, this.args.slice(0));\n204:   };\n205: \n206:   //backup Node's toString function\n207:   //@private\n208:   var nodeToString = FunctionNode.prototype.toString;\n209: \n210:   /**\n211:    * Get string representation. (wrapper function)\n212:    * This overrides parts of Node's toString function.\n213:    * If callback is an object containing callbacks, it\n214:    * calls the correct callback for the current node,\n215:    * otherwise it falls back to calling Node's toString\n216:    * function.\n217:    *\n218:    * @param {Object} options\n219:    * @return {string} str\n220:    * @override\n221:    */\n222:   FunctionNode.prototype.toString = function (options) {\n223:     var customString;\n224:     var name = this.fn.toString(options);\n225:     if (options && (typeof options.handler === 'object') && hasOwnProperty(options.handler, name)) {\n226:       //callback is a map of callback functions\n227:       customString = options.handler[name](this, options);\n228:     }\n229: \n230:     if (typeof customString !== 'undefined') {\n231:       return customString;\n232:     }\n233: \n234:     //fall back to Node's toString\n235:     return nodeToString.call(this, options);\n236:   };\n237: \n238:   /**\n239:    * Get string representation\n240:    * @param {Object} options\n241:    * @return {string} str\n242:    */\n243:   FunctionNode.prototype._toString = function (options) {\n244:     var args = this.args.map(function (arg) {\n245:       return arg.toString(options);\n246:     });\n247: \n248:     // format the arguments like \"add(2, 4.2)\"\n249:     return this.fn.toString(options) + '(' + args.join(', ') + ')';\n250:   };\n251: \n252:   /*\n253:    * Expand a LaTeX template\n254:    *\n255:    * @param {string} template\n256:    * @param {Node} node\n257:    * @param {Object} options\n258:    * @private\n259:    **/\n260:   function expandTemplate(template, node, options) {\n261:     var latex = '';\n262: \n263:     // Match everything of the form ${identifier} or ${identifier[2]} or $$\n264:     // while submatching identifier and 2 (in the second case)\n265:     var regex = new RegExp('\\\\$(?:\\\\{([a-z_][a-z_0-9]*)(?:\\\\[([0-9]+)\\\\])?\\\\}|\\\\$)', 'ig');\n266: \n267:     var inputPos = 0;   //position in the input string\n268:     var match;\n269:     while ((match = regex.exec(template)) !== null) {   //go through all matches\n270:       // add everything in front of the match to the LaTeX string\n271:       latex += template.substring(inputPos, match.index);\n272:       inputPos = match.index;\n273: \n274:       if (match[0] === '$$') { // escaped dollar sign\n275:         latex += '$';\n276:         inputPos++;\n277:       }\n278:       else { // template parameter\n279:         inputPos += match[0].length;\n280:         var property = node[match[1]];\n281:         if (!property) {\n282:           throw new ReferenceError('Template: Property ' + match[1] + ' does not exist.');\n283:         }\n284:         if (match[2] === undefined) { //no square brackets\n285:           switch (typeof property) {\n286:             case 'string':\n287:               latex += property;\n288:               break;\n289:             case 'object':\n290:               if (property.isNode) {\n291:                 latex += property.toTex(options);\n292:               }\n293:               else if (Array.isArray(property)) {\n294:                 //make array of Nodes into comma separated list\n295:                 latex += property.map(function (arg, index) {\n296:                   if (arg && arg.isNode) {\n297:                     return arg.toTex(options);\n298:                   }\n299:                   throw new TypeError('Template: ' + match[1] + '[' + index + '] is not a Node.');\n300:                 }).join(',');\n301:               }\n302:               else {\n303:                 throw new TypeError('Template: ' + match[1] + ' has to be a Node, String or array of Nodes');\n304:               }\n305:               break;\n306:             default:\n307:               throw new TypeError('Template: ' + match[1] + ' has to be a Node, String or array of Nodes');\n308:           }\n309:         }\n310:         else { //with square brackets\n311:           if (property[match[2]] && property[match[2]].isNode) {\n312:             latex += property[match[2]].toTex(options);\n313:           }\n314:           else {\n315:             throw new TypeError('Template: ' + match[1] + '[' + match[2] + '] is not a Node.');\n316:           }\n317:         }\n318:       }\n319:     }\n320:     latex += template.slice(inputPos);  //append rest of the template\n321: \n322:     return latex;\n323:   }\n324: \n325:   //backup Node's toTex function\n326:   //@private\n327:   var nodeToTex = FunctionNode.prototype.toTex;\n328: \n329:   /**\n330:    * Get LaTeX representation. (wrapper function)\n331:    * This overrides parts of Node's toTex function.\n332:    * If callback is an object containing callbacks, it\n333:    * calls the correct callback for the current node,\n334:    * otherwise it falls back to calling Node's toTex\n335:    * function.\n336:    *\n337:    * @param {Object} options\n338:    * @return {string}\n339:    */\n340:   FunctionNode.prototype.toTex = function (options) {\n341:     var customTex;\n342:     if (options && (typeof options.handler === 'object') && hasOwnProperty(options.handler, this.name)) {\n343:       //callback is a map of callback functions\n344:       customTex = options.handler[this.name](this, options);\n345:     }\n346: \n347:     if (typeof customTex !== 'undefined') {\n348:       return customTex;\n349:     }\n350: \n351:     //fall back to Node's toTex\n352:     return nodeToTex.call(this, options);\n353:   };\n354: \n355:   /**\n356:    * Get LaTeX representation\n357:    * @param {Object} options\n358:    * @return {string} str\n359:    */\n360:   FunctionNode.prototype._toTex = function (options) {\n361:     var args = this.args.map(function (arg) { //get LaTeX of the arguments\n362:       return arg.toTex(options);\n363:     });\n364: \n365:     var latexConverter;\n366: \n367:     if (math[this.name] && ((typeof math[this.name].toTex === 'function') || (typeof math[this.name].toTex === 'object') || (typeof math[this.name].toTex === 'string'))) {\n368:       //.toTex is a callback function\n369:       latexConverter = math[this.name].toTex;\n370:     }\n371: \n372:     var customToTex;\n373:     switch (typeof latexConverter) {\n374:       case 'function': //a callback function",
+      "source_summary": "The 'name' variable comes from this.fn.toString(options), where 'fn' is the function name part of a FunctionNode. The 'options' parameter is passed to the toString method and may contain user-provided configuration.",
+      "sink_summary": "The property access options.handler[name] is used to call a custom handler function: options.handler[name](this, options). This could potentially lead to code execution if attacker controls the handler object and property name.",
+      "guard_summary": "The hasOwnProperty check prevents prototype pollution by ensuring the property exists directly on the handler object, not inherited from Object.prototype. The check also validates that options.handler is an object before accessing it.",
+      "risk_pattern": "Safe property access check added to prevent prototype pollution when accessing custom handler functions in the toString method. The check ensures that only properties directly defined on the handler object are accessed, preventing inheritance chain attacks.",
+      "used_variable_sources": [
+        "options (parameter)",
+        "this.fn (FunctionNode's function part)",
+        "name (result of this.fn.toString(options))"
+      ],
+      "called_function_context": [
+        "hasOwnProperty (safe property check from utils/object)",
+        "this.fn.toString (returns function name string)"
+      ],
+      "enclosing_conditions": [
+        "options parameter exists",
+        "options.handler is an object"
+      ],
+      "context_summary": "The change adds a prototype pollution protection check in FunctionNode's toString method when accessing custom handler functions. This prevents attackers from polluting Object.prototype to inject malicious handlers.",
+      "unresolved_facts": [
+        "Exact implementation of this.fn.toString() to determine what values 'name' can contain",
+        "How the options parameter flows into this function and whether it can be attacker-controlled",
+        "Whether there are other paths to prototype pollution in the codebase"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "Prototype pollution prevention using hasOwnProperty check on user-controlled property name",
+        "source": "user-controlled options.handler object and property name",
+        "sensitive_operation": "dynamic method call via property access",
+        "missing_control": "prototype pollution protection",
+        "impact": "remote code execution via prototype pollution",
+        "mechanism_keywords": "prototype pollution hasOwnProperty property access"
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/prototype-polluting-assignment",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 42.922,
+          "raw_bm25_score": 42.922,
+          "description": "Modifying an object obtained via a user-controlled property name may lead to accidental mutation of the built-in Object prototype, and possibly escalate to remote code execution or cross-site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-094",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/missing-x-frame-options",
+          "cwe_id": "CWE-829",
+          "cwe_name": "Inclusion of Functionality from Untrusted Control Sphere",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 40.323,
+          "raw_bm25_score": 40.323,
+          "description": "If the 'X-Frame-Options' setting is not provided, a malicious user may be able to overlay their own UI on top of the site by using an iframe.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-451",
+            "external/cwe/cwe-829"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/unvalidated-dynamic-method-call",
+          "cwe_id": "CWE-754",
+          "cwe_name": "Improper Check for Unusual or Exceptional Conditions",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 34.5082,
+          "raw_bm25_score": 34.5082,
+          "description": "Calling a method with a user-controlled name may dispatch to an unexpected target, which could cause an exception.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-754"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/function-declaration-conflict",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 33.6269,
+          "raw_bm25_score": 33.6269,
+          "description": "If two functions with the same name are declared in the same scope, one of the declarations overrides the other without warning. This makes the code hard to read and maintain, and may even lead to platform-dependent behavior.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/eval-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 33.1495,
+          "raw_bm25_score": 33.1495,
+          "description": "The 'eval' function and the 'Function' constructor execute strings as code. This is dangerous and impedes program analysis and understanding. Consequently, these two functions should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/unsafe-dynamic-method-access",
+          "cwe_id": "CWE-94",
+          "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 31.0101,
+          "raw_bm25_score": 31.0101,
+          "description": "Invoking user-controlled methods on certain objects can lead to remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-094"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/remote-property-injection",
+          "cwe_id": "CWE-400",
+          "cwe_name": "Uncontrolled Resource Consumption",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.6449,
+          "raw_bm25_score": 29.6449,
+          "description": "Allowing writes to arbitrary properties of an object may lead to denial-of-service attacks.",
+          "pattern": "Look for operations that can consume excessive resources without proper limits or controls",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-250",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "fallback/cwe-1321-improperly-controlled-modification-of-object-prototype-attributes-prototype-poll",
+          "cwe_id": "CWE-1321",
+          "cwe_name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 29.3031,
+          "raw_bm25_score": 29.3031,
+          "description": "Attacker-controlled object keys modify Object prototype attributes.",
+          "pattern": "cwe-1321 prototype-pollution __proto__ constructor prototype object-key property-key merge assign recursive-merge",
+          "remediation": "Reject prototype keys and use schema-constrained object updates.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-1321"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/useless-type-test",
+          "cwe_id": "CWE-571",
+          "cwe_name": "Expression is Always True",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.6137,
+          "raw_bm25_score": 28.6137,
+          "description": "Comparing the result of a typeof test against a string other than 'undefined', 'boolean', 'number', 'string', 'object', 'function' or 'symbol' is useless, since this comparison can never succeed.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-571. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "language-features",
+            "external/cwe/cwe-570"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/yield-outside-generator",
+          "cwe_id": "CWE-758",
+          "cwe_name": "Reliance on Undefined, Unspecified, or Implementation-Defined Behavior",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.0373,
+          "raw_bm25_score": 25.0373,
+          "description": "'yield' should only be used in generator functions.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-758. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "language-features",
+            "external/cwe/cwe-758"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

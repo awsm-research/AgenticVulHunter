@@ -1,0 +1,218 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "src/wagtail_2fa/views.py",
+  "changed_line": 64,
+  "statement": "class DeviceListView(OtpRequiredMixin, ListView):",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "observable input/state (view class inheritance) -> exact operation (adding OtpRequiredMixin) -> security-sensitive effect (enforces OTP requirement for device list view)",
+  "security_relevance_score": 0.75,
+  "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: from wagtail_2fa.mixins import OtpRequiredMixin\n21: \n22: \n23: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n24:     template_name = \"wagtail_2fa/otp_form.html\"\n25:     form_class = forms.TokenForm\n26:     redirect_field_name = REDIRECT_FIELD_NAME\n27: \n28:     @method_decorator(sensitive_post_parameters())\n29:     @method_decorator(never_cache)\n30:     def dispatch(self, *args, **kwargs):\n31:         return super().dispatch(*args, **kwargs)\n32: \n33:     def get_form_kwargs(self):\n34:         kwargs = super().get_form_kwargs()\n35:         kwargs[\"user\"] = self.request.user\n36:         return kwargs\n37: \n38:     def get_context_data(self, *args, **kwargs):\n39:         context = super().get_context_data(*args, **kwargs)\n40:         context[self.redirect_field_name] = self.get_redirect_url()\n41:         return context\n42: \n43:     def form_valid(self, form):\n44:         otp_login(self.request, self.request.user.otp_device)\n45:         return super().form_valid(form)\n46: \n47:     def get_redirect_url(self):\n48:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n49:         redirect_to = self.request.POST.get(\n50:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n51:         )\n52:         url_is_safe = is_safe_url(\n53:             url=redirect_to,\n54:             allowed_hosts=self.get_success_url_allowed_hosts(),\n55:             require_https=self.request.is_secure(),\n56:         )\n57:         return redirect_to if url_is_safe else \"\"\n58: \n59:     def get_success_url(self):\n60:         url = self.get_redirect_url()\n61:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n62: \n63: \n64: class DeviceListView(OtpRequiredMixin, ListView):\n65:     template_name = \"wagtail_2fa/device_list.html\"\n66: \n67:     # require OTP if configured\n68:     if_configured = True\n69: \n70:     def get_queryset(self):\n71:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n72: \n73:     def get_context_data(self, **kwargs):\n74:         context = super().get_context_data(**kwargs)\n75:         context['user_id'] = int(self.kwargs['user_id'])\n76:         return context\n77: \n78: \n79: class DeviceCreateView(OtpRequiredMixin, FormView):\n80:     form_class = forms.DeviceForm\n81:     template_name = \"wagtail_2fa/device_form.html\"\n82: \n83:     # require OTP if configured\n84:     if_configured = True\n85: \n86:     def get_form_kwargs(self):\n87:         kwargs = super().get_form_kwargs()\n88:         kwargs[\"user\"] = self.request.user\n89:         kwargs[\"instance\"] = self.device\n90:         return kwargs\n91: \n92:     def form_valid(self, form):\n93:         form.save()\n94:         utils.delete_unconfirmed_devices(form.user)\n95: \n96:         if not self.request.user.is_verified():\n97:             otp_login(self.request, form.instance)\n98:         return super().form_valid(form)\n99: \n100:     def get_success_url(self):\n101:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n102: \n103:     @cached_property\n104:     def device(self):\n105:         if self.request.method.lower() == \"get\":\n106:             return utils.new_unconfirmed_device(self.request.user)\n107:         else:\n108:             return utils.get_unconfirmed_device(self.request.user)\n109: \n110: \n111: class DeviceUpdateView(OtpRequiredMixin, UpdateView):\n112:     form_class = forms.DeviceForm\n113:     template_name = \"wagtail_2fa/device_form.html\"\n114: \n115:     def get_queryset(self):\n116:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n117: \n118:     def get_form_kwargs(self):\n119:         kwargs = super().get_form_kwargs()\n120:         kwargs[\"user\"] = self.request.user\n121:         return kwargs\n122: \n123:     def get_success_url(self):\n124:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n125: \n126: \n127: class DeviceDeleteView(OtpRequiredMixin, DeleteView):\n128:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n129: \n130:     def get_queryset(self):\n131:         device = TOTPDevice.objects.get(**self.kwargs)\n132:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n133: \n134:     def get_success_url(self):\n135:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n136: \n137: \n138: class DeviceQRCodeView(OtpRequiredMixin, View):\n139:     # require OTP if configured\n140:     if_configured = True\n141: \n142:     def get(self, request):\n143:         device = utils.get_unconfirmed_device(self.request.user)\n144:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n145:         response = HttpResponse(content_type=\"image/svg+xml\")\n146:         img.save(response)\n147: \n148:         return response",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "DeviceListView uses user_id from URL kwargs without validating if requesting user can access that user's devices, leading to potential authorization bypass",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "fit_reason": "DeviceListView allows direct access to device lists via user_id parameter without proper authorization checks, enabling forced browsing",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "fit_reason": "DeviceListView enforces OTP but doesn't properly control access to other users' device lists based on user_id parameter",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-208",
+    "CWE-264",
+    "CWE-284",
+    "CWE-285",
+    "CWE-311",
+    "CWE-352",
+    "CWE-425",
+    "CWE-561",
+    "CWE-581",
+    "CWE-628",
+    "CWE-665",
+    "CWE-685",
+    "CWE-687",
+    "CWE-863"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 64,
+      "statement": "class DeviceListView(OtpRequiredMixin, ListView):",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The DeviceListView class inherits from OtpRequiredMixin and accesses devices via TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True). The mechanism involves authorization check failure when accessing another user's devices without proper validation of the requesting user's access rights."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "The view accesses user_id from URL kwargs and passes it directly to devices_for_user() without verifying if the current user has authorization to access that specific user's devices. The connection path is: URL parameter (user_id) -> device access method -> potential unauthorized access to another user's devices."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If the OtpRequiredMixin were removed from DeviceListView, there would be no OTP requirement but still an authorization bypass vulnerability. The patch adds the mixin which enforces OTP but does not address the core authorization issue of validating user access rights to the requested user_id."
+        },
+        "security_control": {
+          "score": 0.65,
+          "evidence": "The code lacks explicit authorization validation for user_id access. While OtpRequiredMixin ensures OTP is required, it does not validate that the requesting user can access the device list of the user specified in user_id. The required control is proper authorization validation before accessing another user's devices.",
+          "required_control": "Authorization validation for user_id parameter",
+          "control_requirement_evidence": "CWE-863 requires correct authorization checks when accessing resources. Accessing another user's devices without validating the requesting user's access rights constitutes incorrect authorization.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin - enforces OTP but not authorization",
+            "devices_for_user() method - no built-in access control"
+          ],
+          "deficiency_evidence": "The code directly uses self.kwargs['user_id'] without checking if the current user is authorized to view that user's devices. The authorization check is missing entirely."
+        },
+        "concrete_impact": {
+          "score": 0.75,
+          "evidence": "An attacker could potentially access another user's 2FA device list by manipulating the user_id parameter in the URL, leading to unauthorized access to sensitive authentication information and possible account takeover."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the DeviceListView would not inherit from OtpRequiredMixin, removing the OTP requirement but leaving the authorization bypass vulnerability intact. The view would still directly access devices for any user_id provided in the URL without proper authorization validation.",
+      "supporting_evidence": [
+        "DeviceListView accesses TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True) directly from URL parameter",
+        "No explicit authorization check before accessing another user's devices",
+        "OtpRequiredMixin only enforces OTP but does not validate access rights to the specified user_id"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the devices_for_user method has built-in access control that was not shown in context",
+        "Exact behavior of TOTPDevice.objects.devices_for_user when user_id is provided"
+      ],
+      "review_comment": "The DeviceListView class allows access to any user's 2FA device list by manipulating the user_id parameter in the URL. The view inherits from OtpRequiredMixin which enforces OTP but does not validate that the requesting user can access the specified user's devices. Add authorization validation to ensure users can only access their own devices or devices they are authorized to manage.",
+      "change_type": "A",
+      "raw_score": 0.7699999999999999,
+      "score": 0.7699999999999999
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 64,
+      "statement": "class DeviceListView(OtpRequiredMixin, ListView):",
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The DeviceListView class inherits from OtpRequiredMixin and ListView, and the get_queryset method accesses TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True) without validating that the current user has authorization to view devices for the specified user_id. This allows an attacker to directly request device lists for other users by manipulating the user_id parameter."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The user_id is passed as a URL parameter in self.kwargs['user_id'], which is used directly in get_queryset without authorization checks. The connection path is: URL parameter (user_id) -> DeviceListView.get_queryset() -> devices_for_user(user_id) -> access to another user's devices."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If the OtpRequiredMixin were removed from DeviceListView, the view would no longer enforce OTP authentication, and more critically, it would allow direct access to device lists for any user_id without authorization checks. The patch adds the OtpRequiredMixin which enforces OTP but does not address the core issue of unauthorized access to other users' devices."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "The code uses OtpRequiredMixin for authentication, but this control is insufficient for authorization. The required control is proper authorization checking on user_id parameter. The existing controls checked include OtpRequiredMixin (which only enforces OTP) and the direct use of user_id from URL parameters without validation.",
+          "required_control": "Authorization check on user_id parameter",
+          "control_requirement_evidence": "CWE-425 requires that all restricted URLs, scripts, or files enforce appropriate authorization. The DeviceListView allows access to device lists for any user_id provided in the URL, bypassing authorization checks.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin (enforces OTP but not authorization)",
+            "Direct use of self.kwargs['user_id'] without validation"
+          ],
+          "deficiency_evidence": "The view directly uses user_id from URL parameters to fetch devices without verifying that the current user is authorized to access those devices. This allows an attacker to enumerate or access other users' device lists."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "An attacker can directly request device lists for any user by manipulating the user_id parameter in the URL, potentially leading to unauthorized access to sensitive information about other users' two-factor authentication devices. This violates authorization principles and could enable further attacks."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, removing OtpRequiredMixin from DeviceListView, the view would still allow direct access to device lists for any user_id without proper authorization checks, but would also remove OTP enforcement. The core vulnerability of forced browsing would remain, though with less overall security protection.",
+      "supporting_evidence": [
+        "DeviceListView inherits from OtpRequiredMixin and ListView",
+        "get_queryset method directly uses self.kwargs['user_id'] to fetch devices",
+        "devices_for_user() is called with user_id parameter without authorization validation",
+        "URL parameter user_id is used directly in the vulnerable operation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the OtpRequiredMixin provides sufficient authorization checks beyond OTP enforcement",
+        "Whether other views in the same file have similar authorization issues"
+      ],
+      "review_comment": "The DeviceListView allows direct access to device lists for any user by passing user_id as a URL parameter without authorization validation. The OtpRequiredMixin enforces OTP but does not prevent unauthorized access to other users' devices. An attacker can enumerate or access other users' two-factor authentication device information by manipulating the user_id parameter. Add authorization checks to ensure that only the owner of the devices can view them.",
+      "change_type": "A",
+      "raw_score": 0.7000000000000001,
+      "score": 0.7000000000000001
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 64,
+      "statement": "class DeviceListView(OtpRequiredMixin, ListView):",
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The DeviceListView class inherits from OtpRequiredMixin, which enforces OTP requirement. However, the view does not validate that the user_id parameter in the URL corresponds to the authenticated user, allowing potential access to other users' device lists."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "The user_id is passed as a URL parameter (self.kwargs['user_id']) and used directly in get_queryset() without validation against the current user. The vulnerable operation occurs in line 71 where devices_for_user is called with an unvalidated user_id."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If this line were reverted to remove OtpRequiredMixin, the OTP enforcement would be removed but access control would still be vulnerable due to lack of user validation. The addition of OtpRequiredMixin does not fix the access control issue; it only adds a layer of authentication that doesn't prevent unauthorized access to other users' data."
+        },
+        "security_control": {
+          "score": 0.85,
+          "evidence": "The required control is proper authorization validation. The view should verify that the user_id parameter matches the authenticated user before allowing access to device list. No such validation exists in the code.",
+          "required_control": "Authorization validation of user_id parameter",
+          "control_requirement_evidence": "CWE-284 requires that access to resources be restricted to authorized actors. The view allows any authenticated user with OTP to potentially access another user's device list if they know or guess the target user_id.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin (only enforces OTP, not authorization)",
+            "get_queryset() method (no user validation)"
+          ],
+          "deficiency_evidence": "The view directly uses self.kwargs['user_id'] in get_queryset() without checking if it matches the current authenticated user. This bypasses any authorization control that should prevent cross-user access."
+        },
+        "concrete_impact": {
+          "score": 0.75,
+          "evidence": "An attacker with OTP access could potentially enumerate or view another user's device list by guessing or manipulating the user_id parameter in the URL, leading to unauthorized access to sensitive authentication data."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, removing OtpRequiredMixin from DeviceListView, then the view would not enforce OTP requirement but would still have the same authorization vulnerability. The OTP enforcement would be removed while the cross-user access control issue remains, making the vulnerability more exploitable as no additional authentication barrier exists.",
+      "supporting_evidence": [
+        "DeviceListView inherits from OtpRequiredMixin which enforces OTP but does not validate user_id parameter",
+        "get_queryset() method directly uses self.kwargs['user_id'] without authorization check",
+        "user_id is passed in URL parameter and used to fetch devices for a specific user"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the exact vulnerability can be exploited in practice without additional conditions",
+        "The full impact of cross-user device enumeration in this specific application context"
+      ],
+      "review_comment": "The DeviceListView view enforces OTP authentication but lacks authorization validation for the user_id parameter. An attacker with valid OTP credentials could access other users' device lists by manipulating the user_id URL parameter. Add authorization check to ensure that only the authenticated user can access their own device list.",
+      "change_type": "A",
+      "raw_score": 0.8099999999999999,
+      "score": 0.8099999999999999
+    }
+  ],
+  "stage4_status": "completed"
+}

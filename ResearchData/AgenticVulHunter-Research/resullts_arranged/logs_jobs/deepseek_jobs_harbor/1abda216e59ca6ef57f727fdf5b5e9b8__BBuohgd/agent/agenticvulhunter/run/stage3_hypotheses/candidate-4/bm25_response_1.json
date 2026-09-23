@@ -1,0 +1,257 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "lib/compile_helpers.py",
+      "changed_line": 49,
+      "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))",
+      "change_type": "A",
+      "function_name": "setup_webdir_if_it_doesnt_exist",
+      "operation_type": "file_filtering_rule",
+      "selection_reason": "Configuration directory path -> regex pattern modification -> controls exclusion of configuration files from web deployment",
+      "security_relevance_score": 0.7,
+      "code_context": "1: # Licensed to the Apache Software Foundation (ASF) under one or more\n2: # contributor license agreements.  See the NOTICE file distributed with\n3: # this work for additional information regarding copyright ownership.\n4: # The ASF licenses this file to You under the Apache License, Version 2.0\n5: # (the \"License\"); you may not use this file except in compliance with\n6: # the License.  You may obtain a copy of the License at\n7: #\n8: #     http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: # Unless required by applicable law or agreed to in writing, software\n11: # distributed under the License is distributed on an \"AS IS\" BASIS,\n12: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n13: # See the License for the specific language governing permissions and\n14: # limitations under the License.\n15: import os\n16: import os.path\n17: import json\n18: import logging\n19: from collections import defaultdict\n20: from build_pack_utils import FileUtil\n21: \n22: \n23: _log = logging.getLogger('helpers')\n24: \n25: \n26: class FakeBuilder(object):\n27:     def __init__(self, ctx):\n28:         self._ctx = ctx\n29: \n30: \n31: class FakeInstaller(object):\n32:     def __init__(self, builder, installer):\n33:         self._installer = installer\n34:         self.builder = builder\n35: \n36: \n37: def setup_webdir_if_it_doesnt_exist(ctx):\n38:     if is_web_app(ctx):\n39:         webdirPath = os.path.join(ctx['BUILD_DIR'], ctx['WEBDIR'])\n40:         if not os.path.exists(webdirPath):\n41:             fu = FileUtil(FakeBuilder(ctx), move=True)\n42:             fu.under('BUILD_DIR')\n43:             fu.into('WEBDIR')\n44:             fu.where_name_does_not_match(\n45:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))\n46:             fu.where_name_does_not_match(\n47:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))\n48:             fu.where_name_does_not_match(\n49:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))\n50:             fu.where_name_does_not_match(\n51:                 '^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))\n52:             fu.where_name_does_not_match(\n53:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))\n54:             fu.done()\n55: \n56: \n57: def setup_log_dir(ctx):\n58:     os.makedirs(os.path.join(ctx['BUILD_DIR'], 'logs'))\n59: \n60: \n61: def load_binary_index(ctx):\n62:     index_path = os.path.join(ctx['BP_DIR'], 'binaries',\n63:                               ctx['STACK'], 'index-all.json')\n64:     return json.load(open(index_path))\n65: \n66: \n67: def find_all_php_versions(index_json):\n68:     return index_json['php'].keys()\n69: \n70: \n71: def find_all_php_extensions(index_json):\n72:     SKIP = ('cli', 'pear', 'cgi', 'fpm')\n73:     exts = defaultdict(list)\n74:     for version, files in index_json['php'].iteritems():\n75:         for f in files:\n76:             if f.endswith('.tar.gz'):\n77:                 tmp = f.split('-')\n78:                 if len(tmp) == 3 and tmp[1] not in SKIP:\n79:                     exts[version].append(tmp[1])\n80:     return exts\n81: \n82: \n83: def validate_php_version(ctx):\n84:     if ctx['PHP_VERSION'] in ctx['ALL_PHP_VERSIONS']:\n85:         _log.debug('App selected PHP [%s]', ctx['PHP_VERSION'])\n86:     else:\n87:         _log.warning('Selected version of PHP [%s] not available.  Defaulting'\n88:                      ' to the latest version [%s]',\n89:                      ctx['PHP_VERSION'], ctx['PHP_54_LATEST'])\n90:         ctx['PHP_VERSION'] = ctx['PHP_54_LATEST']\n91: \n92: \n93: def validate_php_extensions(ctx):\n94:     extns = ctx['ALL_PHP_EXTENSIONS'][ctx['PHP_VERSION']]\n95:     keep = []\n96:     for extn in ctx['PHP_EXTENSIONS']:\n97:         if extn in extns:\n98:             _log.debug('Extension [%s] validated.', extn)\n99:             keep.append(extn)\n100:         else:\n101:             _log.warn('Extension [%s] is not available!', extn)\n102:     ctx['PHP_EXTENSIONS'] = keep\n103: \n104: \n105: def convert_php_extensions(ctx):\n106:     _log.debug('Converting PHP extensions')\n107:     SKIP = ('cli', 'pear', 'cgi')\n108:     ctx['PHP_EXTENSIONS'] = \\\n109:         \"\\n\".join([\"extension=%s.so\" % ex\n110:                    for ex in ctx['PHP_EXTENSIONS'] if ex not in SKIP])\n111:     path = (ctx['PHP_VERSION'].startswith('5.4')) and \\\n112:         '@HOME/php/lib/php/extensions/no-debug-non-zts-20100525' or ''\n113:     ctx['ZEND_EXTENSIONS'] = \\\n114:         \"\\n\".join(['zend_extension=\"%s\"' % os.path.join(path, \"%s.so\" % ze)\n115:                    for ze in ctx['ZEND_EXTENSIONS']])\n116: \n117: \n118: def build_php_environment(ctx):\n119:     _log.debug('Building PHP environment variables')\n120:     ctx[\"PHP_ENV\"] = \\\n121:         \"\\n\".join([\"env[%s] = $%s\" % (k, k) for k in os.environ.keys()])\n122: \n123: \n124: def is_web_app(ctx):\n125:     return ctx.get('WEB_SERVER', '') != 'none'\n126: \n127: \n128: def find_stand_alone_app_to_run(ctx):\n129:     app = ctx.get('APP_START_CMD', None)\n130:     if not app:\n131:         possible_files = ('app.php', 'main.php', 'run.php', 'start.php')\n132:         for pf in possible_files:\n133:             if os.path.exists(os.path.join(ctx['BUILD_DIR'], pf)):\n134:                 app = pf\n135:                 break\n136:         if not app:\n137:             print 'Build pack could not find a PHP file to execute!'\n138:             _log.info('Build pack could not find a file to execute.  Either '\n139:                       'set \"APP_START_CMD\" or include one of these files [%s]',\n140:                       \", \".join(possible_files))\n141:             app = 'app.php'\n142:     return app",
+      "source_summary": "The pattern uses ctx['BUILD_DIR'] which appears to be the application build directory. The .bp-config directory within BUILD_DIR contains build configuration files.",
+      "sink_summary": "The filtering rule excludes files from being copied/moved to the web deployment directory (WEBDIR) when setting up a web application. Files matching the pattern are not deployed to the web server.",
+      "guard_summary": "The filtering occurs only for web applications (when WEB_SERVER != 'none'). Multiple exclusion patterns protect configuration files (.bp, .extensions, .bp-config, manifest.yml, LIBDIR) from web deployment. The FileUtil class applies regex pattern matching to filter files.",
+      "risk_pattern": "Modified exclusion pattern for .bp-config directory in web deployment filtering. The change adds an additional security control to prevent configuration files from being exposed via web server.",
+      "used_variable_sources": [
+        "ctx['BUILD_DIR']",
+        "ctx['WEBDIR']"
+      ],
+      "called_function_context": [
+        "FileUtil.where_name_does_not_match()",
+        "os.path.join()",
+        "is_web_app()"
+      ],
+      "enclosing_conditions": [
+        "if is_web_app(ctx):",
+        "if not os.path.exists(webdirPath):"
+      ],
+      "context_summary": "The function sets up web directory for PHP applications by copying files from BUILD_DIR to WEBDIR, excluding sensitive configuration directories and files using regex patterns. The change adds .bp-config to the exclusion list.",
+      "unresolved_facts": [
+        "How BUILD_DIR and WEBDIR context variables are initialized",
+        "Whether .bp-config contains sensitive credentials or configuration",
+        "The exact deployment environment and web server configuration"
+      ],
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 30.2583,
+          "raw_bm25_score": 30.2583,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/call/wrong-named-class-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.913,
+          "raw_bm25_score": 29.913,
+          "description": "Using a named argument whose name does not correspond to a parameter of the __init__ method of the class being instantiated, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "fallback/cwe-471-modification-of-assumed-immutable-data-maid",
+          "cwe_id": "CWE-471",
+          "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 19.7352,
+          "raw_bm25_score": 19.7352,
+          "description": "Security-critical data assumed immutable can be modified by an attacker.",
+          "pattern": "cwe-471 assumed-immutable immutable-data hidden-field cookie reverse-dns attacker-modified trusted-value mutable security-decision",
+          "remediation": "Do not trust client-modifiable values as immutable security state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-471"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/redos",
+          "cwe_id": "CWE-400",
+          "cwe_name": "Uncontrolled Resource Consumption",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 18.4308,
+          "raw_bm25_score": 18.4308,
+          "description": "A regular expression that requires exponential time to match certain inputs can be a performance bottleneck, and may be vulnerable to denial-of-service attacks.",
+          "pattern": "Look for operations that can consume excessive resources without proper limits or controls",
+          "remediation": "Implement resource consumption limits: memory limits, CPU time limits, connection limits. Use rate limiting and implement proper resource cleanup mechanisms.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1333",
+            "external/cwe/cwe-730",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/unicode-bypass-validation",
+          "cwe_id": "CWE-179",
+          "cwe_name": "Incorrect Behavior Order: Early Validation",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.4435,
+          "raw_bm25_score": 17.4435,
+          "description": "A Unicode transformation is using a remote user-controlled data. The transformation is a Unicode normalization using the algorithms \"NFC\" or \"NFKC\". In all cases, the security measures implemented or the logical validation performed to escape any injection characters, to validate using regex patterns or to perform string-based checks, before the Unicode transformation are **bypassable** by special Unicode characters.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement validation early in the processing pipeline. Ensure validation cannot be bypassed by alternate code paths. Use consistent validation across all entry points.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-176",
+            "external/cwe/cwe-179",
+            "external/cwe/cwe-180"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/csv-injection",
+          "cwe_id": "CWE-1236",
+          "cwe_name": "Improper Neutralization of Formula Elements in a CSV File",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.3942,
+          "raw_bm25_score": 17.3942,
+          "description": "From user-controlled data saved in CSV files, it is easy to attempt information disclosure or other malicious activities when automated by spreadsheet software",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-1236"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/weak-symmetric-encryption",
+          "cwe_id": "CWE-327",
+          "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.0076,
+          "raw_bm25_score": 17.0076,
+          "description": "Finds uses of symmetric cryptography algorithms that are weak, obsolete, or otherwise unaccepted. The key lengths allowed are 128, 192, and 256 bits. These are all the key lengths supported by AES, so any application of AES is considered acceptable.",
+          "pattern": "Identify usage of weak or deprecated cryptographic algorithms and practices",
+          "remediation": "Use modern cryptographic algorithms and proper key management. Avoid deprecated algorithms and implement proper random number generation.",
+          "tags": [
+            "external/cwe/cwe-327"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/client-exposed-cookie",
+          "cwe_id": "CWE-1004",
+          "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.0906,
+          "raw_bm25_score": 16.0906,
+          "description": "Cookies without the `HttpOnly` attribute set can be accessed by JS scripts, making them more vulnerable to XSS attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Set HttpOnly flag on session cookies to prevent JavaScript access. Also use Secure and SameSite attributes.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1004"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/incomplete-hostname-regexp",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.0724,
+          "raw_bm25_score": 16.0724,
+          "description": "Matching a URL or hostname against a regular expression that contains an unescaped dot as part of the hostname might match more hostnames than expected.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/shell-command-constructed-from-input",
+          "cwe_id": "CWE-78",
+          "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.7618,
+          "raw_bm25_score": 15.7618,
+          "description": "Using externally controlled strings in a command line may allow a malicious user to change the meaning of the command.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use safe command execution APIs with parameter arrays. Validate and sanitize command arguments against strict allowlists.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-088",
+            "external/cwe/cwe-073"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

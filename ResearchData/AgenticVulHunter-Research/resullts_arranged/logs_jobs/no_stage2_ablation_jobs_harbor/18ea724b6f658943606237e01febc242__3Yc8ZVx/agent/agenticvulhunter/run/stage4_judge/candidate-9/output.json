@@ -1,0 +1,155 @@
+{
+  "candidate_id": "candidate-9",
+  "filepath": "bottle.py",
+  "changed_line": 2465,
+  "statement": "self.lookup = [os.path.abspath(x) for x in lookup]",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "data_transformation",
+  "selection_reason": "observable input 'lookup' -> list comprehension with os.path.abspath() -> security-sensitive effect of template path resolution",
+  "security_relevance_score": 0.5,
+  "code_context": "2316:         :param port: Server port to bind to. Values below 1024 require root\n2317:                privileges. (default: 8080)\n2318:         :param reloader: Start auto-reloading server? (default: False)\n2319:         :param interval: Auto-reloader interval in seconds (default: 1)\n2320:         :param quiet: Suppress output to stdout and stderr? (default: False)\n2321:         :param options: Options passed to the server adapter.\n2322:      \"\"\"\n2323:     if NORUN: return\n2324:     if reloader and not os.environ.get('BOTTLE_CHILD'):\n2325:         try:\n2326:             fd, lockfile = tempfile.mkstemp(prefix='bottle.', suffix='.lock')\n2327:             os.close(fd) # We only need this file to exist. We never write to it\n2328:             while os.path.exists(lockfile):\n2329:                 args = [sys.executable] + sys.argv\n2330:                 environ = os.environ.copy()\n2331:                 environ['BOTTLE_CHILD'] = 'true'\n2332:                 environ['BOTTLE_LOCKFILE'] = lockfile\n2333:                 p = subprocess.Popen(args, env=environ)\n2334:                 while p.poll() is None: # Busy wait...\n2335:                     os.utime(lockfile, None) # I am alive!\n2336:                     time.sleep(interval)\n2337:                 if p.poll() != 3:\n2338:                     if os.path.exists(lockfile): os.unlink(lockfile)\n2339:                     sys.exit(p.poll())\n2340:         except KeyboardInterrupt:\n2341:             pass\n2342:         finally:\n2343:             if os.path.exists(lockfile):\n2344:                 os.unlink(lockfile)\n2345:         return\n2346: \n2347:     try:\n2348:         app = app or default_app()\n2349:         if isinstance(app, basestring):\n2350:             app = load_app(app)\n2351:         if not callable(app):\n2352:             raise ValueError(\"Application is not callable: %r\" % app)\n2353: \n2354:         for plugin in plugins or []:\n2355:             app.install(plugin)\n2356: \n2357:         if server in server_names:\n2358:             server = server_names.get(server)\n2359:         if isinstance(server, basestring):\n2360:             server = load(server)\n2361:         if isinstance(server, type):\n2362:             server = server(host=host, port=port, **kargs)\n2363:         if not isinstance(server, ServerAdapter):\n2364:             raise ValueError(\"Unknown or unsupported server: %r\" % server)\n2365: \n2366:         server.quiet = server.quiet or quiet\n2367:         if not server.quiet:\n2368:             _stderr(\"Bottle server starting up (using %s)...\\n\" % repr(server))\n2369:             _stderr(\"Listening on http://%s:%d/\\n\" % (server.host, server.port))\n2370:             _stderr(\"Hit Ctrl-C to quit.\\n\\n\")\n2371: \n2372:         if reloader:\n2373:             lockfile = os.environ.get('BOTTLE_LOCKFILE')\n2374:             bgcheck = FileCheckerThread(lockfile, interval)\n2375:             with bgcheck:\n2376:                 server.run(app)\n2377:             if bgcheck.status == 'reload':\n2378:                 sys.exit(3)\n2379:         else:\n2380:             server.run(app)\n2381:     except KeyboardInterrupt:\n2382:         pass\n2383:     except (SyntaxError, ImportError):\n2384:         if not reloader: raise\n2385:         if not getattr(server, 'quiet', False): print_exc()\n2386:         sys.exit(3)\n2387:     finally:\n2388:         if not getattr(server, 'quiet', False): stderr('Shutdown...\\n')\n2389: \n2390: \n2391: class FileCheckerThread(threading.Thread):\n2392:     ''' Interrupt main-thread as soon as a changed module file is detected,\n2393:         the lockfile gets deleted or gets to old. '''\n2394: \n2395:     def __init__(self, lockfile, interval):\n2396:         threading.Thread.__init__(self)\n2397:         self.lockfile, self.interval = lockfile, interval\n2398:         #: Is one of 'reload', 'error' or 'exit'\n2399:         self.status = None\n2400: \n2401:     def run(self):\n2402:         exists = os.path.exists\n2403:         mtime = lambda path: os.stat(path).st_mtime\n2404:         files = dict()\n2405: \n2406:         for module in sys.modules.values():\n2407:             path = getattr(module, '__file__', '')\n2408:             if path[-4:] in ('.pyo', '.pyc'): path = path[:-1]\n2409:             if path and exists(path): files[path] = mtime(path)\n2410: \n2411:         while not self.status:\n2412:             if not exists(self.lockfile)\\\n2413:             or mtime(self.lockfile) < time.time() - self.interval - 5:\n2414:                 self.status = 'error'\n2415:                 thread.interrupt_main()\n2416:             for path, lmtime in files.items():\n2417:                 if not exists(path) or mtime(path) > lmtime:\n2418:                     self.status = 'reload'\n2419:                     thread.interrupt_main()\n2420:                     break\n2421:             time.sleep(self.interval)\n2422:     \n2423:     def __enter__(self):\n2424:         self.start()\n2425:     \n2426:     def __exit__(self, exc_type, exc_val, exc_tb):\n2427:         if not self.status: self.status = 'exit' # silent exit\n2428:         self.join()\n2429:         return issubclass(exc_type, KeyboardInterrupt)\n2430: \n2431: \n2432: \n2433: \n2434: \n2435: ###############################################################################\n2436: # Template Adapters ############################################################\n2437: ###############################################################################\n2438: \n2439: \n2440: class TemplateError(HTTPError):\n2441:     def __init__(self, message):\n2442:         HTTPError.__init__(self, 500, message)\n2443: \n2444: \n2445: class BaseTemplate(object):\n2446:     \"\"\" Base class and minimal API for template adapters \"\"\"\n2447:     extensions = ['tpl','html','thtml','stpl']\n2448:     settings = {} #used in prepare()\n2449:     defaults = {} #used in render()\n2450: \n2451:     def __init__(self, source=None, name=None, lookup=[], encoding='utf8', **settings):\n2452:         \"\"\" Create a new template.\n2453:         If the source parameter (str or buffer) is missing, the name argument\n2454:         is used to guess a template filename. Subclasses can assume that\n2455:         self.source and/or self.filename are set. Both are strings.\n2456:         The lookup, encoding and settings parameters are stored as instance\n2457:         variables.\n2458:         The lookup parameter stores a list containing directory paths.\n2459:         The encoding parameter should be used to decode byte strings or files.\n2460:         The settings parameter contains a dict for engine-specific settings.\n2461:         \"\"\"\n2462:         self.name = name\n2463:         self.source = source.read() if hasattr(source, 'read') else source\n2464:         self.filename = source.filename if hasattr(source, 'filename') else None\n2465:         self.lookup = [os.path.abspath(x) for x in lookup]\n2466:         self.encoding = encoding\n2467:         self.settings = self.settings.copy() # Copy from class variable\n2468:         self.settings.update(settings) # Apply\n2469:         if not self.source and self.name:\n2470:             self.filename = self.search(self.name, self.lookup)\n2471:             if not self.filename:\n2472:                 raise TemplateError('Template %s not found.' % repr(name))\n2473:         if not self.source and not self.filename:\n2474:             raise TemplateError('No template specified.')\n2475:         self.prepare(**self.settings)\n2476: \n2477:     @classmethod\n2478:     def search(cls, name, lookup=[]):\n2479:         \"\"\" Search name in all directories specified in lookup.\n2480:         First without, then with common extensions. Return first hit. \"\"\"\n2481:         if os.path.isfile(name): return name\n2482:         for spath in lookup:\n2483:             fname = os.path.join(spath, name)\n2484:             if os.path.isfile(fname):\n2485:                 return fname\n2486:             for ext in cls.extensions:\n2487:                 if os.path.isfile('%s.%s' % (fname, ext)):\n2488:                     return '%s.%s' % (fname, ext)\n2489: \n2490:     @classmethod\n2491:     def global_config(cls, key, *args):\n2492:         ''' This reads or sets the global settings stored in class.settings. '''\n2493:         if args:\n2494:             cls.settings = cls.settings.copy() # Make settings local to class\n2495:             cls.settings[key] = args[0]\n2496:         else:\n2497:             return cls.settings[key]\n2498: \n2499:     def prepare(self, **options):\n2500:         \"\"\" Run preparations (parsing, caching, ...).\n2501:         It should be possible to call this again to refresh a template or to\n2502:         update settings.\n2503:         \"\"\"\n2504:         raise NotImplementedError\n2505: \n2506:     def render(self, *args, **kwargs):\n2507:         \"\"\" Render the template with the specified local variables and return\n2508:         a single byte or unicode string. If it is a byte string, the encoding\n2509:         must match self.encoding. This method must be thread-safe!\n2510:         Local variables may be provided in dictionaries (*args)\n2511:         or directly, as keywords (**kwargs).\n2512:         \"\"\"\n2513:         raise NotImplementedError\n2514: \n2515: \n2516: class MakoTemplate(BaseTemplate):\n2517:     def prepare(self, **options):\n2518:         from mako.template import Template\n2519:         from mako.lookup import TemplateLookup\n2520:         options.update({'input_encoding':self.encoding})\n2521:         options.setdefault('format_exceptions', bool(DEBUG))\n2522:         lookup = TemplateLookup(directories=self.lookup, **options)\n2523:         if self.source:\n2524:             self.tpl = Template(self.source, lookup=lookup, **options)\n2525:         else:\n2526:             self.tpl = Template(uri=self.name, filename=self.filename, lookup=lookup, **options)\n2527: \n2528:     def render(self, *args, **kwargs):\n2529:         for dictarg in args: kwargs.update(dictarg)\n2530:         _defaults = self.defaults.copy()\n2531:         _defaults.update(kwargs)\n2532:         return self.tpl.render(**_defaults)\n2533: \n2534: \n2535: class CheetahTemplate(BaseTemplate):\n2536:     def prepare(self, **options):\n2537:         from Cheetah.Template import Template\n2538:         self.context = threading.local()\n2539:         self.context.vars = {}\n2540:         options['searchList'] = [self.context.vars]\n2541:         if self.source:\n2542:             self.tpl = Template(source=self.source, **options)\n2543:         else:\n2544:             self.tpl = Template(file=self.filename, **options)\n2545: \n2546:     def render(self, *args, **kwargs):\n2547:         for dictarg in args: kwargs.update(dictarg)\n2548:         self.context.vars.update(self.defaults)\n2549:         self.context.vars.update(kwargs)\n2550:         out = str(self.tpl)\n2551:         self.context.vars.clear()\n2552:         return out\n2553: \n2554: \n2555: class Jinja2Template(BaseTemplate):\n2556:     def prepare(self, filters=None, tests=None, **kwargs):\n2557:         from jinja2 import Environment, FunctionLoader\n2558:         if 'prefix' in kwargs: # TODO: to be removed after a while\n2559:             raise RuntimeError('The keyword argument `prefix` has been removed. '\n2560:                 'Use the full jinja2 environment name line_statement_prefix instead.')\n2561:         self.env = Environment(loader=FunctionLoader(self.loader), **kwargs)\n2562:         if filters: self.env.filters.update(filters)\n2563:         if tests: self.env.tests.update(tests)\n2564:         if self.source:\n2565:             self.tpl = self.env.from_string(self.source)\n2566:         else:\n2567:             self.tpl = self.env.get_template(self.filename)\n2568: \n2569:     def render(self, *args, **kwargs):\n2570:         for dictarg in args: kwargs.update(dictarg)\n2571:         _defaults = self.defaults.copy()\n2572:         _defaults.update(kwargs)\n2573:         return self.tpl.render(**_defaults)\n2574: \n2575:     def loader(self, name):\n2576:         fname = self.search(name, self.lookup)\n2577:         if fname:\n2578:             with open(fname, \"rb\") as f:\n2579:                 return f.read().decode(self.encoding)\n2580: \n2581: \n2582: class SimpleTALTemplate(BaseTemplate):\n2583:     ''' Untested! '''\n2584:     def prepare(self, **options):\n2585:         from simpletal import simpleTAL\n2586:         # TODO: add option to load METAL files during render\n2587:         if self.source:\n2588:             self.tpl = simpleTAL.compileHTMLTemplate(self.source)\n2589:         else:\n2590:             with open(self.filename, 'rb') as fp:\n2591:                 self.tpl = simpleTAL.compileHTMLTemplate(tonat(fp.read()))\n2592: \n2593:     def render(self, *args, **kwargs):\n2594:         from simpletal import simpleTALES\n2595:         for dictarg in args: kwargs.update(dictarg)\n2596:         # TODO: maybe reuse a context instead of always creating one\n2597:         context = simpleTALES.Context()\n2598:         for k,v in self.defaults.items():\n2599:             context.addGlobal(k, v)\n2600:         for k,v in kwargs.items():\n2601:             context.addGlobal(k, v)\n2602:         output = StringIO()\n2603:         self.tpl.expand(context, output)\n2604:         return output.getvalue()\n2605: \n2606: \n2607: class SimpleTemplate(BaseTemplate):\n2608:     blocks = ('if', 'elif', 'else', 'try', 'except', 'finally', 'for', 'while',\n2609:               'with', 'def', 'class')\n2610:     dedent_blocks = ('elif', 'else', 'except', 'finally')\n2611: \n2612:     @lazy_attribute\n2613:     def re_pytokens(cls):\n2614:         ''' This matches comments and all kinds of quoted strings but does",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "Stage-2 evidence shows lookup paths are processed with os.path.abspath() without validation, enabling path traversal via malicious lookup directories",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-23",
+      "cwe_name": "Relative Path Traversal",
+      "fit_reason": "The lookup parameter contains user-controllable paths that can lead to accessing unexpected resources through relative path manipulation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-179",
+    "CWE-19",
+    "CWE-20",
+    "CWE-22",
+    "CWE-23",
+    "CWE-502",
+    "CWE-561",
+    "CWE-59",
+    "CWE-643",
+    "CWE-665",
+    "CWE-74",
+    "CWE-770",
+    "CWE-78"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-9",
+      "filepath": "bottle.py",
+      "changed_line": 2465,
+      "statement": "self.lookup = [os.path.abspath(x) for x in lookup]",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The code uses os.path.abspath() on user-provided lookup paths without validation, which allows path traversal attacks by resolving malicious paths outside of intended directories."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The lookup parameter comes from external input and is used in template resolution. The os.path.abspath() call resolves relative paths and symbolic links, but does not validate that the resulting path remains within a restricted directory."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted to not use os.path.abspath(), or if validation were added, it would prevent path traversal by ensuring paths remain within intended directories. The change introduces the vulnerability by enabling absolute path resolution without restriction."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "The code lacks a security control to validate that resolved paths remain within a restricted directory. No allowlist or canonical path validation is present to ensure lookup paths do not escape the intended template directory.",
+          "required_control": "Path validation or canonical path restriction",
+          "control_requirement_evidence": "CWE-22 requires that pathnames be limited to a restricted directory, which necessitates validating that resolved paths do not escape the intended scope.",
+          "existing_controls_checked": [
+            "os.path.abspath() - does not restrict paths to a specific directory",
+            "Template search logic in BaseTemplate.search() - uses resolved lookup paths without validation"
+          ],
+          "deficiency_evidence": "The code resolves user-provided lookup paths with os.path.abspath() but never checks if the resulting absolute path is within a safe directory, allowing traversal attacks."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "A malicious attacker could provide lookup paths that resolve to files outside of intended directories, potentially leading to unauthorized file access or code execution if templates are rendered with such paths."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, and lookup paths were not resolved with os.path.abspath(), then path traversal would be prevented because the paths would remain relative to the original lookup directory. Alternatively, if a validation step was added to ensure that resolved paths stay within a restricted directory, the vulnerability would also be mitigated.",
+      "supporting_evidence": [
+        "The lookup parameter is user-provided and used in template resolution",
+        "os.path.abspath() resolves relative paths and symbolic links without restriction",
+        "Template search logic uses resolved lookup paths without validation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the specific template engine used (Mako, Jinja2, etc.) actually renders files from these lookup paths",
+        "Whether downstream validation prevents the vulnerability in practice"
+      ],
+      "review_comment": "The code resolves user-provided lookup paths with os.path.abspath() without validating that they remain within a restricted directory. This allows path traversal attacks where malicious paths can resolve to files outside of intended directories. The fix is to validate resolved paths against a whitelist or ensure they stay within the intended template directory scope.",
+      "change_type": "A",
+      "raw_score": 0.7000000000000001,
+      "score": 0.7000000000000001
+    },
+    {
+      "candidate_id": "candidate-9",
+      "filepath": "bottle.py",
+      "changed_line": 2465,
+      "statement": "self.lookup = [os.path.abspath(x) for x in lookup]",
+      "cwe_id": "CWE-23",
+      "cwe_name": "Relative Path Traversal",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The code uses os.path.abspath() on user-provided lookup paths, which can be manipulated to traverse directories. The mechanism is present in the path resolution logic."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The lookup parameter comes from external input and is used in template path resolution. The connection is demonstrated through the BaseTemplate.__init__ method where lookup paths are processed, but the exact control flow to vulnerable sinks is not fully shown."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were removed or changed, the lookup paths would not be canonicalized using os.path.abspath(), potentially allowing relative path traversal attacks. The patch directly addresses the vulnerability by enforcing absolute path resolution."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The code uses os.path.abspath() which is a partial control, but it does not validate or sanitize the paths beyond canonicalization. There is no explicit check to ensure paths are within allowed directories.",
+          "required_control": "Path validation and directory restriction",
+          "control_requirement_evidence": "CWE-23 requires that path traversal be prevented by ensuring paths stay within a restricted directory, which os.path.abspath() alone does not guarantee.",
+          "existing_controls_checked": [
+            "os.path.abspath() usage",
+            "Template lookup path processing"
+          ],
+          "deficiency_evidence": "While os.path.abspath() resolves relative paths, it does not prevent access to files outside the intended directories. The code lacks checks to ensure paths are within allowed boundaries."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "The mechanism allows for path traversal but concrete impact is not demonstrated. Without explicit validation of lookup paths against a whitelist or allowed directory, the vulnerability could allow access to unintended files, though this is speculative without further evidence."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, lookup paths would not be canonicalized using os.path.abspath(), potentially allowing relative path traversal attacks by enabling access to files outside intended directories.",
+      "supporting_evidence": [
+        "The lookup parameter is user-controllable and used in template path resolution",
+        "os.path.abspath() is used to resolve paths but does not enforce directory restrictions"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the lookup paths are validated against a whitelist or allowed directories",
+        "Whether downstream validation prevents access to unintended files",
+        "Concrete impact of path traversal in this specific context"
+      ],
+      "review_comment": "The code resolves user-provided lookup paths using os.path.abspath(), which addresses relative path traversal by canonicalizing paths. However, the mechanism lacks explicit validation to ensure paths remain within allowed directories. This could still allow access to unintended files if lookup paths point outside intended boundaries. Add directory restriction checks to prevent path traversal beyond designated areas.",
+      "change_type": "A",
+      "raw_score": 0.6,
+      "score": 0.6
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,263 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/send.js",
+      "changed_line": 400,
+      "statement": "if (path.substr(0, root.length) !== root) {",
+      "change_type": "A",
+      "function_name": "SendStream.prototype.pipe",
+      "operation_type": "path_validation",
+      "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+      "security_relevance_score": 0.8,
+      "code_context": "251:   return this.req.headers['if-none-match']\n252:     || this.req.headers['if-modified-since'];\n253: };\n254: \n255: /**\n256:  * Strip content-* header fields.\n257:  *\n258:  * @api private\n259:  */\n260: \n261: SendStream.prototype.removeContentHeaderFields = function(){\n262:   var res = this.res;\n263:   Object.keys(res._headers).forEach(function(field){\n264:     if (0 == field.indexOf('content')) {\n265:       res.removeHeader(field);\n266:     }\n267:   });\n268: };\n269: \n270: /**\n271:  * Respond with 304 not modified.\n272:  *\n273:  * @api private\n274:  */\n275: \n276: SendStream.prototype.notModified = function(){\n277:   var res = this.res;\n278:   debug('not modified');\n279:   this.removeContentHeaderFields();\n280:   res.statusCode = 304;\n281:   res.end();\n282: };\n283: \n284: /**\n285:  * Raise error that headers already sent.\n286:  *\n287:  * @api private\n288:  */\n289: \n290: SendStream.prototype.headersAlreadySent = function headersAlreadySent(){\n291:   var err = new Error('Can\\'t set headers after they are sent.');\n292:   debug('headers already sent');\n293:   this.error(500, err);\n294: };\n295: \n296: /**\n297:  * Check if the request is cacheable, aka\n298:  * responded with 2xx or 304 (see RFC 2616 section 14.2{5,6}).\n299:  *\n300:  * @return {Boolean}\n301:  * @api private\n302:  */\n303: \n304: SendStream.prototype.isCachable = function(){\n305:   var res = this.res;\n306:   return (res.statusCode >= 200 && res.statusCode < 300) || 304 == res.statusCode;\n307: };\n308: \n309: /**\n310:  * Handle stat() error.\n311:  *\n312:  * @param {Error} err\n313:  * @api private\n314:  */\n315: \n316: SendStream.prototype.onStatError = function(err){\n317:   var notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR'];\n318:   if (~notfound.indexOf(err.code)) return this.error(404, err);\n319:   this.error(500, err);\n320: };\n321: \n322: /**\n323:  * Check if the cache is fresh.\n324:  *\n325:  * @return {Boolean}\n326:  * @api private\n327:  */\n328: \n329: SendStream.prototype.isFresh = function(){\n330:   return fresh(this.req.headers, this.res._headers);\n331: };\n332: \n333: /**\n334:  * Check if the range is fresh.\n335:  *\n336:  * @return {Boolean}\n337:  * @api private\n338:  */\n339: \n340: SendStream.prototype.isRangeFresh = function isRangeFresh(){\n341:   var ifRange = this.req.headers['if-range'];\n342: \n343:   if (!ifRange) return true;\n344: \n345:   return ~ifRange.indexOf('\"')\n346:     ? ~ifRange.indexOf(this.res._headers['etag'])\n347:     : Date.parse(this.res._headers['last-modified']) <= Date.parse(ifRange);\n348: };\n349: \n350: /**\n351:  * Redirect to `path`.\n352:  *\n353:  * @param {String} path\n354:  * @api private\n355:  */\n356: \n357: SendStream.prototype.redirect = function(path){\n358:   if (listenerCount(this, 'directory') !== 0) {\n359:     return this.emit('directory');\n360:   }\n361: \n362:   if (this.hasTrailingSlash()) return this.error(403);\n363:   var res = this.res;\n364:   path += '/';\n365:   res.statusCode = 301;\n366:   res.setHeader('Content-Type', 'text/html; charset=utf-8');\n367:   res.setHeader('Location', path);\n368:   res.end('Redirecting to <a href=\"' + escapeHtml(path) + '\">' + escapeHtml(path) + '</a>\\n');\n369: };\n370: \n371: /**\n372:  * Pipe to `res.\n373:  *\n374:  * @param {Stream} res\n375:  * @return {Stream} res\n376:  * @api public\n377:  */\n378: \n379: SendStream.prototype.pipe = function(res){\n380:   var self = this\n381:     , args = arguments\n382:     , root = this._root;\n383: \n384:   // references\n385:   this.res = res;\n386: \n387:   // decode the path\n388:   var path = utils.decode(this.path)\n389:   if (path === -1) return this.error(400)\n390: \n391:   // null byte(s)\n392:   if (~path.indexOf('\\0')) return this.error(400);\n393: \n394:   var parts\n395:   if (root !== null) {\n396:     // join / normalize from optional root dir\n397:     path = normalize(join(root, path))\n398: \n399:     // malicious path\n400:     if (path.substr(0, root.length) !== root) {\n401:       debug('malicious path \"%s\"', path)\n402:       return this.error(403)\n403:     }\n404: \n405:     // explode path parts\n406:     parts = path.substr(root.length + 1).split(sep)\n407:   } else {\n408:     // \"..\" is malicious without \"root\"\n409:     if (upPathRegexp.test(path)) {\n410:       debug('malicious path \"%s\"', path)\n411:       return this.error(403)\n412:     }\n413: \n414:     // explode path parts\n415:     parts = normalize(path).split(sep)\n416: \n417:     // resolve the path\n418:     path = resolve(path)\n419:   }\n420: \n421:   // dotfile handling\n422:   if (containsDotFile(parts)) {\n423:     var access = this._hidden\n424:       ? 'allow'\n425:       : 'ignore'\n426: \n427:     debug('%s dotfile \"%s\"', access, path)\n428:     switch (access) {\n429:       case 'allow':\n430:         break\n431:       case 'ignore':\n432:       default:\n433:         return this.error(404)\n434:     }\n435:   }\n436: \n437:   // index file support\n438:   if (this._index.length && this.hasTrailingSlash()) {\n439:     this.sendIndex(path);\n440:     return res;\n441:   }\n442: \n443:   debug('stat \"%s\"', path);\n444:   fs.stat(path, function(err, stat){\n445:     if (err) return self.onStatError(err);\n446:     if (stat.isDirectory()) return self.redirect(self.path);\n447:     self.emit('file', path, stat);\n448:     self.send(path, stat);\n449:   });\n450: \n451:   return res;\n452: };\n453: \n454: /**\n455:  * Transfer `path`.\n456:  *\n457:  * @param {String} path\n458:  * @api public\n459:  */\n460: \n461: SendStream.prototype.send = function(path, stat){\n462:   var options = this.options;\n463:   var len = stat.size;\n464:   var res = this.res;\n465:   var req = this.req;\n466:   var ranges = req.headers.range;\n467:   var offset = options.start || 0;\n468: \n469:   if (res._header) {\n470:     // impossible to send now\n471:     return this.headersAlreadySent();\n472:   }\n473: \n474:   debug('pipe \"%s\"', path)\n475: \n476:   // set header fields\n477:   this.setHeader(path, stat);\n478: \n479:   // set content-type\n480:   this.type(path);\n481: \n482:   // conditional GET support\n483:   if (this.isConditionalGET()\n484:     && this.isCachable()\n485:     && this.isFresh()) {\n486:     return this.notModified();\n487:   }\n488: \n489:   // adjust len to start/end options\n490:   len = Math.max(0, len - offset);\n491:   if (options.end !== undefined) {\n492:     var bytes = options.end - offset + 1;\n493:     if (len > bytes) len = bytes;\n494:   }\n495: \n496:   // Range support\n497:   if (ranges) {\n498:     ranges = parseRange(len, ranges);\n499: \n500:     // If-Range support\n501:     if (!this.isRangeFresh()) {\n502:       debug('range stale');\n503:       ranges = -2;\n504:     }\n505: \n506:     // unsatisfiable\n507:     if (-1 == ranges) {\n508:       debug('range unsatisfiable');\n509:       res.setHeader('Content-Range', 'bytes */' + stat.size);\n510:       return this.error(416);\n511:     }\n512: \n513:     // valid (syntactically invalid/multiple ranges are treated as a regular response)\n514:     if (-2 != ranges && ranges.length === 1) {\n515:       debug('range %j', ranges);\n516: \n517:       options.start = offset + ranges[0].start;\n518:       options.end = offset + ranges[0].end;\n519: \n520:       // Content-Range\n521:       res.statusCode = 206;\n522:       res.setHeader('Content-Range', 'bytes '\n523:         + ranges[0].start\n524:         + '-'\n525:         + ranges[0].end\n526:         + '/'\n527:         + len);\n528:       len = options.end - options.start + 1;\n529:     }\n530:   }\n531: \n532:   // content-length\n533:   res.setHeader('Content-Length', len);\n534: \n535:   // HEAD support\n536:   if ('HEAD' == req.method) return res.end();\n537: \n538:   this.stream(path, options);\n539: };\n540: \n541: /**\n542:  * Transfer index for `path`.\n543:  *\n544:  * @param {String} path\n545:  * @api private\n546:  */\n547: SendStream.prototype.sendIndex = function sendIndex(path){\n548:   var i = -1;\n549:   var self = this;",
+      "source_summary": "The 'root' variable originates from 'this._root', which is initialized in the SendStream constructor from 'options.root' (line 106). The 'options.root' value comes from user-provided configuration when creating a SendStream instance.",
+      "sink_summary": "If the validation fails, the function calls 'this.error(403)' which sends a 403 Forbidden response to the client.",
+      "guard_summary": "The guard is a path traversal check that compares the beginning of the normalized path with the root directory. It's effective in preventing access outside the intended directory when 'root' is properly set.",
+      "risk_pattern": "Path traversal vulnerability check: The code validates that a constructed file path starts with the configured root directory to prevent access to files outside the intended directory scope.",
+      "used_variable_sources": [
+        "this._root",
+        "options.root"
+      ],
+      "called_function_context": [],
+      "enclosing_conditions": [
+        "if (root !== null) {"
+      ],
+      "context_summary": "The code validates that a file path constructed from user input and a configured root directory does not escape the root directory. If it does, a 403 error is returned.",
+      "unresolved_facts": [
+        "The exact source of 'options.root' in the application context is not fully traced - it could come from various configuration sources or user inputs",
+        "Whether 'options.root' is validated or sanitized before being passed to SendStream constructor"
+      ],
+      "retrieval_query": {
+        "source": "user-provided configuration 'options.root'",
+        "sensitive_operation": "path validation check",
+        "missing_control": "validation of root directory path",
+        "mechanism_keywords": [
+          "path traversal",
+          "directory traversal",
+          "root directory",
+          "path prefix"
+        ]
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/zipslip",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 33.4616,
+          "raw_bm25_score": 33.4616,
+          "description": "Extracting files from a malicious ZIP file, or similar type of archive, without validating that the destination file path is within the destination directory can allow an attacker to unexpectedly gain access to resources.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/useless-regexp-character-escape",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.4629,
+          "raw_bm25_score": 29.4629,
+          "description": "Prepending a backslash to an ordinary character in a string does not have any effect, and may make regular expressions constructed from this string behave unexpectedly.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/function-declaration-conflict",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.7932,
+          "raw_bm25_score": 24.7932,
+          "description": "If two functions with the same name are declared in the same scope, one of the declarations overrides the other without warning. This makes the code hard to read and maintain, and may even lead to platform-dependent behavior.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/client-exposed-cookie",
+          "cwe_id": "CWE-1004",
+          "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.3756,
+          "raw_bm25_score": 24.3756,
+          "description": "Sensitive cookies set by a server can be read by the client if the `httpOnly` flag is not set.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Set HttpOnly flag on session cookies to prevent JavaScript access. Also use Secure and SameSite attributes.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1004"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/eval-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.0192,
+          "raw_bm25_score": 23.0192,
+          "description": "The 'eval' function and the 'Function' constructor execute strings as code. This is dangerous and impedes program analysis and understanding. Consequently, these two functions should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "fallback/cwe-119-improper-restriction-of-operations-within-the-bounds-of-a-memory-buffer",
+          "cwe_id": "CWE-119",
+          "cwe_name": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 22.3107,
+          "raw_bm25_score": 22.3107,
+          "description": "Memory operations access outside the intended buffer boundary.",
+          "pattern": "cwe-119 memory-buffer bounds pointer overflow underflow memcpy strcpy allocation index length out-of-bounds read write",
+          "remediation": "Validate buffer sizes, offsets, indexes, and memory-copy lengths.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-119"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/insecure-helmet-configuration",
+          "cwe_id": "CWE-693",
+          "cwe_name": "Protection Mechanism Failure",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.8765,
+          "raw_bm25_score": 21.8765,
+          "description": "The Helmet middleware is used to set security-related HTTP headers in Express applications. This query finds instances where the middleware is configured with important security features disabled.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-693",
+            "external/cwe/cwe-1021"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/missing-x-frame-options",
+          "cwe_id": "CWE-829",
+          "cwe_name": "Inclusion of Functionality from Untrusted Control Sphere",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.09,
+          "raw_bm25_score": 20.09,
+          "description": "If the 'X-Frame-Options' setting is not provided, a malicious user may be able to overlay their own UI on top of the site by using an iframe.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-451",
+            "external/cwe/cwe-829"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/misleading-indentation-after-control-statement",
+          "cwe_id": "CWE-483",
+          "cwe_name": "Incorrect Block Delimitation",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.896,
+          "raw_bm25_score": 19.896,
+          "description": "The body of a control statement should have appropriate indentation to clarify which statements it controls and which ones it does not control.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-483. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "readability",
+            "statistical",
+            "non-attributable"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/password-in-configuration-file",
+          "cwe_id": "CWE-260",
+          "cwe_name": "Password in Configuration File",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 18.2903,
+          "raw_bm25_score": 18.2903,
+          "description": "Storing unencrypted passwords in configuration files is unsafe.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-260. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-256",
+            "external/cwe/cwe-260",
+            "external/cwe/cwe-313",
+            "external/cwe/cwe-522"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,262 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/ejs.js",
+      "changed_line": 276,
+      "statement": "if (p == 'root') {",
+      "change_type": "A",
+      "function_name": "cpOptsInData",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "observable input 'root' option from data object -> conditional early return to prevent setting root option -> security-sensitive effect of preventing potential remote code execution via include directory reset",
+      "security_relevance_score": 0.85,
+      "code_context": "127:  * Get the template from a string or a file, either compiled on-the-fly or\n128:  * read from cache (if enabled), and cache the template if needed.\n129:  *\n130:  * If `template` is not set, the file specified in `options.filename` will be\n131:  * read.\n132:  *\n133:  * If `options.cache` is true, this function reads the file from\n134:  * `options.filename` so it must be set prior to calling this function.\n135:  *\n136:  * @memberof module:ejs-internal\n137:  * @param {Options} options   compilation options\n138:  * @param {String} [template] template source\n139:  * @return {(TemplateFunction|ClientFunction)}\n140:  * Depending on the value of `options.client`, either type might be returned.\n141:  * @static\n142:  */\n143: \n144: function handleCache(options, template) {\n145:   var func;\n146:   var filename = options.filename;\n147:   var hasTemplate = arguments.length > 1;\n148: \n149:   if (options.cache) {\n150:     if (!filename) {\n151:       throw new Error('cache option requires a filename');\n152:     }\n153:     func = exports.cache.get(filename);\n154:     if (func) {\n155:       return func;\n156:     }\n157:     if (!hasTemplate) {\n158:       template = fs.readFileSync(filename).toString().replace(_BOM, '');\n159:     }\n160:   }\n161:   else if (!hasTemplate) {\n162:     // istanbul ignore if: should not happen at all\n163:     if (!filename) {\n164:       throw new Error('Internal EJS error: no file name or template '\n165:                     + 'provided');\n166:     }\n167:     template = fs.readFileSync(filename).toString().replace(_BOM, '');\n168:   }\n169:   func = exports.compile(template, options);\n170:   if (options.cache) {\n171:     exports.cache.set(filename, func);\n172:   }\n173:   return func;\n174: }\n175: \n176: /**\n177:  * Get the template function.\n178:  *\n179:  * If `options.cache` is `true`, then the template is cached.\n180:  *\n181:  * @memberof module:ejs-internal\n182:  * @param {String}  path    path for the specified file\n183:  * @param {Options} options compilation options\n184:  * @return {(TemplateFunction|ClientFunction)}\n185:  * Depending on the value of `options.client`, either type might be returned\n186:  * @static\n187:  */\n188: \n189: function includeFile(path, options) {\n190:   var opts = utils.shallowCopy({}, options);\n191:   opts.filename = getIncludePath(path, opts);\n192:   return handleCache(opts);\n193: }\n194: \n195: /**\n196:  * Get the JavaScript source of an included file.\n197:  *\n198:  * @memberof module:ejs-internal\n199:  * @param {String}  path    path for the specified file\n200:  * @param {Options} options compilation options\n201:  * @return {Object}\n202:  * @static\n203:  */\n204: \n205: function includeSource(path, options) {\n206:   var opts = utils.shallowCopy({}, options);\n207:   var includePath;\n208:   var template;\n209:   includePath = getIncludePath(path,opts);\n210:   template = fs.readFileSync(includePath).toString().replace(_BOM, '');\n211:   opts.filename = includePath;\n212:   var templ = new Template(template, opts);\n213:   templ.generateSource();\n214:   return {\n215:     source: templ.source,\n216:     filename: includePath,\n217:     template: template\n218:   };\n219: }\n220: \n221: /**\n222:  * Re-throw the given `err` in context to the `str` of ejs, `filename`, and\n223:  * `lineno`.\n224:  *\n225:  * @implements RethrowCallback\n226:  * @memberof module:ejs-internal\n227:  * @param {Error}  err      Error object\n228:  * @param {String} str      EJS source\n229:  * @param {String} filename file name of the EJS file\n230:  * @param {String} lineno   line number of the error\n231:  * @static\n232:  */\n233: \n234: function rethrow(err, str, filename, lineno){\n235:   var lines = str.split('\\n');\n236:   var start = Math.max(lineno - 3, 0);\n237:   var end = Math.min(lines.length, lineno + 3);\n238:   // Error context\n239:   var context = lines.slice(start, end).map(function (line, i){\n240:     var curr = i + start + 1;\n241:     return (curr == lineno ? ' >> ' : '    ')\n242:       + curr\n243:       + '| '\n244:       + line;\n245:   }).join('\\n');\n246: \n247:   // Alter exception message\n248:   err.path = filename;\n249:   err.message = (filename || 'ejs') + ':'\n250:     + lineno + '\\n'\n251:     + context + '\\n\\n'\n252:     + err.message;\n253: \n254:   throw err;\n255: }\n256: \n257: /**\n258:  * Copy properties in data object that are recognized as options to an\n259:  * options object.\n260:  *\n261:  * This is used for compatibility with earlier versions of EJS and Express.js.\n262:  *\n263:  * @memberof module:ejs-internal\n264:  * @param {Object}  data data object\n265:  * @param {Options} opts options object\n266:  * @static\n267:  */\n268: \n269: function cpOptsInData(data, opts) {\n270:   _OPTS.forEach(function (p) {\n271:     if (typeof data[p] != 'undefined') {\n272:       // Disallow setting the root opt for includes via a passed data obj\n273:       // Unsanitized, parameterized use of `render` could allow the\n274:       // include directory to be reset, opening up the possibility of\n275:       // remote code execution\n276:       if (p == 'root') {\n277:         return;\n278:       }\n279:       opts[p] = data[p];\n280:     }\n281:   });\n282: }\n283: \n284: /**\n285:  * Compile the given `str` of ejs into a template function.\n286:  *\n287:  * @param {String}  template EJS template\n288:  *\n289:  * @param {Options} opts     compilation options\n290:  *\n291:  * @return {(TemplateFunction|ClientFunction)}\n292:  * Depending on the value of `opts.client`, either type might be returned.\n293:  * @public\n294:  */\n295: \n296: exports.compile = function compile(template, opts) {\n297:   var templ;\n298: \n299:   // v1 compat\n300:   // 'scope' is 'context'\n301:   // FIXME: Remove this in a future version\n302:   if (opts && opts.scope) {\n303:     if (!scopeOptionWarned){\n304:       console.warn('`scope` option is deprecated and will be removed in EJS 3');\n305:       scopeOptionWarned = true;\n306:     }\n307:     if (!opts.context) {\n308:       opts.context = opts.scope;\n309:     }\n310:     delete opts.scope;\n311:   }\n312:   templ = new Template(template, opts);\n313:   return templ.compile();\n314: };\n315: \n316: /**\n317:  * Render the given `template` of ejs.\n318:  *\n319:  * If you would like to include options but not data, you need to explicitly\n320:  * call this function with `data` being an empty object or `null`.\n321:  *\n322:  * @param {String}   template EJS template\n323:  * @param {Object}  [data={}] template data\n324:  * @param {Options} [opts={}] compilation and rendering options\n325:  * @return {String}\n326:  * @public\n327:  */\n328: \n329: exports.render = function (template, d, o) {\n330:   var data = d || {};\n331:   var opts = o || {};\n332: \n333:   // No options object -- if there are optiony names\n334:   // in the data, copy them to options\n335:   if (arguments.length == 2) {\n336:     cpOptsInData(data, opts);\n337:   }\n338: \n339:   return handleCache(opts, template)(data);\n340: };\n341: \n342: /**\n343:  * Render an EJS file at the given `path` and callback `cb(err, str)`.\n344:  *\n345:  * If you would like to include options but not data, you need to explicitly\n346:  * call this function with `data` being an empty object or `null`.\n347:  *\n348:  * @param {String}             path     path to the EJS file\n349:  * @param {Object}            [data={}] template data\n350:  * @param {Options}           [opts={}] compilation and rendering options\n351:  * @param {RenderFileCallback} cb callback\n352:  * @public\n353:  */\n354: \n355: exports.renderFile = function () {\n356:   var args = Array.prototype.slice.call(arguments);\n357:   var filename = args.shift();\n358:   var cb = args.pop();\n359:   var data = args.shift() || {};\n360:   var opts = args.pop() || {};\n361:   var result;\n362: \n363:   // Don't pollute passed in opts obj with new vals\n364:   opts = utils.shallowCopy({}, opts);\n365: \n366:   // No options object -- if there are optiony names\n367:   // in the data, copy them to options\n368:   if (arguments.length == 3) {\n369:     // Express 4\n370:     if (data.settings && data.settings['view options']) {\n371:       cpOptsInData(data.settings['view options'], opts);\n372:     }\n373:     // Express 3 and lower\n374:     else {\n375:       cpOptsInData(data, opts);\n376:     }\n377:   }\n378:   opts.filename = filename;\n379: \n380:   try {\n381:     result = handleCache(opts)(data);\n382:   }\n383:   catch(err) {\n384:     return cb(err);\n385:   }\n386:   return cb(null, result);\n387: };\n388: \n389: /**\n390:  * Clear intermediate JavaScript cache. Calls {@link Cache#reset}.\n391:  * @public\n392:  */\n393: \n394: exports.clearCache = function () {\n395:   exports.cache.reset();\n396: };\n397: \n398: function Template(text, opts) {\n399:   opts = opts || {};\n400:   var options = {};\n401:   this.templateText = text;\n402:   this.mode = null;\n403:   this.truncate = false;\n404:   this.currentLine = 1;\n405:   this.source = '';\n406:   this.dependencies = [];\n407:   options.client = opts.client || false;\n408:   options.escapeFunction = opts.escape || utils.escapeXML;\n409:   options.compileDebug = opts.compileDebug !== false;\n410:   options.debug = !!opts.debug;\n411:   options.filename = opts.filename;\n412:   options.delimiter = opts.delimiter || exports.delimiter || _DEFAULT_DELIMITER;\n413:   options.strict = opts.strict || false;\n414:   options.context = opts.context;\n415:   options.cache = opts.cache || false;\n416:   options.rmWhitespace = opts.rmWhitespace;\n417:   options.root = opts.root;\n418:   options.localsName = opts.localsName || exports.localsName || _DEFAULT_LOCALS_NAME;\n419: \n420:   if (options.strict) {\n421:     options._with = false;\n422:   }\n423:   else {\n424:     options._with = typeof opts._with != 'undefined' ? opts._with : true;\n425:   }",
+      "source_summary": "The function cpOptsInData receives data and opts objects as parameters. The data object can contain option values that are copied to the opts object, with the exception of 'root' which is explicitly skipped.",
+      "sink_summary": "The 'root' option, when set, affects how absolute paths in includes are resolved via the resolveInclude function. If an attacker-controlled value were allowed to set this option, it could potentially allow inclusion of files outside the intended directory, leading to remote code execution.",
+      "guard_summary": "The guard is effective: when p equals 'root', the function returns early without copying the value from data to opts, preventing potential exploitation through user-provided data.",
+      "risk_pattern": "An attacker-provided value for the 'root' option in a data object could allow control over file inclusion paths if not properly restricted. The code explicitly prevents this by skipping the 'root' option during data-to-options copying.",
+      "used_variable_sources": [
+        "data",
+        "opts"
+      ],
+      "called_function_context": [
+        "cpOptsInData(data, opts)"
+      ],
+      "enclosing_conditions": [
+        "if (arguments.length == 2) {",
+        "if (data.settings && data.settings['view options']) {"
+      ],
+      "context_summary": "The cpOptsInData function is called from both render() and renderFile() functions. In render(), it's called when only template and data are provided (arguments.length == 2). In renderFile(), it's called in two scenarios: when Express.js settings are present or when general data is passed. The 'root' option is explicitly excluded from being copied from data to opts to prevent potential remote code execution via include directory manipulation.",
+      "unresolved_facts": [
+        "The exact mechanism by which resolveInclude uses the root option to determine file inclusion paths is not fully detailed in the provided context.",
+        "Whether there are other functions or code paths that could allow setting the 'root' option directly without going through cpOptsInData."
+      ],
+      "retrieval_query": {
+        "sensitive_operation": "setting root option for file inclusion paths",
+        "mechanism_keywords": [
+          "root option",
+          "include directory",
+          "file path resolution"
+        ]
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/template-object-injection",
+          "cwe_id": "CWE-94",
+          "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 41.271,
+          "raw_bm25_score": 41.271,
+          "description": "Instantiating a template using a user-controlled object is vulnerable to local file read and potential remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-073",
+            "external/cwe/cwe-094"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/missing-x-frame-options",
+          "cwe_id": "CWE-829",
+          "cwe_name": "Inclusion of Functionality from Untrusted Control Sphere",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 38.2934,
+          "raw_bm25_score": 38.2934,
+          "description": "If the 'X-Frame-Options' setting is not provided, a malicious user may be able to overlay their own UI on top of the site by using an iframe.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-451",
+            "external/cwe/cwe-829"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/zipslip",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 35.9303,
+          "raw_bm25_score": 35.9303,
+          "description": "Extracting files from a malicious ZIP file, or similar type of archive, without validating that the destination file path is within the destination directory can allow an attacker to unexpectedly gain access to resources.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/eval-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 35.1577,
+          "raw_bm25_score": 35.1577,
+          "description": "The 'eval' function and the 'Function' constructor execute strings as code. This is dangerous and impedes program analysis and understanding. Consequently, these two functions should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/count-untrusted-data-external-api",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 32.5346,
+          "raw_bm25_score": 32.5346,
+          "description": "This reports the external APIs that are used with untrusted data, along with how frequently the API is called, and how many unique sources of untrusted data flow to it.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/function-declaration-conflict",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.0374,
+          "raw_bm25_score": 27.0374,
+          "description": "If two functions with the same name are declared in the same scope, one of the declarations overrides the other without warning. This makes the code hard to read and maintain, and may even lead to platform-dependent behavior.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/prototype-pollution",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.1672,
+          "raw_bm25_score": 26.1672,
+          "description": "Recursively merging a user-controlled object into another object can allow an attacker to modify the built-in Object prototype, and possibly escalate to remote code execution or cross-site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-094",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/insecure-temporary-file",
+          "cwe_id": "CWE-378",
+          "cwe_name": "Creation of Temporary File With Insecure Permissions",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.7892,
+          "raw_bm25_score": 25.7892,
+          "description": "Creating a temporary file that is accessible by other users can lead to information disclosure and sometimes remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-378. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "external/cwe/cwe-377",
+            "external/cwe/cwe-378",
+            "security"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/path-injection",
+          "cwe_id": "CWE-23",
+          "cwe_name": "Relative Path Traversal",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.2478,
+          "raw_bm25_score": 23.2478,
+          "description": "Accessing paths influenced by users can allow an attacker to access unexpected resources.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-023. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-022",
+            "external/cwe/cwe-023",
+            "external/cwe/cwe-036",
+            "external/cwe/cwe-073"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/session-fixation",
+          "cwe_id": "CWE-384",
+          "cwe_name": "Session Fixation",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.2288,
+          "raw_bm25_score": 23.2288,
+          "description": "Reusing an existing session as a different user could allow an attacker to access someone else's account by using their session.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-384"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

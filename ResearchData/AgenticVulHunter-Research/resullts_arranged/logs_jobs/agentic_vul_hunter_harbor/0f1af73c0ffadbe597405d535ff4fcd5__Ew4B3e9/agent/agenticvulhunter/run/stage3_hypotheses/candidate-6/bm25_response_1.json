@@ -1,0 +1,248 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 117,
+      "statement": "return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})",
+      "change_type": "A",
+      "function_name": "DeviceUpdateView.get_success_url",
+      "operation_type": "url_construction",
+      "selection_reason": "user ID from request -> URL construction -> potential bypass of authorization checks",
+      "security_relevance_score": 0.65,
+      "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+      "source_summary": "The user ID comes from self.request.user.id, which is the authenticated user's ID from the HTTP request.",
+      "sink_summary": "The constructed URL points to the 'wagtail_2fa_device_list' view with a user_id parameter that determines which user's devices are displayed.",
+      "guard_summary": "The DeviceUpdateView.get_queryset method correctly filters devices for the current user (self.request.user), but the get_success_url method constructs a URL that uses self.request.user.id without checking if the user has authorization to access another user's device list page. There is no explicit authorization check in the success URL construction.",
+      "risk_pattern": "The DeviceUpdateView.get_success_url method constructs a redirect URL using the current user's ID, but does not validate that the user has authorization to view the device list for that specific user. This could potentially allow a user to construct a URL that redirects them to another user's device list page if they know or guess the target user's ID.",
+      "used_variable_sources": [
+        "self.request.user.id"
+      ],
+      "called_function_context": [
+        "reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})"
+      ],
+      "enclosing_conditions": [],
+      "context_summary": "DeviceUpdateView inherits from UpdateView and has a get_queryset method that properly filters devices for the current user. The get_success_url method constructs a URL to redirect to the device list page, but uses the current user's ID directly without authorization validation.",
+      "unresolved_facts": [
+        "Whether there are any additional authorization checks or middleware that might prevent access to other users' device lists",
+        "If the application has specific policies about cross-user access to 2FA device management"
+      ],
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-863-incorrect-authorization",
+          "cwe_id": "CWE-863",
+          "cwe_name": "Incorrect Authorization",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 28.4487,
+          "raw_bm25_score": 28.4487,
+          "description": "An authorization check exists but evaluates access incorrectly.",
+          "pattern": "cwe-863 incorrect-authorization authorization-check permission-check role-check ownership-check acl-check access-decision bypass",
+          "remediation": "Evaluate authorization from trusted server-side identity and policy state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-863"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/call/wrong-named-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.1896,
+          "raw_bm25_score": 23.1896,
+          "description": "Using a named argument whose name does not correspond to a parameter of the called function or method, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.8159,
+          "raw_bm25_score": 22.8159,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/pam-auth-bypass",
+          "cwe_id": "CWE-285",
+          "cwe_name": "Improper Authorization",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.7978,
+          "raw_bm25_score": 20.7978,
+          "description": "Not using `pam_acct_mgmt` after `pam_authenticate` to check the validity of a login can lead to authorization bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-285"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 19.7661,
+          "raw_bm25_score": 19.7661,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 19.7217,
+          "raw_bm25_score": 19.7217,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/unicode-bypass-validation",
+          "cwe_id": "CWE-179",
+          "cwe_name": "Incorrect Behavior Order: Early Validation",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.9009,
+          "raw_bm25_score": 16.9009,
+          "description": "A Unicode transformation is using a remote user-controlled data. The transformation is a Unicode normalization using the algorithms \"NFC\" or \"NFKC\". In all cases, the security measures implemented or the logical validation performed to escape any injection characters, to validate using regex patterns or to perform string-based checks, before the Unicode transformation are **bypassable** by special Unicode characters.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement validation early in the processing pipeline. Ensure validation cannot be bypassed by alternate code paths. Use consistent validation across all entry points.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-176",
+            "external/cwe/cwe-179",
+            "external/cwe/cwe-180"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/timing-attack-against-header-value",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.441,
+          "raw_bm25_score": 16.441,
+          "description": "Use of a non-constant-time verification routine to check the value of an HTTP header, possibly allowing a timing attack to infer the header's expected value.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208",
+            "experimental"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/jinja2/autoescape-false",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.2274,
+          "raw_bm25_score": 16.2274,
+          "description": "Using jinja2 templates with 'autoescape=False' can cause a cross-site scripting vulnerability.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-079"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/reflective-xss",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.492,
+          "raw_bm25_score": 15.492,
+          "description": "Writing user input directly to a web page allows for a cross-site scripting vulnerability.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output operations. Implement proper escaping for HTML, JavaScript, CSS, and URL contexts.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-116"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

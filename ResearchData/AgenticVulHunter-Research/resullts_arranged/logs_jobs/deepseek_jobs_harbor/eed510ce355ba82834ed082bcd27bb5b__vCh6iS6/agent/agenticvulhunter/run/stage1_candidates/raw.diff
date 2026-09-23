@@ -1,0 +1,261 @@
+diff --git a/index.js b/index.js
+index 3594167..841bb7e 100644
+--- a/index.js
++++ b/index.js
+@@ -1,26 +1,26 @@
+ /*
+ Copyright (c) 2014, Yahoo! Inc. All rights reserved.
+ Copyrights licensed under the New BSD License.
+ See the accompanying LICENSE file for terms.
+ */
+ 
+ 'use strict';
+ 
+ // Generate an internal UID to make the regexp pattern harder to guess.
+ var UID                 = Math.floor(Math.random() * 0x10000000000).toString(16);
+-var PLACE_HOLDER_REGEXP = new RegExp('"@__(F|R|D|M|S|U)-' + UID + '-(\\d+)__@"', 'g');
++var PLACE_HOLDER_REGEXP = new RegExp('"@__(F|R|D|M|S|U|I)-' + UID + '-(\\d+)__@"', 'g');
+ 
+ var IS_NATIVE_CODE_REGEXP = /\{\s*\[native code\]\s*\}/g;
+ var IS_PURE_FUNCTION = /function.*?\(/;
+ var IS_ARROW_FUNCTION = /.*?=>.*?/;
+ var UNSAFE_CHARS_REGEXP   = /[<>\/\u2028\u2029]/g;
+ 
+ var RESERVED_SYMBOLS = ['*', 'async'];
+ 
+ // Mapping of unsafe HTML and invalid JavaScript line terminator chars to their
+ // Unicode char counterparts which are safe to use in JavaScript strings.
+ var ESCAPED_CHARS = {
+     '<'     : '\\u003C',
+     '>'     : '\\u003E',
+     '/'     : '\\u002F',
+     '\u2028': '\\u2028',
+@@ -45,30 +45,31 @@ function deleteFunctions(obj){
+ 
+ module.exports = function serialize(obj, options) {
+     options || (options = {});
+ 
+     // Backwards-compatibility for `space` as the second argument.
+     if (typeof options === 'number' || typeof options === 'string') {
+         options = {space: options};
+     }
+ 
+     var functions = [];
+     var regexps   = [];
+     var dates     = [];
+     var maps      = [];
+     var sets      = [];
+     var undefs    = [];
++    var infinities= [];
+ 
+     // Returns placeholders for functions and regexps (identified by index)
+     // which are later replaced by their string representation.
+     function replacer(key, value) {
+ 
+         // For nested function
+         if(options.ignoreFunction){
+             deleteFunctions(value);
+         }
+ 
+         if (!value && value !== undefined) {
+             return value;
+         }
+ 
+         // If the value is an object w/ a toJSON method, toJSON is called before
+@@ -90,30 +91,34 @@ module.exports = function serialize(obj, options) {
+             }
+ 
+             if(origValue instanceof Set) {
+                 return '@__S-' + UID + '-' + (sets.push(origValue) - 1) + '__@';
+             }
+         }
+ 
+         if (type === 'function') {
+             return '@__F-' + UID + '-' + (functions.push(origValue) - 1) + '__@';
+         }
+ 
+         if (type === 'undefined') {
+             return '@__U-' + UID + '-' + (undefs.push(origValue) - 1) + '__@';
+         }
+ 
++        if (type === 'number' && !isNaN(origValue) && !isFinite(origValue)) {
++            return '@__I-' + UID + '-' + (infinities.push(origValue) - 1) + '__@';
++        }
++
+         return value;
+     }
+ 
+     function serializeFunc(fn) {
+       var serializedFn = fn.toString();
+       if (IS_NATIVE_CODE_REGEXP.test(serializedFn)) {
+           throw new TypeError('Serializing native function: ' + fn.name);
+       }
+ 
+       // pure functions, example: {key: function() {}}
+       if(IS_PURE_FUNCTION.test(serializedFn)) {
+           return serializedFn;
+       }
+ 
+       // arrow functions, example: arg1 => arg1+5
+@@ -163,48 +168,52 @@ module.exports = function serialize(obj, options) {
+     }
+ 
+     // Protects against `JSON.stringify()` returning `undefined`, by serializing
+     // to the literal string: "undefined".
+     if (typeof str !== 'string') {
+         return String(str);
+     }
+ 
+     // Replace unsafe HTML and invalid JavaScript line terminator chars with
+     // their safe Unicode char counterpart. This _must_ happen before the
+     // regexps and functions are serialized and added back to the string.
+     if (options.unsafe !== true) {
+         str = str.replace(UNSAFE_CHARS_REGEXP, escapeUnsafeChars);
+     }
+ 
+-    if (functions.length === 0 && regexps.length === 0 && dates.length === 0 && maps.length === 0 && sets.length === 0 && undefs.length === 0) {
++    if (functions.length === 0 && regexps.length === 0 && dates.length === 0 && maps.length === 0 && sets.length === 0 && undefs.length === 0 && infinities.length === 0) {
+         return str;
+     }
+ 
+     // Replaces all occurrences of function, regexp, date, map and set placeholders in the
+     // JSON string with their string representations. If the original value can
+     // not be found, then `undefined` is used.
+     return str.replace(PLACE_HOLDER_REGEXP, function (match, type, valueIndex) {
+         if (type === 'D') {
+             return "new Date(\"" + dates[valueIndex].toISOString() + "\")";
+         }
+ 
+         if (type === 'R') {
+             return "new RegExp(" + serialize(regexps[valueIndex].source) + ", \"" + regexps[valueIndex].flags + "\")";
+         }
+ 
+         if (type === 'M') {
+             return "new Map(" + serialize(Array.from(maps[valueIndex].entries()), options) + ")";
+         }
+ 
+         if (type === 'S') {
+             return "new Set(" + serialize(Array.from(sets[valueIndex].values()), options) + ")";
+         }
+ 
+         if (type === 'U') {
+             return 'undefined'
+         }
+ 
++        if (type === 'I') {
++            return infinities[valueIndex];
++        }
++
+         var fn = functions[valueIndex];
+ 
+         return serializeFunc(fn);
+     });
+ }
+diff --git a/test/unit/serialize.js b/test/unit/serialize.js
+index 0c0df3d..3944344 100644
+--- a/test/unit/serialize.js
++++ b/test/unit/serialize.js
+@@ -323,69 +323,95 @@ describe('serialize( obj )', function () {
+             expect(d).to.equal('2016-04-28T25:02:17.156Z');
+         });
+ 
+         it('should serialize dates within objects', function () {
+             var d = {foo: new Date('2016-04-28T22:02:17.156Z')};
+             expect(serialize(d)).to.be.a('string').equal('{"foo":new Date("2016-04-28T22:02:17.156Z")}');
+             expect(serialize({t: [d]})).to.be.a('string').equal('{"t":[{"foo":new Date("2016-04-28T22:02:17.156Z")}]}');
+         });
+     });
+ 
+     describe('maps', function () {
+         it('should serialize maps', function () {
+             var regexKey = /.*/;
+             var m = new Map([
+                 ['a', 123],
+-                [regexKey, 456]
++                [regexKey, 456],
++                [Infinity, 789]
+             ]);
+-            expect(serialize(m)).to.be.a('string').equal('new Map([["a",123],[new RegExp(".*", ""),456]])');
+-            expect(serialize({t: [m]})).to.be.a('string').equal('{"t":[new Map([["a",123],[new RegExp(".*", ""),456]])]}');
++            expect(serialize(m)).to.be.a('string').equal('new Map([["a",123],[new RegExp(".*", ""),456],[Infinity,789]])');
++            expect(serialize({t: [m]})).to.be.a('string').equal('{"t":[new Map([["a",123],[new RegExp(".*", ""),456],[Infinity,789]])]}');
+         });
+ 
+         it('should deserialize a map', function () {
+             var m = eval(serialize(new Map([
+                 ['a', 123],
+-                [null, 456]
++                [null, 456],
++                [Infinity, 789]
+             ])));
+             expect(m).to.be.a('Map');
+             expect(m.get(null)).to.equal(456);
+         });
+     });
+ 
+     describe('sets', function () {
+         it('should serialize sets', function () {
+             var regex = /.*/;
+             var m = new Set([
+                 'a',
+                 123,
+-                regex
++                regex,
++                Infinity
+             ]);
+-            expect(serialize(m)).to.be.a('string').equal('new Set(["a",123,new RegExp(".*", "")])');
+-            expect(serialize({t: [m]})).to.be.a('string').equal('{"t":[new Set(["a",123,new RegExp(".*", "")])]}');
++            expect(serialize(m)).to.be.a('string').equal('new Set(["a",123,new RegExp(".*", ""),Infinity])');
++            expect(serialize({t: [m]})).to.be.a('string').equal('{"t":[new Set(["a",123,new RegExp(".*", ""),Infinity])]}');
+         });
+ 
+         it('should deserialize a set', function () {
+             var m = eval(serialize(new Set([
+                 'a',
+                 123,
+-                null
++                null,
++                Infinity
+             ])));
+             expect(m).to.be.a('Set');
+             expect(m.has(null)).to.equal(true);
+         });
+     });
+ 
++    describe('Infinity', function () {
++        it('should serialize Infinity', function () {
++            expect(serialize(Infinity)).to.equal('Infinity');
++            expect(serialize({t: [Infinity]})).to.be.a('string').equal('{"t":[Infinity]}');
++        });
++
++        it('should deserialize Infinity', function () {
++            var d = eval(serialize(Infinity));
++            expect(d).to.equal(Infinity);
++        });
++
++        it('should serialize -Infinity', function () {
++            expect(serialize(-Infinity)).to.equal('-Infinity');
++            expect(serialize({t: [-Infinity]})).to.be.a('string').equal('{"t":[-Infinity]}');
++        });
++
++        it('should deserialize -Infinity', function () {
++            var d = eval(serialize(-Infinity));
++            expect(d).to.equal(-Infinity);
++        });
++    });
++
+     describe('XSS', function () {
+         it('should encode unsafe HTML chars to Unicode', function () {
+             expect(serialize('</script>')).to.equal('"\\u003C\\u002Fscript\\u003E"');
+             expect(JSON.parse(serialize('</script>'))).to.equal('</script>');
+             expect(eval(serialize('</script>'))).to.equal('</script>');
+         });
+     });
+ 
+     describe('options', function () {
+         it('should accept options as the second argument', function () {
+             expect(serialize('foo', {})).to.equal('"foo"');
+         });
+ 
+         it('should accept a `space` option', function () {
+             expect(serialize([1], {space: 0})).to.equal('[1]');

@@ -1,0 +1,384 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "src/wagtail_2fa/views.py",
+    "changed_line": 124,
+    "statement": "device = TOTPDevice.objects.get(**self.kwargs)",
+    "change_type": "A",
+    "function_name": "DeviceDeleteView.get_queryset",
+    "operation_type": "data_retrieval",
+    "selection_reason": "unvalidated user input from URL kwargs -> database query construction -> potential unauthorized device access",
+    "security_relevance_score": 0.85,
+    "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "The code directly retrieves a device using URL kwargs without verifying that the user has authorization to access that specific device, matching the mechanism of incorrect authorization check.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "fit_reason": "The code allows direct access to device deletion by URL parameters without proper authorization checks, enabling forced browsing to unauthorized devices.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "fit_reason": "The lack of access control verification when retrieving a device based on user-provided kwargs leads to potential unauthorized access to devices.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-20",
+      "CWE-200",
+      "CWE-22",
+      "CWE-264",
+      "CWE-284",
+      "CWE-285",
+      "CWE-359",
+      "CWE-425",
+      "CWE-601",
+      "CWE-643",
+      "CWE-77",
+      "CWE-79",
+      "CWE-863",
+      "CWE-89",
+      "CWE-90",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "src/wagtail_2fa/views.py",
+    "changed_line": 128,
+    "statement": "return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})",
+    "change_type": "A",
+    "function_name": "DeviceDeleteView.get_success_url",
+    "operation_type": "url_construction",
+    "selection_reason": "POST data user_id parameter -> URL construction -> potential bypass of authorization checks",
+    "security_relevance_score": 0.8,
+    "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "The DeviceDeleteView.get_success_url method uses POST data user_id directly in URL construction without validating that the current user is authorized to delete devices for that user, leading to incorrect authorization checks.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "fit_reason": "The POST data user_id parameter can be manipulated to directly request access to another user's device list, bypassing normal authorization checks.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-601",
+        "cwe_name": "URL Redirection to Untrusted Site ('Open Redirect')",
+        "fit_reason": "The URL construction using unvalidated POST data user_id could potentially allow redirection to unintended locations if not properly validated.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "The user_id parameter from POST data is used directly in URL construction without proper sanitization or validation, making it vulnerable to bypassing.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-179",
+      "CWE-20",
+      "CWE-285",
+      "CWE-425",
+      "CWE-471",
+      "CWE-502",
+      "CWE-601",
+      "CWE-628",
+      "CWE-697",
+      "CWE-77",
+      "CWE-79",
+      "CWE-863",
+      "CWE-918",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "src/wagtail_2fa/views.py",
+    "changed_line": 67,
+    "statement": "return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)",
+    "change_type": "A",
+    "function_name": "DeviceListView.get_queryset",
+    "operation_type": "data_retrieval",
+    "selection_reason": "unvalidated user input from URL kwargs -> database query construction -> potential unauthorized device access",
+    "security_relevance_score": 0.75,
+    "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "fit_reason": "The unvalidated user_id from URL kwargs leads to a database query that could allow unauthorized access to another user's 2FA devices, which is a classic access control violation.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "fit_reason": "The device list view can be accessed directly by changing the user_id parameter in the URL, bypassing normal access controls and allowing unauthorized browsing of devices.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-943",
+        "cwe_name": "Improper Neutralization of Special Elements in Data Query Logic",
+        "fit_reason": "The direct use of user_id from URL kwargs in the database query construction could allow manipulation of the query logic to access unauthorized devices.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-200",
+      "CWE-208",
+      "CWE-22",
+      "CWE-264",
+      "CWE-284",
+      "CWE-287",
+      "CWE-359",
+      "CWE-425",
+      "CWE-571",
+      "CWE-584",
+      "CWE-601",
+      "CWE-643",
+      "CWE-685",
+      "CWE-77",
+      "CWE-89",
+      "CWE-90",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-4",
+    "filepath": "src/wagtail_2fa/views.py",
+    "changed_line": 71,
+    "statement": "context['user_id'] = int(self.kwargs['user_id'])",
+    "change_type": "A",
+    "function_name": "DeviceListView.get_context_data",
+    "operation_type": "data_transformation",
+    "selection_reason": "unvalidated user input from URL kwargs -> context variable assignment -> potential unauthorized device access",
+    "security_relevance_score": 0.7,
+    "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "fit_reason": "The code assigns user_id from URL kwargs to context without validation, allowing potential access to devices of other users, which is a clear access control weakness.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-264",
+        "cwe_name": "Permissions, Privileges, and Access Controls",
+        "fit_reason": "The mechanism of unvalidated user input leading to unauthorized device access falls under legacy access control failures.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-117",
+      "CWE-1236",
+      "CWE-179",
+      "CWE-19",
+      "CWE-200",
+      "CWE-22",
+      "CWE-23",
+      "CWE-264",
+      "CWE-284",
+      "CWE-359",
+      "CWE-497",
+      "CWE-534",
+      "CWE-563",
+      "CWE-601",
+      "CWE-732",
+      "CWE-74",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-5",
+    "filepath": "src/wagtail_2fa/views.py",
+    "changed_line": 94,
+    "statement": "return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})",
+    "change_type": "A",
+    "function_name": "DeviceCreateView.get_success_url",
+    "operation_type": "url_construction",
+    "selection_reason": "user ID from request -> URL construction -> potential bypass of authorization checks",
+    "security_relevance_score": 0.65,
+    "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "fit_reason": "The URL construction with user ID parameter allows direct access to device lists without proper authorization checks, enabling unauthorized users to browse other users' device lists",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "The code constructs a URL using the user ID from request without verifying if the current user has authorization to access that specific user's device list",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "fit_reason": "The URL construction does not enforce proper access control, allowing users to potentially access resources they shouldn't be able to reach",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1275",
+      "CWE-179",
+      "CWE-20",
+      "CWE-200",
+      "CWE-22",
+      "CWE-264",
+      "CWE-284",
+      "CWE-285",
+      "CWE-425",
+      "CWE-584",
+      "CWE-601",
+      "CWE-697",
+      "CWE-863",
+      "CWE-918"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-6",
+    "filepath": "src/wagtail_2fa/views.py",
+    "changed_line": 117,
+    "statement": "return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})",
+    "change_type": "A",
+    "function_name": "DeviceUpdateView.get_success_url",
+    "operation_type": "url_construction",
+    "selection_reason": "user ID from request -> URL construction -> potential bypass of authorization checks",
+    "security_relevance_score": 0.65,
+    "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "The URL construction uses user_id from request without proper authorization check, allowing potential access to other users' device lists",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "fit_reason": "The URL construction allows direct access to device lists via user ID parameter without proper authorization enforcement",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "fit_reason": "Access control policy is incorrectly enforced for the device list endpoint, allowing unauthorized access based on user ID parameter",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1275",
+      "CWE-179",
+      "CWE-20",
+      "CWE-200",
+      "CWE-22",
+      "CWE-23",
+      "CWE-264",
+      "CWE-284",
+      "CWE-285",
+      "CWE-425",
+      "CWE-584",
+      "CWE-601",
+      "CWE-687",
+      "CWE-697",
+      "CWE-732",
+      "CWE-863",
+      "CWE-918"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-7",
+    "filepath": "src/wagtail_2fa/wagtail_hooks.py",
+    "changed_line": 17,
+    "statement": "r\"^2fa/devices/(?P<user_id>\\d+)$\",",
+    "change_type": "A",
+    "function_name": "urlpatterns",
+    "operation_type": "url_pattern_definition",
+    "selection_reason": "URL pattern with user_id parameter -> potential bypass of authorization checks",
+    "security_relevance_score": 0.6,
+    "code_context": "1: from django.conf import settings\n2: from django.conf.urls import url\n3: from django.urls import reverse\n4: from django.utils.translation import ugettext_lazy as _\n5: from wagtail.admin.menu import MenuItem\n6: from wagtail.core import hooks\n7: from wagtail.users.widgets import UserListingButton\n8: \n9: from wagtail_2fa import views\n10: \n11: \n12: @hooks.register(\"register_admin_urls\")\n13: def urlpatterns():\n14:     return [\n15:         url(r\"^2fa/auth$\", views.LoginView.as_view(), name=\"wagtail_2fa_auth\"),\n16:         url(\n17:             r\"^2fa/devices/(?P<user_id>\\d+)$\",\n18:             views.DeviceListView.as_view(),\n19:             name=\"wagtail_2fa_device_list\",\n20:         ),\n21:         url(\n22:             r\"^2fa/devices/new$\",\n23:             views.DeviceCreateView.as_view(),\n24:             name=\"wagtail_2fa_device_new\",\n25:         ),\n26:         url(\n27:             r\"^2fa/devices/(?P<pk>\\d+)/update$\",\n28:             views.DeviceUpdateView.as_view(),\n29:             name=\"wagtail_2fa_device_update\",\n30:         ),\n31:         url(\n32:             r\"^2fa/devices/(?P<pk>\\d+)/remove$\",\n33:             views.DeviceDeleteView.as_view(),\n34:             name=\"wagtail_2fa_device_remove\",\n35:         ),\n36:         url(\n37:             r\"^2fa/devices/qr-code$\",\n38:             views.DeviceQRCodeView.as_view(),\n39:             name=\"wagtail_2fa_device_qrcode\",\n40:         ),\n41:     ]\n42: \n43: \n44: @hooks.register(\"construct_main_menu\")\n45: def remove_menu_if_unverified(request, menu_items):\n46:     if not request.user.is_verified() and settings.WAGTAIL_2FA_REQUIRED:\n47:         menu_items.clear()\n48:         menu_items.append(MenuItem(\"2FA Setup\", reverse('wagtail_2fa_device_list', kwargs={'user_id': request.user.id})))\n49: \n50: \n51: @hooks.register(\"register_account_menu_item\")\n52: def register(request):\n53:     return {\n54:         \"url\": reverse('wagtail_2fa_device_list', kwargs={'user_id': request.user.id}),\n55:         \"label\": _(\"Manage your 2FA devices\"),\n56:         \"help_text\": _(\"Add or remove devices for 2 factor authentication.\"),\n57:     }\n58: \n59: @hooks.register('register_user_listing_buttons')\n60: def register_user_listing_buttons(context, user):\n61:     yield UserListingButton(    \n62:         _('Manage 2FA'),    \n63:         reverse('wagtail_2fa_device_list', kwargs={'user_id': user.id}),\n64:         attrs={'title': _('Edit this user')}, priority=100)",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "Stage-2 evidence shows URL pattern with user_id parameter that could allow unauthorized access to 2FA device lists for any user, indicating incorrect authorization check",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-425",
+        "cwe_name": "Direct Request ('Forced Browsing')",
+        "fit_reason": "URL pattern directly exposes 2FA device list endpoint that can be accessed without proper authorization, allowing forced browsing to restricted resources",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "URL parameter user_id is not properly validated or sanitized, potentially allowing bypass of access controls through malformed input",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "fit_reason": "Access control policy for 2FA device list is incorrectly enforced, allowing users to access other users' device lists via user_id parameter",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-179",
+      "CWE-20",
+      "CWE-264",
+      "CWE-284",
+      "CWE-285",
+      "CWE-287",
+      "CWE-425",
+      "CWE-502",
+      "CWE-601",
+      "CWE-628",
+      "CWE-697",
+      "CWE-79",
+      "CWE-827",
+      "CWE-863"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  }
+]

@@ -1,0 +1,257 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "tests/tests.py",
+      "changed_line": 61,
+      "statement": "self.cookies[session_cookie] = request.session.session_key",
+      "change_type": "A",
+      "function_name": "Client.login",
+      "operation_type": "cookie_assignment",
+      "selection_reason": "Assigns a session key to a cookie -> if session key is predictable or leaked, could lead to session fixation.",
+      "security_relevance_score": 0.5,
+      "code_context": "1: from datetime import timedelta\n2: import sys\n3: try:\n4:     from urllib.parse import urlencode\n5: except ImportError:\n6:     from urllib import urlencode\n7: \n8: from django.conf import settings\n9: from django.contrib.auth import SESSION_KEY, authenticate, login\n10: from django.contrib.auth.models import User\n11: from django.contrib.sessions.backends.base import CreateError\n12: from django.core.urlresolvers import reverse\n13: from django.db import IntegrityError\n14: from django.http import HttpRequest\n15: from django.test import TestCase, Client as BaseClient\n16: from django.test.utils import override_settings\n17: from django.utils.timezone import now\n18: \n19: from user_sessions.backends.db import SessionStore\n20: from user_sessions.models import Session\n21: from user_sessions.templatetags.user_sessions import location, device\n22: \n23: if sys.version_info[:2] < (2, 7):\n24:     from django.utils.unittest.case import skipUnless\n25: else:\n26:     from unittest import skipUnless\n27: \n28: try:\n29:     from django.contrib.gis.geoip import GeoIP\n30:     geoip = GeoIP()\n31:     geoip_msg = None\n32: except Exception as e:\n33:     geoip = None\n34:     geoip_msg = str(e)\n35: \n36: \n37: class Client(BaseClient):\n38:     def login(self, **credentials):\n39:         \"\"\"\n40:         Sets the Factory to appear as if it has successfully logged into a site.\n41: \n42:         Returns True if login is possible; False if the provided credentials\n43:         are incorrect, or the user is inactive, or if the sessions framework is\n44:         not available.\n45:         \"\"\"\n46:         user = authenticate(**credentials)\n47:         if user and user.is_active:\n48:             # Create a fake request to store login details.\n49:             request = HttpRequest()\n50:             if self.session:\n51:                 request.session = self.session\n52:             else:\n53:                 request.session = SessionStore('Python/2.7', '127.0.0.1')\n54:             login(request, user)\n55: \n56:             # Save the session values.\n57:             request.session.save()\n58: \n59:             # Set the cookie to represent the session.\n60:             session_cookie = settings.SESSION_COOKIE_NAME\n61:             self.cookies[session_cookie] = request.session.session_key\n62:             cookie_data = {\n63:                 'max-age': None,\n64:                 'path': '/',\n65:                 'domain': settings.SESSION_COOKIE_DOMAIN,\n66:                 'secure': settings.SESSION_COOKIE_SECURE or None,\n67:                 'expires': None,\n68:             }\n69:             self.cookies[session_cookie].update(cookie_data)\n70: \n71:             return True\n72:         else:\n73:             return False\n74: \n75: \n76: class MiddlewareTest(TestCase):\n77:     def test_unmodified_session(self):\n78:         self.client.get('/', HTTP_USER_AGENT='Python/2.7')\n79:         self.assertNotIn(settings.SESSION_COOKIE_NAME, self.client.cookies)\n80: \n81:     def test_modify_session(self):\n82:         self.client.get('/modify_session/', HTTP_USER_AGENT='Python/2.7')\n83:         self.assertIn(settings.SESSION_COOKIE_NAME, self.client.cookies)\n84:         session = Session.objects.get(\n85:             pk=self.client.cookies[settings.SESSION_COOKIE_NAME].value\n86:         )\n87:         self.assertEqual(session.user_agent, 'Python/2.7')\n88:         self.assertEqual(session.ip, '127.0.0.1')\n89: \n90:     def test_login(self):\n91:         user = User.objects.create_superuser('bouke', '', 'secret')\n92:         response = self.client.post('/admin/',\n93:                                     data={\n94:                                         'username': 'bouke',\n95:                                         'password': 'secret',\n96:                                         'this_is_the_login_form': '1',\n97:                                         'next': '/admin/'},\n98:                                     HTTP_USER_AGENT='Python/2.7')\n99:         self.assertRedirects(response, '/admin/')\n100:         session = Session.objects.get(\n101:             pk=self.client.cookies[settings.SESSION_COOKIE_NAME].value\n102:         )\n103:         self.assertEqual(user, session.user)\n104: \n105:     def test_long_ua(self):\n106:         self.client.get('/modify_session/',\n107:                         HTTP_USER_AGENT=''.join('a' for _ in range(400)))\n108: \n109: \n110: class ViewsTest(TestCase):\n111:     client_class = Client\n112: \n113:     def setUp(self):\n114:         User.objects.create_user('bouke', '', 'secret')\n115:         assert self.client.login(username='bouke', password='secret')\n116: \n117:     def test_list(self):\n118:         response = self.client.get(reverse('user_sessions:session_list'))\n119:         self.assertContains(response, 'Active Sessions')\n120:         self.assertContains(response, 'End Session', 2)\n121: \n122:     def test_delete(self):\n123:         session_key = self.client.cookies[settings.SESSION_COOKIE_NAME].value\n124:         response = self.client.post(reverse('user_sessions:session_delete',\n125:                                             args=[session_key]))\n126:         self.assertRedirects(response, reverse('user_sessions:session_list'))\n127: \n128: \n129: class SessionStoreTest(TestCase):\n130:     def setUp(self):\n131:         self.store = SessionStore('Python/2.7', '127.0.0.1', None)\n132: \n133:     def test_untouched_init(self):\n134:         self.assertFalse(self.store.modified)\n135:         self.assertFalse(self.store.accessed)\n136: \n137:     def test_auth_session_key(self):\n138:         self.assertFalse(SESSION_KEY in self.store)\n139:         self.assertFalse(self.store.modified)\n140:         self.assertTrue(self.store.accessed)\n141: \n142:         self.store.get(SESSION_KEY)\n143:         self.assertFalse(self.store.modified)\n144: \n145:         self.store[SESSION_KEY] = 1\n146:         self.assertTrue(self.store.modified)\n147: \n148:     def test_save(self):\n149:         self.store[SESSION_KEY] = 1\n150:         self.store.save()\n151: \n152:         session = Session.objects.get(pk=self.store.session_key)\n153:         self.assertEqual(session.user_agent, 'Python/2.7')\n154:         self.assertEqual(session.ip, '127.0.0.1')\n155:         self.assertEqual(session.user_id, 1)\n156:         self.assertAlmostEqual(now(), session.last_activity,\n157:                                delta=timedelta(seconds=5))\n158: \n159:     def test_load_unmodified(self):\n160:         self.store[SESSION_KEY] = 1\n161:         self.store.save()\n162:         store2 = SessionStore('Python/2.7', '127.0.0.1',\n163:                               self.store.session_key)\n164:         store2.load()\n165:         self.assertEqual(store2.user_agent, 'Python/2.7')\n166:         self.assertEqual(store2.ip, '127.0.0.1')\n167:         self.assertEqual(store2.user_id, 1)\n168:         self.assertEqual(store2.modified, False)\n169: \n170:     def test_load_modified(self):\n171:         self.store[SESSION_KEY] = 1\n172:         self.store.save()\n173:         store2 = SessionStore('Python/3.3', '8.8.8.8', self.store.session_key)\n174:         store2.load()\n175:         self.assertEqual(store2.user_agent, 'Python/3.3')\n176:         self.assertEqual(store2.ip, '8.8.8.8')\n177:         self.assertEqual(store2.user_id, 1)\n178:         self.assertEqual(store2.modified, True)\n179: \n180: \n181: @skipUnless(geoip, geoip_msg)\n182: class LocationTemplateFilterTest(TestCase):\n183:     def test_no_location(self):\n184:         self.assertEqual(location('127.0.0.1'), '<i>unknown</i>')\n185: \n186:     def test_google(self):\n187:         self.assertEqual(location('8.8.8.8'), 'United States')\n188: \n189: \n190: class DeviceTemplateFilterTest(TestCase):\n191:     def test_ie(self):\n192:         self.assertEqual(\n193:             'Internet Explorer on Windows XP',\n194:             device('Mozilla/4.0 (Windows; MSIE 6.0; Windows NT 5.1; SV1; '\n195:                    '.NET CLR 2.0.50727)')\n196:         )\n197:         self.assertEqual(\n198:             'Internet Explorer on Windows Vista',\n199:             device('Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.0; '\n200:                    'Trident/4.0; SLCC1; .NET CLR 2.0.50727; .NET CLR 1.1.4322;'\n201:                    ' InfoPath.2; .NET CLR 3.5.21022; .NET CLR 3.5.30729; '\n202:                    'MS-RTC LM 8; OfficeLiveConnector.1.4; OfficeLivePatch.1.3;'\n203:                    ' .NET CLR 3.0.30729)')\n204:         )\n205:         self.assertEqual(\n206:             'Internet Explorer on Windows 7',\n207:             device('Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.1; '\n208:                    'Trident/6.0)')\n209:         )\n210:         self.assertEqual(",
+      "source_summary": "session_key comes from Django's SessionStore which inherits from SessionBase. The session key is generated by _get_new_session_key() method from the parent class.",
+      "sink_summary": "The session key is assigned to a cookie that will be sent with HTTP requests. This cookie represents the user's authenticated session.",
+      "guard_summary": "Session keys are generated using Django's built-in session key generation (cryptographically random). The session is saved to database before cookie assignment. Standard Django session security controls apply (expiration, secure flags from settings).",
+      "risk_pattern": "Session key assignment to cookie in test client login method - follows standard Django session management pattern but in test context.",
+      "used_variable_sources": [
+        "settings.SESSION_COOKIE_NAME",
+        "request.session.session_key"
+      ],
+      "called_function_context": [
+        "authenticate",
+        "login",
+        "SessionStore.__init__",
+        "request.session.save"
+      ],
+      "enclosing_conditions": [
+        "if user and user.is_active:"
+      ],
+      "context_summary": "Test client login method that creates a fake request, authenticates user, creates session, saves it, and sets session cookie with generated session key.",
+      "unresolved_facts": [
+        "Exact implementation of _get_new_session_key() method from Django's SessionBase class",
+        "Cryptographic strength of Django's session key generation algorithm"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "session fixation vulnerability when session key is not regenerated after authentication",
+        "sensitive_operation": "assigning existing session key to authenticated user",
+        "missing_control": "session regeneration on privilege change",
+        "mechanism_keywords": "session fixation, session reuse, authentication bypass"
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/insecure-cookie",
+          "cwe_id": "CWE-614",
+          "cwe_name": "Sensitive Cookie in HTTPS Session Without 'Secure' Attribute",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 36.0823,
+          "raw_bm25_score": 36.0823,
+          "description": "Insecure cookies may be sent in cleartext, which makes them vulnerable to interception.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Set Secure flag on cookies transmitted over HTTPS. Also implement HttpOnly and SameSite attributes for session cookies.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-614"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/pam-auth-bypass",
+          "cwe_id": "CWE-285",
+          "cwe_name": "Improper Authorization",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 31.6741,
+          "raw_bm25_score": 31.6741,
+          "description": "Not using `pam_acct_mgmt` after `pam_authenticate` to check the validity of a login can lead to authorization bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-285"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/call/wrong-named-class-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 30.9219,
+          "raw_bm25_score": 30.9219,
+          "description": "Using a named argument whose name does not correspond to a parameter of the __init__ method of the class being instantiated, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/insecure-randomness",
+          "cwe_id": "CWE-338",
+          "cwe_name": "Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.9095,
+          "raw_bm25_score": 26.9095,
+          "description": "Using a cryptographically weak pseudo-random number generator to generate a security-sensitive value may allow an attacker to predict what value will be generated.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use cryptographically secure random number generators (SecureRandom, os.urandom, crypto.getRandomValues) instead of predictable PRNGs.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-338"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/client-exposed-cookie",
+          "cwe_id": "CWE-1004",
+          "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.0293,
+          "raw_bm25_score": 23.0293,
+          "description": "Cookies without the `HttpOnly` attribute set can be accessed by JS scripts, making them more vulnerable to XSS attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Set HttpOnly flag on session cookies to prevent JavaScript access. Also use Secure and SameSite attributes.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1004"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/call/wrong-number-class-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.885,
+          "raw_bm25_score": 22.885,
+          "description": "Using too many or too few arguments in a call to the `__init__` method of a class will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/unicode-dos",
+          "cwe_id": "CWE-770",
+          "cwe_name": "Allocation of Resources Without Limits or Throttling",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.6233,
+          "raw_bm25_score": 22.6233,
+          "description": "A remote user-controlled data can reach a costly Unicode normalization with either form NFKC or NFKD. On Windows OS, with an attack such as the One Million Unicode Characters, this could lead to a denial of service. And, with the use of special Unicode characters, like U+2100 (℀) or U+2105 (℅), the payload size could be tripled.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-770"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/csv-injection",
+          "cwe_id": "CWE-1236",
+          "cwe_name": "Improper Neutralization of Formula Elements in a CSV File",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.3985,
+          "raw_bm25_score": 20.3985,
+          "description": "From user-controlled data saved in CSV files, it is easy to attempt information disclosure or other malicious activities when automated by spreadsheet software",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-1236"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/flask-constant-secret-key",
+          "cwe_id": "CWE-287",
+          "cwe_name": "Improper Authentication",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.9931,
+          "raw_bm25_score": 19.9931,
+          "description": "Initializing SECRET_KEY of Flask application with Constant value files can lead to Authentication bypass",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-287"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/timing-attack-against-hash",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.846,
+          "raw_bm25_score": 19.846,
+          "description": "When checking a Hash over a message, a constant-time algorithm should be used. Otherwise, an attacker may be able to forge a valid Hash for an arbitrary message by running a timing attack if they can send to the validation procedure. A successful attack can result in authentication bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,256 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 79,
+      "statement": "substitutions[key] = values[0]",
+      "change_type": "A",
+      "function_name": "render_POST",
+      "operation_type": "request_parameter_processing",
+      "selection_reason": "User-controlled request parameters stored without HTML escaping, potentially enabling injection attacks",
+      "security_relevance_score": 0.9,
+      "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: import nacl.signing\n17: import random\n18: import string\n19: from email.header import Header\n20: \n21: from twisted.web.resource import Resource\n22: from unpaddedbase64 import encode_base64\n23: \n24: import json\n25: from sydent.db.invite_tokens import JoinTokenStore\n26: from sydent.db.threepid_associations import GlobalAssociationStore\n27: \n28: from sydent.http.servlets import require_args, send_cors\n29: from sydent.util.emailutils import sendEmail\n30: \n31: \n32: class StoreInviteServlet(Resource):\n33:     def __init__(self, syd):\n34:         self.sydent = syd\n35: \n36:     def render_POST(self, request):\n37:         send_cors(request)\n38:         err = require_args(request, (\"medium\", \"address\", \"room_id\", \"sender\",))\n39:         if err:\n40:             return json.dumps(err)\n41:         medium = request.args[\"medium\"][0]\n42:         address = request.args[\"address\"][0]\n43:         roomId = request.args[\"room_id\"][0]\n44:         sender = request.args[\"sender\"][0]\n45: \n46:         globalAssocStore = GlobalAssociationStore(self.sydent)\n47:         mxid = globalAssocStore.getMxid(medium, address)\n48:         if mxid:\n49:             request.setResponseCode(400)\n50:             return json.dumps({\n51:                 \"errcode\": \"THREEPID_IN_USE\",\n52:                 \"error\": \"Binding already known\",\n53:                 \"mxid\": mxid,\n54:             })\n55: \n56:         if medium != \"email\":\n57:             request.setResponseCode(400)\n58:             return json.dumps({\n59:                 \"errcode\": \"M_UNRECOGNIZED\",\n60:                 \"error\": \"Didn't understand medium '%s'\" % (medium,),\n61:             })\n62: \n63:         token = self._randomString(128)\n64: \n65:         tokenStore = JoinTokenStore(self.sydent)\n66: \n67:         ephemeralPrivateKey = nacl.signing.SigningKey.generate()\n68:         ephemeralPublicKey = ephemeralPrivateKey.verify_key\n69: \n70:         ephemeralPrivateKeyBase64 = encode_base64(ephemeralPrivateKey.encode(), True)\n71:         ephemeralPublicKeyBase64 = encode_base64(ephemeralPublicKey.encode(), True)\n72: \n73:         tokenStore.storeEphemeralPublicKey(ephemeralPublicKeyBase64)\n74:         tokenStore.storeToken(medium, address, roomId, sender, token)\n75: \n76:         substitutions = {}\n77:         for key, values in request.args.items():\n78:             if len(values) == 1 and type(values[0]) == str:\n79:                 substitutions[key] = values[0]\n80:         substitutions[\"token\"] = token\n81: \n82:         required = [\n83:             'sender_display_name',\n84:             'token',\n85:             'room_name',\n86:             'bracketed_room_name',\n87:             'room_avatar_url',\n88:             'sender_display_name',\n89:             'guest_user_id',\n90:             'guest_access_token',\n91:         ]\n92:         for k in required:\n93:             substitutions.setdefault(k, '')\n94: \n95:         substitutions[\"ephemeral_private_key\"] = ephemeralPrivateKeyBase64\n96:         if substitutions[\"room_name\"] != '':\n97:             substitutions[\"bracketed_room_name\"] = \"(%s)\" % substitutions[\"room_name\"]\n98: \n99:         subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')\n100:         substitutions[\"subject_header_value\"] = subject_header.encode()\n101: \n102:         sendEmail(self.sydent, \"email.invite_template\", address, substitutions)\n103: \n104:         pubKey = self.sydent.keyring.ed25519.verify_key\n105:         pubKeyBase64 = encode_base64(pubKey.encode())\n106: \n107:         baseUrl = \"%s/_matrix/identity/api/v1\" % (self.sydent.cfg.get('http', 'client_http_base'),)\n108: \n109:         keysToReturn = []\n110:         keysToReturn.append({\n111:             \"public_key\": pubKeyBase64,\n112:             \"key_validity_url\": baseUrl + \"/pubkey/isvalid\",\n113:         })\n114:         keysToReturn.append({\n115:             \"public_key\": ephemeralPublicKeyBase64,\n116:             \"key_validity_url\": baseUrl + \"/pubkey/ephemeral/isvalid\",\n117:         })\n118: \n119:         resp = {\n120:             \"token\": token,\n121:             \"public_key\": pubKeyBase64,\n122:             \"public_keys\": keysToReturn,\n123:             \"display_name\": self.redact(address),\n124:         }\n125: \n126:         return json.dumps(resp)\n127: \n128:     def redact(self, address):\n129:         return \"@\".join(map(self._redact, address.split(\"@\", 1)))\n130: \n131:     def _redact(self, s):\n132:         if len(s) > 5:\n133:             return s[:3] + \"...\"\n134:         elif len(s) > 1:\n135:             return s[0] + \"...\"\n136:         else:\n137:             return \"...\"\n138: \n139:     def _randomString(self, length):\n140:         return ''.join(random.choice(string.ascii_letters) for _ in xrange(length))",
+      "source_summary": "Request parameters from request.args (user-controlled HTTP request data) are directly copied into substitutions dictionary",
+      "sink_summary": "Substitutions are used in email template formatting via string interpolation (line 56 in emailutils.py) and sent via SMTP",
+      "guard_summary": "Limited filtering: only single-value string parameters are included. HTML escaping is applied in emailutils.py line 53 via cgi.escape for *_forhtml variables",
+      "risk_pattern": "User-controlled request parameters are directly interpolated into email templates without validation, though HTML escaping is applied for specific template variables",
+      "used_variable_sources": [
+        "request.args (HTTP request parameters)"
+      ],
+      "called_function_context": [
+        "sendEmail",
+        "cgi.escape",
+        "urllib.quote"
+      ],
+      "enclosing_conditions": [
+        "if len(values) == 1 and type(values[0]) == str"
+      ],
+      "context_summary": "Request parameters are collected into substitutions dictionary for email invitation template. The email template system applies HTML escaping to variables with _forhtml suffix and URL encoding to variables with _forurl suffix",
+      "unresolved_facts": [
+        "Specific email template content and usage patterns",
+        "Whether all template variables that use raw substitutions are properly escaped",
+        "Configuration of email template file location and content"
+      ],
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.9711,
+          "raw_bm25_score": 22.9711,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/reflective-xss-email",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.2802,
+          "raw_bm25_score": 20.2802,
+          "description": "Writing user input directly to a web page allows for a cross-site scripting vulnerability.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output operations. Implement proper escaping for HTML, JavaScript, CSS, and URL contexts.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-116"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/template-injection",
+          "cwe_id": "CWE-74",
+          "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.7297,
+          "raw_bm25_score": 19.7297,
+          "description": "Using user-controlled data to create a template can lead to remote code execution or cross site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized APIs and separate data from control instructions. Validate input format and escape special characters.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-074"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/shell-command-constructed-from-input",
+          "cwe_id": "CWE-78",
+          "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 18.026,
+          "raw_bm25_score": 18.026,
+          "description": "Using externally controlled strings in a command line may allow a malicious user to change the meaning of the command.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use safe command execution APIs with parameter arrays. Validate and sanitize command arguments against strict allowlists.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-088",
+            "external/cwe/cwe-073"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "fallback/cwe-77-improper-neutralization-of-special-elements-used-in-a-command-command-injection",
+          "cwe_id": "CWE-77",
+          "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 17.5378,
+          "raw_bm25_score": 17.5378,
+          "description": "Externally influenced data changes the syntax or meaning of a command sent to a downstream command interpreter.",
+          "pattern": "cwe-77 command-injection command-construction shell exec spawn process subprocess child_process os.system popen argument-delimiter metacharacter",
+          "remediation": "Keep external data separate from command syntax and use safe argument APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-077"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/partial-ssrf",
+          "cwe_id": "CWE-918",
+          "cwe_name": "Server-Side Request Forgery (SSRF)",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.7441,
+          "raw_bm25_score": 16.7441,
+          "description": "Making a network request to a URL that is partially user-controlled allows for request forgery attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement URL validation with allowlists of permitted destinations. Use network segmentation and validate all outbound requests.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-918"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/unicode-bypass-validation",
+          "cwe_id": "CWE-179",
+          "cwe_name": "Incorrect Behavior Order: Early Validation",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.3801,
+          "raw_bm25_score": 16.3801,
+          "description": "A Unicode transformation is using a remote user-controlled data. The transformation is a Unicode normalization using the algorithms \"NFC\" or \"NFKC\". In all cases, the security measures implemented or the logical validation performed to escape any injection characters, to validate using regex patterns or to perform string-based checks, before the Unicode transformation are **bypassable** by special Unicode characters.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement validation early in the processing pipeline. Ensure validation cannot be bypassed by alternate code paths. Use consistent validation across all entry points.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-176",
+            "external/cwe/cwe-179",
+            "external/cwe/cwe-180"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 15.7539,
+          "raw_bm25_score": 15.7539,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 15.0936,
+          "raw_bm25_score": 15.0936,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.025,
+          "raw_bm25_score": 15.025,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

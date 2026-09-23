@@ -1,0 +1,146 @@
+diff --git a/weblate/accounts/pipeline.py b/weblate/accounts/pipeline.py
+index a717db72270c..7daf0bf3d0e2 100644
+--- a/weblate/accounts/pipeline.py
++++ b/weblate/accounts/pipeline.py
+@@ -58,6 +58,10 @@ def send_validation(strategy, backend, code):
+     if not strategy.request.session.session_key:
+         strategy.request.session.create()
+ 
++    template = 'activation'
++    if strategy.request.session.pop('password_reset', False):
++        template = 'reset'
++
+     url = '{}?verification_code={}&id={}'.format(
+         reverse('social:complete', args=(backend.name,)),
+         code.code,
+@@ -67,7 +71,7 @@ def send_validation(strategy, backend, code):
+     send_notification_email(
+         None,
+         code.email,
+-        'activation',
++        template,
+         info=code.code,
+         context={
+             'url': url
+diff --git a/weblate/accounts/tests.py b/weblate/accounts/tests.py
+index c268a7b1e924..54d4d025ab62 100644
+--- a/weblate/accounts/tests.py
++++ b/weblate/accounts/tests.py
+@@ -67,8 +67,8 @@
+ class RegistrationTest(TestCase, RegistrationTestMixin):
+     clear_cookie = False
+ 
+-    def assert_registration(self):
+-        url = self.assert_registration_mailbox()
++    def assert_registration(self, match=None):
++        url = self.assert_registration_mailbox(match)
+ 
+         if self.clear_cookie:
+             del self.client.cookies['sessionid']
+@@ -144,7 +144,7 @@ def test_reset(self):
+         )
+         self.assertRedirects(response, reverse('email-sent'))
+ 
+-        self.assert_registration()
++        self.assert_registration('[Weblate] Password reset on Weblate')
+ 
+     def test_wrong_username(self):
+         data = REGISTRATION_DATA.copy()
+diff --git a/weblate/accounts/views.py b/weblate/accounts/views.py
+index a36e6a782c0b..c287443a0547 100644
+--- a/weblate/accounts/views.py
++++ b/weblate/accounts/views.py
+@@ -521,6 +521,9 @@ def reset_password(request):
+             user = form.cleaned_data['email']
+             user.set_unusable_password()
+             user.save()
++            if not request.session.session_key:
++                request.session.create()
++            request.session['password_reset'] = True
+             return complete(request, 'email')
+     else:
+         form = ResetForm()
+diff --git a/weblate/html/mail/reset.html b/weblate/html/mail/reset.html
+new file mode 100644
+index 000000000000..546ecbe20ade
+--- /dev/null
++++ b/weblate/html/mail/reset.html
+@@ -0,0 +1,31 @@
++{% extends "mail/base.html" %}
++
++{% load url from future %}
++{% load i18n %}{% load translations %}
++
++{% block content %}
++<p>
++{% trans "Hi,"%}
++</p>
++
++<p>
++{% blocktrans %}There was a request to reset your Weblate password at {{ site_title }}.{% endblocktrans %}
++</p>
++
++<p>
++{% blocktrans %}Please open the following link in your web browser. If the link is split over several lines, you may need to copy it in the address bar.{% endblocktrans %}
++</p>
++
++<p>
++<a href="{{ current_site_url }}{{ url }}">{{ current_site_url }}{{ url }}</a>
++</p>
++
++<p>
++{% blocktrans %}If there is a problem with your registration, please contact us:{% endblocktrans %}
++</p>
++
++<p>
++<a href="{{ current_site_url }}{% url 'contact' %}?subject=Registration">{{ current_site_url }}{% url 'contact' %}?subject=Registration</a>
++</p>
++
++{% endblock %}
+diff --git a/weblate/html/mail/reset.txt b/weblate/html/mail/reset.txt
+new file mode 100644
+index 000000000000..62a41e92a7db
+--- /dev/null
++++ b/weblate/html/mail/reset.txt
+@@ -0,0 +1,13 @@
++{% load url from future %}{% load i18n %}{% load translations %}{% autoescape off %}{% filter wordwrap:72 %}{% trans "Hi," %}
++
++{% blocktrans %}There was a request to reset your Weblate password at {{ site_title }}.{% endblocktrans %}
++
++{% blocktrans %}Please open the following link in your web browser. If the link is split over several lines, you may need to copy it in the address bar.{% endblocktrans %}
++
++{{ current_site_url }}{{ url }}
++
++{% blocktrans %}If there is a problem with your registration, please contact us:{% endblocktrans %}
++
++{{ current_site_url }}{% url 'contact' %}?subject=Registration
++
++{% endfilter%}{% endautoescape %}{% include "mail/signature.txt" %}
+diff --git a/weblate/html/mail/reset_subject.txt b/weblate/html/mail/reset_subject.txt
+new file mode 100644
+index 000000000000..803b388ab139
+--- /dev/null
++++ b/weblate/html/mail/reset_subject.txt
+@@ -0,0 +1 @@
++{% load i18n %}{% load translations %}{% blocktrans %}Password reset on {{ site_title }}{% endblocktrans %}
+diff --git a/weblate/trans/tests/test_views.py b/weblate/trans/tests/test_views.py
+index 12176a4d4e03..03fea8c08940 100644
+--- a/weblate/trans/tests/test_views.py
++++ b/weblate/trans/tests/test_views.py
+@@ -44,12 +44,14 @@ class RegistrationTestMixin(object):
+     """
+     Helper to share code for registration testing.
+     """
+-    def assert_registration_mailbox(self):
++    def assert_registration_mailbox(self, match=None):
++        if match is None:
++            match = '[Weblate] Your registration on Weblate'
+         # Check mailbox
+         self.assertEqual(len(mail.outbox), 1)
+         self.assertEqual(
+             mail.outbox[0].subject,
+-            '[Weblate] Your registration on Weblate'
++            match
+         )
+ 
+         # Parse URL

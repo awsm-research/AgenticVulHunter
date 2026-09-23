@@ -1,0 +1,214 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "shell/server/backup.js",
+  "changed_line": 55,
+  "statement": "_id: Random.id(),",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "token_generation",
+  "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+  "security_relevance_score": 0.8,
+  "code_context": "1: // Sandstorm - Personal Cloud Sandbox\n2: // Copyright (c) 2014 Sandstorm Development Group, Inc. and contributors\n3: // All rights reserved.\n4: //\n5: // Licensed under the Apache License, Version 2.0 (the \"License\");\n6: // you may not use this file except in compliance with the License.\n7: // You may obtain a copy of the License at\n8: //\n9: //   http://www.apache.org/licenses/LICENSE-2.0\n10: //\n11: // Unless required by applicable law or agreed to in writing, software\n12: // distributed under the License is distributed on an \"AS IS\" BASIS,\n13: // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: // See the License for the specific language governing permissions and\n15: // limitations under the License.\n16: \n17: var ChildProcess = Npm.require(\"child_process\");\n18: var Future = Npm.require(\"fibers/future\");\n19: var Promise = Npm.require(\"es6-promise\").Promise;\n20: var Capnp = Npm.require(\"capnp\");\n21: \n22: var GrainInfo = Capnp.importSystem(\"sandstorm/grain.capnp\").GrainInfo;\n23: \n24: var TOKEN_CLEANUP_MINUTES = 15;\n25: var TOKEN_CLEANUP_TIMER = TOKEN_CLEANUP_MINUTES * 60 * 1000;\n26: \n27: function cleanupToken(tokenId) {\n28:   check(tokenId, String);\n29:   waitPromise(sandstormBackend.deleteBackup(tokenId));\n30:   FileTokens.remove({_id: tokenId});\n31: }\n32: \n33: Meteor.startup(function () {\n34:   // Cleanup tokens every TOKEN_CLEANUP_MINUTES\n35:   Meteor.setInterval(function () {\n36:     var queryDate = new Date(Date.now() - TOKEN_CLEANUP_TIMER);\n37: \n38:     FileTokens.find({timestamp: {$lt: queryDate}}).forEach(function (token) {\n39:       cleanupToken(token._id);\n40:     });\n41:   }, TOKEN_CLEANUP_TIMER);\n42: });\n43: \n44: Meteor.methods({\n45:   backupGrain: function (grainId) {\n46:     check(grainId, String);\n47:     var grain = Grains.findOne(grainId);\n48:     if (!grain || !this.userId || grain.userId !== this.userId) {\n49:       throw new Meteor.Error(403, \"Unauthorized\", \"User is not the owner of this grain\");\n50:     }\n51: \n52:     this.unblock();\n53: \n54:     var token = {\n55:       _id: Random.id(),\n56:       timestamp: new Date(),\n57:       name: grain.title\n58:     };\n59: \n60:     // TODO(soon): does the grain need to be offline?\n61: \n62:     var grainInfo = _.pick(grain, \"appId\", \"appVersion\", \"title\");\n63: \n64:     FileTokens.insert(token);\n65:     waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));\n66: \n67:     return token._id;\n68:   },\n69: \n70:   restoreGrain: function (tokenId) {\n71:     check(tokenId, String);\n72:     var token = FileTokens.findOne(tokenId);\n73:     if (!token || !isSignedUpOrDemo()) {\n74:       throw new Meteor.Error(403, \"Unauthorized\",\n75:           \"Token was not found, or user cannot create grains\");\n76:     }\n77: \n78:     this.unblock();\n79: \n80:     var grainId = Random.id(22);\n81: \n82:     try {\n83:       var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;\n84:       if (!grainInfo.appId) {\n85:           throw new Meteor.Error(500, \"Metadata object for uploaded grain has no AppId\");\n86:       }\n87: \n88:       var action = UserActions.findOne({appId: grainInfo.appId, userId: this.userId});\n89:       if (!action) {\n90:         throw new Meteor.Error(500,\n91:                                \"App id for uploaded grain not installed\",\n92:                                \"App Id: \" + grainInfo.appId);\n93:       }\n94:       if (action.appVersion < grainInfo.appVersion) {\n95:         throw new Meteor.Error(500,\n96:                                \"App version for uploaded grain is newer than any \" +\n97:                                \"installed version. You need to upgrade your app first\",\n98:                                \"New version: \" + grainInfo.appVersion +\n99:                                \", Old version: \" + action.appVersion);\n100:       }\n101: \n102:       Grains.insert({\n103:         _id: grainId,\n104:         packageId: action.packageId,\n105:         appId: action.appId,\n106:         appVersion: action.appVersion,\n107:         userId: this.userId,\n108:         title: grainInfo.title,\n109:         private: true\n110:       });\n111:     } finally {\n112:       cleanupToken(tokenId);\n113:     }\n114: \n115:     return grainId;\n116:   },\n117: });\n118: \n119: Router.map(function () {\n120:   this.route(\"downloadBackup\", {\n121:     where: \"server\",\n122:     path: \"/downloadBackup/:tokenId\",\n123:     action: function () {\n124:       var token = FileTokens.findOne(this.params.tokenId);\n125:       var response = this.response;\n126:       if (!token) {\n127:         response.writeHead(404, {\"Content-Type\": \"text/plain\"});\n128:         return response.end(\"File does not exist\");\n129:       }\n130: \n131:       var started = false;\n132:       var filename = (token.name.replace(/[\"\\n]/g, \"\") || \"backup\") + \".zip\";\n133:       var sawEnd = false;\n134: \n135:       var stream = {\n136:         expectSize: function (size) {\n137:           if (!started) {\n138:             started = true;\n139:             response.writeHead(200, {\n140:               \"Content-Length\": size,\n141:               \"Content-Type\": \"application/zip\",\n142:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n143:             });\n144:           }\n145:         },\n146:         write: function (data) {\n147:           if (!started) {\n148:             started = true;\n149:             response.writeHead(200, {\n150:               \"Content-Type\": \"application/zip\",\n151:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n152:             });\n153:           }\n154:           response.write(data);\n155:         },\n156:         done: function (data) {\n157:           if (!started) {\n158:             started = true;\n159:             response.writeHead(200, {\n160:               \"Content-Length\": 0,\n161:               \"Content-Type\": \"application/zip\",\n162:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n163:             });\n164:           }\n165:           sawEnd = true;\n166:           response.end();\n167:         }\n168:       };\n169: \n170:       waitPromise(sandstormBackend.downloadBackup(this.params.tokenId, stream));\n171: \n172:       if (!sawEnd) {\n173:         console.error(\"backend failed to call done() when downloading backup\");\n174:         if (!started) {\n175:           throw new Meteor.Error(500, \"backend failed to produce data\");\n176:         }\n177:         response.end();\n178:       }\n179: \n180:       cleanupToken(this.params.tokenId);\n181:     }\n182:   });\n183: \n184:   this.route(\"uploadBackup\", {\n185:     where: \"server\",\n186:     path: \"/uploadBackup\",\n187:     action: function () {\n188:       if (this.request.method === \"POST\") {\n189:         var request = this.request;\n190:         try {\n191:           var token = {\n192:             _id: Random.id(),\n193:             timestamp: new Date()\n194:           };\n195:           var stream = sandstormBackend.uploadBackup(token._id).stream;\n196: \n197:           FileTokens.insert(token);\n198: \n199:           waitPromise(new Promise(function (resolve, reject) {\n200:             request.on(\"data\", function (data) {\n201:               stream.write(data);\n202:             });\n203:             request.on(\"end\", function () {\n204:               resolve(stream.done());",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-340",
+      "cwe_name": "Generation of Predictable Numbers or Identifiers",
+      "fit_reason": "Use of Random.id() for token generation in backup/restore operations is predictable and insecure",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-338",
+      "cwe_name": "Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)",
+      "fit_reason": "Random.id() does not provide cryptographically secure randomness for token generation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-327",
+      "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+      "fit_reason": "The use of insecure random number generation in token creation may lead to biased results",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-116",
+    "CWE-193",
+    "CWE-255",
+    "CWE-310",
+    "CWE-327",
+    "CWE-338",
+    "CWE-340",
+    "CWE-352",
+    "CWE-367",
+    "CWE-534",
+    "CWE-561",
+    "CWE-563",
+    "CWE-697",
+    "CWE-704",
+    "CWE-758"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 55,
+      "statement": "_id: Random.id(),",
+      "cwe_id": "CWE-340",
+      "cwe_name": "Generation of Predictable Numbers or Identifiers",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The candidate uses Random.id() to generate the _id field for tokens in backupGrain method, which directly matches the CWE-340 mechanism of generating predictable identifiers."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The generated token ID is used as a lookup key in FileTokens collection and passed through the restoreGrain and downloadBackup methods. The token ID is directly connected to security-sensitive operations like grain restoration and backup downloads."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted to use a non-random identifier, it would change the predictability of tokens. The patch introduces Random.id() which makes identifiers predictable, not secure."
+        },
+        "security_control": {
+          "score": 0.9,
+          "evidence": "The code lacks any cryptographic randomness or secure token generation mechanism for the _id field. The required control is secure random identifier generation, which is missing.",
+          "required_control": "Cryptographically secure random number generation",
+          "control_requirement_evidence": "CWE-340 specifically requires that identifiers be unpredictable to prevent attackers from guessing or enumerating valid tokens.",
+          "existing_controls_checked": [
+            "Use of Random.id() - not cryptographically secure",
+            "No explicit validation or entropy checks on token IDs"
+          ],
+          "deficiency_evidence": "The code uses Meteor's Random.id() which generates identifiers based on a simple algorithm, making them predictable and vulnerable to enumeration attacks."
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "An attacker who can guess or enumerate token IDs could access unauthorized backups and restore grains they don't own, leading to privilege escalation and data exposure."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the token ID generation would not use Random.id(), potentially using a different identifier scheme that might be more predictable but not necessarily secure. The change introduces predictability rather than removing it.",
+      "supporting_evidence": [
+        "Use of Random.id() for generating _id field in backupGrain method",
+        "Token IDs are used as lookup keys in FileTokens collection",
+        "Token IDs are passed through restoreGrain and downloadBackup methods"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "The backupGrain method uses Random.id() to generate token identifiers, creating predictable tokens that can be enumerated by attackers. This allows unauthorized access to grain backups and restoration operations. Replace Random.id() with a cryptographically secure random identifier generator to prevent enumeration attacks.",
+      "change_type": "A",
+      "raw_score": 0.8400000000000001,
+      "score": 0.8400000000000001
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 55,
+      "statement": "_id: Random.id(),",
+      "cwe_id": "CWE-338",
+      "cwe_name": "Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code uses Random.id() to generate the _id field for backup tokens, which is a cryptographically weak pseudo-random number generator as per Meteor's implementation and the CWE definition."
+        },
+        "connection": {
+          "score": 1.0,
+          "evidence": "The generated token ID is used as a security-sensitive identifier in the FileTokens collection and is directly referenced in the downloadBackup route, making it an attacker-controlled input that can be used to access backup files."
+        },
+        "diff_causality": {
+          "score": 1.0,
+          "evidence": "If this line were reverted to use a cryptographically secure random number generator, the tokens would be significantly harder to predict or guess, directly addressing the CWE vulnerability."
+        },
+        "security_control": {
+          "score": 1.0,
+          "evidence": "No cryptographic security controls are implemented for token generation; the system relies on Random.id() which is not cryptographically secure.",
+          "required_control": "Cryptographically secure random number generator",
+          "control_requirement_evidence": "CWE-338 specifically requires that PRNGs used in security contexts must be cryptographically strong to prevent predictability and potential exploitation.",
+          "existing_controls_checked": [
+            "No explicit cryptographic controls for token generation",
+            "FileTokens collection access is controlled by Meteor.userId() but tokens are guessable"
+          ],
+          "deficiency_evidence": "The use of Random.id() directly violates the requirement for cryptographically secure randomness in security-sensitive contexts like token generation."
+        },
+        "concrete_impact": {
+          "score": 1.0,
+          "evidence": "An attacker who can predict or guess a backup token ID can access any user's backup file, leading to unauthorized data access and potential information disclosure."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted to use a cryptographically secure random number generator (e.g., crypto.randomBytes() or Meteor.crypto.randomBytes()), then the generated tokens would be unpredictable and resistant to guessing attacks, directly resolving the CWE-338 vulnerability.",
+      "supporting_evidence": [
+        "The code uses Random.id() for generating backup token IDs in line 55",
+        "FileTokens collection is used to store these tokens for access control",
+        "The downloadBackup route accesses files using these token IDs without additional authentication checks beyond the token existence",
+        "Meteor's Random.id() is known to be a non-cryptographically secure PRNG"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "The backup token generation uses Meteor's Random.id(), which produces non-cryptographically secure random numbers. This allows attackers to potentially guess valid token IDs and access unauthorized backup files. Replace Random.id() with a cryptographically secure random number generator for the _id field in FileTokens.",
+      "change_type": "A",
+      "raw_score": 1.0,
+      "score": 1.0
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 55,
+      "statement": "_id: Random.id(),",
+      "cwe_id": "CWE-327",
+      "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The candidate uses Random.id() for token generation, which may not provide cryptographically secure randomness. However, CWE-327 specifically requires broken or risky cryptographic algorithms, and Random.id() is a general-purpose ID generator, not a cryptographic algorithm."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The token generated with Random.id() is used as an identifier for backup operations and is stored in FileTokens collection. This token is later used in downloadBackup and uploadBackup routes, making it a security-sensitive state that could be exploited if the randomness is predictable."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this line were reverted to use a cryptographically secure random number generator, it would materially change the vulnerability by increasing the entropy and unpredictability of tokens, which could prevent attackers from guessing or brute-forcing valid backup tokens."
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "The code does not implement any cryptographic security controls for token generation. The required control is cryptographically secure random number generation, which is necessary to prevent predictability of tokens used in backup operations.",
+          "required_control": "Cryptographically secure random number generation",
+          "control_requirement_evidence": "CWE-327 requires protection against broken or risky cryptographic algorithms, and token predictability directly relates to cryptographic security.",
+          "existing_controls_checked": [
+            "No explicit cryptographic controls for token generation",
+            "FileTokens collection access is controlled by Meteor methods"
+          ],
+          "deficiency_evidence": "The use of Random.id() instead of a cryptographically secure random generator demonstrates a deficiency in the required control, as it does not provide sufficient entropy for security-sensitive identifiers."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "If tokens are predictable due to weak randomness, an attacker could potentially guess valid backup tokens and access unauthorized backups, leading to data exposure or modification. However, the impact is not fully demonstrated without evidence of successful exploitation."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted to use a cryptographically secure random number generator (e.g., crypto.randomBytes), it would significantly increase the entropy and unpredictability of backup tokens, thereby preventing attackers from guessing valid tokens and accessing unauthorized backups.",
+      "supporting_evidence": [
+        "Use of Random.id() for token generation in backupGrain method",
+        "Tokens are used as identifiers in downloadBackup and uploadBackup routes",
+        "FileTokens collection stores these tokens for access control"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the specific implementation of Random.id() is actually cryptographically insecure",
+        "Whether an attacker could successfully exploit predictable tokens to gain unauthorized access",
+        "The exact entropy level provided by Random.id() vs. a secure random generator"
+      ],
+      "review_comment": "The backup token generation uses Random.id() which may not provide sufficient cryptographic security. An attacker could potentially guess valid backup tokens if the randomness is predictable, leading to unauthorized access to backups. Replace Random.id() with a cryptographically secure random number generator for backup tokens.",
+      "change_type": "A",
+      "raw_score": 0.6000000000000001,
+      "score": 0.6000000000000001
+    }
+  ],
+  "stage4_status": "completed"
+}

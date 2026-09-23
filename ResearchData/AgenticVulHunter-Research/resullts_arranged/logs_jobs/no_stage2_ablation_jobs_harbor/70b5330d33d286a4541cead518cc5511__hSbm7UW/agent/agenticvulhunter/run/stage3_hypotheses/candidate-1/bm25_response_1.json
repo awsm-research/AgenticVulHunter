@@ -1,0 +1,238 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/unpack.js",
+      "changed_line": 207,
+      "statement": "if (this.newer && st.mtime > entry.mtime)",
+      "change_type": "A",
+      "function_name": "",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+      "security_relevance_score": 0.8,
+      "code_context": "58:     this.unlink = !!opt.unlink\n59: \n60:     this.cwd = path.resolve(opt.cwd || process.cwd())\n61:     this.strip = +opt.strip || 0\n62:     this.umask = typeof opt.umask === 'number' ? opt.umask : process.umask()\n63:     // default mode for dirs created as parents\n64:     this.dmode = opt.dmode || (0o0777 & (~this.umask))\n65:     this.fmode = opt.fmode || (0o0666 & (~this.umask))\n66:     this.on('entry', entry => this[ONENTRY](entry))\n67:     if (typeof opt.onwarn === 'function')\n68:       this.on('warn', opt.onwarn)\n69:   }\n70: \n71:   [MAYBECLOSE] () {\n72:     if (this[ENDED] && this[PENDING] === 0)\n73:       this.emit('close')\n74:   }\n75: \n76:   [CHECKPATH] (entry) {\n77:     if (this.strip) {\n78:       const parts = entry.path.split(/\\/|\\\\/)\n79:       if (parts.length < this.strip)\n80:         return false\n81:       entry.path = parts.slice(this.strip).join('/')\n82:     }\n83: \n84:     if (!this.preservePaths) {\n85:       const p = entry.path\n86:       if (p.match(/(^|\\/|\\\\)\\.\\.(\\\\|\\/|$)/)) {\n87:         this.warn('path contains \\'..\\'', p)\n88:         return false\n89:       }\n90:       if (path.isAbsolute(p)) {\n91:         const parsed = path.parse(p)\n92:         this.warn('stripping ' + parsed.root + ' from absolute path', p)\n93:         entry.path = p.substr(parsed.root.length)\n94:       }\n95:     }\n96: \n97:     if (path.isAbsolute(entry.path))\n98:       entry.absolute = entry.path\n99:     else\n100:       entry.absolute = path.resolve(this.cwd, entry.path)\n101: \n102:     return true\n103:   }\n104: \n105:   [ONENTRY] (entry) {\n106:     if (!this[CHECKPATH](entry))\n107:       return entry.resume()\n108: \n109:     assert.equal(typeof entry.absolute, 'string')\n110: \n111:     switch (entry.type) {\n112:       case 'File':\n113:       case 'OldFile':\n114:       case 'ContiguousFile':\n115:       case 'Link':\n116:       case 'SymbolicLink':\n117:       case 'Directory':\n118:       case 'GNUDumpDir':\n119:         return this[CHECKFS](entry)\n120: \n121:       case 'CharacterDevice':\n122:       case 'BlockDevice':\n123:       case 'FIFO':\n124:         return this[UNSUPPORTED](entry)\n125: \n126:       // this should be impossible\n127:       /* istanbul ignore next */\n128:       default:\n129:         return this.emit('error', new Error('unknown type: ' + entry.type))\n130:     }\n131:   }\n132: \n133:   [ONERROR] (er, entry) {\n134:     this.warn(er.message, er)\n135:     this[UNPEND]()\n136:     entry.resume()\n137:   }\n138: \n139:   [MKDIR] (dir, mode, cb) {\n140:     mkdir(dir, {\n141:       preserve: this.preservePaths,\n142:       unlink: this.unlink,\n143:       cache: this.dirCache,\n144:       cwd: this.cwd,\n145:       mode: mode\n146:     }, cb)\n147:   }\n148: \n149:   [FILE] (entry) {\n150:     const mode = entry.mode & 0o7777 || this.fmode\n151:     const stream = fs.createWriteStream(entry.absolute, { mode: mode })\n152:     stream.on('error', er => this[ONERROR](er, entry))\n153:     stream.on('close', _ => {\n154:       if (entry.mtime)\n155:         fs.utimes(entry.absolute, entry.atime || new Date(), entry.mtime, _ => _)\n156:       this[UNPEND]()\n157:     })\n158:     entry.pipe(stream)\n159:   }\n160: \n161:   [DIRECTORY] (entry) {\n162:     const mode = entry.mode & 0o7777 || this.dmode\n163:     this[MKDIR](entry.absolute, mode, er => {\n164:       if (er)\n165:         return this[ONERROR](er, entry)\n166:       if (entry.mtime)\n167:         fs.utimes(entry.absolute, entry.atime || new Date(), entry.mtime, _ => _)\n168:       this[UNPEND]()\n169:       entry.resume()\n170:     })\n171:   }\n172: \n173:   [UNSUPPORTED] (entry) {\n174:     this.warn('unsupported entry type: ' + entry.type, entry)\n175:     entry.resume()\n176:   }\n177: \n178:   [SYMLINK] (entry) {\n179:     this[LINK](entry, entry.linkpath, 'symlink')\n180:   }\n181: \n182:   [HARDLINK] (entry) {\n183:     this[LINK](entry, path.resolve(this.cwd, entry.linkpath), 'link')\n184:   }\n185: \n186:   [PEND] () {\n187:     this[PENDING]++\n188:   }\n189: \n190:   [UNPEND] () {\n191:     this[PENDING]--\n192:     this[MAYBECLOSE]()\n193:   }\n194: \n195:   [SKIPNEWER] (entry) {\n196:     this[UNPEND]()\n197:     entry.resume()\n198:   }\n199: \n200:   // check if a thing is there, and if so, try to clobber it\n201:   [CHECKFS] (entry) {\n202:     this[PEND]()\n203:     this[MKDIR](path.dirname(entry.absolute), this.dmode, er => {\n204:       if (er)\n205:         return this[ONERROR](er, entry)\n206:       fs.lstat(entry.absolute, (er, st) => {\n207:         if (this.newer && st.mtime > entry.mtime)\n208:           this[SKIPNEWER](entry)\n209:         else if (er || (entry.type === 'File' && !this.unlink && st.isFile()))\n210:           this[MAKEFS](null, entry)\n211:         else if (st.isDirectory()) {\n212:           if (entry.type === 'Directory') {\n213:             if (!entry.mode || (st.mode & 0o7777) === entry.mode)\n214:               this[MAKEFS](null, entry)\n215:             else\n216:               fs.chmod(entry.absolute, entry.mode, er => this[MAKEFS](er, entry))\n217:           } else\n218:             fs.rmdir(entry.absolute, er => this[MAKEFS](er, entry))\n219:         } else\n220:           fs.unlink(entry.absolute, er => this[MAKEFS](er, entry))\n221:       })\n222:     })\n223:   }\n224: \n225:   [MAKEFS] (er, entry) {\n226:     if (er)\n227:       return this[ONERROR](er, entry)\n228: \n229:     switch (entry.type) {\n230:       case 'File':\n231:       case 'OldFile':\n232:       case 'ContiguousFile':\n233:         return this[FILE](entry)\n234: \n235:       case 'Link':\n236:         return this[HARDLINK](entry)\n237: \n238:       case 'SymbolicLink':\n239:         return this[SYMLINK](entry)\n240: \n241:       case 'Directory':\n242:       case 'GNUDumpDir':\n243:         return this[DIRECTORY](entry)\n244: \n245:       // should be impossible\n246:       /* istanbul ignore next */\n247:       default:\n248:         return this.emit('error', new Error('unknown type: ' + entry.type))\n249:     }\n250:   }\n251: \n252:   [LINK] (entry, linkpath, link) {\n253:     // XXX: get the type ('file' or 'dir') for windows\n254:     fs[link](linkpath, entry.absolute, er => {\n255:       if (er)\n256:         return this[ONERROR](er, entry)\n257:       this[UNPEND]()\n258:       entry.resume()\n259:     })\n260:   }\n261: }\n262: \n263: class UnpackSync extends Unpack {\n264:   constructor (opt) {\n265:     super(opt)\n266:   }\n267: \n268:   [CHECKFS] (entry) {\n269:     const er = this[MKDIR](path.dirname(entry.absolute), this.dmode)\n270:     if (er)\n271:       return this[ONERROR](er, entry)\n272:     try {\n273:       const st = fs.lstatSync(entry.absolute)\n274:       if (this.newer && st.mtime > entry.mtime)\n275:         return this[SKIPNEWER](entry)\n276:       else if (entry.type === 'File' && !this.unlink && st.isFile())\n277:         return this[MAKEFS](null, entry)\n278:       else {\n279:         try {\n280:           if (st.isDirectory()) {\n281:             if (entry.type === 'Directory') {\n282:               if (entry.mode && (st.mode & 0o7777) !== entry.mode)\n283:                 fs.chmodSync(entry.absolute, entry.mode)\n284:             } else\n285:               fs.rmdirSync(entry.absolute)\n286:           } else\n287:             fs.unlinkSync(entry.absolute)\n288:           return this[MAKEFS](null, entry)\n289:         } catch (er) {\n290:           return this[ONERROR](er, entry)\n291:         }\n292:       }\n293:     } catch (er) {\n294:       return this[MAKEFS](null, entry)\n295:     }\n296:   }\n297: \n298:   [FILE] (entry) {\n299:     const mode = entry.mode & 0o7777 || this.fmode\n300:     try {\n301:       const fd = fs.openSync(entry.absolute, 'w', mode)\n302:       entry.on('data', buf => fs.writeSync(fd, buf, 0, buf.length, null))\n303:       entry.on('end', _ => {\n304:         if (entry.mtime) {\n305:           try {\n306:             fs.futimesSync(fd, entry.atime || new Date(), entry.mtime)\n307:           } catch (er) {}\n308:         }\n309:         try { fs.closeSync(fd) } catch (er) { this[ONERROR](er, entry) }\n310:       })\n311:     } catch (er) { this[ONERROR](er, entry) }\n312:   }\n313: \n314:   [DIRECTORY] (entry) {\n315:     const mode = entry.mode & 0o7777 || this.dmode\n316:     const er = this[MKDIR](entry.absolute, mode)\n317:     if (er)\n318:       return this[ONERROR](er, entry)\n319:     if (entry.mtime) {\n320:       try {\n321:         fs.utimesSync(entry.absolute, entry.atime || new Date(), entry.mtime)\n322:       } catch (er) {}\n323:     }\n324:     entry.resume()\n325:   }\n326: \n327:   [MKDIR] (dir, mode) {\n328:     try {\n329:       return mkdir.sync(dir, {\n330:         preserve: this.preservePaths,\n331:         unlink: this.unlink,\n332:         cache: this.dirCache,\n333:         cwd: this.cwd,\n334:         mode: mode\n335:       })\n336:     } catch (er) {\n337:       return er\n338:     }\n339:   }\n340: \n341:   [LINK] (entry, linkpath, link) {\n342:     try {\n343:       fs[link + 'Sync'](linkpath, entry.absolute)\n344:       entry.resume()\n345:     } catch (er) {\n346:       return this[ONERROR](er, entry)\n347:     }\n348:   }\n349: }\n350: \n351: Unpack.Sync = UnpackSync\n352: module.exports = Unpack",
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/useless-regexp-character-escape",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 8.2118,
+          "raw_bm25_score": 8.2118,
+          "description": "Prepending a backslash to an ordinary character in a string does not have any effect, and may make regular expressions constructed from this string behave unexpectedly.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/trivial-conditional",
+          "cwe_id": "CWE-571",
+          "cwe_name": "Expression is Always True",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.4744,
+          "raw_bm25_score": 7.4744,
+          "description": "If a conditional expression always evaluates to true or always evaluates to false, this suggests incomplete code or a logic error.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-571. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-570",
+            "external/cwe/cwe-571"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/redundant-operation",
+          "cwe_id": "CWE-561",
+          "cwe_name": "Dead Code",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.2542,
+          "raw_bm25_score": 7.2542,
+          "description": "Passing identical, or seemingly identical, operands to an operator such as subtraction or conjunction may indicate a typo; even if it is intentional, it makes the code hard to read.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove dead code through static analysis. Use code coverage tools to identify unreachable code. Implement regular code reviews to eliminate unused functionality.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-480",
+            "external/cwe/cwe-561"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/function-declaration-conflict",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 6.4709,
+          "raw_bm25_score": 6.4709,
+          "description": "If two functions with the same name are declared in the same scope, one of the declarations overrides the other without warning. This makes the code hard to read and maintain, and may even lead to platform-dependent behavior.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/file-system-race",
+          "cwe_id": "CWE-367",
+          "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 6.1238,
+          "raw_bm25_score": 6.1238,
+          "description": "Separately checking the state of a file before operating on it may allow an attacker to modify the file between the two operations.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-367"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/index-out-of-bounds",
+          "cwe_id": "CWE-193",
+          "cwe_name": "Off-by-one Error",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 5.8758,
+          "raw_bm25_score": 5.8758,
+          "description": "An array index is compared to be less than or equal to the 'length' property, and then used in an indexing operation that could be out of bounds.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-193. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "logic",
+            "language-features"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/user-controlled-bypass",
+          "cwe_id": "CWE-807",
+          "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 5.3641,
+          "raw_bm25_score": 5.3641,
+          "description": "Conditions that the user controls are not suited for making security-related decisions.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-807",
+            "external/cwe/cwe-290"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/identity-replacement",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 4.9772,
+          "raw_bm25_score": 4.9772,
+          "description": "Replacing a substring with itself has no effect and may indicate a mistake.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output. Implement proper encoding libraries for HTML, JavaScript, URL, and CSS contexts.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-116"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/property-assignment-on-primitive",
+          "cwe_id": "CWE-704",
+          "cwe_name": "Incorrect Type Conversion or Cast",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 4.7594,
+          "raw_bm25_score": 4.7594,
+          "description": "Assigning to a property of a primitive value has no effect and may trigger a runtime error.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-704. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "language-features",
+            "external/cwe/cwe-704"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/missing-token-validation",
+          "cwe_id": "CWE-352",
+          "cwe_name": "Cross-Site Request Forgery (CSRF)",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 4.6797,
+          "raw_bm25_score": 4.6797,
+          "description": "Using cookies without CSRF protection may allow malicious websites to submit requests on behalf of the user.",
+          "pattern": "Find state-changing operations that lack CSRF protection mechanisms",
+          "remediation": "Implement CSRF tokens for all state-changing operations. Use SameSite cookie attributes and validate the Origin/Referer headers.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-352"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

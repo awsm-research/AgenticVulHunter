@@ -1,0 +1,112 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "lib/send.js",
+  "changed_line": 409,
+  "statement": "root = normalize(root)",
+  "change_type": "A",
+  "function_name": "pipe",
+  "operation_type": "path_normalization",
+  "selection_reason": "observable input 'root' -> path normalization operation -> security-sensitive effect of potentially altering path traversal checks",
+  "security_relevance_score": 0.7,
+  "code_context": "260: \n261: SendStream.prototype.isConditionalGET = function(){\n262:   return this.req.headers['if-none-match']\n263:     || this.req.headers['if-modified-since'];\n264: };\n265: \n266: /**\n267:  * Strip content-* header fields.\n268:  *\n269:  * @api private\n270:  */\n271: \n272: SendStream.prototype.removeContentHeaderFields = function(){\n273:   var res = this.res;\n274:   Object.keys(res._headers).forEach(function(field){\n275:     if (0 == field.indexOf('content')) {\n276:       res.removeHeader(field);\n277:     }\n278:   });\n279: };\n280: \n281: /**\n282:  * Respond with 304 not modified.\n283:  *\n284:  * @api private\n285:  */\n286: \n287: SendStream.prototype.notModified = function(){\n288:   var res = this.res;\n289:   debug('not modified');\n290:   this.removeContentHeaderFields();\n291:   res.statusCode = 304;\n292:   res.end();\n293: };\n294: \n295: /**\n296:  * Raise error that headers already sent.\n297:  *\n298:  * @api private\n299:  */\n300: \n301: SendStream.prototype.headersAlreadySent = function headersAlreadySent(){\n302:   var err = new Error('Can\\'t set headers after they are sent.');\n303:   debug('headers already sent');\n304:   this.error(500, err);\n305: };\n306: \n307: /**\n308:  * Check if the request is cacheable, aka\n309:  * responded with 2xx or 304 (see RFC 2616 section 14.2{5,6}).\n310:  *\n311:  * @return {Boolean}\n312:  * @api private\n313:  */\n314: \n315: SendStream.prototype.isCachable = function(){\n316:   var res = this.res;\n317:   return (res.statusCode >= 200 && res.statusCode < 300) || 304 == res.statusCode;\n318: };\n319: \n320: /**\n321:  * Handle stat() error.\n322:  *\n323:  * @param {Error} err\n324:  * @api private\n325:  */\n326: \n327: SendStream.prototype.onStatError = function(err){\n328:   var notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR'];\n329:   if (~notfound.indexOf(err.code)) return this.error(404, err);\n330:   this.error(500, err);\n331: };\n332: \n333: /**\n334:  * Check if the cache is fresh.\n335:  *\n336:  * @return {Boolean}\n337:  * @api private\n338:  */\n339: \n340: SendStream.prototype.isFresh = function(){\n341:   return fresh(this.req.headers, this.res._headers);\n342: };\n343: \n344: /**\n345:  * Check if the range is fresh.\n346:  *\n347:  * @return {Boolean}\n348:  * @api private\n349:  */\n350: \n351: SendStream.prototype.isRangeFresh = function isRangeFresh(){\n352:   var ifRange = this.req.headers['if-range'];\n353: \n354:   if (!ifRange) return true;\n355: \n356:   return ~ifRange.indexOf('\"')\n357:     ? ~ifRange.indexOf(this.res._headers['etag'])\n358:     : Date.parse(this.res._headers['last-modified']) <= Date.parse(ifRange);\n359: };\n360: \n361: /**\n362:  * Redirect to `path`.\n363:  *\n364:  * @param {String} path\n365:  * @api private\n366:  */\n367: \n368: SendStream.prototype.redirect = function(path){\n369:   if (listenerCount(this, 'directory') !== 0) {\n370:     return this.emit('directory');\n371:   }\n372: \n373:   if (this.hasTrailingSlash()) return this.error(403);\n374:   var res = this.res;\n375:   path += '/';\n376:   res.statusCode = 301;\n377:   res.setHeader('Content-Type', 'text/html; charset=utf-8');\n378:   res.setHeader('Location', path);\n379:   res.end('Redirecting to <a href=\"' + escapeHtml(path) + '\">' + escapeHtml(path) + '</a>\\n');\n380: };\n381: \n382: /**\n383:  * Pipe to `res.\n384:  *\n385:  * @param {Stream} res\n386:  * @return {Stream} res\n387:  * @api public\n388:  */\n389: \n390: SendStream.prototype.pipe = function(res){\n391:   var self = this\n392:     , args = arguments\n393:     , root = this._root;\n394: \n395:   // references\n396:   this.res = res;\n397: \n398:   // decode the path\n399:   var path = utils.decode(this.path)\n400:   if (path === -1) return this.error(400)\n401: \n402:   // null byte(s)\n403:   if (~path.indexOf('\\0')) return this.error(400);\n404: \n405:   var parts\n406:   if (root !== null) {\n407:     // join / normalize from optional root dir\n408:     path = normalize(join(root, path))\n409:     root = normalize(root)\n410: \n411:     // malicious path\n412:     if (path.substr(0, root.length) !== root) {\n413:       debug('malicious path \"%s\"', path)\n414:       return this.error(403)\n415:     }\n416: \n417:     // explode path parts\n418:     parts = path.substr(root.length + 1).split(sep)\n419:   } else {\n420:     // \"..\" is malicious without \"root\"\n421:     if (upPathRegexp.test(path)) {\n422:       debug('malicious path \"%s\"', path)\n423:       return this.error(403)\n424:     }\n425: \n426:     // explode path parts\n427:     parts = normalize(path).split(sep)\n428: \n429:     // resolve the path\n430:     path = resolve(path)\n431:   }\n432: \n433:   // dotfile handling\n434:   if (containsDotFile(parts)) {\n435:     var access = this._dotfiles\n436: \n437:     // legacy support\n438:     if (access === undefined) {\n439:       access = parts[parts.length - 1][0] === '.'\n440:         ? (this._hidden ? 'allow' : 'ignore')\n441:         : 'allow'\n442:     }\n443: \n444:     debug('%s dotfile \"%s\"', access, path)\n445:     switch (access) {\n446:       case 'allow':\n447:         break\n448:       case 'deny':\n449:         return this.error(403)\n450:       case 'ignore':\n451:       default:\n452:         return this.error(404)\n453:     }\n454:   }\n455: \n456:   // index file support\n457:   if (this._index.length && this.hasTrailingSlash()) {\n458:     this.sendIndex(path);\n459:     return res;\n460:   }\n461: \n462:   debug('stat \"%s\"', path);\n463:   fs.stat(path, function(err, stat){\n464:     if (err) return self.onStatError(err);\n465:     if (stat.isDirectory()) return self.redirect(self.path);\n466:     self.emit('file', path, stat);\n467:     self.send(path, stat);\n468:   });\n469: \n470:   return res;\n471: };\n472: \n473: /**\n474:  * Transfer `path`.\n475:  *\n476:  * @param {String} path\n477:  * @api public\n478:  */\n479: \n480: SendStream.prototype.send = function(path, stat){\n481:   var options = this.options;\n482:   var len = stat.size;\n483:   var res = this.res;\n484:   var req = this.req;\n485:   var ranges = req.headers.range;\n486:   var offset = options.start || 0;\n487: \n488:   if (res._header) {\n489:     // impossible to send now\n490:     return this.headersAlreadySent();\n491:   }\n492: \n493:   debug('pipe \"%s\"', path)\n494: \n495:   // set header fields\n496:   this.setHeader(path, stat);\n497: \n498:   // set content-type\n499:   this.type(path);\n500: \n501:   // conditional GET support\n502:   if (this.isConditionalGET()\n503:     && this.isCachable()\n504:     && this.isFresh()) {\n505:     return this.notModified();\n506:   }\n507: \n508:   // adjust len to start/end options\n509:   len = Math.max(0, len - offset);\n510:   if (options.end !== undefined) {\n511:     var bytes = options.end - offset + 1;\n512:     if (len > bytes) len = bytes;\n513:   }\n514: \n515:   // Range support\n516:   if (ranges) {\n517:     ranges = parseRange(len, ranges);\n518: \n519:     // If-Range support\n520:     if (!this.isRangeFresh()) {\n521:       debug('range stale');\n522:       ranges = -2;\n523:     }\n524: \n525:     // unsatisfiable\n526:     if (-1 == ranges) {\n527:       debug('range unsatisfiable');\n528:       res.setHeader('Content-Range', 'bytes */' + stat.size);\n529:       return this.error(416);\n530:     }\n531: \n532:     // valid (syntactically invalid/multiple ranges are treated as a regular response)\n533:     if (-2 != ranges && ranges.length === 1) {\n534:       debug('range %j', ranges);\n535: \n536:       options.start = offset + ranges[0].start;\n537:       options.end = offset + ranges[0].end;\n538: \n539:       // Content-Range\n540:       res.statusCode = 206;\n541:       res.setHeader('Content-Range', 'bytes '\n542:         + ranges[0].start\n543:         + '-'\n544:         + ranges[0].end\n545:         + '/'\n546:         + len);\n547:       len = options.end - options.start + 1;\n548:     }\n549:   }\n550: \n551:   // content-length\n552:   res.setHeader('Content-Length', len);\n553: \n554:   // HEAD support\n555:   if ('HEAD' == req.method) return res.end();\n556: \n557:   this.stream(path, options);\n558: };",
+  "source_summary": "The 'root' variable originates from 'this._root', which is set during the SendStream constructor. It can be initialized from the 'options.root' parameter or from 'options.from' via the 'from' method, and is resolved using 'path.resolve'.",
+  "sink_summary": "The normalized root value is used in a security check to verify that the computed file path is within the allowed root directory. If the path check fails, a 403 error is returned.",
+  "guard_summary": "The guard is a path traversal check that compares the beginning of the normalized path with the normalized root. This check is designed to prevent directory traversal attacks by ensuring that the requested file path is within the specified root directory. The normalization of 'root' on line 409 affects this check.",
+  "risk_pattern": "The path normalization of 'root' on line 409 can alter the comparison in the malicious path check on line 412, potentially allowing an attacker to bypass the directory traversal protection if the original root contained sequences that normalize to a different string than what's expected in the security check.",
+  "used_variable_sources": [
+    "this._root"
+  ],
+  "called_function_context": [
+    "path.normalize"
+  ],
+  "enclosing_conditions": [
+    "if (root !== null)"
+  ],
+  "context_summary": "In the 'pipe' method, when a root directory is specified, the code normalizes both the root and the computed path. The normalized root is then used in a check to ensure that the final computed path starts with the normalized root. This normalization can potentially alter the security check if the original root contained sequences like './', '../', or other path components that normalize differently.",
+  "unresolved_facts": [
+    "The exact behavior of path.normalize() on different inputs is not fully specified in the code context, though it's known to be imported from node.js 'path' module",
+    "Whether the specific normalization behavior of path.normalize() on the root value could lead to bypassing the security check is not definitively established by this code analysis alone"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Path Traversal",
+      "fit_reason": "The mechanism of path normalization on the root directory affecting a security check for directory traversal is directly aligned with CWE-22. The Stage-2 evidence shows that normalizing 'root' can alter the comparison in the malicious path check, potentially allowing bypassing directory traversal protection.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-116",
+    "CWE-193",
+    "CWE-22",
+    "CWE-378",
+    "CWE-561",
+    "CWE-563",
+    "CWE-571",
+    "CWE-643",
+    "CWE-676",
+    "CWE-807",
+    "CWE-829"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/send.js",
+      "changed_line": 409,
+      "statement": "root = normalize(root)",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The candidate line normalizes the 'root' variable, which is then used in a security check to ensure that file paths are within the allowed root directory. This directly matches CWE-22's mechanism where improper handling of pathnames allows traversal outside restricted directories."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The 'root' variable originates from 'this._root', which is set during constructor and can be initialized from external input (options.root or options.from). The normalized root value is used in a security check on line 412 to verify path traversal protection, establishing a concrete connection between attacker-controllable input and the vulnerable operation."
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "If line 409 were reverted (removing 'root = normalize(root)'), the normalization would not occur, potentially preventing the alteration of the root value that could bypass the security check on line 412. The patch introduces normalization which changes how the path comparison behaves."
+        },
+        "security_control": {
+          "score": 0.65,
+          "evidence": "The security control in question is the path traversal check that ensures paths are within the root directory. While there is a check, the normalization of 'root' on line 409 can alter the comparison such that an attacker-controlled value may bypass this check if the original root contained sequences that normalize differently.",
+          "required_control": "Consistent canonical path resolution for both root and computed paths",
+          "control_requirement_evidence": "CWE-22 requires that pathnames be properly neutralized to prevent traversal outside restricted directories. The control is needed to ensure that the comparison between normalized path and normalized root is accurate.",
+          "existing_controls_checked": [
+            "Path traversal check on line 412",
+            "Input validation for null bytes (line 403)",
+            "Malicious path detection without root (lines 421-424)"
+          ],
+          "deficiency_evidence": "The normalization of 'root' can cause the security check to fail because the normalized root may not match the expected prefix of the computed path, allowing bypass of directory traversal protection."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "If an attacker can manipulate the 'root' value such that normalization changes its effective value, they could potentially cause the security check to pass when it should fail, allowing access to files outside the intended root directory. However, the exact conditions for this bypass are not fully established in the code context."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, path normalization would not occur on the 'root' variable before the security check. This could prevent potential bypasses of the directory traversal protection if the original root contained sequences that normalize differently than expected in the comparison.",
+      "supporting_evidence": [
+        "The code explicitly normalizes 'root' and uses it in a path traversal check",
+        "Stage-2 evidence shows that normalization affects the security check",
+        "The 'root' variable originates from external input ('this._root')",
+        "The vulnerability is specifically about path traversal protection being bypassed"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "The exact behavior of path.normalize() on different inputs is not fully specified in the code context",
+        "Whether the specific normalization behavior could lead to bypassing the security check is not definitively established by this code analysis alone"
+      ],
+      "review_comment": "The normalization of 'root' on line 409 can alter the comparison in the malicious path check on line 412, potentially allowing an attacker to bypass directory traversal protection. The patch introduces normalization that changes how the root value is compared against computed paths. Ensure consistent canonical path resolution for both root and computed paths to prevent bypass of directory traversal checks.",
+      "change_type": "A",
+      "raw_score": 0.6499999999999999,
+      "score": 0.6499999999999999
+    }
+  ],
+  "stage4_status": "completed"
+}

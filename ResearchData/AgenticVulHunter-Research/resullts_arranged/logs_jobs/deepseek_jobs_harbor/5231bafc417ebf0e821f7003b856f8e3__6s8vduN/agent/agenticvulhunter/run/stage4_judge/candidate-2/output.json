@@ -1,0 +1,377 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "tests/tests.py",
+  "changed_line": 61,
+  "statement": "self.cookies[session_cookie] = request.session.session_key",
+  "change_type": "A",
+  "function_name": "Client.login",
+  "operation_type": "cookie_assignment",
+  "selection_reason": "Assigns a session key to a cookie -> if session key is predictable or leaked, could lead to session fixation.",
+  "security_relevance_score": 0.5,
+  "code_context": "1: from datetime import timedelta\n2: import sys\n3: try:\n4:     from urllib.parse import urlencode\n5: except ImportError:\n6:     from urllib import urlencode\n7: \n8: from django.conf import settings\n9: from django.contrib.auth import SESSION_KEY, authenticate, login\n10: from django.contrib.auth.models import User\n11: from django.contrib.sessions.backends.base import CreateError\n12: from django.core.urlresolvers import reverse\n13: from django.db import IntegrityError\n14: from django.http import HttpRequest\n15: from django.test import TestCase, Client as BaseClient\n16: from django.test.utils import override_settings\n17: from django.utils.timezone import now\n18: \n19: from user_sessions.backends.db import SessionStore\n20: from user_sessions.models import Session\n21: from user_sessions.templatetags.user_sessions import location, device\n22: \n23: if sys.version_info[:2] < (2, 7):\n24:     from django.utils.unittest.case import skipUnless\n25: else:\n26:     from unittest import skipUnless\n27: \n28: try:\n29:     from django.contrib.gis.geoip import GeoIP\n30:     geoip = GeoIP()\n31:     geoip_msg = None\n32: except Exception as e:\n33:     geoip = None\n34:     geoip_msg = str(e)\n35: \n36: \n37: class Client(BaseClient):\n38:     def login(self, **credentials):\n39:         \"\"\"\n40:         Sets the Factory to appear as if it has successfully logged into a site.\n41: \n42:         Returns True if login is possible; False if the provided credentials\n43:         are incorrect, or the user is inactive, or if the sessions framework is\n44:         not available.\n45:         \"\"\"\n46:         user = authenticate(**credentials)\n47:         if user and user.is_active:\n48:             # Create a fake request to store login details.\n49:             request = HttpRequest()\n50:             if self.session:\n51:                 request.session = self.session\n52:             else:\n53:                 request.session = SessionStore('Python/2.7', '127.0.0.1')\n54:             login(request, user)\n55: \n56:             # Save the session values.\n57:             request.session.save()\n58: \n59:             # Set the cookie to represent the session.\n60:             session_cookie = settings.SESSION_COOKIE_NAME\n61:             self.cookies[session_cookie] = request.session.session_key\n62:             cookie_data = {\n63:                 'max-age': None,\n64:                 'path': '/',\n65:                 'domain': settings.SESSION_COOKIE_DOMAIN,\n66:                 'secure': settings.SESSION_COOKIE_SECURE or None,\n67:                 'expires': None,\n68:             }\n69:             self.cookies[session_cookie].update(cookie_data)\n70: \n71:             return True\n72:         else:\n73:             return False\n74: \n75: \n76: class MiddlewareTest(TestCase):\n77:     def test_unmodified_session(self):\n78:         self.client.get('/', HTTP_USER_AGENT='Python/2.7')\n79:         self.assertNotIn(settings.SESSION_COOKIE_NAME, self.client.cookies)\n80: \n81:     def test_modify_session(self):\n82:         self.client.get('/modify_session/', HTTP_USER_AGENT='Python/2.7')\n83:         self.assertIn(settings.SESSION_COOKIE_NAME, self.client.cookies)\n84:         session = Session.objects.get(\n85:             pk=self.client.cookies[settings.SESSION_COOKIE_NAME].value\n86:         )\n87:         self.assertEqual(session.user_agent, 'Python/2.7')\n88:         self.assertEqual(session.ip, '127.0.0.1')\n89: \n90:     def test_login(self):\n91:         user = User.objects.create_superuser('bouke', '', 'secret')\n92:         response = self.client.post('/admin/',\n93:                                     data={\n94:                                         'username': 'bouke',\n95:                                         'password': 'secret',\n96:                                         'this_is_the_login_form': '1',\n97:                                         'next': '/admin/'},\n98:                                     HTTP_USER_AGENT='Python/2.7')\n99:         self.assertRedirects(response, '/admin/')\n100:         session = Session.objects.get(\n101:             pk=self.client.cookies[settings.SESSION_COOKIE_NAME].value\n102:         )\n103:         self.assertEqual(user, session.user)\n104: \n105:     def test_long_ua(self):\n106:         self.client.get('/modify_session/',\n107:                         HTTP_USER_AGENT=''.join('a' for _ in range(400)))\n108: \n109: \n110: class ViewsTest(TestCase):\n111:     client_class = Client\n112: \n113:     def setUp(self):\n114:         User.objects.create_user('bouke', '', 'secret')\n115:         assert self.client.login(username='bouke', password='secret')\n116: \n117:     def test_list(self):\n118:         response = self.client.get(reverse('user_sessions:session_list'))\n119:         self.assertContains(response, 'Active Sessions')\n120:         self.assertContains(response, 'End Session', 2)\n121: \n122:     def test_delete(self):\n123:         session_key = self.client.cookies[settings.SESSION_COOKIE_NAME].value\n124:         response = self.client.post(reverse('user_sessions:session_delete',\n125:                                             args=[session_key]))\n126:         self.assertRedirects(response, reverse('user_sessions:session_list'))\n127: \n128: \n129: class SessionStoreTest(TestCase):\n130:     def setUp(self):\n131:         self.store = SessionStore('Python/2.7', '127.0.0.1', None)\n132: \n133:     def test_untouched_init(self):\n134:         self.assertFalse(self.store.modified)\n135:         self.assertFalse(self.store.accessed)\n136: \n137:     def test_auth_session_key(self):\n138:         self.assertFalse(SESSION_KEY in self.store)\n139:         self.assertFalse(self.store.modified)\n140:         self.assertTrue(self.store.accessed)\n141: \n142:         self.store.get(SESSION_KEY)\n143:         self.assertFalse(self.store.modified)\n144: \n145:         self.store[SESSION_KEY] = 1\n146:         self.assertTrue(self.store.modified)\n147: \n148:     def test_save(self):\n149:         self.store[SESSION_KEY] = 1\n150:         self.store.save()\n151: \n152:         session = Session.objects.get(pk=self.store.session_key)\n153:         self.assertEqual(session.user_agent, 'Python/2.7')\n154:         self.assertEqual(session.ip, '127.0.0.1')\n155:         self.assertEqual(session.user_id, 1)\n156:         self.assertAlmostEqual(now(), session.last_activity,\n157:                                delta=timedelta(seconds=5))\n158: \n159:     def test_load_unmodified(self):\n160:         self.store[SESSION_KEY] = 1\n161:         self.store.save()\n162:         store2 = SessionStore('Python/2.7', '127.0.0.1',\n163:                               self.store.session_key)\n164:         store2.load()\n165:         self.assertEqual(store2.user_agent, 'Python/2.7')\n166:         self.assertEqual(store2.ip, '127.0.0.1')\n167:         self.assertEqual(store2.user_id, 1)\n168:         self.assertEqual(store2.modified, False)\n169: \n170:     def test_load_modified(self):\n171:         self.store[SESSION_KEY] = 1\n172:         self.store.save()\n173:         store2 = SessionStore('Python/3.3', '8.8.8.8', self.store.session_key)\n174:         store2.load()\n175:         self.assertEqual(store2.user_agent, 'Python/3.3')\n176:         self.assertEqual(store2.ip, '8.8.8.8')\n177:         self.assertEqual(store2.user_id, 1)\n178:         self.assertEqual(store2.modified, True)\n179: \n180: \n181: @skipUnless(geoip, geoip_msg)\n182: class LocationTemplateFilterTest(TestCase):\n183:     def test_no_location(self):\n184:         self.assertEqual(location('127.0.0.1'), '<i>unknown</i>')\n185: \n186:     def test_google(self):\n187:         self.assertEqual(location('8.8.8.8'), 'United States')\n188: \n189: \n190: class DeviceTemplateFilterTest(TestCase):\n191:     def test_ie(self):\n192:         self.assertEqual(\n193:             'Internet Explorer on Windows XP',\n194:             device('Mozilla/4.0 (Windows; MSIE 6.0; Windows NT 5.1; SV1; '\n195:                    '.NET CLR 2.0.50727)')\n196:         )\n197:         self.assertEqual(\n198:             'Internet Explorer on Windows Vista',\n199:             device('Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.0; '\n200:                    'Trident/4.0; SLCC1; .NET CLR 2.0.50727; .NET CLR 1.1.4322;'\n201:                    ' InfoPath.2; .NET CLR 3.5.21022; .NET CLR 3.5.30729; '\n202:                    'MS-RTC LM 8; OfficeLiveConnector.1.4; OfficeLivePatch.1.3;'\n203:                    ' .NET CLR 3.0.30729)')\n204:         )\n205:         self.assertEqual(\n206:             'Internet Explorer on Windows 7',\n207:             device('Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.1; '\n208:                    'Trident/6.0)')\n209:         )\n210:         self.assertEqual(",
+  "source_summary": "session_key comes from Django's SessionStore which inherits from SessionBase. The session key is generated by _get_new_session_key() method from the parent class.",
+  "sink_summary": "The session key is assigned to a cookie that will be sent with HTTP requests. This cookie represents the user's authenticated session.",
+  "guard_summary": "Session keys are generated using Django's built-in session key generation (cryptographically random). The session is saved to database before cookie assignment. Standard Django session security controls apply (expiration, secure flags from settings).",
+  "risk_pattern": "Session key assignment to cookie in test client login method - follows standard Django session management pattern but in test context.",
+  "used_variable_sources": [
+    "settings.SESSION_COOKIE_NAME",
+    "request.session.session_key"
+  ],
+  "called_function_context": [
+    "authenticate",
+    "login",
+    "SessionStore.__init__",
+    "request.session.save"
+  ],
+  "enclosing_conditions": [
+    "if user and user.is_active:"
+  ],
+  "context_summary": "Test client login method that creates a fake request, authenticates user, creates session, saves it, and sets session cookie with generated session key.",
+  "unresolved_facts": [
+    "Exact implementation of _get_new_session_key() method from Django's SessionBase class",
+    "Cryptographic strength of Django's session key generation algorithm"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-614",
+      "cwe_name": "Sensitive Cookie in HTTPS Session Without 'Secure' Attribute",
+      "fit_reason": "Cookie assignment uses settings for secure flag but in test context may not enforce HTTPS",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-338",
+      "cwe_name": "Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)",
+      "fit_reason": "Session key generation relies on Django's internal PRNG which may be weak if misconfigured",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-1004",
+      "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+      "fit_reason": "Cookie assignment does not explicitly set HttpOnly flag, relying on Django defaults",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-340",
+      "cwe_name": "Generation of Predictable Numbers or Identifiers",
+      "fit_reason": "Session key predictability could lead to session fixation if generation is not cryptographically secure",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-1275",
+      "cwe_name": "Sensitive Cookie with Improper SameSite Attribute",
+      "fit_reason": "Cookie assignment relies on Django defaults for SameSite attribute which may be insufficient",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1004",
+    "CWE-1236",
+    "CWE-1275",
+    "CWE-20",
+    "CWE-208",
+    "CWE-22",
+    "CWE-285",
+    "CWE-287",
+    "CWE-338",
+    "CWE-340",
+    "CWE-377",
+    "CWE-614",
+    "CWE-628",
+    "CWE-685",
+    "CWE-770",
+    "CWE-772",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "tests/tests.py",
+      "changed_line": 61,
+      "statement": "self.cookies[session_cookie] = request.session.session_key",
+      "cwe_id": "CWE-614",
+      "cwe_name": "Sensitive Cookie in HTTPS Session Without 'Secure' Attribute",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-614 requires a sensitive cookie transmitted over HTTPS without the Secure attribute. The evidence shows cookie assignment with secure flag from settings.SESSION_COOKIE_SECURE (line 66), but no demonstration of HTTPS context or missing Secure attribute."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "The session key (sensitive authentication token) is assigned to a cookie that will be sent with HTTP requests. The cookie configuration includes secure flag from settings (line 66), but HTTPS transport is not demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "If this line were removed, the test client would not set the session cookie after login, breaking test functionality. The line creates the cookie assignment but doesn't materially affect Secure attribute presence."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "The cookie configuration includes 'secure': settings.SESSION_COOKIE_SECURE or None (line 66), showing Secure attribute control exists and is configurable via Django settings.",
+          "required_control": "Secure attribute on sensitive cookies transmitted over HTTPS",
+          "control_requirement_evidence": "CWE-614 requires cookies containing sensitive data (session keys) transmitted over HTTPS to have Secure attribute to prevent transmission over unencrypted HTTP.",
+          "existing_controls_checked": [
+            "settings.SESSION_COOKIE_SECURE configuration (line 66)",
+            "Django's standard session cookie handling"
+          ],
+          "deficiency_evidence": "No evidence shows the Secure attribute is missing or that HTTPS is being used. The code references settings.SESSION_COOKIE_SECURE, indicating configurable Secure attribute control exists."
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No demonstrated impact. This is test code simulating client behavior, not production session management. No evidence shows actual HTTPS transmission without Secure attribute."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the test client would not set the session cookie after successful authentication, causing test failures for any test that relies on authenticated session cookies.",
+      "supporting_evidence": [
+        "Line 61 assigns session.session_key to self.cookies[session_cookie]",
+        "Line 66 shows cookie configuration includes 'secure': settings.SESSION_COOKIE_SECURE or None",
+        "Session key is authentication-sensitive data"
+      ],
+      "contradicting_evidence": [
+        "Line 66 explicitly references settings.SESSION_COOKIE_SECURE for Secure attribute configuration",
+        "This is test client code, not production session management",
+        "No evidence shows HTTPS context or missing Secure attribute"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether this test runs in HTTPS context",
+        "Actual value of settings.SESSION_COOKIE_SECURE during test execution",
+        "Whether cookie would actually be transmitted without Secure attribute over HTTPS"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.22000000000000003,
+      "score": 0.22000000000000003
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "tests/tests.py",
+      "changed_line": 61,
+      "statement": "self.cookies[session_cookie] = request.session.session_key",
+      "cwe_id": "CWE-338",
+      "cwe_name": "Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "The candidate line assigns a session key to a cookie. The session key generation occurs upstream in Django's SessionStore, not in this line. No PRNG usage is demonstrated in the candidate or its immediate context."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "The session key (generated elsewhere) is connected to the cookie that will be sent with HTTP requests. However, the PRNG mechanism itself is not demonstrated in the candidate line or its immediate context."
+        },
+        "diff_causality": {
+          "score": 0.2,
+          "evidence": "If this candidate line were reverted, the test client would not set the session cookie, breaking test functionality. The line does not create, expose, or modify any PRNG mechanism - it merely uses an already-generated session key."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "Cryptographically strong PRNG for session key generation",
+          "control_requirement_evidence": "CWE-338 requires demonstration that a weak PRNG is used in a security context. Session keys require cryptographic randomness to prevent prediction/guessing.",
+          "existing_controls_checked": [
+            "Django's SessionStore.session_key generation (upstream, not shown)",
+            "Standard Django session security settings (not shown in candidate)"
+          ],
+          "deficiency_evidence": "No evidence demonstrates that the PRNG is weak. The candidate line only assigns an already-generated key to a cookie. The PRNG mechanism and its strength are not shown in the candidate or its immediate context."
+        },
+        "concrete_impact": {
+          "score": 0.15,
+          "evidence": "No concrete security consequence is demonstrated. The line is in a test client login method for testing purposes. Even if the upstream PRNG were weak, this line doesn't demonstrate that weakness or its exploitation."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the test client would not set the session cookie after login, causing test failures but not affecting the PRNG mechanism itself.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "The candidate line is in a test file (tests/tests.py), not production code",
+        "The line only assigns an already-generated session key to a cookie - no PRNG usage is shown",
+        "The session key generation occurs upstream in Django's SessionStore, outside the candidate's context"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Implementation of Django's _get_new_session_key() method",
+        "Cryptographic strength of Django's session key generation algorithm",
+        "Whether this test code reflects production session management"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.17,
+      "score": 0.17
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "tests/tests.py",
+      "changed_line": 61,
+      "statement": "self.cookies[session_cookie] = request.session.session_key",
+      "cwe_id": "CWE-1004",
+      "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-1004 requires a sensitive cookie without HttpOnly flag, but the session cookie is explicitly configured with security attributes including secure flags from Django settings"
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "The session key (sensitive data) is assigned to a cookie that will be sent with HTTP requests"
+        },
+        "diff_causality": {
+          "score": 0.2,
+          "evidence": "The line assigns a session key to a cookie, but the cookie security configuration occurs separately at lines 62-69 with settings-driven security attributes"
+        },
+        "security_control": {
+          "score": 0.15,
+          "evidence": "",
+          "required_control": "HttpOnly flag on sensitive cookies",
+          "control_requirement_evidence": "CWE-1004 requires HttpOnly flag to prevent client-side script access to sensitive cookies",
+          "existing_controls_checked": [
+            "SESSION_COOKIE_SECURE setting",
+            "SESSION_COOKIE_DOMAIN setting",
+            "cookie path configuration"
+          ],
+          "deficiency_evidence": "The code explicitly configures cookie security attributes from Django settings at lines 62-69, but HttpOnly flag configuration is not demonstrated in this test context"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No evidence of actual information exposure or XSS vulnerability that would exploit missing HttpOnly flag in this test environment"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the session cookie would not be set in the test client, but the cookie security configuration (including potential HttpOnly settings) would remain unchanged as it's handled by Django's session framework.",
+      "supporting_evidence": [
+        "Session key (sensitive authentication token) is assigned to HTTP cookie",
+        "Cookie configuration includes security attributes from Django settings"
+      ],
+      "contradicting_evidence": [
+        "Cookie security configuration is explicitly handled separately at lines 62-69 using Django settings",
+        "This is test code simulating client behavior, not production cookie handling",
+        "Django's session framework typically handles HttpOnly flag through SESSION_COOKIE_HTTPONLY setting"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Actual SESSION_COOKIE_HTTPONLY setting value in Django configuration",
+        "Whether this test code accurately reflects production cookie handling",
+        "If HttpOnly flag is actually missing in the deployed application"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.17,
+      "score": 0.17
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "tests/tests.py",
+      "changed_line": 61,
+      "statement": "self.cookies[session_cookie] = request.session.session_key",
+      "cwe_id": "CWE-340",
+      "cwe_name": "Generation of Predictable Numbers or Identifiers",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "The candidate line assigns an already-generated session key to a cookie, but does not demonstrate the generation mechanism itself. CWE-340 specifically addresses the generation process, not the assignment or usage of identifiers."
+        },
+        "connection": {
+          "score": 0.2,
+          "evidence": "The session key flows from request.session.session_key to self.cookies, but this is normal session management flow, not a vulnerability path. No attacker control or security boundary crossing is demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.15,
+          "evidence": "The added line implements standard session cookie assignment functionality. Reverting it would break test client login functionality but would not affect session key generation predictability."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "Cryptographically secure random number generation for session identifiers",
+          "control_requirement_evidence": "CWE-340 requires that identifiers be generated with sufficient entropy to prevent prediction",
+          "existing_controls_checked": [
+            "Django's built-in session key generation in SessionBase._get_new_session_key()"
+          ],
+          "deficiency_evidence": "No evidence demonstrates deficiency in Django's session key generation. The code uses standard Django session management without modifying generation logic."
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No concrete security impact is demonstrated. This is test code implementing standard session management patterns without showing actual predictability issues."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the test client would not set session cookies, breaking authentication functionality in tests, but would not affect the predictability of session key generation.",
+      "supporting_evidence": [
+        "Line assigns session.session_key to cookie, which is the identifier in question"
+      ],
+      "contradicting_evidence": [
+        "This is test code, not production vulnerability",
+        "The line assigns but does not generate the identifier",
+        "Uses standard Django session management without modification to generation logic"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Actual implementation of Django's SessionBase._get_new_session_key() method",
+        "Cryptographic properties of Django's session key generation"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.13,
+      "score": 0.13
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "tests/tests.py",
+      "changed_line": 61,
+      "statement": "self.cookies[session_cookie] = request.session.session_key",
+      "cwe_id": "CWE-1275",
+      "cwe_name": "Sensitive Cookie with Improper SameSite Attribute",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "CWE-1275 requires a SameSite attribute deficiency on a sensitive cookie. The demonstrated code sets a session cookie but does not show any SameSite attribute handling. The cookie_data dictionary (lines 63-68) includes max-age, path, domain, secure, expires - but no SameSite attribute. However, this is test code (Client.login method in a test file) that simulates browser behavior, not production cookie handling."
+        },
+        "connection": {
+          "score": 0.2,
+          "evidence": "The session key (sensitive authentication token) is assigned to a cookie that would be sent with HTTP requests. However, this is test client code that simulates browser behavior; the actual cookie SameSite attribute would be controlled by Django's session middleware in production, not this test utility."
+        },
+        "diff_causality": {
+          "score": 0.1,
+          "evidence": "This line is part of a test client's login simulation. Reverting this line would break the test client's ability to simulate authenticated sessions in tests, but would not affect production cookie SameSite attributes. The cookie attributes (including SameSite) are determined by Django's session middleware configuration, not this test code."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "",
+          "required_control": "Proper SameSite attribute setting for sensitive session cookies",
+          "control_requirement_evidence": "CWE-1275 requires that sensitive cookies have appropriate SameSite attributes (Strict or Lax) to prevent CSRF attacks via cross-site requests.",
+          "existing_controls_checked": [
+            "Django's session middleware cookie settings configuration",
+            "Test client cookie update with max-age, path, domain, secure, expires attributes"
+          ],
+          "deficiency_evidence": "No SameSite attribute deficiency is demonstrated. This is test code that simulates browser behavior; actual SameSite attributes would be controlled by Django's SESSION_COOKIE_SAMESITE setting in production. The cookie_data dictionary shows what attributes the test client sets, but this doesn't represent production cookie behavior."
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "No concrete security impact is demonstrated. This is test code for simulating authenticated sessions in Django tests. Any SameSite attribute deficiency would be in Django's session middleware configuration, not in this test utility."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the test client would not set the session cookie, breaking test simulations of authenticated sessions but having no effect on production cookie SameSite attributes.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "This is test code (tests/tests.py) not production code",
+        "The Client class is a test utility for simulating browser behavior",
+        "Actual SameSite attributes are controlled by Django's SESSION_COOKIE_SAMESITE setting, not test code",
+        "The cookie_data dictionary shows attributes being set but doesn't represent production cookie behavior"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether Django's session middleware configuration has proper SameSite settings",
+        "Whether this test code accurately reflects production cookie behavior"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.06000000000000001,
+      "score": 0.06000000000000001
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,60 @@
+{
+  "candidate": {
+    "candidate_id": "candidate-1",
+    "filepath": "src/index.js",
+    "changed_line": 252,
+    "statement": "await utils.run(`git clone ${remoteUrl} ${_tmpDir}`);",
+    "change_type": "A",
+    "function_name": "module.exports (gitDiffApply)",
+    "operation_type": "shell_command_execution",
+    "selection_reason": "user-controlled remoteUrl directly interpolated into git clone command -> executed via shell -> potential command injection",
+    "security_relevance_score": 0.9,
+    "code_context": "103: \n104:     if (!(reset || init)) {\n105:       await copyToSubDir(startTag);\n106: \n107:       await gitRemoveAll({ cwd: newTmpDir });\n108:     }\n109: \n110:     await copyToSubDir(endTag);\n111: \n112:     _tmpDir = newTmpDir;\n113:     tmpWorkingDir = newTmpSubDir;\n114:   }\n115: \n116:   async function copy() {\n117:     await utils.copy(tmpWorkingDir, cwd);\n118:   }\n119: \n120:   async function resetIgnoredFiles() {\n121:     for (let ignoredFile of ignoredFiles) {\n122:       // An exist check is not good enough.\n123:       // `git checkout` will fail unless it is also tracked.\n124:       let isTracked = await utils.run(`git ls-files ${ignoredFile}`);\n125:       if (isTracked) {\n126:         await utils.run(`git checkout -- ${ignoredFile}`);\n127:       } else {\n128:         await fs.remove(ignoredFile);\n129:       }\n130:     }\n131:   }\n132: \n133:   async function createPatchFile() {\n134:     let patchFile = path.join(await tmpDir(), 'file.patch');\n135:     await utils.run(`git diff ${startTag} ${endTag} --binary > ${patchFile}`, { cwd: _tmpDir });\n136:     if (await fs.readFile(patchFile, 'utf8') !== '') {\n137:       return patchFile;\n138:     }\n139:   }\n140: \n141:   async function applyDiff() {\n142:     let patchFile = await createPatchFile();\n143:     if (patchFile) {\n144:       // --whitespace=fix seems to prevent any unnecessary conflicts with line endings\n145:       // https://stackoverflow.com/questions/6308625/how-to-avoid-git-apply-changing-line-endings#comment54419617_11189296\n146:       await utils.run(`git apply --whitespace=fix ${patchFile}`);\n147:     }\n148:   }\n149: \n150:   async function go() {\n151:     if (reset || init) {\n152:       await checkOutTag(_tmpDir, endTag);\n153: \n154:       isCodeUntracked = true;\n155:       isCodeModified = true;\n156:       if (reset) {\n157:         await utils.gitRemoveAll({ cwd: root });\n158:       }\n159: \n160:       await copy();\n161: \n162:       await utils.run('git reset');\n163: \n164:       await resetIgnoredFiles();\n165: \n166:       return;\n167:     }\n168: \n169:     await checkOutTag(_tmpDir, startTag);\n170: \n171:     oldBranchName = await getCheckedOutBranchName();\n172:     await utils.run(`git checkout --orphan ${tempBranchName}`);\n173:     isTempBranchCheckedOut = true;\n174: \n175:     await utils.gitRemoveAll({ cwd: root });\n176: \n177:     gitIgnoredFiles = await tmpDir();\n178:     await mergeDir(cwd, gitIgnoredFiles);\n179:     shouldReturnGitIgnoredFiles = true;\n180: \n181:     isCodeUntracked = true;\n182:     await copy();\n183: \n184:     isTempBranchCommitted = true;\n185:     await commit();\n186:     isCodeUntracked = false;\n187: \n188:     isCodeUntracked = true;\n189:     isCodeModified = true;\n190:     await applyDiff();\n191: \n192:     await resetIgnoredFiles();\n193: \n194:     let wereAnyChanged = !await isGitClean();\n195: \n196:     if (wereAnyChanged) {\n197:       await commit();\n198:     }\n199:     isCodeUntracked = false;\n200:     isCodeModified = false;\n201: \n202:     let sha;\n203:     if (wereAnyChanged) {\n204:       sha = await utils.run('git rev-parse HEAD');\n205:     }\n206: \n207:     await utils.run(`git checkout ${oldBranchName}`);\n208:     isTempBranchCheckedOut = false;\n209: \n210:     if (wereAnyChanged) {\n211:       try {\n212:         await utils.run(`git cherry-pick --no-commit ${sha.trim()}`);\n213:       } catch (err) {\n214:         hasConflicts = true;\n215:       }\n216:     }\n217:   }\n218: \n219:   try {\n220:     if (startTag === endTag && !(reset || init)) {\n221:       throw 'Tags match, nothing to apply';\n222:     }\n223: \n224:     let isClean;\n225: \n226:     try {\n227:       isClean = await isGitClean();\n228:     } catch (err) {\n229:       throw 'Not a git repository';\n230:     }\n231: \n232:     if (!isClean) {\n233:       throw 'You must start with a clean working directory';\n234:     }\n235: \n236:     if (createCustomDiff) {\n237:       let tmpPath = await createCustomRemote({\n238:         startCommand,\n239:         endCommand,\n240:         startTag,\n241:         endTag,\n242:         reset,\n243:         init\n244:       });\n245: \n246:       remoteUrl = tmpPath;\n247:     }\n248: \n249:     _tmpDir = await tmpDir();\n250:     tmpWorkingDir = _tmpDir;\n251: \n252:     await utils.run(`git clone ${remoteUrl} ${_tmpDir}`);\n253: \n254:     returnObject = await buildReturnObject();\n255: \n256:     root = await getRootDir();\n257:     let subDir = await getSubDir(root);\n258:     if (subDir) {\n259:       debug('subDir', subDir);\n260: \n261:       await namespaceRepoWithSubDir(subDir);\n262:     }\n263: \n264:     cwd = process.cwd();\n265: \n266:     await go();\n267: \n268:     debug('success');\n269:   } catch (_err) {\n270:     err = _err;\n271: \n272:     try {\n273:       if (isCodeUntracked) {\n274:         await utils.run('git clean -f');\n275:       }\n276:       if (isCodeModified) {\n277:         await utils.run('git reset --hard');\n278:       }\n279: \n280:       if (isTempBranchCheckedOut) {\n281:         await utils.run(`git checkout ${oldBranchName}`);\n282:       }\n283:     } catch (err2) {\n284:       throw {\n285:         err,\n286:         err2\n287:       };\n288:     }\n289:   }\n290: \n291:   try {\n292:     if (isTempBranchCommitted && await doesBranchExist(tempBranchName)) {\n293:       await utils.run(`git branch -D ${tempBranchName}`);\n294:     }\n295: \n296:     if (shouldReturnGitIgnoredFiles) {\n297:       await mergeDir(gitIgnoredFiles, cwd);\n298:     }\n299:   } catch (err2) {\n300:     err = {\n301:       err,\n302:       err2\n303:     };\n304:   }\n305: \n306:   if (err) {\n307:     debug('failure');\n308: \n309:     throw err;\n310:   }\n311: \n312:   if (hasConflicts && _resolveConflicts) {\n313:     returnObject.resolveConflictsProcess = resolveConflicts({\n314:       shouldPipe: !wasRunAsExecutable\n315:     });\n316:   }\n317: \n318:   return returnObject;\n319: };\n320: \n321: module.exports.run = utils.run;\n322: module.exports.gitInit = gitInit;\n323: module.exports.gitStatus = gitStatus;\n324: module.exports.isGitClean = isGitClean;\n325: module.exports.gitRemoveAll = gitRemoveAll;",
+    "source_summary": "remoteUrl comes from function parameter or createCustomRemote() output; when createCustomDiff=true, remoteUrl is a temporary directory path; when false, remoteUrl is direct user input parameter",
+    "sink_summary": "git clone command executed via child_process.exec() with shell interpolation of remoteUrl and _tmpDir variables",
+    "guard_summary": "No validation or sanitization of remoteUrl before interpolation; git clean working directory check present but unrelated to command injection",
+    "risk_pattern": "User-controlled remoteUrl directly interpolated into shell command string without validation, escaping, or parameterization",
+    "used_variable_sources": [
+      "remoteUrl (function parameter)",
+      "_tmpDir (tmpDir() function output)"
+    ],
+    "called_function_context": [
+      "utils.run() -> execPromise(command, options) -> child_process.exec()"
+    ],
+    "enclosing_conditions": [
+      "if (createCustomDiff) branch determines remoteUrl source"
+    ],
+    "context_summary": "Command executes in git diff apply workflow; remoteUrl either from user input or generated temporary path",
+    "unresolved_facts": [
+      "Default value and validation of createCustomDiff parameter",
+      "Whether remoteUrl receives any validation when passed as direct parameter",
+      "Security controls in createCustomRemote's startCommand/endCommand execution"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  "target_cwe": {
+    "cwe_id": "CWE-88",
+    "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+    "description": "The product constructs a string for a command to be executed by a separate component in another control sphere, but it does not properly delimit the intended arguments, options, or switches within that command string. When creating commands using interpolation into a string, developers may assume...",
+    "impact": "code execution, data access, data modification",
+    "patterns": [
+      "Look for security-sensitive operations that handle user input without proper validation or sanitization"
+    ],
+    "detection_indicators": [],
+    "remediation_steps": [
+      "Use parameterized queries and prepared statements",
+      "Implement strict input validation with whitelisting"
+    ],
+    "related_cwes": [
+      "CWE-77",
+      "CWE-74"
+    ]
+  },
+  "stage3_hypothesis": {
+    "cwe_id": "CWE-88",
+    "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+    "fit_reason": "git clone with user-controlled remoteUrl directly interpolated into shell command - specifically matches second-order command injection pattern for git commands",
+    "proposal_source": "adaptive_bm25",
+    "retrieved_by_sast": true
+  }
+}

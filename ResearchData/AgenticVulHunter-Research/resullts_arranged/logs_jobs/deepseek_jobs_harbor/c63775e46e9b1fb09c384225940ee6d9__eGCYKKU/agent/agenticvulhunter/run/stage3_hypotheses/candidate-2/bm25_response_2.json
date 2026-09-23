@@ -1,0 +1,256 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 168,
+      "statement": "this.cachedValidations[txid].parents.filter(p => p.txid === parentTxids[i]).map(p => p.valid = valid);",
+      "change_type": "A",
+      "function_name": "isValidSlpTxid",
+      "operation_type": "validation_state_propagation",
+      "selection_reason": "Validation result -> propagates to all matching parent entries -> affects downstream security decisions",
+      "security_relevance_score": 0.7,
+      "code_context": "19: \n20: export class LocalValidator implements SlpValidator {\n21:     BITBOX: BITBOX;\n22:     cachedRawTransactions: { [txid: string]: string }\n23:     cachedValidations: { [txid: string]: Validation }\n24:     getRawTransactions: GetRawTransactionsAsync;\n25:     slp: Slp;\n26: \n27:     constructor(BITBOX: BITBOX, getRawTransactions: GetRawTransactionsAsync) {\n28:         if(!BITBOX)\n29:             throw Error(\"Must provide BITBOX instance to class constructor.\")\n30:         if(!getRawTransactions)\n31:             throw Error(\"Must provide method getRawTransactions to class constructor.\")\n32:         this.BITBOX = BITBOX;\n33:         this.getRawTransactions = getRawTransactions;\n34:         this.slp = new Slp(BITBOX);\n35:         this.cachedValidations = {};\n36:         this.cachedRawTransactions = {};\n37:     }\n38: \n39:     addValidationFromStore(hex: string, isValid: boolean) {\n40:         let id = (<Buffer>this.BITBOX.Crypto.sha256(this.BITBOX.Crypto.sha256(Buffer.from(hex, 'hex'))).reverse()).toString('hex');\n41:         if(!this.cachedValidations[id])\n42:             this.cachedValidations[id] = { hex: hex, validity: isValid, parents: [], details: null, invalidReason: null }\n43:         if(!this.cachedRawTransactions[id])\n44:             this.cachedRawTransactions[id] = hex;\n45:     }\n46:     \n47:     async waitForCurrentValidationProcessing(txid: string) {\n48:         // TODO: Add some timeout?\n49:         let cached: Validation = this.cachedValidations[txid];\n50: \n51:         while(true) {\n52:             if(typeof cached.validity === 'boolean')\n53:                 break\n54:             await sleep(10);\n55:         }\n56:     }\n57: \n58:     async waitForTransactionPreProcessing(txid: string){\n59:         // TODO: Add some timeout?\n60:         while(true) {\n61:             if(this.cachedValidations[txid].hex && (this.cachedValidations[txid].details || typeof this.cachedValidations.validity === 'boolean'))\n62:                 break\n63:             await sleep(10);\n64:         }\n65:         //await sleep(100); // short wait to make sure parent's properties gets set first.\n66:         return\n67:     }\n68: \n69:     async getRawTransaction(txid: string) {\n70:         if(this.cachedRawTransactions[txid])\n71:             return this.cachedRawTransactions[txid];\n72:         this.cachedRawTransactions[txid] = (await this.getRawTransactions([txid]))[0]\n73:         if(this.cachedRawTransactions[txid])\n74:             return this.cachedRawTransactions[txid];\n75:         return null;\n76:     }\n77: \n78:     async isValidSlpTxid(txid: string) {\n79:         if(txid && !this.cachedValidations[txid]) {\n80:             this.cachedValidations[txid] = { hex: null, validity: null, parents: [], details: null, invalidReason: null }\n81:             this.cachedValidations[txid].hex = await this.getRawTransaction(txid);\n82:         }\n83: \n84:         // Check to see how we should proceed based on the validation-cache state\n85:         if(!this.cachedValidations[txid].hex)\n86:             await this.waitForTransactionPreProcessing(txid);\n87:         if(typeof this.cachedValidations[txid].validity === 'boolean')\n88:             return this.cachedValidations[txid].validity;\n89:         if(this.cachedValidations[txid].details)\n90:             await this.waitForCurrentValidationProcessing(txid);\n91: \n92:         // Check SLP message validity\n93:         let txn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[txid].hex)\n94:         let slpmsg: SlpTransactionDetails;\n95:         try {\n96:             slpmsg = this.cachedValidations[txid].details = this.slp.parseSlpOutputScript(txn.outputs[0]._scriptBuffer)\n97:         } catch(e) {\n98:             this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"\n99:             return this.cachedValidations[txid].validity = false;\n100:         }\n101: \n102:         // Check DAG validity\n103:         if(slpmsg.transactionType === SlpTransactionType.GENESIS) {\n104:             return this.cachedValidations[txid].validity = true;\n105:         } \n106:         else if (slpmsg.transactionType === SlpTransactionType.MINT) {\n107:             for(let i = 0; i < txn.inputs.length; i++) {\n108:                 let input_txid = txn.inputs[i].prevTxId.toString('hex')\n109:                 let input_txhex = await this.getRawTransaction(input_txid)\n110:                 if (input_txhex) {\n111:                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);\n112:                     try {\n113:                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)\n114:                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)\n115:                             input_slpmsg.tokenIdHex = input_txid;\n116:                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {\n117:                             if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {\n118:                                 if(txn.inputs[i].outputIndex === input_slpmsg.batonVout)\n119:                                     this.cachedValidations[txid].parents.push({ txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType ,valid: null, inputQty: null })\n120:                             }\n121:                         }\n122:                     } catch(_) {}\n123:                 }\n124:             }\n125:             if(this.cachedValidations[txid].parents.length !== 1) {\n126:                 this.cachedValidations[txid].invalidReason = \"MINT transaction must have 1 valid baton parent.\"\n127:                 return this.cachedValidations[txid].validity = false;\n128:             }\n129:         }\n130:         else if(slpmsg.transactionType === SlpTransactionType.SEND) {\n131:             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))\n132:             let tokenInQty = new BigNumber(0);\n133:             for(let i = 0; i < txn.inputs.length; i++) {\n134:                 let input_txid = txn.inputs[i].prevTxId.toString('hex')\n135:                 let input_txhex = await this.getRawTransaction(input_txid)\n136:                 if (input_txhex) {\n137:                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);\n138:                     try {\n139:                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)\n140:                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)\n141:                             input_slpmsg.tokenIdHex = input_txid;\n142:                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {\n143:                             if(input_slpmsg.transactionType === SlpTransactionType.SEND) {\n144:                                 tokenInQty = tokenInQty.plus(input_slpmsg.sendOutputs[txn.inputs[i].outputIndex])\n145:                                 this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.sendOutputs[txn.inputs[i].outputIndex] })\n146:                             }\n147:                             else if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {\n148:                                 if(txn.inputs[i].outputIndex === 1)\n149:                                     tokenInQty = tokenInQty.plus(input_slpmsg.genesisOrMintQuantity)\n150:                                     this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.genesisOrMintQuantity })\n151:                             }\n152:                         }\n153:                     } catch(_) {}\n154:                 }\n155:             }\n156:             \n157:             // Check token inputs are greater than token outputs (includes valid and invalid inputs)\n158:             if(tokenOutQty.isGreaterThan(tokenInQty)) {\n159:                 this.cachedValidations[txid].invalidReason = \"Token outputs are greater than possible token inputs.\"\n160:                 return this.cachedValidations[txid].validity = false;\n161:             }\n162:         }\n163: \n164:         // Set validity validation-cache for parents, and handle MINT condition with no valid input\n165:         let parentTxids = [...new Set(this.cachedValidations[txid].parents.map(p => p.txid))];\n166:         for(let i = 0; i < parentTxids.length; i++) {\n167:             let valid = await this.isValidSlpTxid(parentTxids[i])\n168:             this.cachedValidations[txid].parents.filter(p => p.txid === parentTxids[i]).map(p => p.valid = valid);\n169:             if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.MINT && !valid) {\n170:                 this.cachedValidations[txid].invalidReason = \"MINT transaction with invalid baton parent.\"\n171:                 return this.cachedValidations[txid].validity = false;\n172:             }\n173:         }\n174: \n175:         // Check valid inputs are greater than token outputs\n176:         if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {\n177:             let validInputQty = this.cachedValidations[txid].parents.reduce((t, v) => { return v.valid ? t.plus(v.inputQty) : t }, new BigNumber(0));\n178:             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))\n179:             if(tokenOutQty.isGreaterThan(validInputQty)) {\n180:                 this.cachedValidations[txid].invalidReason = \"Token outputs are greater than valid token inputs.\"\n181:                 return this.cachedValidations[txid].validity = false;\n182:             }\n183:         }\n184: \n185:         // Check versionType is not different from any valid parent\n186:         if(this.cachedValidations[txid].parents.filter(p => p.valid).length > 0) {\n187:             let validVersionType = this.cachedValidations[txid].parents.find(p => p.valid).versionType;\n188:             if(this.cachedValidations[txid].details.versionType !== validVersionType) {\n189:                 this.cachedValidations[txid].invalidReason = \"SLP version/type mismatch from valid parent.\"\n190:                 return this.cachedValidations[txid].validity = false;\n191:             }\n192:         } \n193:         // For case with 0 token SEND with no valid parents, must check GENESIS validity / versionType.\n194:         else if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {\n195:             let slpmsg = this.cachedValidations[txid].details\n196:             let valid = await this.isValidSlpTxid(slpmsg.tokenIdHex);\n197:             if(valid) {\n198:                 let genesisTxn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[slpmsg.tokenIdHex].hex)\n199:                 let genesisMsg = this.slp.parseSlpOutputScript(genesisTxn.outputs[0]._scriptBuffer)\n200:                 if(genesisMsg.versionType !== slpmsg.versionType) {\n201:                     this.cachedValidations[txid].invalidReason = \"SLP version/type mismatch from valid GENESIS.\"\n202:                     return this.cachedValidations[txid].validity = false;\n203:                 }\n204:             } else {\n205:                 this.cachedValidations[txid].invalidReason = \"SEND has 0 outputs, but has invalid token GENESIS.\"\n206:                 return this.cachedValidations[txid].validity = false;\n207:             }\n208:         }\n209: \n210:         return this.cachedValidations[txid].validity = true;\n211:     }\n212: \n213:     async validateSlpTransactions(txids: string[]): Promise<string[]> {\n214:         let res = [];\n215:         for (let i = 0; i < txids.length; i++) {\n216:             res.push((await this.isValidSlpTxid) ? txids[i] : '')\n217:         }\n218:         return res.filter((id: string) => id.length > 0);\n219:     }\n220: }",
+      "source_summary": "Parent transaction validation results from recursive isValidSlpTxid() calls",
+      "sink_summary": "Parent validation state used in SEND transaction quantity validation (line 177) and version type validation (line 186)",
+      "guard_summary": "No validation controls on the propagation itself; relies on recursive validation correctness",
+      "risk_pattern": "Validation state propagation to parent entries affects downstream security decisions without intermediate validation",
+      "used_variable_sources": [
+        "parentTxids[i] from unique parent transaction IDs",
+        "valid from recursive isValidSlpTxid(parentTxids[i]) call"
+      ],
+      "called_function_context": [
+        "isValidSlpTxid(parentTxids[i]) - recursive validation call"
+      ],
+      "enclosing_conditions": [
+        "Loop over unique parent transaction IDs",
+        "MINT transaction type check after propagation"
+      ],
+      "context_summary": "Propagates validation results from parent transactions to parent entries in cache, affecting SEND transaction quantity validation and version compatibility checks",
+      "unresolved_facts": [
+        "Whether recursive validation could create infinite loops or stack overflows",
+        "Whether parent validation state could be manipulated during propagation"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "validation state propagation without proper synchronization, potential race condition in cached validation state",
+        "sensitive_operation": "cached validation state modification",
+        "missing_control": "synchronization mechanism for concurrent access to cached validation state"
+      },
+      "language": "typescript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-77-improper-neutralization-of-special-elements-used-in-a-command-command-injection",
+          "cwe_id": "CWE-77",
+          "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 10.3705,
+          "raw_bm25_score": 10.3705,
+          "description": "Externally influenced data changes the syntax or meaning of a command sent to a downstream command interpreter.",
+          "pattern": "cwe-77 command-injection command-construction shell exec spawn process subprocess child_process os.system popen argument-delimiter metacharacter",
+          "remediation": "Keep external data separate from command syntax and use safe argument APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-077"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "fallback/cwe-264-permissions-privileges-and-access-controls",
+          "cwe_id": "CWE-264",
+          "cwe_name": "Permissions, Privileges, and Access Controls",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 6.7564,
+          "raw_bm25_score": 6.7564,
+          "description": "Legacy access-control category for failures in permissions, privileges, or authorization enforcement.",
+          "pattern": "cwe-264 permissions privileges access-control authorization acl role privilege owner permission enforcement",
+          "remediation": "Enforce trusted authorization, role, ownership, and permission checks.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-264"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "fallback/cwe-697-incorrect-comparison",
+          "cwe_id": "CWE-697",
+          "cwe_name": "Incorrect Comparison",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.9953,
+          "raw_bm25_score": 5.9953,
+          "description": "A security-relevant comparison checks the wrong, incomplete, or non-canonical value.",
+          "pattern": "cwe-697 incorrect-comparison equality compare comparator mismatch canonicalization hostname url signature token partial-comparison substring",
+          "remediation": "Compare canonical complete values with the intended security predicate.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-697"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "fallback/cwe-125-out-of-bounds-read",
+          "cwe_id": "CWE-125",
+          "cwe_name": "Out-of-bounds Read",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.9354,
+          "raw_bm25_score": 5.9354,
+          "description": "A read accesses memory before or beyond the valid buffer range.",
+          "pattern": "cwe-125 out-of-bounds-read buffer-read memory-read index offset length parser decode malformed-input boundary",
+          "remediation": "Check read offsets, indexes, and lengths before buffer access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-125"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "fallback/cwe-1321-improperly-controlled-modification-of-object-prototype-attributes-prototype-poll",
+          "cwe_id": "CWE-1321",
+          "cwe_name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.6124,
+          "raw_bm25_score": 5.6124,
+          "description": "Attacker-controlled object keys modify Object prototype attributes.",
+          "pattern": "cwe-1321 prototype-pollution __proto__ constructor prototype object-key property-key merge assign recursive-merge",
+          "remediation": "Reject prototype keys and use schema-constrained object updates.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-1321"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "fallback/cwe-59-improper-link-resolution-before-file-access-link-following",
+          "cwe_id": "CWE-59",
+          "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.6002,
+          "raw_bm25_score": 5.6002,
+          "description": "File access follows a symlink, hardlink, or shortcut to an unintended resource.",
+          "pattern": "cwe-59 symlink hardlink link-following symbolic-link file-link archive-extraction path-resolution file-overwrite race filesystem",
+          "remediation": "Reject unsafe links and verify resolved file targets before access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-059"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "fallback/cwe-311-missing-encryption-of-sensitive-data",
+          "cwe_id": "CWE-311",
+          "cwe_name": "Missing Encryption of Sensitive Data",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.5305,
+          "raw_bm25_score": 5.5305,
+          "description": "Sensitive data is stored or transmitted without required encryption.",
+          "pattern": "cwe-311 missing-encryption cleartext plaintext sensitive-data unencrypted storage transmission tls data-at-rest data-in-transit",
+          "remediation": "Encrypt sensitive data in transit and at rest.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-311"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "fallback/cwe-863-incorrect-authorization",
+          "cwe_id": "CWE-863",
+          "cwe_name": "Incorrect Authorization",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.4832,
+          "raw_bm25_score": 5.4832,
+          "description": "An authorization check exists but evaluates access incorrectly.",
+          "pattern": "cwe-863 incorrect-authorization authorization-check permission-check role-check ownership-check acl-check access-decision bypass",
+          "remediation": "Evaluate authorization from trusted server-side identity and policy state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-863"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "fallback/cwe-668-exposure-of-resource-to-wrong-sphere",
+          "cwe_id": "CWE-668",
+          "cwe_name": "Exposure of Resource to Wrong Sphere",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.3495,
+          "raw_bm25_score": 5.3495,
+          "description": "A protected resource crosses its intended trust or control boundary and becomes accessible to an unintended actor.",
+          "pattern": "cwe-668 wrong-sphere control-sphere trust-boundary resource-exposure unintended-actor private-resource public-exposure insecure-permission cross-boundary",
+          "remediation": "Keep protected resources inside their intended trust boundary.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-668"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-255-credentials-management-errors",
+          "cwe_id": "CWE-255",
+          "cwe_name": "Credentials Management Errors",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 4.8703,
+          "raw_bm25_score": 4.8703,
+          "description": "Legacy category for insecure credential creation, storage, validation, or handling.",
+          "pattern": "cwe-255 credential-management password token secret credential storage rotation validation authentication-secret",
+          "remediation": "Protect credentials throughout storage, validation, transport, and rotation.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-255"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

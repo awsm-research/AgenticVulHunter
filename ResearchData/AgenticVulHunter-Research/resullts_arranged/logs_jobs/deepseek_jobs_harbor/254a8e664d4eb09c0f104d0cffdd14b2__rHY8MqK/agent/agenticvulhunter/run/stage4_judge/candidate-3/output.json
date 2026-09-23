@@ -1,0 +1,260 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "glance/api/v1/images.py",
+  "changed_line": 832,
+  "statement": "status = 'pending_delete'",
+  "change_type": "A",
+  "function_name": "delete",
+  "operation_type": "state_assignment",
+  "selection_reason": "Configuration-controlled condition -> sets status to pending_delete -> affects deletion workflow and timing",
+  "security_relevance_score": 0.6,
+  "code_context": "683: \n684:         image_meta = self._reserve(req, image_meta)\n685:         id = image_meta['id']\n686: \n687:         image_meta = self._handle_source(req, id, image_meta, image_data)\n688: \n689:         location_uri = image_meta.get('location')\n690:         if location_uri:\n691:             self.update_store_acls(req, id, location_uri, public=is_public)\n692: \n693:         # Prevent client from learning the location, as it\n694:         # could contain security credentials\n695:         image_meta.pop('location', None)\n696: \n697:         return {'image_meta': image_meta}\n698: \n699:     @utils.mutating\n700:     def update(self, req, id, image_meta, image_data):\n701:         \"\"\"\n702:         Updates an existing image with the registry.\n703: \n704:         :param request: The WSGI/Webob Request object\n705:         :param id: The opaque image identifier\n706: \n707:         :retval Returns the updated image information as a mapping\n708:         \"\"\"\n709:         self._enforce(req, 'modify_image')\n710:         is_public = image_meta.get('is_public')\n711:         if is_public:\n712:             self._enforce(req, 'publicize_image')\n713: \n714:         orig_image_meta = self.get_image_meta_or_404(req, id)\n715:         orig_status = orig_image_meta['status']\n716: \n717:         # The default behaviour for a PUT /images/<IMAGE_ID> is to\n718:         # override any properties that were previously set. This, however,\n719:         # leads to a number of issues for the common use case where a caller\n720:         # registers an image with some properties and then almost immediately\n721:         # uploads an image file along with some more properties. Here, we\n722:         # check for a special header value to be false in order to force\n723:         # properties NOT to be purged. However we also disable purging of\n724:         # properties if an image file is being uploaded...\n725:         purge_props = req.headers.get('x-glance-registry-purge-props', True)\n726:         purge_props = (utils.bool_from_string(purge_props) and\n727:                        image_data is None)\n728: \n729:         if image_data is not None and orig_status != 'queued':\n730:             raise HTTPConflict(_(\"Cannot upload to an unqueued image\"))\n731: \n732:         # Only allow the Location|Copy-From fields to be modified if the\n733:         # image is in queued status, which indicates that the user called\n734:         # POST /images but originally supply neither a Location|Copy-From\n735:         # field NOR image data\n736:         location = self._external_source(image_meta, req)\n737:         reactivating = orig_status != 'queued' and location\n738:         activating = orig_status == 'queued' and (location or image_data)\n739: \n740:         # Make image public in the backend store (if implemented)\n741:         orig_or_updated_loc = location or orig_image_meta.get('location', None)\n742:         if orig_or_updated_loc:\n743:             self.update_store_acls(req, id, orig_or_updated_loc,\n744:                                    public=is_public)\n745: \n746:         if reactivating:\n747:             msg = _(\"Attempted to update Location field for an image \"\n748:                     \"not in queued status.\")\n749:             raise HTTPBadRequest(explanation=msg,\n750:                                  request=req,\n751:                                  content_type=\"text/plain\")\n752: \n753:         try:\n754:             if location:\n755:                 image_meta['size'] = self._get_size(req.context, image_meta,\n756:                                                     location)\n757: \n758:             image_meta = registry.update_image_metadata(req.context,\n759:                                                         id,\n760:                                                         image_meta,\n761:                                                         purge_props)\n762: \n763:             if activating:\n764:                 image_meta = self._handle_source(req, id, image_meta,\n765:                                                  image_data)\n766: \n767:         except exception.Invalid, e:\n768:             msg = (_(\"Failed to update image metadata. Got error: %(e)s\")\n769:                    % locals())\n770:             for line in msg.split('\\n'):\n771:                 LOG.error(line)\n772:             self.notifier.error('image.update', msg)\n773:             raise HTTPBadRequest(explanation=msg,\n774:                                  request=req,\n775:                                  content_type=\"text/plain\")\n776:         except exception.NotFound, e:\n777:             msg = (\"Failed to find image to update: %(e)s\" % locals())\n778:             for line in msg.split('\\n'):\n779:                 LOG.info(line)\n780:             self.notifier.info('image.update', msg)\n781:             raise HTTPNotFound(explanation=msg,\n782:                                request=req,\n783:                                content_type=\"text/plain\")\n784:         except exception.Forbidden, e:\n785:             msg = (\"Forbidden to update image: %(e)s\" % locals())\n786:             for line in msg.split('\\n'):\n787:                 LOG.info(line)\n788:             self.notifier.info('image.update', msg)\n789:             raise HTTPForbidden(explanation=msg,\n790:                                 request=req,\n791:                                 content_type=\"text/plain\")\n792:         else:\n793:             self.notifier.info('image.update', image_meta)\n794: \n795:         # Prevent client from learning the location, as it\n796:         # could contain security credentials\n797:         image_meta.pop('location', None)\n798: \n799:         return {'image_meta': image_meta}\n800: \n801:     @utils.mutating\n802:     def delete(self, req, id):\n803:         \"\"\"\n804:         Deletes the image and all its chunks from the Glance\n805: \n806:         :param req: The WSGI/Webob Request object\n807:         :param id: The opaque image identifier\n808: \n809:         :raises HttpBadRequest if image registry is invalid\n810:         :raises HttpNotFound if image or any chunk is not available\n811:         :raises HttpUnauthorized if image or any chunk is not\n812:                 deleteable by the requesting user\n813:         \"\"\"\n814:         self._enforce(req, 'delete_image')\n815: \n816:         image = self.get_image_meta_or_404(req, id)\n817:         if image['protected']:\n818:             msg = _(\"Image is protected\")\n819:             LOG.debug(msg)\n820:             raise HTTPForbidden(explanation=msg,\n821:                                 request=req,\n822:                                 content_type=\"text/plain\")\n823: \n824:         status = 'deleted'\n825:         try:\n826:             # The image's location field may be None in the case\n827:             # of a saving or queued image, therefore don't ask a backend\n828:             # to delete the image if the backend doesn't yet store it.\n829:             # See https://bugs.launchpad.net/glance/+bug/747799\n830:             if image['location']:\n831:                 if CONF.delayed_delete:\n832:                     status = 'pending_delete'\n833:                     schedule_delayed_delete_from_backend(image['location'], id)\n834:                 else:\n835:                     safe_delete_from_backend(image['location'],\n836:                                              req.context, id)\n837: \n838:             registry.update_image_metadata(req.context, id, {'status': status})\n839:             registry.delete_image_metadata(req.context, id)\n840:         except exception.NotFound, e:\n841:             msg = (\"Failed to find image to delete: %(e)s\" % locals())\n842:             for line in msg.split('\\n'):\n843:                 LOG.info(line)\n844:             self.notifier.info('image.delete', msg)\n845:             raise HTTPNotFound(explanation=msg,\n846:                                request=req,\n847:                                content_type=\"text/plain\")\n848:         except exception.Forbidden, e:\n849:             msg = (\"Forbidden to delete image: %(e)s\" % locals())\n850:             for line in msg.split('\\n'):\n851:                 LOG.info(line)\n852:             self.notifier.info('image.delete', msg)\n853:             raise HTTPForbidden(explanation=msg,\n854:                                 request=req,\n855:                                 content_type=\"text/plain\")\n856:         else:\n857:             self.notifier.info('image.delete', image)\n858: \n859:     def get_store_or_400(self, request, scheme):\n860:         \"\"\"\n861:         Grabs the storage backend for the supplied store name\n862:         or raises an HTTPBadRequest (400) response\n863: \n864:         :param request: The WSGI/Webob Request object\n865:         :param scheme: The backend store scheme\n866: \n867:         :raises HTTPNotFound if store does not exist\n868:         \"\"\"\n869:         try:\n870:             return get_store_from_scheme(request.context, scheme)\n871:         except exception.UnknownScheme:\n872:             msg = _(\"Store for scheme %s not found\")\n873:             LOG.error(msg % scheme)\n874:             raise HTTPBadRequest(explanation=msg,\n875:                                  request=request,\n876:                                  content_type='text/plain')\n877: \n878:     def verify_scheme_or_exit(self, scheme):\n879:         \"\"\"\n880:         Verifies availability of the storage backend for the\n881:         given scheme or exits\n882: \n883:         :param scheme: The backend store scheme\n884:         \"\"\"\n885:         try:\n886:             get_store_from_scheme(context.RequestContext(), scheme)\n887:         except exception.UnknownScheme:\n888:             msg = _(\"Store for scheme %s not found\")\n889:             LOG.error(msg % scheme)\n890:             # message on stderr will only be visible if started directly via\n891:             # bin/glance-api, as opposed to being daemonized by glance-control\n892:             sys.stderr.write(msg % scheme)\n893:             sys.exit(255)\n894: \n895: \n896: class ImageDeserializer(wsgi.JSONRequestDeserializer):\n897:     \"\"\"Handles deserialization of specific controller method requests.\"\"\"\n898: \n899:     def _deserialize(self, request):\n900:         result = {}\n901:         try:\n902:             result['image_meta'] = utils.get_image_meta_from_headers(request)\n903:         except exception.Invalid:\n904:             image_size_str = request.headers['x-image-meta-size']\n905:             msg = _(\"Incoming image size of %s was not convertible to \"\n906:                     \"an integer.\") % image_size_str\n907:             raise HTTPBadRequest(explanation=msg, request=request)\n908: \n909:         image_meta = result['image_meta']\n910:         image_meta = validate_image_meta(request, image_meta)\n911:         if request.content_length:\n912:             image_size = request.content_length\n913:         elif 'size' in image_meta:\n914:             image_size = image_meta['size']\n915:         else:\n916:             image_size = None\n917: \n918:         data = request.body_file if self.has_body(request) else None\n919: \n920:         if image_size is None and data is not None:\n921:             data = utils.LimitingReader(data, CONF.image_size_cap)\n922: \n923:             #NOTE(bcwaldon): this is a hack to make sure the downstream code\n924:             # gets the correct image data\n925:             request.body_file = data\n926: \n927:         elif image_size > CONF.image_size_cap:\n928:             max_image_size = CONF.image_size_cap\n929:             msg = _(\"Denying attempt to upload image larger than %d bytes.\")\n930:             LOG.warn(msg % max_image_size)\n931:             raise HTTPBadRequest(explanation=msg % max_image_size,\n932:                                  request=request)\n933: \n934:         result['image_data'] = data\n935:         return result\n936: \n937:     def create(self, request):\n938:         return self._deserialize(request)\n939: \n940:     def update(self, request):\n941:         return self._deserialize(request)\n942: \n943: \n944: class ImageSerializer(wsgi.JSONResponseSerializer):\n945:     \"\"\"Handles serialization of specific controller method responses.\"\"\"\n946: \n947:     def __init__(self):\n948:         self.notifier = notifier.Notifier()\n949: \n950:     def _inject_location_header(self, response, image_meta):\n951:         location = self._get_image_location(image_meta)\n952:         response.headers['Location'] = location.encode('utf-8')\n953: \n954:     def _inject_checksum_header(self, response, image_meta):\n955:         if image_meta['checksum'] is not None:\n956:             response.headers['ETag'] = image_meta['checksum'].encode('utf-8')\n957: \n958:     def _inject_image_meta_headers(self, response, image_meta):\n959:         \"\"\"\n960:         Given a response and mapping of image metadata, injects\n961:         the Response with a set of HTTP headers for the image\n962:         metadata. Each main image metadata field is injected\n963:         as a HTTP header with key 'x-image-meta-<FIELD>' except\n964:         for the properties field, which is further broken out\n965:         into a set of 'x-image-meta-property-<KEY>' headers\n966: \n967:         :param response: The Webob Response object\n968:         :param image_meta: Mapping of image metadata\n969:         \"\"\"\n970:         headers = utils.image_meta_to_http_headers(image_meta)\n971: \n972:         for k, v in headers.items():\n973:             response.headers[k.encode('utf-8')] = v.encode('utf-8')\n974: \n975:     def _get_image_location(self, image_meta):\n976:         \"\"\"Build a relative url to reach the image defined by image_meta.\"\"\"\n977:         return \"/v1/images/%s\" % image_meta['id']\n978: \n979:     def meta(self, response, result):\n980:         image_meta = result['image_meta']\n981:         self._inject_image_meta_headers(response, image_meta)",
+  "source_summary": "image['location'] comes from image metadata retrieved via get_image_meta_or_404(req, id). CONF.delayed_delete is a boolean configuration setting.",
+  "sink_summary": "When delayed_delete=True: schedule_delayed_delete_from_backend writes URI and timestamp to file. When delayed_delete=False: safe_delete_from_backend calls delete_from_backend which calls store.delete(loc) on the storage backend.",
+  "guard_summary": "Authentication: self._enforce(req, 'delete_image') at line 814. Authorization: protected image check at lines 817-822 prevents deletion of protected images. Location validation: Only attempts deletion if image['location'] exists (line 830).",
+  "risk_pattern": "Configuration-controlled deletion timing: delayed_delete setting determines whether image deletion is immediate or scheduled for later execution via file-based queue.",
+  "used_variable_sources": [
+    "image['location'] from get_image_meta_or_404",
+    "CONF.delayed_delete from configuration"
+  ],
+  "called_function_context": [
+    "get_image_meta_or_404",
+    "schedule_delayed_delete_from_backend",
+    "safe_delete_from_backend",
+    "delete_from_backend",
+    "registry.update_image_metadata",
+    "registry.delete_image_metadata"
+  ],
+  "enclosing_conditions": [
+    "if image['location']:",
+    "if CONF.delayed_delete:"
+  ],
+  "context_summary": "The candidate statement is in the delete() method, which handles image deletion. When delayed_delete is enabled, it sets status to 'pending_delete' and schedules deletion via file-based queue instead of immediate deletion.",
+  "unresolved_facts": [
+    "Specific store backend implementations and their security characteristics",
+    "Scrubber process implementation that handles scheduled deletions",
+    "Exact file permissions and security of scrubber_datadir"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-668",
+      "cwe_name": "Exposure of Resource to Wrong Sphere",
+      "fit_reason": "Delayed deletion via file queue may expose image resources beyond intended timing boundary when scrubber process fails or is delayed",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-772",
+      "cwe_name": "Missing Release of Resource after Effective Lifetime",
+      "fit_reason": "Pending_delete status delays actual resource cleanup, potentially leaving images accessible longer than intended",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "fit_reason": "Configuration-controlled timing may create access control gaps between deletion request and actual cleanup",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1236",
+    "CWE-200",
+    "CWE-208",
+    "CWE-22",
+    "CWE-264",
+    "CWE-284",
+    "CWE-377",
+    "CWE-425",
+    "CWE-570",
+    "CWE-571",
+    "CWE-59",
+    "CWE-601",
+    "CWE-668",
+    "CWE-772",
+    "CWE-863",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 832,
+      "statement": "status = 'pending_delete'",
+      "cwe_id": "CWE-668",
+      "cwe_name": "Exposure of Resource to Wrong Sphere",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The candidate introduces a configuration-controlled timing change for deletion, potentially exposing resources longer than intended. However, CWE-668 typically involves exposing resources to unintended actors across trust boundaries, not just timing delays within the same control sphere."
+        },
+        "connection": {
+          "score": 0.5,
+          "evidence": "The image resource (identified by image['location']) is connected to the deletion mechanism. When CONF.delayed_delete=True, deletion is deferred via schedule_delayed_delete_from_backend instead of immediate safe_delete_from_backend."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If the candidate line were reverted, status would remain 'deleted' regardless of CONF.delayed_delete setting, and immediate deletion would always occur when image['location'] exists. The patch materially creates a conditional timing exposure based on configuration."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The required control for CWE-668 is proper access control and resource isolation across trust boundaries. The demonstrated deficiency is timing-based exposure rather than actor-based exposure.",
+          "required_control": "Access control ensuring resources are only accessible to intended actors within appropriate time windows",
+          "control_requirement_evidence": "CWE-668 requires preventing unintended actors from accessing resources. The demonstrated mechanism changes timing but doesn't demonstrate cross-actor exposure.",
+          "existing_controls_checked": [
+            "Authentication via self._enforce(req, 'delete_image')",
+            "Authorization via protected image check",
+            "Location validation before deletion"
+          ],
+          "deficiency_evidence": "The patch introduces a timing gap where resources marked for deletion remain accessible until scrubber processes them, but evidence doesn't show this exposes resources to unintended actors rather than just delaying cleanup."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Potential extended exposure of image data if scrubber fails or is delayed, but no demonstrated cross-sphere exposure or unintended actor access. Impact is speculative without evidence of scrubber failure or unauthorized access during pending_delete state."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, status would always be 'deleted' when image['location'] exists, and immediate deletion via safe_delete_from_backend would occur regardless of CONF.delayed_delete setting. The configuration-controlled delayed deletion mechanism would not be implemented.",
+      "supporting_evidence": [
+        "The patch introduces conditional status assignment based on CONF.delayed_delete configuration",
+        "When delayed_delete=True, deletion is deferred via schedule_delayed_delete_from_backend instead of immediate safe_delete_from_backend",
+        "Image resources remain accessible in 'pending_delete' state until scrubber processes them"
+      ],
+      "contradicting_evidence": [
+        "Authentication and authorization checks remain unchanged and prevent unauthorized deletion",
+        "The same actors (authenticated users with delete_image permission) control both immediate and delayed deletion paths",
+        "No evidence shows resources become accessible to unintended actors during pending_delete state"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether scrubber process has different security context than API process",
+        "Whether pending_delete images are accessible to users who shouldn't see them",
+        "Whether file-based queue exposes image locations to unintended processes",
+        "Whether delayed deletion creates race conditions allowing unauthorized access"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.4699999999999999,
+      "score": 0.4699999999999999
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 832,
+      "statement": "status = 'pending_delete'",
+      "cwe_id": "CWE-772",
+      "cwe_name": "Missing Release of Resource after Effective Lifetime",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code introduces a delayed deletion mechanism where resources (image data) are not immediately released when deletion is requested, but scheduled for later cleanup via 'pending_delete' status and file-based queue."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The connection is direct: when CONF.delayed_delete=True, the image location (resource identifier) is passed to schedule_delayed_delete_from_backend() instead of immediate deletion via safe_delete_from_backend()."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If the candidate line were reverted, images would always be immediately deleted when location exists. The addition creates the delayed cleanup path that depends on external scrubber process execution."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "The delayed deletion mechanism introduces a timing gap where resources remain allocated but marked for deletion.",
+          "required_control": "Timely resource release after deletion request",
+          "control_requirement_evidence": "CWE-772 requires resources to be released after their effective lifetime ends. The delayed mechanism creates a window where resources remain allocated despite deletion intent.",
+          "existing_controls_checked": [
+            "Authentication/authorization prevents unauthorized deletion",
+            "Protected image check prevents deletion of protected images",
+            "Location validation ensures only valid resources are processed"
+          ],
+          "deficiency_evidence": "The control deficiency is the intentional delay in resource release, creating a window where deleted-but-not-cleaned resources remain accessible if the scrubber process fails or is delayed."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Impact depends on scrubber reliability and timing. If scrubber fails, images marked for deletion may remain accessible longer than intended, potentially allowing unauthorized access to supposedly deleted data."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, images would always be immediately deleted via safe_delete_from_backend() when location exists, eliminating the delayed cleanup path and associated timing window.",
+      "supporting_evidence": [
+        "The code explicitly creates two deletion paths: immediate (safe_delete_from_backend) and delayed (schedule_delayed_delete_from_backend)",
+        "Delayed path sets status to 'pending_delete' and writes to file-based queue instead of immediate resource release",
+        "Configuration control (CONF.delayed_delete) determines which path is taken"
+      ],
+      "contradicting_evidence": [
+        "The delayed deletion is an intentional feature with a scrubber process designed to eventually clean up resources",
+        "Resource release does occur, just on a delayed schedule rather than immediately"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Scrubber process reliability and execution frequency",
+        "File permissions and security of scrubber_datadir",
+        "Actual time window between deletion request and resource cleanup",
+        "Whether delayed deletion introduces actual security risks or is a benign operational feature"
+      ],
+      "review_comment": "The delayed deletion feature introduces a timing gap where images marked for deletion remain accessible until the scrubber process executes. While this is an intentional operational feature, ensure the scrubber process is reliable, runs frequently, and the scrubber_datadir has appropriate file permissions to prevent unauthorized access to deletion queue entries. Consider monitoring scrubber execution to detect failures that could leave deleted images accessible longer than intended.",
+      "change_type": "A",
+      "raw_score": 0.5,
+      "score": 0.5
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 832,
+      "statement": "status = 'pending_delete'",
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-284 requires improper restriction of access to resources from unauthorized actors. The candidate line controls deletion timing but does not demonstrate access control bypass or authorization failure."
+        },
+        "connection": {
+          "score": 0.25,
+          "evidence": "The line connects configuration (CONF.delayed_delete) to deletion workflow timing, but no connection to unauthorized access is established."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "If reverted, immediate deletion would occur instead of scheduled deletion when delayed_delete=True, changing timing but not access control."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "Access control enforcement preventing unauthorized deletion",
+          "control_requirement_evidence": "CWE-284 requires demonstrated failure to restrict access to authorized users only",
+          "existing_controls_checked": [
+            "Authentication via self._enforce(req, 'delete_image')",
+            "Authorization check for protected images at lines 817-822"
+          ],
+          "deficiency_evidence": "No evidence of access control bypass; authentication and authorization checks remain intact regardless of deletion timing"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No concrete security impact demonstrated; timing change in deletion workflow does not equate to access control failure."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, images would be deleted immediately when delayed_delete=True instead of being scheduled for deletion, but all access controls would remain unchanged.",
+      "supporting_evidence": [
+        "Authentication check at line 814 via self._enforce(req, 'delete_image')",
+        "Protected image authorization check at lines 817-822"
+      ],
+      "contradicting_evidence": [
+        "Access controls are enforced before reaching the candidate line",
+        "No evidence of authorization bypass or privilege escalation"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether delayed deletion creates any actual access control window",
+        "Downstream scrubber process security implementation"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.2,
+      "score": 0.2
+    }
+  ],
+  "stage4_status": "completed"
+}

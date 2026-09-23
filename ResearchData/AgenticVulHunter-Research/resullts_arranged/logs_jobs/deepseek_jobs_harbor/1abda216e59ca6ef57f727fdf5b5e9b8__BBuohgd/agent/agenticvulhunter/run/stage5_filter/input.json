@@ -1,0 +1,1683 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "lib/compile_helpers.py",
+    "changed_line": 53,
+    "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))",
+    "change_type": "A",
+    "function_name": "setup_webdir_if_it_doesnt_exist",
+    "operation_type": "regex_pattern_construction",
+    "selection_reason": "User-controlled LIBDIR context value -> regex pattern construction -> controls which library files are excluded from web directory deployment",
+    "security_relevance_score": 0.8,
+    "code_context": "1: # Licensed to the Apache Software Foundation (ASF) under one or more\n2: # contributor license agreements.  See the NOTICE file distributed with\n3: # this work for additional information regarding copyright ownership.\n4: # The ASF licenses this file to You under the Apache License, Version 2.0\n5: # (the \"License\"); you may not use this file except in compliance with\n6: # the License.  You may obtain a copy of the License at\n7: #\n8: #     http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: # Unless required by applicable law or agreed to in writing, software\n11: # distributed under the License is distributed on an \"AS IS\" BASIS,\n12: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n13: # See the License for the specific language governing permissions and\n14: # limitations under the License.\n15: import os\n16: import os.path\n17: import json\n18: import logging\n19: from collections import defaultdict\n20: from build_pack_utils import FileUtil\n21: \n22: \n23: _log = logging.getLogger('helpers')\n24: \n25: \n26: class FakeBuilder(object):\n27:     def __init__(self, ctx):\n28:         self._ctx = ctx\n29: \n30: \n31: class FakeInstaller(object):\n32:     def __init__(self, builder, installer):\n33:         self._installer = installer\n34:         self.builder = builder\n35: \n36: \n37: def setup_webdir_if_it_doesnt_exist(ctx):\n38:     if is_web_app(ctx):\n39:         webdirPath = os.path.join(ctx['BUILD_DIR'], ctx['WEBDIR'])\n40:         if not os.path.exists(webdirPath):\n41:             fu = FileUtil(FakeBuilder(ctx), move=True)\n42:             fu.under('BUILD_DIR')\n43:             fu.into('WEBDIR')\n44:             fu.where_name_does_not_match(\n45:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))\n46:             fu.where_name_does_not_match(\n47:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))\n48:             fu.where_name_does_not_match(\n49:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))\n50:             fu.where_name_does_not_match(\n51:                 '^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))\n52:             fu.where_name_does_not_match(\n53:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))\n54:             fu.done()\n55: \n56: \n57: def setup_log_dir(ctx):\n58:     os.makedirs(os.path.join(ctx['BUILD_DIR'], 'logs'))\n59: \n60: \n61: def load_binary_index(ctx):\n62:     index_path = os.path.join(ctx['BP_DIR'], 'binaries',\n63:                               ctx['STACK'], 'index-all.json')\n64:     return json.load(open(index_path))\n65: \n66: \n67: def find_all_php_versions(index_json):\n68:     return index_json['php'].keys()\n69: \n70: \n71: def find_all_php_extensions(index_json):\n72:     SKIP = ('cli', 'pear', 'cgi', 'fpm')\n73:     exts = defaultdict(list)\n74:     for version, files in index_json['php'].iteritems():\n75:         for f in files:\n76:             if f.endswith('.tar.gz'):\n77:                 tmp = f.split('-')\n78:                 if len(tmp) == 3 and tmp[1] not in SKIP:\n79:                     exts[version].append(tmp[1])\n80:     return exts\n81: \n82: \n83: def validate_php_version(ctx):\n84:     if ctx['PHP_VERSION'] in ctx['ALL_PHP_VERSIONS']:\n85:         _log.debug('App selected PHP [%s]', ctx['PHP_VERSION'])\n86:     else:\n87:         _log.warning('Selected version of PHP [%s] not available.  Defaulting'\n88:                      ' to the latest version [%s]',\n89:                      ctx['PHP_VERSION'], ctx['PHP_54_LATEST'])\n90:         ctx['PHP_VERSION'] = ctx['PHP_54_LATEST']\n91: \n92: \n93: def validate_php_extensions(ctx):\n94:     extns = ctx['ALL_PHP_EXTENSIONS'][ctx['PHP_VERSION']]\n95:     keep = []\n96:     for extn in ctx['PHP_EXTENSIONS']:\n97:         if extn in extns:\n98:             _log.debug('Extension [%s] validated.', extn)\n99:             keep.append(extn)\n100:         else:\n101:             _log.warn('Extension [%s] is not available!', extn)\n102:     ctx['PHP_EXTENSIONS'] = keep\n103: \n104: \n105: def convert_php_extensions(ctx):\n106:     _log.debug('Converting PHP extensions')\n107:     SKIP = ('cli', 'pear', 'cgi')\n108:     ctx['PHP_EXTENSIONS'] = \\\n109:         \"\\n\".join([\"extension=%s.so\" % ex\n110:                    for ex in ctx['PHP_EXTENSIONS'] if ex not in SKIP])\n111:     path = (ctx['PHP_VERSION'].startswith('5.4')) and \\\n112:         '@HOME/php/lib/php/extensions/no-debug-non-zts-20100525' or ''\n113:     ctx['ZEND_EXTENSIONS'] = \\\n114:         \"\\n\".join(['zend_extension=\"%s\"' % os.path.join(path, \"%s.so\" % ze)\n115:                    for ze in ctx['ZEND_EXTENSIONS']])\n116: \n117: \n118: def build_php_environment(ctx):\n119:     _log.debug('Building PHP environment variables')\n120:     ctx[\"PHP_ENV\"] = \\\n121:         \"\\n\".join([\"env[%s] = $%s\" % (k, k) for k in os.environ.keys()])\n122: \n123: \n124: def is_web_app(ctx):\n125:     return ctx.get('WEB_SERVER', '') != 'none'\n126: \n127: \n128: def find_stand_alone_app_to_run(ctx):\n129:     app = ctx.get('APP_START_CMD', None)\n130:     if not app:\n131:         possible_files = ('app.php', 'main.php', 'run.php', 'start.php')\n132:         for pf in possible_files:\n133:             if os.path.exists(os.path.join(ctx['BUILD_DIR'], pf)):\n134:                 app = pf\n135:                 break\n136:         if not app:\n137:             print 'Build pack could not find a PHP file to execute!'\n138:             _log.info('Build pack could not find a file to execute.  Either '\n139:                       'set \"APP_START_CMD\" or include one of these files [%s]',\n140:                       \", \".join(possible_files))\n141:             app = 'app.php'\n142:     return app",
+    "source_summary": "LIBDIR comes from build context with default 'lib' but can be overridden by user configuration. BUILD_DIR is the application build directory.",
+    "sink_summary": "Pattern used in FileUtil.where_name_does_not_match() to exclude files from being moved/copied to WEBDIR during web directory setup.",
+    "guard_summary": "No validation or sanitization of LIBDIR value before regex construction. Pattern is compiled and used for file path matching without escaping.",
+    "risk_pattern": "User-influenced directory name inserted into regex pattern without sanitization, controlling which files are excluded from web deployment.",
+    "used_variable_sources": [
+      "ctx['LIBDIR']",
+      "ctx['BUILD_DIR']"
+    ],
+    "called_function_context": [
+      "FileUtil.where_name_does_not_match()",
+      "os.path.join()"
+    ],
+    "enclosing_conditions": [
+      "is_web_app(ctx) returns True",
+      "webdirPath does not exist"
+    ],
+    "context_summary": "Function creates exclusion rules for FileUtil to prevent certain directories (.bp, .extensions, .bp-config, manifest.yml, LIBDIR) from being deployed to web directory.",
+    "unresolved_facts": [
+      "Whether LIBDIR value is properly validated/sanitized before use",
+      "Whether regex metacharacters in LIBDIR could cause unintended file exclusion/inclusion"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-730",
+        "cwe_name": "Security Issue (CWE-730)",
+        "fit_reason": "User-controlled LIBDIR value inserted into regex pattern without escaping, allowing regex injection that could bypass file exclusion controls",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-400",
+        "cwe_name": "Uncontrolled Resource Consumption",
+        "fit_reason": "Malicious LIBDIR value could create regex patterns causing ReDoS during file matching operations",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "User-controlled path component affects which files are excluded from web deployment, potentially allowing unintended file access",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "LIBDIR value could contain path traversal sequences affecting file exclusion logic",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-1236",
+      "CWE-179",
+      "CWE-22",
+      "CWE-23",
+      "CWE-287",
+      "CWE-327",
+      "CWE-400",
+      "CWE-59",
+      "CWE-628",
+      "CWE-685",
+      "CWE-730",
+      "CWE-77",
+      "CWE-770",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 53,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))",
+        "cwe_id": "CWE-730",
+        "cwe_name": "Security Issue (CWE-730)",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-730 specifically addresses regex injection leading to exponential time complexity (ReDoS). The demonstrated pattern constructs a static exclusion rule for file operations, not a regex that processes variable-length input strings susceptible to catastrophic backtracking."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "User-controlled LIBDIR value flows directly into regex pattern construction via string formatting. The pattern is used by FileUtil.where_name_does_not_match() to control file exclusion during web directory deployment."
+          },
+          "diff_causality": {
+            "score": 0.85,
+            "evidence": "This line was added to create an exclusion rule for LIBDIR. Reverting would remove the LIBDIR exclusion, potentially exposing library files in the web directory."
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "No regex escaping or validation of LIBDIR value before pattern construction",
+            "required_control": "regex escaping for user-controlled input in regex patterns",
+            "control_requirement_evidence": "CWE-730 requires escaping regex metacharacters when user input is used in regex construction to prevent injection",
+            "existing_controls_checked": [
+              "No escaping function applied to LIBDIR value before regex construction"
+            ],
+            "deficiency_evidence": "LIBDIR value is directly interpolated into regex pattern without escaping, but the demonstrated use case (file path exclusion) doesn't create the exponential complexity scenario CWE-730 addresses"
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No evidence of exponential time complexity impact. The pattern matches file paths, not variable-length input strings that could cause catastrophic backtracking."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the LIBDIR exclusion rule would be removed, potentially allowing library directory contents to be deployed to the web directory.",
+        "supporting_evidence": [
+          "User-controlled LIBDIR value flows directly into regex pattern construction",
+          "No escaping or validation applied to LIBDIR before regex interpolation"
+        ],
+        "contradicting_evidence": [
+          "The regex pattern '^%s/.*$' with a fixed path prefix doesn't create exponential backtracking scenarios",
+          "Pattern is used for static file path matching, not processing variable user input"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether LIBDIR value contains regex metacharacters that could alter pattern behavior",
+          "Whether altered pattern behavior could lead to security impact beyond CWE-730 scope"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.41,
+        "score": 0.41
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 53,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))",
+        "cwe_id": "CWE-400",
+        "cwe_name": "Uncontrolled Resource Consumption",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "CWE-400 requires uncontrolled allocation/maintenance of limited resources. The regex pattern construction could potentially lead to inefficient matching, but this is not the core mechanism of CWE-400 which typically involves memory, CPU, file handles, or other system resources."
+          },
+          "connection": {
+            "score": 0.45,
+            "evidence": "User-controlled LIBDIR value flows into regex pattern construction, which is used by FileUtil.where_name_does_not_match() to control file exclusion during web directory deployment. The path is: ctx['LIBDIR'] -> os.path.join() -> regex pattern -> FileUtil matching operation."
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "If this candidate line were reverted, the LIBDIR exclusion pattern would be removed, changing which files are excluded from web deployment. The pattern construction is new in this diff."
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "",
+            "required_control": "Input validation/sanitization for regex metacharacters in LIBDIR",
+            "control_requirement_evidence": "CWE-400 requires proper resource management controls. For regex-based operations, this includes validating inputs that could cause pathological matching behavior.",
+            "existing_controls_checked": [
+              "No validation observed on LIBDIR before regex construction",
+              "Pattern uses simple string formatting without escaping"
+            ],
+            "deficiency_evidence": "LIBDIR value is used directly in regex pattern without validation for metacharacters that could cause inefficient matching, but no evidence demonstrates this would cause resource exhaustion rather than just slower matching."
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "No evidence demonstrates actual resource consumption impact. The pattern matching occurs during build-time directory setup, not runtime, and the scope is limited to file exclusion operations."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the LIBDIR exclusion pattern would be removed, potentially allowing library files to be deployed to the web directory, but the regex construction vulnerability would be eliminated.",
+        "supporting_evidence": [
+          "User-controlled LIBDIR flows into regex pattern without validation",
+          "Pattern used in file matching operation during deployment"
+        ],
+        "contradicting_evidence": [
+          "Operation occurs during build-time setup, not continuous runtime",
+          "No evidence of actual resource exhaustion or performance impact",
+          "Scope limited to single file matching operation"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether LIBDIR values with regex metacharacters cause measurable performance impact",
+          "Whether the FileUtil matching operation is performance-critical",
+          "Whether this could be exploited to cause denial of service"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.37,
+        "score": 0.37
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 53,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-22 requires path traversal to access files outside restricted directories. This code constructs an exclusion pattern for files that should NOT be deployed, not a pathname to access files."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "User-controlled LIBDIR value flows directly into regex pattern construction for file exclusion rules. BUILD_DIR is fixed application directory."
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "Adding this line creates a new exclusion rule based on LIBDIR. Reverting would remove this specific exclusion, potentially exposing library files to web deployment."
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "No validation of LIBDIR before regex construction, but this affects exclusion patterns, not access paths.",
+            "required_control": "Path validation and sanitization for directory traversal",
+            "control_requirement_evidence": "CWE-22 requires controls to prevent accessing files outside restricted directories",
+            "existing_controls_checked": [
+              "FileUtil exclusion patterns define what files are excluded from deployment"
+            ],
+            "deficiency_evidence": "The demonstrated mechanism is about exclusion patterns, not path traversal access. No evidence shows this enables accessing files outside BUILD_DIR."
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "Impact is limited to incorrect file exclusion/inclusion in deployment, not demonstrated file access outside restricted directories."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, files in the LIBDIR would no longer be automatically excluded from web directory deployment, potentially exposing library files to web access.",
+        "supporting_evidence": [
+          "LIBDIR is user-controllable via build context",
+          "Pattern construction uses string formatting without sanitization",
+          "Pattern controls which files are excluded from web deployment"
+        ],
+        "contradicting_evidence": [
+          "The mechanism constructs exclusion patterns, not access paths",
+          "All operations remain within BUILD_DIR boundary",
+          "Function prevents deployment, not enables access"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether malicious LIBDIR value could cause unintended file inclusion/exclusion",
+          "Whether regex metacharacters in LIBDIR could bypass intended exclusions"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.33999999999999997,
+        "score": 0.33999999999999997
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 53,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))",
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-23 requires constructing a pathname that resolves outside a restricted directory. The demonstrated mechanism constructs a regex pattern for file exclusion, not a filesystem path for access. The pattern is used for matching, not for directory traversal."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "LIBDIR value from user-controlled context is used to construct regex pattern. The pattern controls which files are excluded from web directory deployment via FileUtil.where_name_does_not_match()."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If this candidate line were reverted, the LIBDIR exclusion rule would not exist, potentially allowing library files to be deployed to the web directory. The patch adds protection against deploying library files."
+          },
+          "security_control": {
+            "score": 0.3,
+            "evidence": "No validation or sanitization of LIBDIR value before regex construction.",
+            "required_control": "Input validation/sanitization for regex metacharacters",
+            "control_requirement_evidence": "When constructing regex patterns from user input, metacharacters like '.', '*', '+', '?', '^', '$', '[', ']', '(', ')', '{', '}', '|', '\\\\' must be escaped to prevent unintended pattern behavior.",
+            "existing_controls_checked": [
+              "No validation of LIBDIR before regex construction",
+              "Pattern is used directly in where_name_does_not_match()"
+            ],
+            "deficiency_evidence": "LIBDIR value is directly interpolated into regex pattern without escaping metacharacters. This could cause unintended file exclusion/inclusion if LIBDIR contains regex metacharacters."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "Potential unintended file exclusion or inclusion from web deployment if LIBDIR contains regex metacharacters. No demonstrated path traversal or access outside restricted directory."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the exclusion rule for LIBDIR would not exist, potentially allowing library files to be deployed to the web directory alongside application files.",
+        "supporting_evidence": [
+          "LIBDIR value from user-controlled context is used in regex pattern construction",
+          "No validation or sanitization of LIBDIR before regex construction",
+          "Pattern controls file exclusion from web directory deployment"
+        ],
+        "contradicting_evidence": [
+          "The mechanism constructs a regex pattern for matching, not a filesystem path for traversal",
+          "The pattern is used for exclusion logic, not for accessing files outside restricted directories",
+          "No demonstrated use of '..' sequences or path resolution outside BUILD_DIR"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether LIBDIR value contains or could contain regex metacharacters",
+          "Whether unintended pattern behavior could lead to security-relevant file inclusion/exclusion",
+          "Whether this could be exploited to bypass intended file exclusion rules"
+        ],
+        "review_comment": "The patch adds an exclusion rule for LIBDIR files from web deployment, but constructs the regex pattern without escaping metacharacters. If LIBDIR contains regex special characters (like '.', '*', '^', '$'), the pattern may not match intended paths, potentially allowing library files to be deployed or excluding unintended files. Escape regex metacharacters in LIBDIR before pattern construction using re.escape().",
+        "change_type": "A",
+        "raw_score": 0.38,
+        "score": 0.38
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "lib/compile_helpers.py",
+    "changed_line": 45,
+    "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))",
+    "change_type": "A",
+    "function_name": "setup_webdir_if_it_doesnt_exist",
+    "operation_type": "file_filtering_rule",
+    "selection_reason": "Build configuration path -> regex pattern modification -> controls exclusion of .bp directory files from web deployment",
+    "security_relevance_score": 0.7,
+    "code_context": "1: # Licensed to the Apache Software Foundation (ASF) under one or more\n2: # contributor license agreements.  See the NOTICE file distributed with\n3: # this work for additional information regarding copyright ownership.\n4: # The ASF licenses this file to You under the Apache License, Version 2.0\n5: # (the \"License\"); you may not use this file except in compliance with\n6: # the License.  You may obtain a copy of the License at\n7: #\n8: #     http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: # Unless required by applicable law or agreed to in writing, software\n11: # distributed under the License is distributed on an \"AS IS\" BASIS,\n12: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n13: # See the License for the specific language governing permissions and\n14: # limitations under the License.\n15: import os\n16: import os.path\n17: import json\n18: import logging\n19: from collections import defaultdict\n20: from build_pack_utils import FileUtil\n21: \n22: \n23: _log = logging.getLogger('helpers')\n24: \n25: \n26: class FakeBuilder(object):\n27:     def __init__(self, ctx):\n28:         self._ctx = ctx\n29: \n30: \n31: class FakeInstaller(object):\n32:     def __init__(self, builder, installer):\n33:         self._installer = installer\n34:         self.builder = builder\n35: \n36: \n37: def setup_webdir_if_it_doesnt_exist(ctx):\n38:     if is_web_app(ctx):\n39:         webdirPath = os.path.join(ctx['BUILD_DIR'], ctx['WEBDIR'])\n40:         if not os.path.exists(webdirPath):\n41:             fu = FileUtil(FakeBuilder(ctx), move=True)\n42:             fu.under('BUILD_DIR')\n43:             fu.into('WEBDIR')\n44:             fu.where_name_does_not_match(\n45:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))\n46:             fu.where_name_does_not_match(\n47:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))\n48:             fu.where_name_does_not_match(\n49:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))\n50:             fu.where_name_does_not_match(\n51:                 '^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))\n52:             fu.where_name_does_not_match(\n53:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))\n54:             fu.done()\n55: \n56: \n57: def setup_log_dir(ctx):\n58:     os.makedirs(os.path.join(ctx['BUILD_DIR'], 'logs'))\n59: \n60: \n61: def load_binary_index(ctx):\n62:     index_path = os.path.join(ctx['BP_DIR'], 'binaries',\n63:                               ctx['STACK'], 'index-all.json')\n64:     return json.load(open(index_path))\n65: \n66: \n67: def find_all_php_versions(index_json):\n68:     return index_json['php'].keys()\n69: \n70: \n71: def find_all_php_extensions(index_json):\n72:     SKIP = ('cli', 'pear', 'cgi', 'fpm')\n73:     exts = defaultdict(list)\n74:     for version, files in index_json['php'].iteritems():\n75:         for f in files:\n76:             if f.endswith('.tar.gz'):\n77:                 tmp = f.split('-')\n78:                 if len(tmp) == 3 and tmp[1] not in SKIP:\n79:                     exts[version].append(tmp[1])\n80:     return exts\n81: \n82: \n83: def validate_php_version(ctx):\n84:     if ctx['PHP_VERSION'] in ctx['ALL_PHP_VERSIONS']:\n85:         _log.debug('App selected PHP [%s]', ctx['PHP_VERSION'])\n86:     else:\n87:         _log.warning('Selected version of PHP [%s] not available.  Defaulting'\n88:                      ' to the latest version [%s]',\n89:                      ctx['PHP_VERSION'], ctx['PHP_54_LATEST'])\n90:         ctx['PHP_VERSION'] = ctx['PHP_54_LATEST']\n91: \n92: \n93: def validate_php_extensions(ctx):\n94:     extns = ctx['ALL_PHP_EXTENSIONS'][ctx['PHP_VERSION']]\n95:     keep = []\n96:     for extn in ctx['PHP_EXTENSIONS']:\n97:         if extn in extns:\n98:             _log.debug('Extension [%s] validated.', extn)\n99:             keep.append(extn)\n100:         else:\n101:             _log.warn('Extension [%s] is not available!', extn)\n102:     ctx['PHP_EXTENSIONS'] = keep\n103: \n104: \n105: def convert_php_extensions(ctx):\n106:     _log.debug('Converting PHP extensions')\n107:     SKIP = ('cli', 'pear', 'cgi')\n108:     ctx['PHP_EXTENSIONS'] = \\\n109:         \"\\n\".join([\"extension=%s.so\" % ex\n110:                    for ex in ctx['PHP_EXTENSIONS'] if ex not in SKIP])\n111:     path = (ctx['PHP_VERSION'].startswith('5.4')) and \\\n112:         '@HOME/php/lib/php/extensions/no-debug-non-zts-20100525' or ''\n113:     ctx['ZEND_EXTENSIONS'] = \\\n114:         \"\\n\".join(['zend_extension=\"%s\"' % os.path.join(path, \"%s.so\" % ze)\n115:                    for ze in ctx['ZEND_EXTENSIONS']])\n116: \n117: \n118: def build_php_environment(ctx):\n119:     _log.debug('Building PHP environment variables')\n120:     ctx[\"PHP_ENV\"] = \\\n121:         \"\\n\".join([\"env[%s] = $%s\" % (k, k) for k in os.environ.keys()])\n122: \n123: \n124: def is_web_app(ctx):\n125:     return ctx.get('WEB_SERVER', '') != 'none'\n126: \n127: \n128: def find_stand_alone_app_to_run(ctx):\n129:     app = ctx.get('APP_START_CMD', None)\n130:     if not app:\n131:         possible_files = ('app.php', 'main.php', 'run.php', 'start.php')\n132:         for pf in possible_files:\n133:             if os.path.exists(os.path.join(ctx['BUILD_DIR'], pf)):\n134:                 app = pf\n135:                 break\n136:         if not app:\n137:             print 'Build pack could not find a PHP file to execute!'\n138:             _log.info('Build pack could not find a file to execute.  Either '\n139:                       'set \"APP_START_CMD\" or include one of these files [%s]',\n140:                       \", \".join(possible_files))\n141:             app = 'app.php'\n142:     return app",
+    "source_summary": "Build directory path context variable used to construct regex pattern for file exclusion",
+    "sink_summary": "FileUtil filtering system that controls which files are copied/moved from BUILD_DIR to WEBDIR during deployment",
+    "guard_summary": "Multiple exclusion patterns prevent build artifacts (.bp, .extensions, .bp-config directories, manifest.yml, LIBDIR) from being deployed to web directory",
+    "risk_pattern": "Path-based regex filtering controls deployment content by excluding build system directories and configuration files from web-accessible locations",
+    "used_variable_sources": [
+      "ctx['BUILD_DIR']",
+      "ctx['WEBDIR']",
+      "ctx['LIBDIR']"
+    ],
+    "called_function_context": [
+      "FileUtil.where_name_does_not_match()",
+      "FileUtil.under()",
+      "FileUtil.into()",
+      "FileUtil.done()"
+    ],
+    "enclosing_conditions": [
+      "is_web_app(ctx) returns true",
+      "webdirPath does not exist"
+    ],
+    "context_summary": "Sets up web directory for PHP applications by copying files from BUILD_DIR to WEBDIR, excluding build system artifacts using regex patterns",
+    "unresolved_facts": [
+      "Specific values of BUILD_DIR, WEBDIR, and LIBDIR context variables",
+      "Whether BUILD_DIR contains user-controllable content",
+      "Security implications of the specific directories being excluded"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "BUILD_DIR path variable used in regex pattern construction for file filtering could allow path traversal if path contains special regex characters",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-730",
+        "cwe_name": "Security Issue (CWE-730)",
+        "fit_reason": "Regex pattern constructed with path variables without proper escaping could lead to regex injection affecting file filtering behavior",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-179",
+        "cwe_name": "Incorrect Behavior Order: Early Validation",
+        "fit_reason": "Path validation and regex pattern construction order may allow bypass of intended file exclusion controls",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "Path construction using BUILD_DIR variable could be manipulated to bypass file exclusion patterns",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-1236",
+      "CWE-179",
+      "CWE-200",
+      "CWE-22",
+      "CWE-23",
+      "CWE-400",
+      "CWE-563",
+      "CWE-628",
+      "CWE-643",
+      "CWE-685",
+      "CWE-730",
+      "CWE-77",
+      "CWE-78",
+      "CWE-79"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 45,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "The code constructs a regex pattern for file exclusion, not a file path for access. CWE-22 requires pathname resolution that escapes restricted directories, but this is a filtering rule that excludes files from being copied, not a file access operation."
+          },
+          "connection": {
+            "score": 0.25,
+            "evidence": "The BUILD_DIR context variable is used to construct a regex pattern that controls which files are excluded from web deployment. However, there's no demonstrated path traversal sequence or external input that could manipulate the path resolution."
+          },
+          "diff_causality": {
+            "score": 0.4,
+            "evidence": "The added line creates an exclusion pattern for .bp directory files. Reverting would remove this specific exclusion, potentially allowing .bp directory contents to be deployed to the web directory."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Path validation and canonicalization for file operations",
+            "control_requirement_evidence": "CWE-22 requires controls to prevent path traversal when resolving file paths",
+            "existing_controls_checked": [
+              "Regex-based filtering using FileUtil.where_name_does_not_match()"
+            ],
+            "deficiency_evidence": "No path traversal vulnerability is demonstrated; the code uses BUILD_DIR to construct exclusion patterns, not to resolve file access paths"
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No concrete security impact is demonstrated. The pattern excludes build artifacts from web deployment, which is a defensive measure rather than a vulnerability."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the exclusion pattern for .bp directory files would be removed, potentially allowing build system artifacts to be deployed to the web directory alongside application files.",
+        "supporting_evidence": [
+          "The code uses BUILD_DIR context variable to construct regex patterns",
+          "Multiple exclusion patterns control which files are copied to the web directory"
+        ],
+        "contradicting_evidence": [
+          "This is a file exclusion/filtering mechanism, not a file access operation",
+          "The pattern construction uses BUILD_DIR for exclusion, not for path resolution that could traverse directories",
+          "No evidence of external input manipulating the path resolution"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether BUILD_DIR contains user-controllable content",
+          "Specific values and security implications of the context variables",
+          "Whether the regex pattern construction could be exploited for path traversal"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.22000000000000003,
+        "score": 0.22000000000000003
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 45,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))",
+        "cwe_id": "CWE-730",
+        "cwe_name": "Security Issue (CWE-730)",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-730 specifically addresses regex injection leading to exponential time complexity (ReDoS). The code constructs a regex pattern from build directory paths, but there's no evidence this is attacker-controlled input or that the regex could exhibit exponential behavior."
+          },
+          "connection": {
+            "score": 0.1,
+            "evidence": "The BUILD_DIR path comes from build context, not external user input. No demonstrated path from external input to this regex construction."
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "The candidate line adds a new regex pattern that excludes .bp directory files from web deployment. Reverting would remove this specific exclusion rule."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "The regex pattern uses fixed directory names (.bp) combined with BUILD_DIR path. No escaping is needed for this specific use case since it's constructing a literal path pattern, not evaluating user input as regex.",
+            "required_control": "regex escaping for user input",
+            "control_requirement_evidence": "CWE-730 requires escaping when user input is used in regex patterns to prevent injection",
+            "existing_controls_checked": [
+              "BUILD_DIR context variable appears to be build system controlled"
+            ],
+            "deficiency_evidence": "No user input is used in this regex construction - BUILD_DIR is build system context, .bp is literal string"
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No demonstrated security impact. The pattern excludes build artifacts from web deployment, which is a security improvement, not a vulnerability."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the .bp directory would not be excluded from web deployment, potentially exposing build artifacts in the web-accessible directory.",
+        "supporting_evidence": [
+          "Regex pattern construction using string formatting with path variables"
+        ],
+        "contradicting_evidence": [
+          "BUILD_DIR appears to be build system controlled, not user input",
+          "Pattern uses fixed directory name '.bp' combined with path",
+          "No evidence of regex evaluation complexity issues"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether BUILD_DIR contains any user-influenced content",
+          "Whether the regex pattern could ever match paths that cause exponential evaluation"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.23000000000000004,
+        "score": 0.23000000000000004
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 45,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))",
+        "cwe_id": "CWE-179",
+        "cwe_name": "Incorrect Behavior Order: Early Validation",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-179 requires validation before modification that alters input, but this code constructs a static regex pattern for file exclusion without any input modification or validation ordering issue"
+          },
+          "connection": {
+            "score": 0.1,
+            "evidence": "No external input flow demonstrated; BUILD_DIR is a build configuration variable, not user input. The pattern is constructed once during deployment setup."
+          },
+          "diff_causality": {
+            "score": 0.2,
+            "evidence": "The added line creates an exclusion pattern for .bp directory files, but doesn't change validation order or create a bypass condition"
+          },
+          "security_control": {
+            "score": 0.1,
+            "evidence": "",
+            "required_control": "validation after input modification/canonicalization",
+            "control_requirement_evidence": "CWE-179 requires that validation occurs after input modification to prevent bypass via modified inputs",
+            "existing_controls_checked": [
+              "static regex pattern construction for file exclusion"
+            ],
+            "deficiency_evidence": "No input modification or validation ordering issue demonstrated; the pattern is constructed from build configuration variables, not user input"
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No security consequence demonstrated; this adds a build artifact exclusion rule, not a validation bypass"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the .bp directory would not be excluded from web deployment, potentially exposing build artifacts, but this doesn't relate to validation order issues.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The code constructs a static regex pattern from build configuration variables, not user input",
+          "No input modification or transformation occurs that could create a validation bypass scenario",
+          "The pattern is used for file exclusion, not input validation with ordering issues"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether BUILD_DIR contains any user-influenced content",
+          "Whether the file filtering system processes any external input that could be modified"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.13,
+        "score": 0.13
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 45,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))",
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "The code constructs a regex pattern for file exclusion, not a filesystem path. CWE-23 requires pathname construction that allows traversal outside restricted directories via sequences like '..'"
+          },
+          "connection": {
+            "score": 0.15,
+            "evidence": "The BUILD_DIR variable is used to construct a regex pattern, but there's no demonstrated path traversal sequence or filesystem path resolution that could escape directory boundaries"
+          },
+          "diff_causality": {
+            "score": 0.4,
+            "evidence": "The added line creates a new exclusion pattern for .bp directory files. If reverted, .bp directory files might be copied to WEBDIR, but this doesn't create a path traversal vulnerability"
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Path validation/sanitization to prevent directory traversal",
+            "control_requirement_evidence": "CWE-23 requires validation that pathnames cannot escape restricted directories",
+            "existing_controls_checked": [
+              "Regex pattern matching for file exclusion"
+            ],
+            "deficiency_evidence": "No path traversal mechanism is demonstrated; the code uses regex patterns for filtering, not filesystem path resolution"
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No demonstrated security impact from path traversal. The pattern controls which files are copied, but doesn't show how this could lead to directory escape"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, files in the .bp directory would not be excluded from being copied to the WEBDIR, potentially exposing build artifacts, but this doesn't create a path traversal vulnerability.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The code constructs regex patterns for file filtering, not filesystem paths",
+          "No path resolution or directory traversal sequences ('..') are present",
+          "The operation is file exclusion based on name matching, not path navigation"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether BUILD_DIR contains user-controllable content",
+          "Whether the regex pattern could be manipulated to bypass exclusions",
+          "Security implications of exposing .bp directory contents"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.19,
+        "score": 0.19
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "lib/compile_helpers.py",
+    "changed_line": 47,
+    "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))",
+    "change_type": "A",
+    "function_name": "setup_webdir_if_it_doesnt_exist",
+    "operation_type": "file_filtering_rule",
+    "selection_reason": "Extensions directory path -> regex pattern modification -> controls exclusion of extension files from web deployment",
+    "security_relevance_score": 0.7,
+    "code_context": "1: # Licensed to the Apache Software Foundation (ASF) under one or more\n2: # contributor license agreements.  See the NOTICE file distributed with\n3: # this work for additional information regarding copyright ownership.\n4: # The ASF licenses this file to You under the Apache License, Version 2.0\n5: # (the \"License\"); you may not use this file except in compliance with\n6: # the License.  You may obtain a copy of the License at\n7: #\n8: #     http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: # Unless required by applicable law or agreed to in writing, software\n11: # distributed under the License is distributed on an \"AS IS\" BASIS,\n12: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n13: # See the License for the specific language governing permissions and\n14: # limitations under the License.\n15: import os\n16: import os.path\n17: import json\n18: import logging\n19: from collections import defaultdict\n20: from build_pack_utils import FileUtil\n21: \n22: \n23: _log = logging.getLogger('helpers')\n24: \n25: \n26: class FakeBuilder(object):\n27:     def __init__(self, ctx):\n28:         self._ctx = ctx\n29: \n30: \n31: class FakeInstaller(object):\n32:     def __init__(self, builder, installer):\n33:         self._installer = installer\n34:         self.builder = builder\n35: \n36: \n37: def setup_webdir_if_it_doesnt_exist(ctx):\n38:     if is_web_app(ctx):\n39:         webdirPath = os.path.join(ctx['BUILD_DIR'], ctx['WEBDIR'])\n40:         if not os.path.exists(webdirPath):\n41:             fu = FileUtil(FakeBuilder(ctx), move=True)\n42:             fu.under('BUILD_DIR')\n43:             fu.into('WEBDIR')\n44:             fu.where_name_does_not_match(\n45:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))\n46:             fu.where_name_does_not_match(\n47:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))\n48:             fu.where_name_does_not_match(\n49:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))\n50:             fu.where_name_does_not_match(\n51:                 '^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))\n52:             fu.where_name_does_not_match(\n53:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))\n54:             fu.done()\n55: \n56: \n57: def setup_log_dir(ctx):\n58:     os.makedirs(os.path.join(ctx['BUILD_DIR'], 'logs'))\n59: \n60: \n61: def load_binary_index(ctx):\n62:     index_path = os.path.join(ctx['BP_DIR'], 'binaries',\n63:                               ctx['STACK'], 'index-all.json')\n64:     return json.load(open(index_path))\n65: \n66: \n67: def find_all_php_versions(index_json):\n68:     return index_json['php'].keys()\n69: \n70: \n71: def find_all_php_extensions(index_json):\n72:     SKIP = ('cli', 'pear', 'cgi', 'fpm')\n73:     exts = defaultdict(list)\n74:     for version, files in index_json['php'].iteritems():\n75:         for f in files:\n76:             if f.endswith('.tar.gz'):\n77:                 tmp = f.split('-')\n78:                 if len(tmp) == 3 and tmp[1] not in SKIP:\n79:                     exts[version].append(tmp[1])\n80:     return exts\n81: \n82: \n83: def validate_php_version(ctx):\n84:     if ctx['PHP_VERSION'] in ctx['ALL_PHP_VERSIONS']:\n85:         _log.debug('App selected PHP [%s]', ctx['PHP_VERSION'])\n86:     else:\n87:         _log.warning('Selected version of PHP [%s] not available.  Defaulting'\n88:                      ' to the latest version [%s]',\n89:                      ctx['PHP_VERSION'], ctx['PHP_54_LATEST'])\n90:         ctx['PHP_VERSION'] = ctx['PHP_54_LATEST']\n91: \n92: \n93: def validate_php_extensions(ctx):\n94:     extns = ctx['ALL_PHP_EXTENSIONS'][ctx['PHP_VERSION']]\n95:     keep = []\n96:     for extn in ctx['PHP_EXTENSIONS']:\n97:         if extn in extns:\n98:             _log.debug('Extension [%s] validated.', extn)\n99:             keep.append(extn)\n100:         else:\n101:             _log.warn('Extension [%s] is not available!', extn)\n102:     ctx['PHP_EXTENSIONS'] = keep\n103: \n104: \n105: def convert_php_extensions(ctx):\n106:     _log.debug('Converting PHP extensions')\n107:     SKIP = ('cli', 'pear', 'cgi')\n108:     ctx['PHP_EXTENSIONS'] = \\\n109:         \"\\n\".join([\"extension=%s.so\" % ex\n110:                    for ex in ctx['PHP_EXTENSIONS'] if ex not in SKIP])\n111:     path = (ctx['PHP_VERSION'].startswith('5.4')) and \\\n112:         '@HOME/php/lib/php/extensions/no-debug-non-zts-20100525' or ''\n113:     ctx['ZEND_EXTENSIONS'] = \\\n114:         \"\\n\".join(['zend_extension=\"%s\"' % os.path.join(path, \"%s.so\" % ze)\n115:                    for ze in ctx['ZEND_EXTENSIONS']])\n116: \n117: \n118: def build_php_environment(ctx):\n119:     _log.debug('Building PHP environment variables')\n120:     ctx[\"PHP_ENV\"] = \\\n121:         \"\\n\".join([\"env[%s] = $%s\" % (k, k) for k in os.environ.keys()])\n122: \n123: \n124: def is_web_app(ctx):\n125:     return ctx.get('WEB_SERVER', '') != 'none'\n126: \n127: \n128: def find_stand_alone_app_to_run(ctx):\n129:     app = ctx.get('APP_START_CMD', None)\n130:     if not app:\n131:         possible_files = ('app.php', 'main.php', 'run.php', 'start.php')\n132:         for pf in possible_files:\n133:             if os.path.exists(os.path.join(ctx['BUILD_DIR'], pf)):\n134:                 app = pf\n135:                 break\n136:         if not app:\n137:             print 'Build pack could not find a PHP file to execute!'\n138:             _log.info('Build pack could not find a file to execute.  Either '\n139:                       'set \"APP_START_CMD\" or include one of these files [%s]',\n140:                       \", \".join(possible_files))\n141:             app = 'app.php'\n142:     return app",
+    "source_summary": "The pattern excludes files from the .extensions directory in the BUILD_DIR from being copied to the web deployment directory (WEBDIR). The .extensions directory contains custom application extensions that can control build pack behavior.",
+    "sink_summary": "The filtering rule prevents .extensions directory contents from being deployed to the web-accessible WEBDIR, which would otherwise expose potentially sensitive extension files.",
+    "guard_summary": "The where_name_does_not_match filter acts as a security control to exclude the .extensions directory from web deployment. This is part of a series of filters that also exclude .bp, .bp-config, manifest.yml, and LIBDIR.",
+    "risk_pattern": "Application-provided extension files in .extensions directory are excluded from web deployment to prevent exposure of sensitive build-time extension code.",
+    "used_variable_sources": [
+      "ctx['BUILD_DIR']"
+    ],
+    "called_function_context": [
+      "FileUtil.where_name_does_not_match()",
+      "FileUtil.done()",
+      "FileUtil._copy_or_move()"
+    ],
+    "enclosing_conditions": [
+      "if is_web_app(ctx)",
+      "if not os.path.exists(webdirPath)"
+    ],
+    "context_summary": "The function creates a web directory if it doesn't exist, copying files from BUILD_DIR to WEBDIR while excluding sensitive directories including the newly added .extensions exclusion.",
+    "unresolved_facts": [
+      "Specific security-sensitive content that might be present in .extensions directories",
+      "Whether .extensions files could contain web-accessible sensitive data if not filtered"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-497",
+        "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+        "fit_reason": "The file filtering rule prevents .extensions directory contents from being deployed to web directory, addressing potential exposure of sensitive build-time extension files and configuration",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "The change adds protection against exposing sensitive .extensions directory files to web-accessible areas, preventing information disclosure",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-668",
+        "cwe_name": "Exposure of Resource to Wrong Sphere",
+        "fit_reason": "The filtering rule ensures build-time extension files (protected resource) don't cross into the web deployment sphere where they could be accessed by unauthorized users",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-534",
+        "cwe_name": "Information Exposure Through Debug Log Files",
+        "fit_reason": "Similar mechanism - preventing sensitive files (like debug/extension files) from being exposed through web deployment",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-359",
+        "cwe_name": "Exposure of Private Personal Information to an Unauthorized Actor",
+        "fit_reason": "The change prevents potential exposure of sensitive information that might be contained in .extensions directory files",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1236",
+      "CWE-20",
+      "CWE-200",
+      "CWE-22",
+      "CWE-359",
+      "CWE-400",
+      "CWE-497",
+      "CWE-534",
+      "CWE-628",
+      "CWE-668",
+      "CWE-730"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 47,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))",
+        "cwe_id": "CWE-497",
+        "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.3,
+            "evidence": "CWE-497 focuses on exposing system-level information (OS details, internal paths, configuration) to unauthorized actors. The demonstrated mechanism is a file-filtering rule that excludes a directory from web deployment. This is a preventive measure against potential exposure, not a demonstrated exposure of system information itself. The exact CWE mechanism requires actual information leakage, which is not shown."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "The BUILD_DIR is the source directory containing application files. The filtering rule connects this source to the FileUtil copy/move operation that would deploy files to the WEBDIR (web-accessible directory). The path is: BUILD_DIR/.extensions files -> filtered out -> not copied to WEBDIR. The connection is direct in the code flow but demonstrates prevention, not exposure."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If the candidate line were reverted, the regex pattern excluding '.extensions' would be absent. The FileUtil would then copy files from the .extensions directory to the WEBDIR when creating the web directory, assuming no other filter blocks them. The patch materially adds protection by explicitly excluding this directory."
+          },
+          "security_control": {
+            "score": 0.7,
+            "evidence": "The filtering rule acts as an access control (exclusion) preventing files from being deployed to a web-accessible location.",
+            "required_control": "Access control to prevent sensitive system or build-time information from being placed in a publicly accessible directory.",
+            "control_requirement_evidence": "CWE-497 requires preventing unauthorized access to sensitive information. For a web application, placing sensitive files in the web root constitutes exposure. A control must exist to exclude such files from deployment.",
+            "existing_controls_checked": [
+              "Series of 'where_name_does_not_match' filters for .bp, .bp-config, manifest.yml, LIBDIR. The candidate adds .extensions to this list."
+            ],
+            "deficiency_evidence": "Without this specific filter, files from the .extensions directory would be copied to WEBDIR. The .extensions directory is described as containing 'custom application extensions that can control build pack behavior,' which is sensitive build-time configuration. The patch adds the missing control."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "The concrete impact is speculative. The evidence shows a preventive measure is added. The actual exposure of sensitive information from .extensions is not demonstrated—the content and sensitivity of files that might be present are unresolved. The impact is potential, not evidenced."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the filter excluding the '.extensions' directory from the FileUtil copy operation would be missing. During web directory setup, files from the BUILD_DIR/.extensions directory would be copied to the WEBDIR (web-accessible directory), assuming they are not excluded by another rule.",
+        "supporting_evidence": [
+          "The candidate adds a regex pattern '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions') to the 'where_name_does_not_match' filter chain.",
+          "The filter is part of a FileUtil operation that copies files from BUILD_DIR to WEBDIR when the web directory doesn't exist.",
+          "The .extensions directory is described in source_summary as containing 'custom application extensions that can control build pack behavior,' implying sensitive configuration.",
+          "Other similar exclusions exist for .bp, .bp-config, manifest.yml, and LIBDIR, establishing a pattern of excluding sensitive directories."
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Specific security-sensitive content that might be present in .extensions directories.",
+          "Whether .extensions files could contain web-accessible sensitive data if not filtered.",
+          "Whether the WEBDIR is actually publicly accessible or has additional access controls.",
+          "If any other mechanism (e.g., default web server configuration) already prevents access to .extensions files."
+        ],
+        "review_comment": "The patch adds a filter to prevent files from the .extensions directory from being copied to the web deployment directory (WEBDIR). This addresses a potential exposure of sensitive build-time extension code and configuration. Ensure the .extensions directory remains excluded in all deployment paths and consider adding the exclusion to any other file-copy operations that might deploy from BUILD_DIR.",
+        "change_type": "A",
+        "raw_score": 0.49000000000000005,
+        "score": 0.49000000000000005
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 47,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))",
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The change adds a filter to prevent .extensions directory contents from being copied to web-accessible WEBDIR, which could contain sensitive build-time extension code."
+          },
+          "connection": {
+            "score": 0.45,
+            "evidence": "The BUILD_DIR contains application files including .extensions directory. The FileUtil copies files to WEBDIR unless filtered. Without this filter, .extensions files would be deployed to web-accessible location."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "The candidate line adds the .extensions directory to the exclusion list. If reverted, .extensions files would be included in web deployment."
+          },
+          "security_control": {
+            "score": 0.6,
+            "evidence": "The filter acts as an access control preventing deployment of sensitive files.",
+            "required_control": "Access control to prevent deployment of sensitive build-time files to web-accessible directories",
+            "control_requirement_evidence": "CWE-200 requires preventing unauthorized access to sensitive information. Build-time extension files should not be web-accessible.",
+            "existing_controls_checked": [
+              "FileUtil filtering with where_name_does_not_match() for other sensitive directories (.bp, .bp-config, manifest.yml, LIBDIR)"
+            ],
+            "deficiency_evidence": "Without this specific filter, .extensions directory contents would be deployed to WEBDIR. The patch adds the missing control for this specific directory."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "Impact depends on what sensitive content might exist in .extensions directories, which is not demonstrated in the evidence."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the .extensions directory would not be filtered out and its contents would be copied to the web-accessible WEBDIR during deployment.",
+        "supporting_evidence": [
+          "The change adds .extensions to the exclusion list alongside other sensitive directories (.bp, .bp-config, manifest.yml, LIBDIR)",
+          "The .extensions directory contains custom application extensions that can control build pack behavior",
+          "The filtering occurs in setup_webdir_if_it_doesnt_exist function which copies files to WEBDIR"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "What specific sensitive information might be present in .extensions directories",
+          "Whether .extensions files actually contain information that would constitute a security exposure if web-accessible",
+          "Whether there are other controls preventing access to sensitive .extensions content"
+        ],
+        "review_comment": "The change adds protection by excluding the .extensions directory from web deployment, preventing potential exposure of build-time extension files. This follows the existing pattern of filtering other sensitive directories. Ensure that .extensions directory contents are properly secured and not required for web application functionality.",
+        "change_type": "A",
+        "raw_score": 0.49000000000000005,
+        "score": 0.49000000000000005
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 47,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))",
+        "cwe_id": "CWE-668",
+        "cwe_name": "Exposure of Resource to Wrong Sphere",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code demonstrates a control that prevents build-time extension files (.extensions directory) from being copied to the web deployment directory (WEBDIR), directly addressing exposure of a resource (extension files) to the wrong sphere (web-accessible area)."
+          },
+          "connection": {
+            "score": 0.9,
+            "evidence": "The BUILD_DIR contains application files including .extensions directory. The FileUtil moves files from BUILD_DIR to WEBDIR. The filtering rule at line 47 prevents .extensions files from being copied, establishing a direct connection between the source resource and the deployment boundary."
+          },
+          "diff_causality": {
+            "score": 0.95,
+            "evidence": "The candidate line adds a new filtering rule for .extensions directory. Without this line, .extensions files would be copied to WEBDIR when the web directory is created, exposing them to the web sphere."
+          },
+          "security_control": {
+            "score": 0.8,
+            "evidence": "The filtering rule acts as an access control boundary preventing sensitive build-time resources from entering the web deployment sphere.",
+            "required_control": "Access control boundary between build-time resources and web-deployment sphere",
+            "control_requirement_evidence": "CWE-668 requires preventing resources from crossing trust boundaries. Build-time extension files should remain in the build sphere, not be exposed to the web sphere.",
+            "existing_controls_checked": [
+              "FileUtil.where_name_does_not_match() filters for .bp, .bp-config, manifest.yml, and LIBDIR directories"
+            ],
+            "deficiency_evidence": "Without this specific filter, .extensions files would lack protection and be copied to WEBDIR. The patch adds the missing control for this specific resource type."
+          },
+          "concrete_impact": {
+            "score": 0.75,
+            "evidence": "If .extensions files contain sensitive configuration, build scripts, or proprietary code, exposure to the web sphere could lead to information disclosure, unauthorized access to build logic, or potential code execution if web servers interpret these files."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the .extensions directory would not be filtered out when creating the web directory, causing build-time extension files to be copied to the web-accessible WEBDIR, exposing them to potential web access.",
+        "supporting_evidence": [
+          "The .extensions directory contains custom application extensions that can control build pack behavior (source_summary)",
+          "The filtering rule prevents .extensions directory contents from being deployed to the web-accessible WEBDIR (sink_summary)",
+          "The patch adds this filter alongside existing filters for .bp, .bp-config, manifest.yml, and LIBDIR directories",
+          "The function only executes when creating a web directory for web applications (is_web_app(ctx) condition)"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Specific security-sensitive content that might be present in .extensions directories",
+          "Whether web servers would actually serve files from .extensions directory if exposed"
+        ],
+        "review_comment": "The patch adds a filtering rule to exclude the .extensions directory from web deployment, preventing build-time extension files from being exposed to the web-accessible sphere. This addresses a trust boundary violation where sensitive build configuration and extension code could be accessed via web requests. Ensure the filter pattern correctly matches all .extensions subdirectories and files to prevent any leakage.",
+        "change_type": "A",
+        "raw_score": 0.85,
+        "score": 0.85
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 47,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))",
+        "cwe_id": "CWE-534",
+        "cwe_name": "Information Exposure Through Debug Log Files",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-534 specifically addresses exposure through debug log files, but this candidate involves filtering .extensions directory contents from web deployment, not debug logging mechanisms."
+          },
+          "connection": {
+            "score": 0.25,
+            "evidence": "The filtering rule connects BUILD_DIR contents to web deployment, but no evidence shows .extensions contains debug log files or that debug logging is involved."
+          },
+          "diff_causality": {
+            "score": 0.4,
+            "evidence": "The added filter prevents .extensions directory contents from being copied to WEBDIR, which could prevent exposure of sensitive files."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "The filter acts as an access control, but CWE-534 requires evidence of debug logging controls, which are not demonstrated.",
+            "required_control": "Prevention of sensitive information in debug log files",
+            "control_requirement_evidence": "CWE-534 requires controls to prevent sensitive data from being written to debug logs",
+            "existing_controls_checked": [
+              "File filtering to exclude .extensions from web deployment"
+            ],
+            "deficiency_evidence": "No debug logging mechanism or debug log file handling is demonstrated; the control addresses web deployment filtering, not debug logging"
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "Potential information exposure is speculative; no evidence shows .extensions contains debug logs or sensitive information that would be exposed."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, files from the .extensions directory would not be excluded from web deployment, potentially exposing extension files to web access.",
+        "supporting_evidence": [
+          "Added filter excludes .extensions directory from web deployment",
+          "Part of systematic filtering of sensitive directories (.bp, .bp-config, LIBDIR)"
+        ],
+        "contradicting_evidence": [
+          "No debug logging mechanism or debug log files are involved",
+          "CWE-534 is deprecated and specifically addresses debug log exposure"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether .extensions contains debug log files",
+          "Whether .extensions files contain sensitive information",
+          "Whether debug logging occurs in the application"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.24,
+        "score": 0.24
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 47,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))",
+        "cwe_id": "CWE-359",
+        "cwe_name": "Exposure of Private Personal Information to an Unauthorized Actor",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The change adds a filter to prevent .extensions directory contents from being deployed to web-accessible locations, which could contain sensitive information. However, CWE-359 specifically requires exposure of personal information, not just any sensitive data."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The filtering rule directly connects BUILD_DIR (source) to WEBDIR (web-accessible deployment) via FileUtil operations. The path is: ctx['BUILD_DIR'] → FileUtil filtering → WEBDIR deployment."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If this candidate line were reverted, the .extensions directory would not be filtered out, potentially exposing its contents to web deployment. The addition materially creates protection that was previously absent."
+          },
+          "security_control": {
+            "score": 0.45,
+            "evidence": "The filter acts as an access control preventing deployment of .extensions content.",
+            "required_control": "Access control to prevent unauthorized exposure of sensitive information",
+            "control_requirement_evidence": "CWE-359 requires controls to prevent unauthorized access to personal information",
+            "existing_controls_checked": [
+              "FileUtil filtering mechanism with multiple where_name_does_not_match rules"
+            ],
+            "deficiency_evidence": "The control is being added, but evidence doesn't establish what specific personal information exists in .extensions or that it was previously exposed"
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "No evidence demonstrates that .extensions directory actually contains personal information or that such information was previously exposed. The impact remains speculative."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the .extensions directory would not be excluded from web deployment, potentially allowing its contents to be copied to the web-accessible WEBDIR.",
+        "supporting_evidence": [
+          "The change adds a filter to exclude .extensions directory from web deployment",
+          "The .extensions directory is described as containing 'custom application extensions that can control build pack behavior'",
+          "Multiple similar filters exist for other sensitive directories (.bp, .bp-config, LIBDIR)"
+        ],
+        "contradicting_evidence": [
+          "No evidence that .extensions directory contains personal information as required by CWE-359",
+          "The description mentions 'build-time extension code' rather than personal data"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether .extensions directory contains personal information or just application configuration",
+          "Whether the directory was previously exposed to web deployment",
+          "What specific sensitive content might be present in .extensions files"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.49000000000000005,
+        "score": 0.49000000000000005
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-4",
+    "filepath": "lib/compile_helpers.py",
+    "changed_line": 49,
+    "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))",
+    "change_type": "A",
+    "function_name": "setup_webdir_if_it_doesnt_exist",
+    "operation_type": "file_filtering_rule",
+    "selection_reason": "Configuration directory path -> regex pattern modification -> controls exclusion of configuration files from web deployment",
+    "security_relevance_score": 0.7,
+    "code_context": "1: # Licensed to the Apache Software Foundation (ASF) under one or more\n2: # contributor license agreements.  See the NOTICE file distributed with\n3: # this work for additional information regarding copyright ownership.\n4: # The ASF licenses this file to You under the Apache License, Version 2.0\n5: # (the \"License\"); you may not use this file except in compliance with\n6: # the License.  You may obtain a copy of the License at\n7: #\n8: #     http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: # Unless required by applicable law or agreed to in writing, software\n11: # distributed under the License is distributed on an \"AS IS\" BASIS,\n12: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n13: # See the License for the specific language governing permissions and\n14: # limitations under the License.\n15: import os\n16: import os.path\n17: import json\n18: import logging\n19: from collections import defaultdict\n20: from build_pack_utils import FileUtil\n21: \n22: \n23: _log = logging.getLogger('helpers')\n24: \n25: \n26: class FakeBuilder(object):\n27:     def __init__(self, ctx):\n28:         self._ctx = ctx\n29: \n30: \n31: class FakeInstaller(object):\n32:     def __init__(self, builder, installer):\n33:         self._installer = installer\n34:         self.builder = builder\n35: \n36: \n37: def setup_webdir_if_it_doesnt_exist(ctx):\n38:     if is_web_app(ctx):\n39:         webdirPath = os.path.join(ctx['BUILD_DIR'], ctx['WEBDIR'])\n40:         if not os.path.exists(webdirPath):\n41:             fu = FileUtil(FakeBuilder(ctx), move=True)\n42:             fu.under('BUILD_DIR')\n43:             fu.into('WEBDIR')\n44:             fu.where_name_does_not_match(\n45:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))\n46:             fu.where_name_does_not_match(\n47:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))\n48:             fu.where_name_does_not_match(\n49:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))\n50:             fu.where_name_does_not_match(\n51:                 '^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))\n52:             fu.where_name_does_not_match(\n53:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))\n54:             fu.done()\n55: \n56: \n57: def setup_log_dir(ctx):\n58:     os.makedirs(os.path.join(ctx['BUILD_DIR'], 'logs'))\n59: \n60: \n61: def load_binary_index(ctx):\n62:     index_path = os.path.join(ctx['BP_DIR'], 'binaries',\n63:                               ctx['STACK'], 'index-all.json')\n64:     return json.load(open(index_path))\n65: \n66: \n67: def find_all_php_versions(index_json):\n68:     return index_json['php'].keys()\n69: \n70: \n71: def find_all_php_extensions(index_json):\n72:     SKIP = ('cli', 'pear', 'cgi', 'fpm')\n73:     exts = defaultdict(list)\n74:     for version, files in index_json['php'].iteritems():\n75:         for f in files:\n76:             if f.endswith('.tar.gz'):\n77:                 tmp = f.split('-')\n78:                 if len(tmp) == 3 and tmp[1] not in SKIP:\n79:                     exts[version].append(tmp[1])\n80:     return exts\n81: \n82: \n83: def validate_php_version(ctx):\n84:     if ctx['PHP_VERSION'] in ctx['ALL_PHP_VERSIONS']:\n85:         _log.debug('App selected PHP [%s]', ctx['PHP_VERSION'])\n86:     else:\n87:         _log.warning('Selected version of PHP [%s] not available.  Defaulting'\n88:                      ' to the latest version [%s]',\n89:                      ctx['PHP_VERSION'], ctx['PHP_54_LATEST'])\n90:         ctx['PHP_VERSION'] = ctx['PHP_54_LATEST']\n91: \n92: \n93: def validate_php_extensions(ctx):\n94:     extns = ctx['ALL_PHP_EXTENSIONS'][ctx['PHP_VERSION']]\n95:     keep = []\n96:     for extn in ctx['PHP_EXTENSIONS']:\n97:         if extn in extns:\n98:             _log.debug('Extension [%s] validated.', extn)\n99:             keep.append(extn)\n100:         else:\n101:             _log.warn('Extension [%s] is not available!', extn)\n102:     ctx['PHP_EXTENSIONS'] = keep\n103: \n104: \n105: def convert_php_extensions(ctx):\n106:     _log.debug('Converting PHP extensions')\n107:     SKIP = ('cli', 'pear', 'cgi')\n108:     ctx['PHP_EXTENSIONS'] = \\\n109:         \"\\n\".join([\"extension=%s.so\" % ex\n110:                    for ex in ctx['PHP_EXTENSIONS'] if ex not in SKIP])\n111:     path = (ctx['PHP_VERSION'].startswith('5.4')) and \\\n112:         '@HOME/php/lib/php/extensions/no-debug-non-zts-20100525' or ''\n113:     ctx['ZEND_EXTENSIONS'] = \\\n114:         \"\\n\".join(['zend_extension=\"%s\"' % os.path.join(path, \"%s.so\" % ze)\n115:                    for ze in ctx['ZEND_EXTENSIONS']])\n116: \n117: \n118: def build_php_environment(ctx):\n119:     _log.debug('Building PHP environment variables')\n120:     ctx[\"PHP_ENV\"] = \\\n121:         \"\\n\".join([\"env[%s] = $%s\" % (k, k) for k in os.environ.keys()])\n122: \n123: \n124: def is_web_app(ctx):\n125:     return ctx.get('WEB_SERVER', '') != 'none'\n126: \n127: \n128: def find_stand_alone_app_to_run(ctx):\n129:     app = ctx.get('APP_START_CMD', None)\n130:     if not app:\n131:         possible_files = ('app.php', 'main.php', 'run.php', 'start.php')\n132:         for pf in possible_files:\n133:             if os.path.exists(os.path.join(ctx['BUILD_DIR'], pf)):\n134:                 app = pf\n135:                 break\n136:         if not app:\n137:             print 'Build pack could not find a PHP file to execute!'\n138:             _log.info('Build pack could not find a file to execute.  Either '\n139:                       'set \"APP_START_CMD\" or include one of these files [%s]',\n140:                       \", \".join(possible_files))\n141:             app = 'app.php'\n142:     return app",
+    "source_summary": "The pattern uses ctx['BUILD_DIR'] which appears to be the application build directory. The .bp-config directory within BUILD_DIR contains build configuration files.",
+    "sink_summary": "The filtering rule excludes files from being copied/moved to the web deployment directory (WEBDIR) when setting up a web application. Files matching the pattern are not deployed to the web server.",
+    "guard_summary": "The filtering occurs only for web applications (when WEB_SERVER != 'none'). Multiple exclusion patterns protect configuration files (.bp, .extensions, .bp-config, manifest.yml, LIBDIR) from web deployment. The FileUtil class applies regex pattern matching to filter files.",
+    "risk_pattern": "Modified exclusion pattern for .bp-config directory in web deployment filtering. The change adds an additional security control to prevent configuration files from being exposed via web server.",
+    "used_variable_sources": [
+      "ctx['BUILD_DIR']",
+      "ctx['WEBDIR']"
+    ],
+    "called_function_context": [
+      "FileUtil.where_name_does_not_match()",
+      "os.path.join()",
+      "is_web_app()"
+    ],
+    "enclosing_conditions": [
+      "if is_web_app(ctx):",
+      "if not os.path.exists(webdirPath):"
+    ],
+    "context_summary": "The function sets up web directory for PHP applications by copying files from BUILD_DIR to WEBDIR, excluding sensitive configuration directories and files using regex patterns. The change adds .bp-config to the exclusion list.",
+    "unresolved_facts": [
+      "How BUILD_DIR and WEBDIR context variables are initialized",
+      "Whether .bp-config contains sensitive credentials or configuration",
+      "The exact deployment environment and web server configuration"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "Regex pattern filtering for file exclusion in web deployment - incomplete patterns could allow configuration file exposure via path manipulation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "fit_reason": "Missing access control for .bp-config directory in file deployment filtering could allow unauthorized access to configuration files",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-732",
+        "cwe_name": "Incorrect Permission Assignment for Critical Resource",
+        "fit_reason": "Incorrect file filtering permissions could expose sensitive configuration files to web server access",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-497",
+        "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+        "fit_reason": "Configuration files in .bp-config directory could contain sensitive system information exposed through incomplete filtering",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "Incomplete file exclusion patterns could lead to exposure of sensitive configuration information via web server",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1004",
+      "CWE-1236",
+      "CWE-179",
+      "CWE-20",
+      "CWE-200",
+      "CWE-22",
+      "CWE-264",
+      "CWE-284",
+      "CWE-327",
+      "CWE-400",
+      "CWE-471",
+      "CWE-497",
+      "CWE-534",
+      "CWE-628",
+      "CWE-732",
+      "CWE-78",
+      "CWE-863"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 49,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "The code constructs a regex pattern for file exclusion, not for accessing files. CWE-22 requires external input to construct a pathname that escapes restricted directories, but this code uses hardcoded patterns with BUILD_DIR as a fixed base."
+          },
+          "connection": {
+            "score": 0.1,
+            "evidence": "No external input is used to construct the path pattern. The pattern uses ctx['BUILD_DIR'] which appears to be an internal build context variable, not user-controlled input."
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "The patch adds an exclusion pattern for .bp-config directory, preventing configuration files from being deployed to the web directory. Reverting would remove this protection."
+          },
+          "security_control": {
+            "score": 0.25,
+            "evidence": "The change adds a security control (exclusion filter) rather than demonstrating a missing control. CWE-22 requires evidence of insufficient path validation, but this shows path restriction being strengthened.",
+            "required_control": "Proper validation and sanitization of pathnames constructed from external input",
+            "control_requirement_evidence": "CWE-22 requires that pathnames constructed from external input are properly validated to prevent directory traversal",
+            "existing_controls_checked": [
+              "Fixed regex pattern with BUILD_DIR base",
+              "Multiple exclusion patterns for sensitive directories"
+            ],
+            "deficiency_evidence": "No deficiency demonstrated - the change adds protection rather than showing a vulnerability"
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "The change prevents potential exposure of configuration files, but no path traversal mechanism or concrete impact is demonstrated."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the .bp-config directory would not be excluded from web deployment, potentially exposing configuration files if they contain sensitive information.",
+        "supporting_evidence": [
+          "The code adds a regex pattern to exclude .bp-config directory from web deployment",
+          "Multiple similar patterns exist for other sensitive directories (.bp, .extensions, manifest.yml, LIBDIR)"
+        ],
+        "contradicting_evidence": [
+          "No external input is used to construct the path pattern",
+          "The pattern uses fixed BUILD_DIR context variable, not user input",
+          "The code adds security protection rather than demonstrating a vulnerability"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether .bp-config contains sensitive credentials or configuration",
+          "The exact deployment environment and web server configuration",
+          "How BUILD_DIR context variable is initialized and whether it can be influenced externally"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.27999999999999997,
+        "score": 0.27999999999999997
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 49,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))",
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.25,
+            "evidence": "The change adds an exclusion pattern for .bp-config directory, which is a security control measure. However, CWE-284 specifically requires improper access control to resources, not the addition of proper controls."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "The pattern connects BUILD_DIR (source) to WEBDIR (web deployment) via file filtering. Files matching the pattern are excluded from web deployment, preventing web access."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If this line were reverted, .bp-config files would not be excluded from web deployment, potentially exposing configuration files to web access."
+          },
+          "security_control": {
+            "score": 0.3,
+            "evidence": "The change adds a security control (exclusion filter) rather than demonstrating a missing or weakened control. CWE-284 requires evidence of improper access control, not proper control addition.",
+            "required_control": "Access control mechanism to restrict unauthorized access to resources",
+            "control_requirement_evidence": "CWE-284 requires evidence that access control is missing, bypassed, or improperly implemented for the demonstrated resource",
+            "existing_controls_checked": [
+              "FileUtil filtering with regex patterns for multiple sensitive directories"
+            ],
+            "deficiency_evidence": "The evidence shows control addition, not deficiency. The patch strengthens access control by adding .bp-config to the exclusion list"
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "No concrete impact is demonstrated. The change prevents potential exposure, but there's no evidence that .bp-config files contain sensitive data or that they were previously accessible."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the .bp-config directory would not be excluded from web deployment, potentially allowing configuration files to be deployed to the web-accessible directory.",
+        "supporting_evidence": [
+          "The change adds .bp-config to the exclusion pattern list alongside other sensitive directories (.bp, .extensions, manifest.yml, LIBDIR)",
+          "The filtering occurs only for web applications where files would be publicly accessible"
+        ],
+        "contradicting_evidence": [
+          "The change adds security controls rather than demonstrating improper access control",
+          "No evidence shows that .bp-config files were previously accessible or contained sensitive data"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether .bp-config contains sensitive credentials or configuration",
+          "Whether the files were previously accessible without this control",
+          "The exact deployment environment and web server configuration"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.39,
+        "score": 0.39
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 49,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))",
+        "cwe_id": "CWE-732",
+        "cwe_name": "Incorrect Permission Assignment for Critical Resource",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-732 requires incorrect permission assignment to a critical resource. The demonstrated behavior is file filtering/exclusion during deployment, not permission assignment. The pattern prevents files from being copied, which is access control via deployment filtering rather than filesystem permissions."
+          },
+          "connection": {
+            "score": 0.35,
+            "evidence": "The pattern connects BUILD_DIR context to file filtering logic that excludes .bp-config files from web deployment. However, there's no demonstrated connection to permission assignment or modification of existing resource permissions."
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "The patch adds an exclusion pattern for .bp-config directory. If reverted, .bp-config files might be deployed to the web directory, potentially exposing configuration files."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "The control demonstrated is file filtering during deployment, not permission assignment. The patch strengthens deployment filtering by adding .bp-config to exclusion patterns.",
+            "required_control": "Correct permission assignment for critical resources",
+            "control_requirement_evidence": "CWE-732 requires that security-critical resources have appropriate permissions set to prevent unauthorized access",
+            "existing_controls_checked": [
+              "File filtering during deployment via regex patterns",
+              "Web application detection check"
+            ],
+            "deficiency_evidence": "No evidence of filesystem permission assignment or modification. The demonstrated control is deployment filtering, which is a different security mechanism."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "Potential exposure of configuration files if deployed to web directory, but no demonstrated permission assignment vulnerability. Impact relates to information disclosure through deployment, not permission misconfiguration."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the .bp-config directory would not be explicitly excluded from web deployment, potentially allowing configuration files to be copied to the web-accessible directory.",
+        "supporting_evidence": [
+          "The pattern excludes .bp-config files from web deployment using regex filtering",
+          "The filtering occurs only for web applications (WEB_SERVER != 'none')",
+          "Multiple similar exclusions exist for other sensitive directories (.bp, .extensions, manifest.yml, LIBDIR)"
+        ],
+        "contradicting_evidence": [
+          "CWE-732 specifically addresses permission assignment, but the code shows file filtering during deployment operations",
+          "No filesystem permission modification or assignment operations are demonstrated",
+          "The mechanism is deployment filtering, not permission-based access control"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether .bp-config contains sensitive information requiring protection",
+          "The actual filesystem permissions of deployed files",
+          "Whether web server configuration would prevent access even if files are deployed"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.31,
+        "score": 0.31
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 49,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))",
+        "cwe_id": "CWE-497",
+        "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The change adds a filtering rule to exclude .bp-config directory from web deployment, which could contain system configuration information. However, CWE-497 requires actual exposure to unauthorized actors, not just the potential for exposure."
+          },
+          "connection": {
+            "score": 0.45,
+            "evidence": "The BUILD_DIR context variable connects to the filtering rule that controls which files are deployed to the web-accessible WEBDIR. Files not excluded by this pattern would be copied to the web server directory."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If this line were reverted, the .bp-config directory would not be excluded from web deployment, potentially exposing configuration files to web access. The change materially adds protection against information disclosure."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "",
+            "required_control": "Access control preventing configuration files from being deployed to web-accessible directories",
+            "control_requirement_evidence": "CWE-497 requires preventing unauthorized access to sensitive system information. Configuration files in .bp-config may contain sensitive deployment settings.",
+            "existing_controls_checked": [
+              "Multiple where_name_does_not_match filters for .bp, .extensions, manifest.yml, LIBDIR directories"
+            ],
+            "deficiency_evidence": "The control is being added, not deficient. The evidence shows the patch strengthens existing filtering rather than fixing a demonstrated deficiency."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "No evidence demonstrates that .bp-config files were previously exposed or contain sensitive information. The impact remains speculative without evidence of actual exposure or sensitive content."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the .bp-config directory would not be excluded from the web deployment filtering rules, potentially allowing configuration files to be copied to the web-accessible directory.",
+        "supporting_evidence": [
+          "The change adds .bp-config to the exclusion list alongside other sensitive directories (.bp, .extensions)",
+          "The filtering occurs only for web applications where files would be publicly accessible",
+          "The pattern uses BUILD_DIR context to construct proper exclusion paths"
+        ],
+        "contradicting_evidence": [
+          "No evidence shows that .bp-config files contain sensitive system information",
+          "No demonstration of actual exposure to unauthorized actors occurred",
+          "The change appears preventive rather than corrective"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether .bp-config directory contains sensitive system information",
+          "Whether files in .bp-config were previously accessible via web server",
+          "The specific contents and sensitivity of configuration files",
+          "Whether unauthorized actors could access the web deployment directory"
+        ],
+        "review_comment": "The change adds .bp-config to the web deployment exclusion list, preventing potential exposure of configuration files. This strengthens existing filtering controls that protect sensitive directories from web access. Ensure .bp-config contains only non-sensitive configuration and consider if other build-related directories need similar protection.",
+        "change_type": "A",
+        "raw_score": 0.45,
+        "score": 0.45
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 49,
+        "statement": "'^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))",
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The change adds a file exclusion pattern for .bp-config directory, which could contain sensitive build configuration. However, CWE-200 requires actual exposure of sensitive information, not just the potential for exposure through incomplete filtering."
+          },
+          "connection": {
+            "score": 0.45,
+            "evidence": "The pattern controls which files are copied from BUILD_DIR to WEBDIR (web deployment directory). Files matching the pattern are excluded from web deployment, preventing potential web access. The connection is from build configuration files to web-accessible deployment."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If this line were reverted, the .bp-config directory would not be excluded from web deployment, potentially exposing configuration files. The change materially adds protection by expanding the exclusion patterns."
+          },
+          "security_control": {
+            "score": 0.6,
+            "evidence": "The required control for CWE-200 is proper access control to sensitive information. The demonstrated control is file filtering during deployment.",
+            "required_control": "Access control preventing unauthorized access to sensitive configuration files",
+            "control_requirement_evidence": "CWE-200 requires preventing exposure of sensitive information to unauthorized actors. Configuration files in .bp-config may contain sensitive build and deployment information.",
+            "existing_controls_checked": [
+              "Multiple regex exclusion patterns (.bp, .extensions, .bp-config, manifest.yml, LIBDIR)",
+              "Web application check (is_web_app())",
+              "FileUtil filtering mechanism"
+            ],
+            "deficiency_evidence": "The patch adds missing protection for .bp-config directory that was previously not excluded. Without this control, configuration files could be deployed to web-accessible locations."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "No concrete evidence demonstrates that .bp-config actually contains sensitive information or that such information would be exposed without this control. The impact remains speculative."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the .bp-config directory would not be excluded from web deployment, potentially allowing configuration files to be copied to the web-accessible WEBDIR.",
+        "supporting_evidence": [
+          "The change adds .bp-config to the exclusion patterns in FileUtil.where_name_does_not_match()",
+          "The filtering occurs only for web applications (WEB_SERVER != 'none')",
+          "Multiple similar exclusions exist for other sensitive directories (.bp, .extensions, LIBDIR)"
+        ],
+        "contradicting_evidence": [
+          "No evidence shows that .bp-config actually contains sensitive information requiring protection",
+          "The function already excludes other configuration directories, suggesting defense-in-depth rather than fixing a specific vulnerability"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "Whether .bp-config directory contains sensitive credentials or configuration data",
+          "Whether web server configuration would actually serve files from .bp-config if deployed",
+          "How BUILD_DIR and WEBDIR context variables are initialized and their relationship"
+        ],
+        "review_comment": "The change adds .bp-config to the file exclusion patterns during web directory setup, preventing potential exposure of build configuration files. This improves defense-in-depth by ensuring configuration directories are not deployed to web-accessible locations. Maintain consistent exclusion patterns for all sensitive directories to prevent information disclosure.",
+        "change_type": "A",
+        "raw_score": 0.49000000000000005,
+        "score": 0.49000000000000005
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-5",
+    "filepath": "lib/compile_helpers.py",
+    "changed_line": 51,
+    "statement": "'^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))",
+    "change_type": "A",
+    "function_name": "setup_webdir_if_it_doesnt_exist",
+    "operation_type": "file_filtering_rule",
+    "selection_reason": "Manifest file path -> regex pattern tightening -> changes from prefix match to exact match for manifest.yml exclusion",
+    "security_relevance_score": 0.6,
+    "code_context": "1: # Licensed to the Apache Software Foundation (ASF) under one or more\n2: # contributor license agreements.  See the NOTICE file distributed with\n3: # this work for additional information regarding copyright ownership.\n4: # The ASF licenses this file to You under the Apache License, Version 2.0\n5: # (the \"License\"); you may not use this file except in compliance with\n6: # the License.  You may obtain a copy of the License at\n7: #\n8: #     http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: # Unless required by applicable law or agreed to in writing, software\n11: # distributed under the License is distributed on an \"AS IS\" BASIS,\n12: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n13: # See the License for the specific language governing permissions and\n14: # limitations under the License.\n15: import os\n16: import os.path\n17: import json\n18: import logging\n19: from collections import defaultdict\n20: from build_pack_utils import FileUtil\n21: \n22: \n23: _log = logging.getLogger('helpers')\n24: \n25: \n26: class FakeBuilder(object):\n27:     def __init__(self, ctx):\n28:         self._ctx = ctx\n29: \n30: \n31: class FakeInstaller(object):\n32:     def __init__(self, builder, installer):\n33:         self._installer = installer\n34:         self.builder = builder\n35: \n36: \n37: def setup_webdir_if_it_doesnt_exist(ctx):\n38:     if is_web_app(ctx):\n39:         webdirPath = os.path.join(ctx['BUILD_DIR'], ctx['WEBDIR'])\n40:         if not os.path.exists(webdirPath):\n41:             fu = FileUtil(FakeBuilder(ctx), move=True)\n42:             fu.under('BUILD_DIR')\n43:             fu.into('WEBDIR')\n44:             fu.where_name_does_not_match(\n45:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))\n46:             fu.where_name_does_not_match(\n47:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))\n48:             fu.where_name_does_not_match(\n49:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))\n50:             fu.where_name_does_not_match(\n51:                 '^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))\n52:             fu.where_name_does_not_match(\n53:                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))\n54:             fu.done()\n55: \n56: \n57: def setup_log_dir(ctx):\n58:     os.makedirs(os.path.join(ctx['BUILD_DIR'], 'logs'))\n59: \n60: \n61: def load_binary_index(ctx):\n62:     index_path = os.path.join(ctx['BP_DIR'], 'binaries',\n63:                               ctx['STACK'], 'index-all.json')\n64:     return json.load(open(index_path))\n65: \n66: \n67: def find_all_php_versions(index_json):\n68:     return index_json['php'].keys()\n69: \n70: \n71: def find_all_php_extensions(index_json):\n72:     SKIP = ('cli', 'pear', 'cgi', 'fpm')\n73:     exts = defaultdict(list)\n74:     for version, files in index_json['php'].iteritems():\n75:         for f in files:\n76:             if f.endswith('.tar.gz'):\n77:                 tmp = f.split('-')\n78:                 if len(tmp) == 3 and tmp[1] not in SKIP:\n79:                     exts[version].append(tmp[1])\n80:     return exts\n81: \n82: \n83: def validate_php_version(ctx):\n84:     if ctx['PHP_VERSION'] in ctx['ALL_PHP_VERSIONS']:\n85:         _log.debug('App selected PHP [%s]', ctx['PHP_VERSION'])\n86:     else:\n87:         _log.warning('Selected version of PHP [%s] not available.  Defaulting'\n88:                      ' to the latest version [%s]',\n89:                      ctx['PHP_VERSION'], ctx['PHP_54_LATEST'])\n90:         ctx['PHP_VERSION'] = ctx['PHP_54_LATEST']\n91: \n92: \n93: def validate_php_extensions(ctx):\n94:     extns = ctx['ALL_PHP_EXTENSIONS'][ctx['PHP_VERSION']]\n95:     keep = []\n96:     for extn in ctx['PHP_EXTENSIONS']:\n97:         if extn in extns:\n98:             _log.debug('Extension [%s] validated.', extn)\n99:             keep.append(extn)\n100:         else:\n101:             _log.warn('Extension [%s] is not available!', extn)\n102:     ctx['PHP_EXTENSIONS'] = keep\n103: \n104: \n105: def convert_php_extensions(ctx):\n106:     _log.debug('Converting PHP extensions')\n107:     SKIP = ('cli', 'pear', 'cgi')\n108:     ctx['PHP_EXTENSIONS'] = \\\n109:         \"\\n\".join([\"extension=%s.so\" % ex\n110:                    for ex in ctx['PHP_EXTENSIONS'] if ex not in SKIP])\n111:     path = (ctx['PHP_VERSION'].startswith('5.4')) and \\\n112:         '@HOME/php/lib/php/extensions/no-debug-non-zts-20100525' or ''\n113:     ctx['ZEND_EXTENSIONS'] = \\\n114:         \"\\n\".join(['zend_extension=\"%s\"' % os.path.join(path, \"%s.so\" % ze)\n115:                    for ze in ctx['ZEND_EXTENSIONS']])\n116: \n117: \n118: def build_php_environment(ctx):\n119:     _log.debug('Building PHP environment variables')\n120:     ctx[\"PHP_ENV\"] = \\\n121:         \"\\n\".join([\"env[%s] = $%s\" % (k, k) for k in os.environ.keys()])\n122: \n123: \n124: def is_web_app(ctx):\n125:     return ctx.get('WEB_SERVER', '') != 'none'\n126: \n127: \n128: def find_stand_alone_app_to_run(ctx):\n129:     app = ctx.get('APP_START_CMD', None)\n130:     if not app:\n131:         possible_files = ('app.php', 'main.php', 'run.php', 'start.php')\n132:         for pf in possible_files:\n133:             if os.path.exists(os.path.join(ctx['BUILD_DIR'], pf)):\n134:                 app = pf\n135:                 break\n136:         if not app:\n137:             print 'Build pack could not find a PHP file to execute!'\n138:             _log.info('Build pack could not find a file to execute.  Either '\n139:                       'set \"APP_START_CMD\" or include one of these files [%s]',\n140:                       \", \".join(possible_files))\n141:             app = 'app.php'\n142:     return app",
+    "source_summary": "The pattern is constructed from ctx['BUILD_DIR'] context variable and literal 'manifest.yml' string. BUILD_DIR is the application build directory.",
+    "sink_summary": "The regex pattern is used in FileUtil.where_name_does_not_match() to exclude files from being copied/moved during web directory setup. Files matching the pattern are filtered out.",
+    "guard_summary": "The filter is part of a series of exclusion patterns that prevent build artifacts (.bp, .extensions, .bp-config) and manifest.yml from being copied to the web directory. The change tightens from prefix match to exact match for manifest.yml.",
+    "risk_pattern": "Pattern tightening changes manifest.yml exclusion from matching any file starting with the path to matching only the exact file. This could potentially allow files with similar names to be copied if they were previously excluded.",
+    "used_variable_sources": [
+      "ctx['BUILD_DIR']"
+    ],
+    "called_function_context": [
+      "FileUtil.where_name_does_not_match()",
+      "os.path.join()"
+    ],
+    "enclosing_conditions": [
+      "if is_web_app(ctx):",
+      "if not os.path.exists(webdirPath):"
+    ],
+    "context_summary": "The function sets up a web directory by copying files from BUILD_DIR to WEBDIR, excluding certain build artifacts and configuration files. The candidate statement adds an exclusion filter for manifest.yml using an exact path match.",
+    "unresolved_facts": [
+      "What the previous pattern was before the change (prefix vs exact match)",
+      "Whether manifest.yml contains sensitive configuration data",
+      "If there are other files with similar names that might be affected by the pattern change"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "Regex pattern construction from BUILD_DIR path for file filtering matches path traversal mechanisms",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-730",
+        "cwe_name": "Security Issue (CWE-730)",
+        "fit_reason": "Regex pattern used in file filtering without proper validation of pattern specificity",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "Overly permissive regex pattern ranges may allow bypass of file exclusion filters",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-179",
+        "cwe_name": "Incorrect Behavior Order: Early Validation",
+        "fit_reason": "Pattern validation order and specificity change from prefix to exact match affects filtering logic",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-1236",
+      "CWE-179",
+      "CWE-20",
+      "CWE-200",
+      "CWE-208",
+      "CWE-22",
+      "CWE-327",
+      "CWE-347",
+      "CWE-534",
+      "CWE-628",
+      "CWE-685",
+      "CWE-730",
+      "CWE-732",
+      "CWE-77",
+      "CWE-770",
+      "CWE-78"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 51,
+        "statement": "'^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "The code constructs a regex pattern for file filtering, but there is no evidence of path traversal where external input bypasses directory restrictions. The pattern uses BUILD_DIR (internal build context) and a fixed filename."
+          },
+          "connection": {
+            "score": 0.1,
+            "evidence": "No external input is connected to the path construction. BUILD_DIR is an internal build context variable, not user-controlled input. The pattern is used for exclusion filtering, not for accessing files outside restricted directories."
+          },
+          "diff_causality": {
+            "score": 0.25,
+            "evidence": "The change tightens the regex pattern from prefix match to exact match for manifest.yml exclusion. If reverted, the pattern would be less specific but there's no evidence this enables path traversal."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "path validation to prevent directory traversal",
+            "control_requirement_evidence": "CWE-22 requires validation to prevent path traversal attacks where external input can access files outside restricted directories",
+            "existing_controls_checked": [
+              "fixed regex pattern using internal BUILD_DIR context",
+              "file filtering for exclusion purposes only"
+            ],
+            "deficiency_evidence": "No evidence of missing path validation for external input - the pattern uses internal build context and fixed filename"
+          },
+          "concrete_impact": {
+            "score": 0.15,
+            "evidence": "No demonstrated security impact. The change affects file filtering behavior but doesn't enable access outside restricted directories or demonstrate any security consequence."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the manifest.yml exclusion pattern would be less specific (likely reverting to a prefix match), potentially allowing files with similar names to be excluded or included differently, but there's no evidence this would enable path traversal.",
+        "supporting_evidence": [
+          "Regex pattern construction using os.path.join with BUILD_DIR context",
+          "File filtering operation for web directory setup"
+        ],
+        "contradicting_evidence": [
+          "No external input is used in path construction - BUILD_DIR is internal build context",
+          "Pattern is used for exclusion filtering, not for accessing files outside restricted directories",
+          "Fixed filename 'manifest.yml' with no path traversal elements"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "What specific security risk the pattern tightening addresses",
+          "Whether manifest.yml contains sensitive data requiring strict exclusion",
+          "What the previous pattern was and how it differed in security implications"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.16999999999999998,
+        "score": 0.16999999999999998
+      },
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 51,
+        "statement": "'^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))",
+        "cwe_id": "CWE-730",
+        "cwe_name": "Security Issue (CWE-730)",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "CWE-730 specifically addresses regex injection leading to ReDoS. The pattern uses fixed BUILD_DIR path and literal 'manifest.yml' - no user input is incorporated into the regex pattern itself."
+          },
+          "connection": {
+            "score": 0.15,
+            "evidence": "BUILD_DIR is application build directory context, not external user input. The regex pattern is constructed from fixed path components and literal filename."
+          },
+          "diff_causality": {
+            "score": 0.3,
+            "evidence": "The change tightens from prefix match to exact match for manifest.yml exclusion, improving specificity but not introducing regex injection vulnerability."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Input validation/sanitization for regex patterns containing user input",
+            "control_requirement_evidence": "CWE-730 requires validation when user input affects regex patterns to prevent ReDoS",
+            "existing_controls_checked": [
+              "Fixed BUILD_DIR context variable",
+              "Literal 'manifest.yml' string"
+            ],
+            "deficiency_evidence": "No user input is incorporated into the regex pattern, so the CWE-730 control requirement does not apply"
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No evidence of exponential time complexity or resource exhaustion from this fixed pattern construction."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the manifest.yml exclusion would revert to a less specific pattern (likely prefix match), potentially allowing files with similar names to be copied, but not introducing regex injection.",
+        "supporting_evidence": [
+          "Regex pattern construction uses string formatting with BUILD_DIR context"
+        ],
+        "contradicting_evidence": [
+          "Pattern components are fixed: BUILD_DIR context variable and literal 'manifest.yml' filename",
+          "No user-controlled input is incorporated into the regex pattern"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether BUILD_DIR contains any user-controlled content",
+          "What the previous pattern was before this change"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.16999999999999998,
+        "score": 0.16999999999999998
+      },
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 51,
+        "statement": "'^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))",
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.3,
+            "evidence": "The candidate adds a regex pattern for file exclusion. CWE-20 requires validation of input properties for safe processing. The pattern is a validation rule for file paths, but the demonstrated mechanism is pattern tightening (exact match vs prefix), not validation failure."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "The pattern uses ctx['BUILD_DIR'] to construct a path. BUILD_DIR is externally influenced (application source). The pattern is connected to FileUtil.where_name_does_not_match() which filters files during copy operations. However, attacker control over file names in BUILD_DIR is not established."
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "If the candidate line were reverted, the manifest.yml exclusion would revert to its previous state (presumably a prefix match). The patch materially changes the exclusion rule from matching any file starting with the path to matching only the exact file."
+          },
+          "security_control": {
+            "score": 0.35,
+            "evidence": "The pattern is a file-filtering control. The change tightens validation.",
+            "required_control": "Validation of file paths to exclude sensitive configuration files from web-accessible directories",
+            "control_requirement_evidence": "For CWE-20 in file filtering context, validation must correctly identify files to exclude based on path patterns to prevent sensitive data exposure.",
+            "existing_controls_checked": [
+              "Series of where_name_does_not_match patterns for .bp, .extensions, .bp-config, LIBDIR"
+            ],
+            "deficiency_evidence": "The evidence shows a control being added/strengthened (exact match), not missing or weakened. The previous pattern behavior is unknown, so deficiency is speculative."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "If manifest.yml contains sensitive configuration and the pattern change allows it to be copied to webdir, it could lead to information disclosure. However, manifest.yml content and web accessibility are not demonstrated."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the manifest.yml exclusion would revert to its previous pattern (likely a prefix match '^%s/.*$'), potentially allowing files with names starting with the manifest.yml path to be excluded, while the exact manifest.yml file might not be excluded if the previous pattern required a trailing slash.",
+        "supporting_evidence": [
+          "The pattern uses BUILD_DIR context variable",
+          "Pattern is used in FileUtil.where_name_does_not_match() for file filtering",
+          "Change tightens from prefix match to exact match for manifest.yml exclusion"
+        ],
+        "contradicting_evidence": [
+          "The patch adds/strengthens a validation control, rather than demonstrating improper validation",
+          "No evidence shows the previous pattern was insufficient or bypassed"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "What the previous pattern was before the change",
+          "Whether manifest.yml contains sensitive configuration data",
+          "If attacker can place files in BUILD_DIR with crafted names",
+          "Whether webdir is publicly accessible"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.38,
+        "score": 0.38
+      },
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "lib/compile_helpers.py",
+        "changed_line": 51,
+        "statement": "'^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))",
+        "cwe_id": "CWE-179",
+        "cwe_name": "Incorrect Behavior Order: Early Validation",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "CWE-179 requires validation before modification that changes input semantics. This code shows file filtering pattern change from prefix to exact match, not validation timing relative to input transformation."
+          },
+          "connection": {
+            "score": 0.15,
+            "evidence": "No demonstrated path from external input to security-sensitive operation. The pattern uses BUILD_DIR context variable for file exclusion during directory setup."
+          },
+          "diff_causality": {
+            "score": 0.25,
+            "evidence": "The change tightens pattern matching from prefix to exact match for manifest.yml exclusion. If reverted, the pattern would match more broadly."
+          },
+          "security_control": {
+            "score": 0.1,
+            "evidence": "",
+            "required_control": "validation after input modification/canonicalization",
+            "control_requirement_evidence": "CWE-179 requires validation to occur after input transformation to prevent bypass",
+            "existing_controls_checked": [
+              "file filtering patterns for build artifacts"
+            ],
+            "deficiency_evidence": "No evidence of validation timing issue or input transformation that would require this control"
+          },
+          "concrete_impact": {
+            "score": 0.1,
+            "evidence": "No demonstrated security impact. The change affects file copying behavior during build setup, not runtime security validation."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the file filtering pattern would revert from exact match '^path/to/manifest.yml$' back to prefix match '^path/to/manifest.yml/.*$', potentially excluding more files from being copied to the web directory.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The code performs file filtering during build setup, not input validation",
+          "No evidence of input transformation that would require validation timing adjustment",
+          "The change tightens pattern matching rather than introducing validation order issues"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether manifest.yml contains sensitive data requiring protection",
+          "What specific security risk the pattern change addresses",
+          "If there are files with similar names that could be affected"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.13999999999999999,
+        "score": 0.13999999999999999
+      }
+    ],
+    "stage4_status": "completed"
+  }
+]

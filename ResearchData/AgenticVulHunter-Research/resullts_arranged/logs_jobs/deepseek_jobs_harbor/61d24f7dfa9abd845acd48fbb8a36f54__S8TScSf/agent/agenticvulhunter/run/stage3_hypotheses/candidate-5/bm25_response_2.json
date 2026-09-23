@@ -1,0 +1,271 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 151,
+      "statement": "this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.sendOutputs[txn.inputs[i].outputIndex] })",
+      "change_type": "A",
+      "function_name": "isValidSlpTxid",
+      "operation_type": "data_storage",
+      "selection_reason": "SEND transaction input -> parent validation data storage -> critical for SLP token integrity validation",
+      "security_relevance_score": 0.6,
+      "code_context": "2: import { SlpValidator, Slp } from './slp';\n3: import { SlpTransactionType, SlpTransactionDetails } from './slpjs';\n4: import * as bitcore from 'bitcore-lib-cash';\n5: import { BitcoreTransaction } from './global';\n6: import BigNumber from 'bignumber.js';\n7: import axios from 'axios';\n8: \n9: export interface Validation { hex: string|null; validity: boolean|null; parents: Parent[], details: SlpTransactionDetails|null, invalidReason: string|null } \n10: export type GetRawTransactionsAsync = (txid: string[]) => Promise<string[]|null>;\n11: \n12: const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))\n13: \n14: interface Parent {\n15:     txid: string;\n16:     versionType: number;\n17:     valid: boolean|null;\n18:     inputQty: BigNumber|null;\n19: }\n20: \n21: export class LocalValidator implements SlpValidator {\n22:     BITBOX: BITBOX;\n23:     cachedRawTransactions: { [txid: string]: string }\n24:     cachedValidations: { [txid: string]: Validation }\n25:     getRawTransactions: GetRawTransactionsAsync;\n26:     slp: Slp;\n27: \n28:     constructor(BITBOX: BITBOX, getRawTransactions: GetRawTransactionsAsync) {\n29:         this.BITBOX = BITBOX;\n30:         this.getRawTransactions = getRawTransactions;\n31:         this.slp = new Slp(BITBOX);\n32:         this.cachedValidations = {};\n33:         this.cachedRawTransactions = {};\n34:     }\n35: \n36:     addValidationFromStore(hex: string, isValid: boolean) {\n37:         let id = (<Buffer>this.BITBOX.Crypto.sha256(this.BITBOX.Crypto.sha256(Buffer.from(hex, 'hex'))).reverse()).toString('hex');\n38:         if(!this.cachedValidations[id])\n39:             this.cachedValidations[id] = { hex: hex, validity: isValid, parents: [], details: null, invalidReason: null }\n40:         if(!this.cachedRawTransactions[id])\n41:             this.cachedRawTransactions[id] = hex;\n42:     }\n43:     \n44:     async waitForParentValidationProcessing(txid: string) {\n45:         // TODO: Add some timeout?\n46:         let cached: Validation = this.cachedValidations[txid];\n47: \n48:         while(true) {\n49:             let slpParentCount = cached.parents.length;\n50:             let count = 0;\n51:             cached.parents.forEach(p => {\n52:                 let parent = this.cachedValidations[p.txid];\n53:                 if(parent) {\n54:                     if(typeof parent.validity === 'boolean')\n55:                         count += 1;\n56:                 }\n57:             });\n58:             if(count === slpParentCount && typeof cached.validity === 'boolean')\n59:                 break\n60:             await sleep(200);\n61:         }\n62:     }\n63: \n64:     async waitForTransactionPreProcessing(txid: string){\n65:         // TODO: Add some timeout?\n66:         while(true) {\n67:             if(this.cachedValidations[txid].hex && this.cachedValidations[txid].details)\n68:                 break\n69:             await sleep(200);\n70:         }\n71:         //await sleep(100); // short wait to make sure parent's properties gets set first.\n72:         return\n73:     }\n74: \n75:     async getRawTransaction(txid: string) {\n76:         if(this.cachedRawTransactions[txid])\n77:             return this.cachedRawTransactions[txid];\n78:         this.cachedRawTransactions[txid] = (await this.getRawTransactions([txid]))[0]\n79:         if(this.cachedRawTransactions[txid])\n80:             return this.cachedRawTransactions[txid];\n81:         return null;\n82:     }\n83: \n84:     async isValidSlpTxid(txid: string) {\n85:         if(txid && !this.cachedValidations[txid]) {\n86:             this.cachedValidations[txid] = { hex: null, validity: null, parents: [], details: null, invalidReason: null }\n87:             this.cachedValidations[txid].hex = await this.getRawTransaction(txid);\n88:         }\n89: \n90:         // Check to see how we should proceed based on the validation-cache state\n91:         if(!this.cachedValidations[txid].hex)\n92:             await this.waitForTransactionPreProcessing(txid);\n93:         if(typeof this.cachedValidations[txid].validity === 'boolean')\n94:             return this.cachedValidations[txid].validity;\n95:         if(this.cachedValidations[txid].details)\n96:             await this.waitForParentValidationProcessing(txid);\n97: \n98:         // Check SLP message validity\n99:         let txn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[txid].hex)\n100:         let slpmsg: SlpTransactionDetails;\n101:         try {\n102:             slpmsg = this.cachedValidations[txid].details = this.slp.parseSlpOutputScript(txn.outputs[0]._scriptBuffer)\n103:         } catch(e) {\n104:             this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"\n105:             return this.cachedValidations[txid].validity = false;\n106:         }\n107: \n108:         // Check DAG validity\n109:         if(slpmsg.transactionType === SlpTransactionType.GENESIS) {\n110:             return this.cachedValidations[txid].validity = true;\n111:         } \n112:         else if (slpmsg.transactionType === SlpTransactionType.MINT) {\n113:             for(let i = 0; i < txn.inputs.length; i++) {\n114:                 let input_txid = txn.inputs[i].prevTxId.toString('hex')\n115:                 let input_txhex = await this.getRawTransaction(input_txid)\n116:                 if (input_txhex) {\n117:                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);\n118:                     try {\n119:                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)\n120:                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)\n121:                             input_slpmsg.tokenIdHex = input_txid;\n122:                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {\n123:                             if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {\n124:                                 if(txn.inputs[i].outputIndex === input_slpmsg.batonVout)\n125:                                     this.cachedValidations[txid].parents.push({ txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType ,valid: null, inputQty: null })\n126:                             }\n127:                         }\n128:                     } catch(_) {}\n129:                 }\n130:             }\n131:             if(this.cachedValidations[txid].parents.length !== 1) {\n132:                 this.cachedValidations[txid].invalidReason = \"MINT transaction must have 1 valid baton parent.\"\n133:                 return this.cachedValidations[txid].validity = false;\n134:             }\n135:         }\n136:         else if(slpmsg.transactionType === SlpTransactionType.SEND) {\n137:             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))\n138:             let tokenInQty = new BigNumber(0);\n139:             for(let i = 0; i < txn.inputs.length; i++) {\n140:                 let input_txid = txn.inputs[i].prevTxId.toString('hex')\n141:                 let input_txhex = await this.getRawTransaction(input_txid)\n142:                 if (input_txhex) {\n143:                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);\n144:                     try {\n145:                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)\n146:                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)\n147:                             input_slpmsg.tokenIdHex = input_txid;\n148:                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {\n149:                             if(input_slpmsg.transactionType === SlpTransactionType.SEND) {\n150:                                 tokenInQty = tokenInQty.plus(input_slpmsg.sendOutputs[txn.inputs[i].outputIndex])\n151:                                 this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.sendOutputs[txn.inputs[i].outputIndex] })\n152:                             }\n153:                             else if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {\n154:                                 if(txn.inputs[i].outputIndex === 1)\n155:                                     tokenInQty = tokenInQty.plus(input_slpmsg.genesisOrMintQuantity)\n156:                                     this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.genesisOrMintQuantity })\n157:                             }\n158:                         }\n159:                     } catch(_) {}\n160:                 }\n161:             }\n162:             \n163:             // Check token inputs are greater than token outputs (includes valid and invalid inputs)\n164:             if(tokenOutQty.isGreaterThan(tokenInQty)) {\n165:                 this.cachedValidations[txid].invalidReason = \"Token outputs are greater than possible token inputs.\"\n166:                 return this.cachedValidations[txid].validity = false;\n167:             }\n168:         }\n169: \n170:         // Set validity validation-cache for parents, and handle MINT condition with no valid input\n171:         for(let i = 0; i < this.cachedValidations[txid].parents.length; i++) {\n172:             let valid = await this.isValidSlpTxid(this.cachedValidations[txid].parents[i].txid)\n173:             this.cachedValidations[txid].parents.find(p => p.txid === this.cachedValidations[txid].parents[i].txid).valid = valid;\n174:             if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.MINT && !valid) {\n175:                 this.cachedValidations[txid].invalidReason = \"MINT transaction with invalid baton parent.\"\n176:                 return this.cachedValidations[txid].validity = false;\n177:             }\n178:         }\n179: \n180:         // Check valid inputs are greater than token outputs\n181:         if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {\n182:             let validInputQty = this.cachedValidations[txid].parents.reduce((t, v) => { return v.valid ? t.plus(v.inputQty) : t }, new BigNumber(0));\n183:             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))\n184:             if(tokenOutQty.isGreaterThan(validInputQty)) {\n185:                 this.cachedValidations[txid].invalidReason = \"Token outputs are greater than valid token inputs.\"\n186:                 return this.cachedValidations[txid].validity = false;\n187:             }\n188:         }\n189: \n190:         // Check versionType is not different from any valid parent\n191:         if(this.cachedValidations[txid].parents.filter(p => p.valid).length > 0) {\n192:             let validVersionType = this.cachedValidations[txid].parents.find(p => p.valid).versionType;\n193:             if(this.cachedValidations[txid].details.versionType !== validVersionType) {\n194:                 this.cachedValidations[txid].invalidReason = \"SLP version/type mismatch from valid parent.\"\n195:                 return this.cachedValidations[txid].validity = false;\n196:             }\n197:         } \n198:         // For case with 0 token SEND with no valid parents, must check GENESIS validity / versionType.\n199:         else if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {\n200:             let slpmsg = this.cachedValidations[txid].details\n201:             let valid = await this.isValidSlpTxid(slpmsg.tokenIdHex);\n202:             if(valid) {\n203:                 let genesisTxn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[slpmsg.tokenIdHex].hex)\n204:                 let genesisMsg = this.slp.parseSlpOutputScript(genesisTxn.outputs[0]._scriptBuffer)\n205:                 if(genesisMsg.versionType !== slpmsg.versionType) {\n206:                     this.cachedValidations[txid].invalidReason = \"SLP version/type mismatch from valid GENESIS.\"\n207:                     return this.cachedValidations[txid].validity = false;\n208:                 }\n209:             } else {\n210:                 this.cachedValidations[txid].invalidReason = \"SEND has 0 outputs, but has invalid token GENESIS.\"\n211:                 console.log(this.cachedValidations[slpmsg.tokenIdHex].invalidReason)\n212:                 return this.cachedValidations[txid].validity = false;\n213:             }\n214:         }\n215: \n216:         return this.cachedValidations[txid].validity = true;\n217:     }\n218: \n219:     async validateSlpTransactions(txids: string[]): Promise<string[]> {\n220:         let res = [];\n221:         for (let i = 0; i < txids.length; i++) {\n222:             res.push((await this.isValidSlpTxid) ? txids[i] : '')\n223:         }\n224:         return res.filter((id: string) => id.length > 0);\n225:     }\n226: }",
+      "source_summary": "Transaction input data parsed from blockchain SLP OP_RETURN scripts via parseSlpOutputScript, which extracts token quantities from SEND transaction outputs",
+      "sink_summary": "Stored in cachedValidations[txid].parents array for later validation checks including token quantity balance verification and version type consistency",
+      "guard_summary": "Multiple validation layers: SLP message parsing with error handling, token ID matching, transaction type checking, and later validation of parent transactions via recursive isValidSlpTxid calls",
+      "risk_pattern": "Storing unvalidated parent transaction quantities for SEND inputs that are later used in critical token balance calculations without immediate validation of the source transaction's validity",
+      "used_variable_sources": [
+        "txn.inputs[i].prevTxId",
+        "txn.inputs[i].outputIndex",
+        "input_slpmsg.versionType",
+        "input_slpmsg.sendOutputs"
+      ],
+      "called_function_context": [
+        "parseSlpOutputScript",
+        "getRawTransaction",
+        "isValidSlpTxid"
+      ],
+      "enclosing_conditions": [
+        "if(input_slpmsg.transactionType === SlpTransactionType.SEND)",
+        "if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex)",
+        "if (input_txhex)"
+      ],
+      "context_summary": "Part of SLP token validation logic for SEND transactions, storing parent transaction references and quantities that will be used to verify token input/output balance consistency",
+      "unresolved_facts": [
+        "Whether parseSlpOutputScript properly validates all SLP message fields before extraction",
+        "Whether the outputIndex bounds are validated before accessing sendOutputs array",
+        "Whether there are additional validation checks on the stored inputQty values before use in balance calculations"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "Storing unvalidated transaction input quantities for later balance calculations in SLP token validation",
+        "source": "SLP transaction input data from blockchain",
+        "sensitive_operation": "token balance calculation and validation",
+        "missing_control": "immediate validation of source transaction validity before storing quantities",
+        "impact": "incorrect token balance validation leading to token theft or inflation",
+        "mechanism_keywords": [
+          "unvalidated data",
+          "cached validation",
+          "token balance",
+          "input quantity",
+          "race condition"
+        ]
+      },
+      "language": "typescript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-311-missing-encryption-of-sensitive-data",
+          "cwe_id": "CWE-311",
+          "cwe_name": "Missing Encryption of Sensitive Data",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 15.374,
+          "raw_bm25_score": 15.374,
+          "description": "Sensitive data is stored or transmitted without required encryption.",
+          "pattern": "cwe-311 missing-encryption cleartext plaintext sensitive-data unencrypted storage transmission tls data-at-rest data-in-transit",
+          "remediation": "Encrypt sensitive data in transit and at rest.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-311"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "fallback/cwe-19-data-processing-errors",
+          "cwe_id": "CWE-19",
+          "cwe_name": "Data Processing Errors",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 15.2827,
+          "raw_bm25_score": 15.2827,
+          "description": "Legacy category for incorrect handling or transformation of structured data.",
+          "pattern": "cwe-19 data-processing parser parsing malformed-data format-conversion serialization transformation structured-data processing-error",
+          "remediation": "Validate structured input and use safe parsing and conversion routines.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-019"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "fallback/cwe-125-out-of-bounds-read",
+          "cwe_id": "CWE-125",
+          "cwe_name": "Out-of-bounds Read",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 14.149,
+          "raw_bm25_score": 14.149,
+          "description": "A read accesses memory before or beyond the valid buffer range.",
+          "pattern": "cwe-125 out-of-bounds-read buffer-read memory-read index offset length parser decode malformed-input boundary",
+          "remediation": "Check read offsets, indexes, and lengths before buffer access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-125"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "fallback/cwe-255-credentials-management-errors",
+          "cwe_id": "CWE-255",
+          "cwe_name": "Credentials Management Errors",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 13.6484,
+          "raw_bm25_score": 13.6484,
+          "description": "Legacy category for insecure credential creation, storage, validation, or handling.",
+          "pattern": "cwe-255 credential-management password token secret credential storage rotation validation authentication-secret",
+          "remediation": "Protect credentials throughout storage, validation, transport, and rotation.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-255"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "fallback/cwe-697-incorrect-comparison",
+          "cwe_id": "CWE-697",
+          "cwe_name": "Incorrect Comparison",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 11.5233,
+          "raw_bm25_score": 11.5233,
+          "description": "A security-relevant comparison checks the wrong, incomplete, or non-canonical value.",
+          "pattern": "cwe-697 incorrect-comparison equality compare comparator mismatch canonicalization hostname url signature token partial-comparison substring",
+          "remediation": "Compare canonical complete values with the intended security predicate.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-697"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 9.4826,
+          "raw_bm25_score": 9.4826,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "fallback/cwe-77-improper-neutralization-of-special-elements-used-in-a-command-command-injection",
+          "cwe_id": "CWE-77",
+          "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 8.9749,
+          "raw_bm25_score": 8.9749,
+          "description": "Externally influenced data changes the syntax or meaning of a command sent to a downstream command interpreter.",
+          "pattern": "cwe-77 command-injection command-construction shell exec spawn process subprocess child_process os.system popen argument-delimiter metacharacter",
+          "remediation": "Keep external data separate from command syntax and use safe argument APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-077"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "fallback/cwe-471-modification-of-assumed-immutable-data-maid",
+          "cwe_id": "CWE-471",
+          "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 8.4127,
+          "raw_bm25_score": 8.4127,
+          "description": "Security-critical data assumed immutable can be modified by an attacker.",
+          "pattern": "cwe-471 assumed-immutable immutable-data hidden-field cookie reverse-dns attacker-modified trusted-value mutable security-decision",
+          "remediation": "Do not trust client-modifiable values as immutable security state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-471"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 8.3501,
+          "raw_bm25_score": 8.3501,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-59-improper-link-resolution-before-file-access-link-following",
+          "cwe_id": "CWE-59",
+          "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 7.9914,
+          "raw_bm25_score": 7.9914,
+          "description": "File access follows a symlink, hardlink, or shortcut to an unintended resource.",
+          "pattern": "cwe-59 symlink hardlink link-following symbolic-link file-link archive-extraction path-resolution file-overwrite race filesystem",
+          "remediation": "Reject unsafe links and verify resolved file targets before access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-059"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

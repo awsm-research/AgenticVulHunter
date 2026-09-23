@@ -1,0 +1,253 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/rules_block/reference.js",
+      "changed_line": 105,
+      "statement": "if (!state.md.validateLink(res.str)) { return false; }",
+      "change_type": "A",
+      "function_name": "reference",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+      "security_relevance_score": 0.8,
+      "code_context": "1: 'use strict';\n2: \n3: \n4: var parseLinkDestination = require('../helpers/parse_link_destination');\n5: var parseLinkTitle       = require('../helpers/parse_link_title');\n6: var normalizeReference   = require('../common/utils').normalizeReference;\n7: \n8: \n9: module.exports = function reference(state, startLine, _endLine, silent) {\n10:   var ch,\n11:       destEndPos,\n12:       destEndLineNo,\n13:       endLine,\n14:       href,\n15:       i,\n16:       l,\n17:       label,\n18:       labelEnd,\n19:       res,\n20:       start,\n21:       str,\n22:       terminate,\n23:       terminatorRules,\n24:       title,\n25:       lines = 0,\n26:       pos = state.bMarks[startLine] + state.tShift[startLine],\n27:       max = state.eMarks[startLine],\n28:       nextLine = startLine + 1;\n29: \n30:   if (state.src.charCodeAt(pos) !== 0x5B/* [ */) { return false; }\n31: \n32:   // Simple check to quickly interrupt scan on [link](url) at the start of line.\n33:   // Can be useful on practice: https://github.com/markdown-it/markdown-it/issues/54\n34:   while (++pos < max) {\n35:     if (state.src.charCodeAt(pos) === 0x5D /* ] */ &&\n36:         state.src.charCodeAt(pos - 1) !== 0x5C/* \\ */) {\n37:       if (pos + 1 === max) { return false; }\n38:       if (state.src.charCodeAt(pos + 1) !== 0x3A/* : */) { return false; }\n39:       break;\n40:     }\n41:   }\n42: \n43:   endLine = state.lineMax;\n44: \n45:   // jump line-by-line until empty one or EOF\n46:   if (nextLine < endLine && !state.isEmpty(nextLine)) {\n47:     terminatorRules = state.md.block.ruler.getRules('reference');\n48: \n49:     for (; nextLine < endLine && !state.isEmpty(nextLine); nextLine++) {\n50:       // this would be a code block normally, but after paragraph\n51:       // it's considered a lazy continuation regardless of what's there\n52:       if (state.tShift[nextLine] - state.blkIndent > 3) { continue; }\n53: \n54:       // Some tags can terminate paragraph without empty line.\n55:       terminate = false;\n56:       for (i = 0, l = terminatorRules.length; i < l; i++) {\n57:         if (terminatorRules[i](state, nextLine, endLine, true)) {\n58:           terminate = true;\n59:           break;\n60:         }\n61:       }\n62:       if (terminate) { break; }\n63:     }\n64:   }\n65: \n66:   str = state.getLines(startLine, nextLine, state.blkIndent, false).trim();\n67:   max = str.length;\n68: \n69:   for (pos = 1; pos < max; pos++) {\n70:     ch = str.charCodeAt(pos);\n71:     if (ch === 0x5B /* [ */) {\n72:       return false;\n73:     } else if (ch === 0x5D /* ] */) {\n74:       labelEnd = pos;\n75:       break;\n76:     } else if (ch === 0x0A /* \\n */) {\n77:       lines++;\n78:     } else if (ch === 0x5C /* \\ */) {\n79:       pos++;\n80:       if (pos < max && str.charCodeAt(pos) === 0x0A) {\n81:         lines++;\n82:       }\n83:     }\n84:   }\n85: \n86:   if (labelEnd < 0 || str.charCodeAt(labelEnd + 1) !== 0x3A/* : */) { return false; }\n87: \n88:   // [label]:   destination   'title'\n89:   //         ^^^ skip optional whitespace here\n90:   for (pos = labelEnd + 2; pos < max; pos++) {\n91:     ch = str.charCodeAt(pos);\n92:     if (ch === 0x0A) {\n93:       lines++;\n94:     } else if (ch === 0x20) {\n95:       /*eslint no-empty:0*/\n96:     } else {\n97:       break;\n98:     }\n99:   }\n100: \n101:   // [label]:   destination   'title'\n102:   //            ^^^^^^^^^^^ parse this\n103:   res = parseLinkDestination(str, pos, max);\n104:   if (!res.ok) { return false; }\n105:   if (!state.md.validateLink(res.str)) { return false; }\n106:   href = res.str;\n107:   pos = res.pos;\n108:   lines += res.lines;\n109: \n110:   // save cursor state, we could require to rollback later\n111:   destEndPos = pos;\n112:   destEndLineNo = lines;\n113: \n114:   // [label]:   destination   'title'\n115:   //                       ^^^ skipping those spaces\n116:   start = pos;\n117:   for (; pos < max; pos++) {\n118:     ch = str.charCodeAt(pos);\n119:     if (ch === 0x0A) {\n120:       lines++;\n121:     } else if (ch === 0x20) {\n122:       /*eslint no-empty:0*/\n123:     } else {\n124:       break;\n125:     }\n126:   }\n127: \n128:   // [label]:   destination   'title'\n129:   //                          ^^^^^^^ parse this\n130:   res = parseLinkTitle(str, pos, max);\n131:   if (pos < max && start !== pos && res.ok) {\n132:     title = res.str;\n133:     pos = res.pos;\n134:     lines += res.lines;\n135:   } else {\n136:     title = '';\n137:     pos = destEndPos;\n138:     lines = destEndLineNo;\n139:   }\n140: \n141:   // skip trailing spaces until the rest of the line\n142:   while (pos < max && str.charCodeAt(pos) === 0x20/* space */) { pos++; }\n143: \n144:   if (pos < max && str.charCodeAt(pos) !== 0x0A) {\n145:     // garbage at the end of the line\n146:     return false;\n147:   }\n148: \n149:   // Reference can not terminate anything. This check is for safety only.\n150:   /*istanbul ignore if*/\n151:   if (silent) { return true; }\n152: \n153:   label = normalizeReference(str.slice(1, labelEnd));\n154:   if (typeof state.env.references === 'undefined') {\n155:     state.env.references = {};\n156:   }\n157:   if (typeof state.env.references[label] === 'undefined') {\n158:     state.env.references[label] = { title: title, href: href };\n159:   }\n160: \n161:   state.line = startLine + lines + 1;\n162:   return true;\n163: };",
+      "source_summary": "The value 'res.str' comes from the parseLinkDestination helper function, which parses the link destination from markdown reference syntax. The string is extracted from the input text and processed through unescapeAll and normalizeLink functions.",
+      "sink_summary": "The security-sensitive decision occurs when validateLink is called on res.str. If validation fails, the function returns false, preventing the reference from being added to the document's references.",
+      "guard_summary": "The guard is the validateLink function which checks if the link contains a bad protocol (javascript:, vbscript:, file:) and returns false if found. This is an allowlist-based security control that prevents certain dangerous protocols from being used in links.",
+      "risk_pattern": "A malicious user could attempt to inject a javascript: or other dangerous protocol URL into a markdown reference, but the validateLink function will reject such inputs before they can be stored as valid references.",
+      "used_variable_sources": [
+        "res.str"
+      ],
+      "called_function_context": [
+        "parseLinkDestination",
+        "validateLink"
+      ],
+      "enclosing_conditions": [],
+      "context_summary": "This code is part of the reference rule parser in markdown-it. It processes markdown references like [label]: url 'title' and validates that the URL does not use dangerous protocols before storing it.",
+      "unresolved_facts": [],
+      "retrieval_query": {
+        "mechanism_summary": "A security-sensitive decision is made based on validation of a parsed link destination string, where the validation rejects certain dangerous protocols like javascript: or file: before storing the reference."
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/eval-like-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 47.9159,
+          "raw_bm25_score": 47.9159,
+          "description": "DOM functions that act like 'eval' and execute strings as code are dangerous and impede program analysis and understanding. Consequently, they should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "readability",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/regex-injection",
+          "cwe_id": "CWE-730",
+          "cwe_name": "Security Issue (CWE-730)",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 37.3655,
+          "raw_bm25_score": 37.3655,
+          "description": "User input should not be used in regular expressions without first being escaped, otherwise a malicious user may be able to inject an expression that could require exponential time on certain inputs.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-730",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/invalid-prototype-value",
+          "cwe_id": "CWE-704",
+          "cwe_name": "Incorrect Type Conversion or Cast",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.037,
+          "raw_bm25_score": 26.037,
+          "description": "An attempt to use a value that is not an object or 'null' as a prototype will either be ignored or result in a runtime error.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-704. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "language-features",
+            "external/cwe/cwe-704"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/useless-regexp-character-escape",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.4731,
+          "raw_bm25_score": 25.4731,
+          "description": "Prepending a backslash to an ordinary character in a string does not have any effect, and may make regular expressions constructed from this string behave unexpectedly.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/function-declaration-conflict",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.2755,
+          "raw_bm25_score": 25.2755,
+          "description": "If two functions with the same name are declared in the same scope, one of the declarations overrides the other without warning. This makes the code hard to read and maintain, and may even lead to platform-dependent behavior.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/file-system-race",
+          "cwe_id": "CWE-367",
+          "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.9831,
+          "raw_bm25_score": 24.9831,
+          "description": "Separately checking the state of a file before operating on it may allow an attacker to modify the file between the two operations.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-367"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/hardcoded-data-interpreted-as-code",
+          "cwe_id": "CWE-506",
+          "cwe_name": "Embedded Malicious Code",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.9453,
+          "raw_bm25_score": 24.9453,
+          "description": "Transforming hard-coded data (such as hexadecimal constants) into code to be executed is a technique often associated with backdoors and should be avoided.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-506"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/misleading-indentation-after-control-statement",
+          "cwe_id": "CWE-483",
+          "cwe_name": "Incorrect Block Delimitation",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.8884,
+          "raw_bm25_score": 23.8884,
+          "description": "The body of a control statement should have appropriate indentation to clarify which statements it controls and which ones it does not control.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-483. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "readability",
+            "statistical",
+            "non-attributable"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/inconsistent-loop-direction",
+          "cwe_id": "CWE-835",
+          "cwe_name": "Loop with Unreachable Exit Condition ('Infinite Loop')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.7735,
+          "raw_bm25_score": 22.7735,
+          "description": "A 'for' loop that increments its loop variable but checks it against a lower bound, or decrements its loop variable but checks it against an upper bound, will either stop iterating immediately or keep iterating indefinitely, and is usually indicative of a typo.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement loop bounds and timeout mechanisms. Add maximum iteration counts. Use break conditions that cannot be controlled by user input.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-835"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 22.2721,
+          "raw_bm25_score": 22.2721,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

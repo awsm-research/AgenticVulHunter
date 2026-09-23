@@ -1,0 +1,244 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "index.js",
+      "changed_line": 252,
+      "statement": "xfs.link(srcpath, name, function (err) {",
+      "change_type": "A",
+      "function_name": "",
+      "operation_type": "file_operation",
+      "selection_reason": "constructed path (srcpath) -> hard link creation -> potential privilege escalation or symlink attack",
+      "security_relevance_score": 0.6,
+      "code_context": "103:     if (stat.isDirectory()) {\n104:       header.size = 0\n105:       header.type = 'directory'\n106:       header = map(header) || header\n107:       return pack.entry(header, onnextentry)\n108:     }\n109: \n110:     if (stat.isSymbolicLink()) {\n111:       header.size = 0\n112:       header.type = 'symlink'\n113:       header = map(header) || header\n114:       return onsymlink(filename, header)\n115:     }\n116: \n117:     // TODO: add fifo etc...\n118: \n119:     header = map(header) || header\n120: \n121:     if (!stat.isFile()) {\n122:       if (strict) return pack.destroy(new Error('unsupported type for ' + filename))\n123:       return onnextentry()\n124:     }\n125: \n126:     var entry = pack.entry(header, onnextentry)\n127:     if (!entry) return\n128: \n129:     var rs = mapStream(xfs.createReadStream(path.join(cwd, filename)), header)\n130: \n131:     rs.on('error', function (err) { // always forward errors on destroy\n132:       entry.destroy(err)\n133:     })\n134: \n135:     pump(rs, entry)\n136:   }\n137: \n138:   var onnextentry = function (err) {\n139:     if (err) return pack.destroy(err)\n140:     statNext(onstat)\n141:   }\n142: \n143:   onnextentry()\n144: \n145:   return pack\n146: }\n147: \n148: var head = function (list) {\n149:   return list.length ? list[list.length - 1] : null\n150: }\n151: \n152: var processGetuid = function () {\n153:   return process.getuid ? process.getuid() : -1\n154: }\n155: \n156: var processUmask = function () {\n157:   return process.umask ? process.umask() : 0\n158: }\n159: \n160: exports.extract = function (cwd, opts) {\n161:   if (!cwd) cwd = '.'\n162:   if (!opts) opts = {}\n163: \n164:   var xfs = opts.fs || fs\n165:   var ignore = opts.ignore || opts.filter || noop\n166:   var map = opts.map || noop\n167:   var mapStream = opts.mapStream || echo\n168:   var own = opts.chown !== false && !win32 && processGetuid() === 0\n169:   var extract = opts.extract || tar.extract()\n170:   var stack = []\n171:   var now = new Date()\n172:   var umask = typeof opts.umask === 'number' ? ~opts.umask : ~processUmask()\n173:   var dmode = typeof opts.dmode === 'number' ? opts.dmode : 0\n174:   var fmode = typeof opts.fmode === 'number' ? opts.fmode : 0\n175:   var strict = opts.strict !== false\n176: \n177:   if (opts.strip) map = strip(map, opts.strip)\n178: \n179:   if (opts.readable) {\n180:     dmode |= parseInt(555, 8)\n181:     fmode |= parseInt(444, 8)\n182:   }\n183:   if (opts.writable) {\n184:     dmode |= parseInt(333, 8)\n185:     fmode |= parseInt(222, 8)\n186:   }\n187: \n188:   var utimesParent = function (name, cb) { // we just set the mtime on the parent dir again everytime we write an entry\n189:     var top\n190:     while ((top = head(stack)) && name.slice(0, top[0].length) !== top[0]) stack.pop()\n191:     if (!top) return cb()\n192:     xfs.utimes(top[0], now, top[1], cb)\n193:   }\n194: \n195:   var utimes = function (name, header, cb) {\n196:     if (opts.utimes === false) return cb()\n197: \n198:     if (header.type === 'directory') return xfs.utimes(name, now, header.mtime, cb)\n199:     if (header.type === 'symlink') return utimesParent(name, cb) // TODO: how to set mtime on link?\n200: \n201:     xfs.utimes(name, now, header.mtime, function (err) {\n202:       if (err) return cb(err)\n203:       utimesParent(name, cb)\n204:     })\n205:   }\n206: \n207:   var chperm = function (name, header, cb) {\n208:     var link = header.type === 'symlink'\n209:     var chmod = link ? xfs.lchmod : xfs.chmod\n210:     var chown = link ? xfs.lchown : xfs.chown\n211: \n212:     if (!chmod) return cb()\n213:     chmod(name, (header.mode | (header.type === 'directory' ? dmode : fmode)) & umask, function (err) {\n214:       if (err) return cb(err)\n215:       if (!own) return cb()\n216:       if (!chown) return cb()\n217:       chown(name, header.uid, header.gid, cb)\n218:     })\n219:   }\n220: \n221:   extract.on('entry', function (header, stream, next) {\n222:     header = map(header) || header\n223:     header.name = normalize(header.name)\n224:     var name = path.join(cwd, path.join('/', header.name))\n225: \n226:     if (ignore(name, header)) {\n227:       stream.resume()\n228:       return next()\n229:     }\n230: \n231:     var stat = function (err) {\n232:       if (err) return next(err)\n233:       utimes(name, header, function (err) {\n234:         if (err) return next(err)\n235:         if (win32) return next()\n236:         chperm(name, header, next)\n237:       })\n238:     }\n239: \n240:     var onsymlink = function () {\n241:       if (win32) return next() // skip symlinks on win for now before it can be tested\n242:       xfs.unlink(name, function () {\n243:         xfs.symlink(header.linkname, name, stat)\n244:       })\n245:     }\n246: \n247:     var onlink = function () {\n248:       if (win32) return next() // skip links on win for now before it can be tested\n249:       xfs.unlink(name, function () {\n250:         var srcpath = path.resolve(cwd, header.linkname)\n251: \n252:         xfs.link(srcpath, name, function (err) {\n253:           if (err && err.code === 'EPERM' && opts.hardlinkAsFilesFallback) {\n254:             stream = xfs.createReadStream(srcpath)\n255:             return onfile()\n256:           }\n257: \n258:           stat(err)\n259:         })\n260:       })\n261:     }\n262: \n263:     var onfile = function () {\n264:       var ws = xfs.createWriteStream(name)\n265:       var rs = mapStream(stream, header)\n266: \n267:       ws.on('error', function (err) { // always forward errors on destroy\n268:         rs.destroy(err)\n269:       })\n270: \n271:       pump(rs, ws, function (err) {\n272:         if (err) return next(err)\n273:         ws.on('close', stat)\n274:       })\n275:     }\n276: \n277:     if (header.type === 'directory') {\n278:       stack.push([name, header.mtime])\n279:       return mkdirp(name, {fs: xfs}, stat)\n280:     }\n281: \n282:     mkdirp(path.dirname(name), {fs: xfs}, function (err) {\n283:       if (err) return next(err)\n284: \n285:       switch (header.type) {\n286:         case 'file': return onfile()\n287:         case 'link': return onlink()\n288:         case 'symlink': return onsymlink()\n289:       }\n290: \n291:       if (strict) return next(new Error('unsupported type for ' + name + ' (' + header.type + ')'))\n292: \n293:       stream.resume()\n294:       next()\n295:     })\n296:   })\n297: \n298:   return extract\n299: }",
+      "retrieval_query": {
+        "source": "hard link creation with user-controllable path",
+        "sensitive_operation": "link creation without path validation",
+        "control": "lacks path resolution checks before hard link creation",
+        "weakness_mechanism": "path traversal via hard links",
+        "impact": "privilege escalation or symlink attack"
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-59-improper-link-resolution-before-file-access-link-following",
+          "cwe_id": "CWE-59",
+          "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 40.6616,
+          "raw_bm25_score": 40.6616,
+          "description": "File access follows a symlink, hardlink, or shortcut to an unintended resource.",
+          "pattern": "cwe-59 symlink hardlink link-following symbolic-link file-link archive-extraction path-resolution file-overwrite race filesystem",
+          "remediation": "Reject unsafe links and verify resolved file targets before access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-059"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/unsafe-external-link",
+          "cwe_id": "CWE-200",
+          "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 18.0075,
+          "raw_bm25_score": 18.0075,
+          "description": "External links that open in a new tab or window but do not specify link type 'noopener' or 'noreferrer' are a potential security risk.",
+          "pattern": "Find code that may expose sensitive information in error messages, logs, or responses",
+          "remediation": "Implement proper access controls and avoid exposing sensitive information in responses, errors, or logs.",
+          "tags": [
+            "maintainability",
+            "security",
+            "external/cwe/cwe-200",
+            "external/cwe/cwe-1022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/zipslip",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.5172,
+          "raw_bm25_score": 15.5172,
+          "description": "Extracting files from a malicious ZIP file, or similar type of archive, without validating that the destination file path is within the destination directory can allow an attacker to unexpectedly gain access to resources.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/insecure-temporary-file",
+          "cwe_id": "CWE-378",
+          "cwe_name": "Creation of Temporary File With Insecure Permissions",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 14.0335,
+          "raw_bm25_score": 14.0335,
+          "description": "Creating a temporary file that is accessible by other users can lead to information disclosure and sometimes remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-378. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "external/cwe/cwe-377",
+            "external/cwe/cwe-378",
+            "security"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/function-declaration-conflict",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 13.3066,
+          "raw_bm25_score": 13.3066,
+          "description": "If two functions with the same name are declared in the same scope, one of the declarations overrides the other without warning. This makes the code hard to read and maintain, and may even lead to platform-dependent behavior.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/path-injection",
+          "cwe_id": "CWE-23",
+          "cwe_name": "Relative Path Traversal",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 11.9897,
+          "raw_bm25_score": 11.9897,
+          "description": "Accessing paths influenced by users can allow an attacker to access unexpected resources.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-023. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-022",
+            "external/cwe/cwe-023",
+            "external/cwe/cwe-036",
+            "external/cwe/cwe-073"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/file-system-race",
+          "cwe_id": "CWE-367",
+          "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 10.3056,
+          "raw_bm25_score": 10.3056,
+          "description": "Separately checking the state of a file before operating on it may allow an attacker to modify the file between the two operations.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-367"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/superfluous-trailing-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 9.6345,
+          "raw_bm25_score": 9.6345,
+          "description": "A function is invoked with extra trailing arguments that are ignored.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "language-features",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/template-object-injection",
+          "cwe_id": "CWE-94",
+          "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 9.501,
+          "raw_bm25_score": 9.501,
+          "description": "Instantiating a template using a user-controlled object is vulnerable to local file read and potential remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-073",
+            "external/cwe/cwe-094"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/prototype-polluting-assignment",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 9.2827,
+          "raw_bm25_score": 9.2827,
+          "description": "Modifying an object obtained via a user-controlled property name may lead to accidental mutation of the built-in Object prototype, and possibly escalate to remote code execution or cross-site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-094",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

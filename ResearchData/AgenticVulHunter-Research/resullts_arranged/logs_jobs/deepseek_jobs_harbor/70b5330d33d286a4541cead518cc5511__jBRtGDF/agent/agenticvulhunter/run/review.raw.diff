@@ -1,0 +1,251 @@
+diff --git a/lib/unpack.js b/lib/unpack.js
+index 25ebbfd..cf503b7 100644
+--- a/lib/unpack.js
++++ b/lib/unpack.js
+@@ -16,46 +16,50 @@ const MAKEFS = Symbol('makeFs')
+ const FILE = Symbol('file')
+ const DIRECTORY = Symbol('directory')
+ const LINK = Symbol('link')
+ const SYMLINK = Symbol('symlink')
+ const HARDLINK = Symbol('hardlink')
+ const UNSUPPORTED = Symbol('unsupported')
+ const UNKNOWN = Symbol('unknown')
+ const CHECKPATH = Symbol('checkPath')
+ const MKDIR = Symbol('mkdir')
+ const ONERROR = Symbol('onError')
+ const PENDING = Symbol('pending')
+ const PEND = Symbol('pend')
+ const UNPEND = Symbol('unpend')
+ const ENDED = Symbol('ended')
+ const MAYBECLOSE = Symbol('maybeClose')
++const SKIPNEWER = Symbol('skipNewer')
+ 
+ class Unpack extends Parser {
+   constructor (opt) {
+     super(opt)
+     if (!opt)
+       opt = {}
+ 
+     this[PENDING] = 0
+     this[ENDED] = false
+     this.on('end', _ => {
+       this[ENDED] = true
+       this[MAYBECLOSE]()
+     })
+ 
+     this.dirCache = opt.dirCache || new Map()
+ 
++    // do not unpack over files that are newer than what's in the archive
++    this.newer = !!opt.newer
++
+     // allow .., absolute path entries, and unpacking through symlinks
+     // without this, warn and skip .., relativize absolutes, and error
+     // on symlinks in extraction path
+     this.preservePaths = !!opt.preservePaths
+ 
+     // unlink files and links before writing. This breaks existing hard
+     // links, and removes symlink directories rather than erroring
+     this.unlink = !!opt.unlink
+ 
+     this.cwd = path.resolve(opt.cwd || process.cwd())
+     this.strip = +opt.strip || 0
+     this.umask = typeof opt.umask === 'number' ? opt.umask : process.umask()
+     // default mode for dirs created as parents
+     this.dmode = opt.dmode || (0o0777 & (~this.umask))
+     this.fmode = opt.fmode || (0o0666 & (~this.umask))
+@@ -92,31 +96,30 @@ class Unpack extends Parser {
+ 
+     if (path.isAbsolute(entry.path))
+       entry.absolute = entry.path
+     else
+       entry.absolute = path.resolve(this.cwd, entry.path)
+ 
+     return true
+   }
+ 
+   [ONENTRY] (entry) {
+     if (!this[CHECKPATH](entry))
+       return entry.resume()
+ 
+     assert.equal(typeof entry.absolute, 'string')
+ 
+-
+     switch (entry.type) {
+       case 'File':
+       case 'OldFile':
+       case 'ContiguousFile':
+       case 'Link':
+       case 'SymbolicLink':
+       case 'Directory':
+       case 'GNUDumpDir':
+         return this[CHECKFS](entry)
+ 
+       case 'CharacterDevice':
+       case 'BlockDevice':
+       case 'FIFO':
+         return this[UNSUPPORTED](entry)
+ 
+@@ -177,38 +180,45 @@ class Unpack extends Parser {
+   }
+ 
+   [HARDLINK] (entry) {
+     this[LINK](entry, path.resolve(this.cwd, entry.linkpath), 'link')
+   }
+ 
+   [PEND] () {
+     this[PENDING]++
+   }
+ 
+   [UNPEND] () {
+     this[PENDING]--
+     this[MAYBECLOSE]()
+   }
+ 
++  [SKIPNEWER] (entry) {
++    this[UNPEND]()
++    entry.resume()
++  }
++
+   // check if a thing is there, and if so, try to clobber it
+   [CHECKFS] (entry) {
+     this[PEND]()
+     this[MKDIR](path.dirname(entry.absolute), this.dmode, er => {
+       if (er)
+         return this[ONERROR](er, entry)
+       fs.lstat(entry.absolute, (er, st) => {
+-        if (er || (entry.type === 'File' && !this.unlink && st.isFile()))
++        if (this.newer && st.mtime > entry.mtime)
++          this[SKIPNEWER](entry)
++        else if (er || (entry.type === 'File' && !this.unlink && st.isFile()))
+           this[MAKEFS](null, entry)
+         else if (st.isDirectory()) {
+           if (entry.type === 'Directory') {
+             if (!entry.mode || (st.mode & 0o7777) === entry.mode)
+               this[MAKEFS](null, entry)
+             else
+               fs.chmod(entry.absolute, entry.mode, er => this[MAKEFS](er, entry))
+           } else
+             fs.rmdir(entry.absolute, er => this[MAKEFS](er, entry))
+         } else
+           fs.unlink(entry.absolute, er => this[MAKEFS](er, entry))
+       })
+     })
+   }
+ 
+@@ -249,31 +259,33 @@ class Unpack extends Parser {
+     })
+   }
+ }
+ 
+ class UnpackSync extends Unpack {
+   constructor (opt) {
+     super(opt)
+   }
+ 
+   [CHECKFS] (entry) {
+     const er = this[MKDIR](path.dirname(entry.absolute), this.dmode)
+     if (er)
+       return this[ONERROR](er, entry)
+     try {
+       const st = fs.lstatSync(entry.absolute)
+-      if (entry.type === 'File' && !this.unlink && st.isFile())
++      if (this.newer && st.mtime > entry.mtime)
++        return this[SKIPNEWER](entry)
++      else if (entry.type === 'File' && !this.unlink && st.isFile())
+         return this[MAKEFS](null, entry)
+       else {
+         try {
+           if (st.isDirectory()) {
+             if (entry.type === 'Directory') {
+               if (entry.mode && (st.mode & 0o7777) !== entry.mode)
+                 fs.chmodSync(entry.absolute, entry.mode)
+             } else
+               fs.rmdirSync(entry.absolute)
+           } else
+             fs.unlinkSync(entry.absolute)
+           return this[MAKEFS](null, entry)
+         } catch (er) {
+           return this[ONERROR](er, entry)
+         }
+diff --git a/test/unpack.js b/test/unpack.js
+index 2ab29a3..85d1993 100644
+--- a/test/unpack.js
++++ b/test/unpack.js
+@@ -1319,15 +1319,77 @@ t.test('fail close', t => {
+       cwd: dir,
+       onwarn: (w, d) => warnings.push([w, d])
+     }).on('close', _ => check(t)).end(data)
+   })
+ 
+   t.test('sync', t => {
+     new UnpackSync({
+       cwd: dir,
+       onwarn: (w, d) => warnings.push([w, d])
+     }).end(data)
+     check(t)
+   })
+ 
+   t.end()
+ })
++
++t.test('skip newer', t => {
++  const dir = path.join(unpackdir, 'skip-newer')
++  t.teardown(_ => rimraf.sync(dir))
++
++  const date = new Date('2013-12-19T17:00:00.000Z')
++  t.beforeEach(cb => {
++    rimraf.sync(dir)
++    mkdirp.sync(dir)
++    fs.writeFileSync(dir + '/x', 'y')
++    fs.utimesSync(dir + '/x', date, date)
++    cb()
++  })
++
++  const data = Buffer.concat([
++    new Header({
++      path: 'x',
++      type: 'File',
++      size: 1,
++      mode: 0o751,
++      mtime: new Date('2011-03-27T22:16:31.000Z')
++    }),
++    'x',
++    '',
++    ''
++  ].map(c => {
++    if (typeof c === 'string') {
++      const b = Buffer.alloc(512)
++      b.write(c)
++      return b
++    } else {
++      c.encode()
++      return c.block
++    }
++  }))
++
++  const check = t => {
++    const st = fs.lstatSync(dir + '/x')
++    t.equal(st.atime.toISOString(), date.toISOString())
++    t.equal(st.mtime.toISOString(), date.toISOString())
++    const data = fs.readFileSync(dir + '/x', 'utf8')
++    t.equal(data, 'y')
++    t.end()
++  }
++
++  t.test('async', t => {
++    new Unpack({
++      cwd: dir,
++      newer: true
++    }).on('close', _ => check(t)).end(data)
++  })
++
++  t.test('sync', t => {
++    new UnpackSync({
++      cwd: dir,
++      newer: true
++    }).end(data)
++    check(t)
++  })
++
++  t.end()
++})

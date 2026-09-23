@@ -1,0 +1,63 @@
+{
+  "candidate": {
+    "candidate_id": "candidate-4",
+    "filepath": "anymail/webhooks/base.py",
+    "changed_line": 44,
+    "statement": "basic_auth = get_request_basic_auth(request)",
+    "change_type": "A",
+    "function_name": "validate_request",
+    "operation_type": "authentication_validation",
+    "selection_reason": "request -> get_request_basic_auth -> authentication decision",
+    "security_relevance_score": 0.6,
+    "code_context": "1: import re\n2: import warnings\n3: \n4: import six\n5: from django.http import HttpResponse\n6: from django.utils.decorators import method_decorator\n7: from django.views.decorators.csrf import csrf_exempt\n8: from django.views.generic import View\n9: \n10: from ..exceptions import AnymailInsecureWebhookWarning, AnymailWebhookValidationFailure\n11: from ..utils import get_anymail_setting, collect_all_methods, get_request_basic_auth\n12: \n13: \n14: class AnymailBasicAuthMixin(object):\n15:     \"\"\"Implements webhook basic auth as mixin to AnymailBaseWebhookView.\"\"\"\n16: \n17:     # Whether to warn if basic auth is not configured.\n18:     # For most ESPs, basic auth is the only webhook security,\n19:     # so the default is True. Subclasses can set False if\n20:     # they enforce other security (like signed webhooks).\n21:     warn_if_no_basic_auth = True\n22: \n23:     # List of allowable HTTP basic-auth 'user:pass' strings.\n24:     basic_auth = None  # (Declaring class attr allows override by kwargs in View.as_view.)\n25: \n26:     def __init__(self, **kwargs):\n27:         self.basic_auth = get_anymail_setting('webhook_authorization', default=[],\n28:                                               kwargs=kwargs)  # no esp_name -- auth is shared between ESPs\n29:         # Allow a single string:\n30:         if isinstance(self.basic_auth, six.string_types):\n31:             self.basic_auth = [self.basic_auth]\n32:         if self.warn_if_no_basic_auth and len(self.basic_auth) < 1:\n33:             warnings.warn(\n34:                 \"Your Anymail webhooks are insecure and open to anyone on the web. \"\n35:                 \"You should set WEBHOOK_AUTHORIZATION in your ANYMAIL settings. \"\n36:                 \"See 'Securing webhooks' in the Anymail docs.\",\n37:                 AnymailInsecureWebhookWarning)\n38:         # noinspection PyArgumentList\n39:         super(AnymailBasicAuthMixin, self).__init__(**kwargs)\n40: \n41:     def validate_request(self, request):\n42:         \"\"\"If configured for webhook basic auth, validate request has correct auth.\"\"\"\n43:         if self.basic_auth:\n44:             basic_auth = get_request_basic_auth(request)\n45:             if basic_auth is None or basic_auth not in self.basic_auth:\n46:                 # noinspection PyUnresolvedReferences\n47:                 raise AnymailWebhookValidationFailure(\n48:                     \"Missing or invalid basic auth in Anymail %s webhook\" % self.esp_name)\n49: \n50: \n51: # Mixin note: Django's View.__init__ doesn't cooperate with chaining,\n52: # so all mixins that need __init__ must appear before View in MRO.\n53: class AnymailBaseWebhookView(AnymailBasicAuthMixin, View):\n54:     \"\"\"Base view for processing ESP event webhooks\n55: \n56:     ESP-specific implementations should subclass\n57:     and implement parse_events. They may also\n58:     want to implement validate_request\n59:     if additional security is available.\n60:     \"\"\"\n61: \n62:     def __init__(self, **kwargs):\n63:         super(AnymailBaseWebhookView, self).__init__(**kwargs)\n64:         self.validators = collect_all_methods(self.__class__, 'validate_request')\n65: \n66:     # Subclass implementation:\n67: \n68:     # Where to send events: either ..signals.inbound or ..signals.tracking\n69:     signal = None\n70: \n71:     def validate_request(self, request):\n72:         \"\"\"Check validity of webhook post, or raise AnymailWebhookValidationFailure.\n73: \n74:         AnymailBaseWebhookView includes basic auth validation.\n75:         Subclasses can implement (or provide via mixins) if the ESP supports\n76:         additional validation (such as signature checking).\n77: \n78:         *All* definitions of this method in the class chain (including mixins)\n79:         will be called. There is no need to chain to the superclass.\n80:         (See self.run_validators and collect_all_methods.)\n81:         \"\"\"\n82:         # if request.POST['signature'] != expected_signature:\n83:         #     raise AnymailWebhookValidationFailure(\"...message...\")\n84:         # (else just do nothing)\n85:         pass\n86: \n87:     def parse_events(self, request):\n88:         \"\"\"Return a list of normalized AnymailWebhookEvent extracted from ESP post data.\n89: \n90:         Subclasses must implement.\n91:         \"\"\"\n92:         raise NotImplementedError()\n93: \n94:     # HTTP handlers (subclasses shouldn't need to override):\n95: \n96:     http_method_names = [\"post\", \"head\", \"options\"]\n97: \n98:     @method_decorator(csrf_exempt)\n99:     def dispatch(self, request, *args, **kwargs):\n100:         return super(AnymailBaseWebhookView, self).dispatch(request, *args, **kwargs)\n101: \n102:     def head(self, request, *args, **kwargs):\n103:         # Some ESPs verify the webhook with a HEAD request at configuration time\n104:         return HttpResponse()\n105: \n106:     def post(self, request, *args, **kwargs):\n107:         # Normal Django exception handling will do the right thing:\n108:         # - AnymailWebhookValidationFailure will turn into an HTTP 400 response\n109:         #   (via Django SuspiciousOperation handling)\n110:         # - Any other errors (e.g., in signal dispatch) will turn into HTTP 500\n111:         #   responses (via normal Django error handling). ESPs generally\n112:         #   treat that as \"try again later\".\n113:         self.run_validators(request)\n114:         events = self.parse_events(request)\n115:         esp_name = self.esp_name\n116:         for event in events:\n117:             self.signal.send(sender=self.__class__, event=event, esp_name=esp_name)\n118:         return HttpResponse()\n119: \n120:     # Request validation (subclasses shouldn't need to override):\n121: \n122:     def run_validators(self, request):\n123:         for validator in self.validators:\n124:             validator(self, request)\n125: \n126:     @property\n127:     def esp_name(self):\n128:         \"\"\"\n129:         Read-only name of the ESP for this webhook view.\n130: \n131:         (E.g., MailgunTrackingWebhookView will return \"Mailgun\")\n132:         \"\"\"\n133:         return re.sub(r'(Tracking|Inbox)WebhookView$', \"\", self.__class__.__name__)",
+    "source_summary": "HTTP Authorization header from incoming webhook request, extracted via request.META['HTTP_AUTHORIZATION']",
+    "sink_summary": "Authentication decision that raises AnymailWebhookValidationFailure if credentials are missing or invalid, preventing webhook processing",
+    "guard_summary": "Basic auth validation against configured credentials list; fails closed (raises exception) if auth fails or is missing when required",
+    "risk_pattern": "Webhook authentication bypass if basic auth is not properly configured or if validation logic has flaws",
+    "used_variable_sources": [
+      "request.META['HTTP_AUTHORIZATION']",
+      "self.basic_auth (configured credentials)"
+    ],
+    "called_function_context": [
+      "get_request_basic_auth",
+      "base64.b64decode",
+      "AnymailWebhookValidationFailure"
+    ],
+    "enclosing_conditions": [
+      "if self.basic_auth:",
+      "if basic_auth is None or basic_auth not in self.basic_auth:"
+    ],
+    "context_summary": "Basic auth validation runs as part of webhook request validation chain before processing events; protects against unauthorized webhook access",
+    "unresolved_facts": [
+      "Specific ESP implementations may add additional security controls beyond basic auth",
+      "Default credential configuration practices and strength requirements are unknown"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  "target_cwe": {
+    "cwe_id": "CWE-284",
+    "cwe_name": "Improper Access Control",
+    "description": "The product does not restrict or incorrectly restricts access to a resource from an unauthorized actor.",
+    "impact": "auth vulnerability impact",
+    "patterns": [
+      "authentication",
+      "authorization"
+    ],
+    "detection_indicators": [
+      "authentication",
+      "authorization"
+    ],
+    "remediation_steps": [
+      "Implement proper authentication and session management",
+      "Use multi-factor authentication where appropriate"
+    ],
+    "related_cwes": []
+  },
+  "stage3_hypothesis": {
+    "cwe_id": "CWE-284",
+    "cwe_name": "Improper Access Control",
+    "fit_reason": "Webhook access control via basic auth may be improperly enforced",
+    "proposal_source": "adaptive_bm25",
+    "retrieved_by_sast": true
+  }
+}

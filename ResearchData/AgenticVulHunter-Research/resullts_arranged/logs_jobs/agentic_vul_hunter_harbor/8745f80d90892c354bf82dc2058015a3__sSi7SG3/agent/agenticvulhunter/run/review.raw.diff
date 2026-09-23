@@ -1,0 +1,156 @@
+diff --git a/qutebrowser/browser/qutescheme.py b/qutebrowser/browser/qutescheme.py
+index 0e05cd7fb..0f86d0980 100644
+--- a/qutebrowser/browser/qutescheme.py
++++ b/qutebrowser/browser/qutescheme.py
+@@ -180,39 +180,41 @@ def qute_bookmarks(_url):
+ 
+     html = jinja.render('bookmarks.html',
+                         title='Bookmarks',
+                         bookmarks=bookmarks,
+                         quickmarks=quickmarks)
+     return 'text/html', html
+ 
+ 
+ def history_data(start_time, offset=None):
+     """Return history data.
+ 
+     Arguments:
+         start_time: select history starting from this timestamp.
+         offset: number of items to skip
+     """
++    # history atimes are stored as ints, ensure start_time is not a float
++    start_time = int(start_time)
+     hist = objreg.get('web-history')
+     if offset is not None:
+         entries = hist.entries_before(start_time, limit=1000, offset=offset)
+     else:
+         # end is 24hrs earlier than start
+         end_time = start_time - 24*60*60
+         entries = hist.entries_between(end_time, start_time)
+ 
+-    return [{"url": e.url, "title": e.title or e.url, "time": e.atime * 1000}
++    return [{"url": e.url, "title": e.title or e.url, "time": e.atime}
+             for e in entries]
+ 
+ 
+ @add_handler('history')
+ def qute_history(url):
+     """Handler for qute://history. Display and serve history."""
+     if url.path() == '/data':
+         try:
+             offset = QUrlQuery(url).queryItemValue("offset")
+             offset = int(offset) if offset else None
+         except ValueError as e:
+             raise QuteSchemeError("Query parameter offset is invalid", e)
+         # Use start_time in query or current time.
+         try:
+             start_time = QUrlQuery(url).queryItemValue("start_time")
+@@ -240,31 +242,31 @@ def qute_history(url):
+                 if query_date:
+                     curr_date = datetime.datetime.strptime(query_date,
+                         "%Y-%m-%d").date()
+             except ValueError:
+                 log.misc.debug("Invalid date passed to qute:history: " +
+                     query_date)
+ 
+             one_day = datetime.timedelta(days=1)
+             next_date = curr_date + one_day
+             prev_date = curr_date - one_day
+ 
+             # start_time is the last second of curr_date
+             start_time = time.mktime(next_date.timetuple()) - 1
+             history = [
+                 (i["url"], i["title"],
+-                 datetime.datetime.fromtimestamp(i["time"]/1000),
++                 datetime.datetime.fromtimestamp(i["time"]),
+                  QUrl(i["url"]).host())
+                 for i in history_data(start_time)
+             ]
+ 
+             return 'text/html', jinja.render(
+                 'history_nojs.html',
+                 title='History',
+                 history=history,
+                 curr_date=curr_date,
+                 next_date=next_date,
+                 prev_date=prev_date,
+                 today=datetime.date.today(),
+             )
+ 
+ 
+diff --git a/qutebrowser/javascript/history.js b/qutebrowser/javascript/history.js
+index 3f5f9def6..26b4405e9 100644
+--- a/qutebrowser/javascript/history.js
++++ b/qutebrowser/javascript/history.js
+@@ -162,31 +162,32 @@ window.loadHistory = (function() {
+         }
+ 
+         if (history.length === 0) {
+             // Reached end of history
+             window.onscroll = null;
+             EOF_MESSAGE.style.display = "block";
+             LOAD_LINK.style.display = "none";
+             return;
+         }
+ 
+         nextTime = history[history.length - 1].time;
+         nextOffset = 0;
+ 
+         for (var i = 0, len = history.length; i < len; i++) {
+             var item = history[i];
+-            var currentItemDate = new Date(item.time);
++            // python's time.time returns seconds, but js Date expects ms
++            var currentItemDate = new Date(item.time * 1000);
+             getSessionNode(currentItemDate).appendChild(makeHistoryRow(
+                 item.url, item.title, currentItemDate.toLocaleTimeString()
+             ));
+             lastItemDate = currentItemDate;
+             if (item.time === nextTime) {
+                 nextOffset++;
+             }
+         }
+     }
+ 
+     /**
+      * Load new history.
+      * @return {void}
+      */
+     function loadHistory() {
+diff --git a/tests/unit/browser/test_qutescheme.py b/tests/unit/browser/test_qutescheme.py
+index 154af0355..693b2607c 100644
+--- a/tests/unit/browser/test_qutescheme.py
++++ b/tests/unit/browser/test_qutescheme.py
+@@ -117,31 +117,31 @@ class TestHistoryHandler:
+         (72*60*60, 0)
+     ])
+     def test_qutehistory_data(self, start_time_offset, expected_item_count,
+             now):
+         """Ensure qute://history/data returns correct items."""
+         start_time = now - start_time_offset
+         url = QUrl("qute://history/data?start_time=" + str(start_time))
+         _mimetype, data = qutescheme.qute_history(url)
+         items = json.loads(data)
+ 
+         assert len(items) == expected_item_count
+ 
+         # test times
+         end_time = start_time - 24*60*60
+         for item in items:
+-            assert item['time'] <= start_time * 1000
+-            assert item['time'] > end_time * 1000
++            assert item['time'] <= start_time
++            assert item['time'] > end_time
+ 
+     def test_qute_history_benchmark(self, fake_web_history, benchmark, now):
+         r = range(100000)
+         entries = {
+             'atime': [int(now - t) for t in r],
+             'url': ['www.x.com/{}'.format(t) for t in r],
+             'title': ['x at {}'.format(t) for t in r],
+             'redirect': [False for _ in r],
+         }
+ 
+         fake_web_history.insert_batch(entries)
+         url = QUrl("qute://history/data?start_time={}".format(now))
+         _mimetype, data = benchmark(qutescheme.qute_history, url)
+         assert len(json.loads(data)) > 1

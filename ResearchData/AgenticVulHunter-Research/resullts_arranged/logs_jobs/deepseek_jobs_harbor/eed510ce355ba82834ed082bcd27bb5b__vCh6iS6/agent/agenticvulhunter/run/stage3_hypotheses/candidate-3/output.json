@@ -1,0 +1,75 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "index.js",
+  "changed_line": 11,
+  "statement": "var PLACE_HOLDER_REGEXP = new RegExp('\"@__(F|R|D|M|S|U|I)-' + UID + '-(\\\\d+)__@\"', 'g');",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "regexp_construction",
+  "selection_reason": "Extended placeholder regexp to include 'I' type -> allows injection of Infinity values during deserialization",
+  "security_relevance_score": 0.8,
+  "code_context": "1: /*\n2: Copyright (c) 2014, Yahoo! Inc. All rights reserved.\n3: Copyrights licensed under the New BSD License.\n4: See the accompanying LICENSE file for terms.\n5: */\n6: \n7: 'use strict';\n8: \n9: // Generate an internal UID to make the regexp pattern harder to guess.\n10: var UID                 = Math.floor(Math.random() * 0x10000000000).toString(16);\n11: var PLACE_HOLDER_REGEXP = new RegExp('\"@__(F|R|D|M|S|U|I)-' + UID + '-(\\\\d+)__@\"', 'g');\n12: \n13: var IS_NATIVE_CODE_REGEXP = /\\{\\s*\\[native code\\]\\s*\\}/g;\n14: var IS_PURE_FUNCTION = /function.*?\\(/;\n15: var IS_ARROW_FUNCTION = /.*?=>.*?/;\n16: var UNSAFE_CHARS_REGEXP   = /[<>\\/\\u2028\\u2029]/g;\n17: \n18: var RESERVED_SYMBOLS = ['*', 'async'];\n19: \n20: // Mapping of unsafe HTML and invalid JavaScript line terminator chars to their\n21: // Unicode char counterparts which are safe to use in JavaScript strings.\n22: var ESCAPED_CHARS = {\n23:     '<'     : '\\\\u003C',\n24:     '>'     : '\\\\u003E',\n25:     '/'     : '\\\\u002F',\n26:     '\\u2028': '\\\\u2028',\n27:     '\\u2029': '\\\\u2029'\n28: };\n29: \n30: function escapeUnsafeChars(unsafeChar) {\n31:     return ESCAPED_CHARS[unsafeChar];\n32: }\n33: \n34: function deleteFunctions(obj){\n35:     var functionKeys = [];\n36:     for (var key in obj) {\n37:         if (typeof obj[key] === \"function\") {\n38:             functionKeys.push(key);\n39:         }\n40:     }\n41:     for (var i = 0; i < functionKeys.length; i++) {\n42:         delete obj[functionKeys[i]];\n43:     }\n44: }\n45: \n46: module.exports = function serialize(obj, options) {\n47:     options || (options = {});\n48: \n49:     // Backwards-compatibility for `space` as the second argument.\n50:     if (typeof options === 'number' || typeof options === 'string') {\n51:         options = {space: options};\n52:     }\n53: \n54:     var functions = [];\n55:     var regexps   = [];\n56:     var dates     = [];\n57:     var maps      = [];\n58:     var sets      = [];\n59:     var undefs    = [];\n60:     var infinities= [];\n61: \n62:     // Returns placeholders for functions and regexps (identified by index)\n63:     // which are later replaced by their string representation.\n64:     function replacer(key, value) {\n65: \n66:         // For nested function\n67:         if(options.ignoreFunction){\n68:             deleteFunctions(value);\n69:         }\n70: \n71:         if (!value && value !== undefined) {\n72:             return value;\n73:         }\n74: \n75:         // If the value is an object w/ a toJSON method, toJSON is called before\n76:         // the replacer runs, so we use this[key] to get the non-toJSONed value.\n77:         var origValue = this[key];\n78:         var type = typeof origValue;\n79: \n80:         if (type === 'object') {\n81:             if(origValue instanceof RegExp) {\n82:                 return '@__R-' + UID + '-' + (regexps.push(origValue) - 1) + '__@';\n83:             }\n84: \n85:             if(origValue instanceof Date) {\n86:                 return '@__D-' + UID + '-' + (dates.push(origValue) - 1) + '__@';\n87:             }\n88: \n89:             if(origValue instanceof Map) {\n90:                 return '@__M-' + UID + '-' + (maps.push(origValue) - 1) + '__@';\n91:             }\n92: \n93:             if(origValue instanceof Set) {\n94:                 return '@__S-' + UID + '-' + (sets.push(origValue) - 1) + '__@';\n95:             }\n96:         }\n97: \n98:         if (type === 'function') {\n99:             return '@__F-' + UID + '-' + (functions.push(origValue) - 1) + '__@';\n100:         }\n101: \n102:         if (type === 'undefined') {\n103:             return '@__U-' + UID + '-' + (undefs.push(origValue) - 1) + '__@';\n104:         }\n105: \n106:         if (type === 'number' && !isNaN(origValue) && !isFinite(origValue)) {\n107:             return '@__I-' + UID + '-' + (infinities.push(origValue) - 1) + '__@';\n108:         }\n109: \n110:         return value;\n111:     }\n112: \n113:     function serializeFunc(fn) {\n114:       var serializedFn = fn.toString();\n115:       if (IS_NATIVE_CODE_REGEXP.test(serializedFn)) {\n116:           throw new TypeError('Serializing native function: ' + fn.name);\n117:       }\n118: \n119:       // pure functions, example: {key: function() {}}\n120:       if(IS_PURE_FUNCTION.test(serializedFn)) {\n121:           return serializedFn;\n122:       }\n123: \n124:       // arrow functions, example: arg1 => arg1+5\n125:       if(IS_ARROW_FUNCTION.test(serializedFn)) {\n126:           return serializedFn;\n127:       }\n128: \n129:       var argsStartsAt = serializedFn.indexOf('(');\n130:       var def = serializedFn.substr(0, argsStartsAt)\n131:         .trim()\n132:         .split(' ')\n133:         .filter(function(val) { return val.length > 0 });\n134: \n135:       var nonReservedSymbols = def.filter(function(val) {\n136:         return RESERVED_SYMBOLS.indexOf(val) === -1\n137:       });\n138: \n139:       // enhanced literal objects, example: {key() {}}\n140:       if(nonReservedSymbols.length > 0) {\n141:           return (def.indexOf('async') > -1 ? 'async ' : '') + 'function'\n142:             + (def.join('').indexOf('*') > -1 ? '*' : '')\n143:             + serializedFn.substr(argsStartsAt);\n144:       }\n145: \n146:       // arrow functions\n147:       return serializedFn;\n148:     }\n149: \n150:     // Check if the parameter is function\n151:     if (options.ignoreFunction && typeof obj === \"function\") {\n152:         obj = undefined;\n153:     }\n154:     // Protects against `JSON.stringify()` returning `undefined`, by serializing\n155:     // to the literal string: \"undefined\".\n156:     if (obj === undefined) {\n157:         return String(obj);\n158:     }\n159: \n160:     var str;",
+  "source_summary": "Infinity values from user-provided objects during serialization",
+  "sink_summary": "eval() function in test suite that evaluates serialized output containing Infinity placeholders",
+  "guard_summary": "No validation of Infinity values before serialization; unsafe eval() usage without sanitization",
+  "risk_pattern": "Infinity values are serialized with '@__I-' placeholders and directly injected into eval() context without sanitization",
+  "used_variable_sources": [
+    "UID (randomly generated)",
+    "infinities array (user-provided Infinity values)"
+  ],
+  "called_function_context": [
+    "serialize()",
+    "replacer()",
+    "str.replace() with PLACE_HOLDER_REGEXP"
+  ],
+  "enclosing_conditions": [
+    "options.isJSON check for serialization mode"
+  ],
+  "context_summary": "The regex change adds 'I' type for Infinity values. When serialized objects contain Infinity, they get placeholder tokens that are later replaced with raw Infinity values and evaluated with eval()",
+  "unresolved_facts": [
+    "Whether the serialized output is used in production with eval() or only in tests",
+    "If there are any input validation mechanisms for Infinity values before serialization",
+    "Whether the eval() usage is limited to test environments only"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-502",
+      "cwe_name": "Deserialization of Untrusted Data",
+      "fit_reason": "Stage-2 evidence shows serialization of user-provided Infinity values with placeholders that are later evaluated via eval() - matches deserialization vulnerability pattern",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-94",
+      "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+      "fit_reason": "Infinity values from user input are serialized into placeholders that get replaced and evaluated as code in eval() context",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-676",
+      "cwe_name": "Use of Potentially Dangerous Function",
+      "fit_reason": "eval() function used to evaluate serialized output containing Infinity placeholders - dangerous function usage",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-116",
+    "CWE-19",
+    "CWE-200",
+    "CWE-340",
+    "CWE-502",
+    "CWE-506",
+    "CWE-563",
+    "CWE-571",
+    "CWE-676",
+    "CWE-685",
+    "CWE-704",
+    "CWE-829",
+    "CWE-863",
+    "CWE-88",
+    "CWE-94"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25"
+}

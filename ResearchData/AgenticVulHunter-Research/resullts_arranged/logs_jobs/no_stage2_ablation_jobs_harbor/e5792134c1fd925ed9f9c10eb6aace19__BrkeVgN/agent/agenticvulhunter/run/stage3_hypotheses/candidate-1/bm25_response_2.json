@@ -1,0 +1,232 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 79,
+      "statement": "substitutions[key] = values[0]",
+      "change_type": "A",
+      "function_name": "StoreInviteServlet.render_POST",
+      "operation_type": "data_propagation",
+      "selection_reason": "observable input from request.args -> exact operation of direct assignment without sanitization -> security-sensitive effect of potentially injecting unescaped data into email templates",
+      "security_relevance_score": 0.85,
+      "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: import nacl.signing\n17: import random\n18: import string\n19: from email.header import Header\n20: \n21: from twisted.web.resource import Resource\n22: from unpaddedbase64 import encode_base64\n23: \n24: import json\n25: from sydent.db.invite_tokens import JoinTokenStore\n26: from sydent.db.threepid_associations import GlobalAssociationStore\n27: \n28: from sydent.http.servlets import require_args, send_cors\n29: from sydent.util.emailutils import sendEmail\n30: \n31: \n32: class StoreInviteServlet(Resource):\n33:     def __init__(self, syd):\n34:         self.sydent = syd\n35: \n36:     def render_POST(self, request):\n37:         send_cors(request)\n38:         err = require_args(request, (\"medium\", \"address\", \"room_id\", \"sender\",))\n39:         if err:\n40:             return json.dumps(err)\n41:         medium = request.args[\"medium\"][0]\n42:         address = request.args[\"address\"][0]\n43:         roomId = request.args[\"room_id\"][0]\n44:         sender = request.args[\"sender\"][0]\n45: \n46:         globalAssocStore = GlobalAssociationStore(self.sydent)\n47:         mxid = globalAssocStore.getMxid(medium, address)\n48:         if mxid:\n49:             request.setResponseCode(400)\n50:             return json.dumps({\n51:                 \"errcode\": \"THREEPID_IN_USE\",\n52:                 \"error\": \"Binding already known\",\n53:                 \"mxid\": mxid,\n54:             })\n55: \n56:         if medium != \"email\":\n57:             request.setResponseCode(400)\n58:             return json.dumps({\n59:                 \"errcode\": \"M_UNRECOGNIZED\",\n60:                 \"error\": \"Didn't understand medium '%s'\" % (medium,),\n61:             })\n62: \n63:         token = self._randomString(128)\n64: \n65:         tokenStore = JoinTokenStore(self.sydent)\n66: \n67:         ephemeralPrivateKey = nacl.signing.SigningKey.generate()\n68:         ephemeralPublicKey = ephemeralPrivateKey.verify_key\n69: \n70:         ephemeralPrivateKeyBase64 = encode_base64(ephemeralPrivateKey.encode(), True)\n71:         ephemeralPublicKeyBase64 = encode_base64(ephemeralPublicKey.encode(), True)\n72: \n73:         tokenStore.storeEphemeralPublicKey(ephemeralPublicKeyBase64)\n74:         tokenStore.storeToken(medium, address, roomId, sender, token)\n75: \n76:         substitutions = {}\n77:         for key, values in request.args.items():\n78:             if len(values) == 1 and type(values[0]) == str:\n79:                 substitutions[key] = values[0]\n80:         substitutions[\"token\"] = token\n81: \n82:         required = [\n83:             'sender_display_name',\n84:             'token',\n85:             'room_name',\n86:             'bracketed_room_name',\n87:             'room_avatar_url',\n88:             'sender_display_name',\n89:             'guest_user_id',\n90:             'guest_access_token',\n91:         ]\n92:         for k in required:\n93:             substitutions.setdefault(k, '')\n94: \n95:         substitutions[\"ephemeral_private_key\"] = ephemeralPrivateKeyBase64\n96:         if substitutions[\"room_name\"] != '':\n97:             substitutions[\"bracketed_room_name\"] = \"(%s)\" % substitutions[\"room_name\"]\n98: \n99:         subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')\n100:         substitutions[\"subject_header_value\"] = subject_header.encode()\n101: \n102:         sendEmail(self.sydent, \"email.invite_template\", address, substitutions)\n103: \n104:         pubKey = self.sydent.keyring.ed25519.verify_key\n105:         pubKeyBase64 = encode_base64(pubKey.encode())\n106: \n107:         baseUrl = \"%s/_matrix/identity/api/v1\" % (self.sydent.cfg.get('http', 'client_http_base'),)\n108: \n109:         keysToReturn = []\n110:         keysToReturn.append({\n111:             \"public_key\": pubKeyBase64,\n112:             \"key_validity_url\": baseUrl + \"/pubkey/isvalid\",\n113:         })\n114:         keysToReturn.append({\n115:             \"public_key\": ephemeralPublicKeyBase64,\n116:             \"key_validity_url\": baseUrl + \"/pubkey/ephemeral/isvalid\",\n117:         })\n118: \n119:         resp = {\n120:             \"token\": token,\n121:             \"public_key\": pubKeyBase64,\n122:             \"public_keys\": keysToReturn,\n123:             \"display_name\": self.redact(address),\n124:         }\n125: \n126:         return json.dumps(resp)\n127: \n128:     def redact(self, address):\n129:         return \"@\".join(map(self._redact, address.split(\"@\", 1)))\n130: \n131:     def _redact(self, s):\n132:         if len(s) > 5:\n133:             return s[:3] + \"...\"\n134:         elif len(s) > 1:\n135:             return s[0] + \"...\"\n136:         else:\n137:             return \"...\"\n138: \n139:     def _randomString(self, length):\n140:         return ''.join(random.choice(string.ascii_letters) for _ in xrange(length))",
+      "retrieval_query": {
+        "mechanism_summary": "data from request.args directly assigned to template substitutions without sanitization, leading to potential injection into email templates"
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 17.9264,
+          "raw_bm25_score": 17.9264,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/template-injection",
+          "cwe_id": "CWE-74",
+          "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 12.9067,
+          "raw_bm25_score": 12.9067,
+          "description": "Using user-controlled data to create a template can lead to remote code execution or cross site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized APIs and separate data from control instructions. Validate input format and escape special characters.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-074"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 11.7368,
+          "raw_bm25_score": 11.7368,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/decompression-bomb",
+          "cwe_id": "CWE-409",
+          "cwe_name": "Improper Handling of Highly Compressed Data (Data Amplification)",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 10.1295,
+          "raw_bm25_score": 10.1295,
+          "description": "Uncontrolled data that flows into decompression library APIs without checking the compression rate is dangerous",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-409"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/predictable-token",
+          "cwe_id": "CWE-340",
+          "cwe_name": "Generation of Predictable Numbers or Identifiers",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 8.9988,
+          "raw_bm25_score": 8.9988,
+          "description": "Tokens used for sensitive tasks, such as, password recovery, and email confirmation, should not use predictable values.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-340"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/reflective-xss-email",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 8.873,
+          "raw_bm25_score": 8.873,
+          "description": "Writing user input directly to a web page allows for a cross-site scripting vulnerability.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output operations. Implement proper escaping for HTML, JavaScript, CSS, and URL contexts.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-116"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/xpath-injection",
+          "cwe_id": "CWE-643",
+          "cwe_name": "Improper Neutralization of Data within XPath Expressions ('XPath Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 8.4692,
+          "raw_bm25_score": 8.4692,
+          "description": "Building a XPath query from user-controlled sources is vulnerable to insertion of malicious Xpath code by the user.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-643"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/jinja2/autoescape-false",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 8.4501,
+          "raw_bm25_score": 8.4501,
+          "description": "Using jinja2 templates with 'autoescape=False' can cause a cross-site scripting vulnerability.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-079"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.7725,
+          "raw_bm25_score": 7.7725,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/log-injection",
+          "cwe_id": "CWE-117",
+          "cwe_name": "Improper Output Neutralization for Logs",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.4602,
+          "raw_bm25_score": 7.4602,
+          "description": "Building log entries from user-controlled data is vulnerable to insertion of forged log entries by a malicious user.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-117"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

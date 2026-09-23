@@ -1,0 +1,61 @@
+{
+  "candidate": {
+    "candidate_id": "candidate-3",
+    "filepath": "anymail/webhooks/mandrill.py",
+    "changed_line": 49,
+    "statement": "url = self.webhook_url or get_request_uri(request)",
+    "change_type": "A",
+    "function_name": "MandrillSignatureMixin.validate_request",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.7,
+    "code_context": "1: import json\n2: from datetime import datetime\n3: \n4: import hashlib\n5: import hmac\n6: from base64 import b64encode\n7: from django.utils.crypto import constant_time_compare\n8: from django.utils.timezone import utc\n9: \n10: from .base import AnymailBaseWebhookView\n11: from ..exceptions import AnymailWebhookValidationFailure, AnymailConfigurationError\n12: from ..signals import tracking, AnymailTrackingEvent, EventType\n13: from ..utils import get_anymail_setting, getfirst, get_request_uri\n14: \n15: \n16: class MandrillSignatureMixin(object):\n17:     \"\"\"Validates Mandrill webhook signature\"\"\"\n18: \n19:     # These can be set from kwargs in View.as_view, or pulled from settings in init:\n20:     webhook_key = None  # required\n21:     webhook_url = None  # optional; defaults to actual url used\n22: \n23:     def __init__(self, **kwargs):\n24:         # noinspection PyUnresolvedReferences\n25:         esp_name = self.esp_name\n26:         # webhook_key is required for POST, but not for HEAD when Mandrill validates webhook url.\n27:         # Defer \"missing setting\" error until we actually try to use it in the POST...\n28:         webhook_key = get_anymail_setting('webhook_key', esp_name=esp_name, default=None,\n29:                                           kwargs=kwargs, allow_bare=True)\n30:         if webhook_key is not None:\n31:             self.webhook_key = webhook_key.encode('ascii')  # hmac.new requires bytes key in python 3\n32:         self.webhook_url = get_anymail_setting('webhook_url', esp_name=esp_name, default=None,\n33:                                                kwargs=kwargs, allow_bare=True)\n34:         # noinspection PyArgumentList\n35:         super(MandrillSignatureMixin, self).__init__(**kwargs)\n36: \n37:     def validate_request(self, request):\n38:         if self.webhook_key is None:\n39:             # issue deferred \"missing setting\" error (re-call get-setting without a default)\n40:             # noinspection PyUnresolvedReferences\n41:             get_anymail_setting('webhook_key', esp_name=self.esp_name, allow_bare=True)\n42: \n43:         try:\n44:             signature = request.META[\"HTTP_X_MANDRILL_SIGNATURE\"]\n45:         except KeyError:\n46:             raise AnymailWebhookValidationFailure(\"X-Mandrill-Signature header missing from webhook POST\")\n47: \n48:         # Mandrill signs the exact URL (including basic auth, if used) plus the sorted POST params:\n49:         url = self.webhook_url or get_request_uri(request)\n50:         params = request.POST.dict()\n51:         signed_data = url\n52:         for key in sorted(params.keys()):\n53:             signed_data += key + params[key]\n54: \n55:         expected_signature = b64encode(hmac.new(key=self.webhook_key, msg=signed_data.encode('utf-8'),\n56:                                                 digestmod=hashlib.sha1).digest())\n57:         if not constant_time_compare(signature, expected_signature):\n58:             raise AnymailWebhookValidationFailure(\n59:                 \"Mandrill webhook called with incorrect signature (for url %r)\" % url)\n60: \n61: \n62: class MandrillBaseWebhookView(MandrillSignatureMixin, AnymailBaseWebhookView):\n63:     \"\"\"Base view class for Mandrill webhooks\"\"\"\n64: \n65:     warn_if_no_basic_auth = False  # because we validate against signature\n66: \n67:     def parse_events(self, request):\n68:         esp_events = json.loads(request.POST['mandrill_events'])\n69:         return [self.esp_to_anymail_event(esp_event) for esp_event in esp_events]\n70: \n71:     def esp_to_anymail_event(self, esp_event):\n72:         raise NotImplementedError()\n73: \n74: \n75: class MandrillTrackingWebhookView(MandrillBaseWebhookView):\n76: \n77:     signal = tracking\n78: \n79:     event_types = {\n80:         # Message events:\n81:         'send': EventType.SENT,\n82:         'deferral': EventType.DEFERRED,\n83:         'hard_bounce': EventType.BOUNCED,\n84:         'soft_bounce': EventType.DEFERRED,\n85:         'open': EventType.OPENED,\n86:         'click': EventType.CLICKED,\n87:         'spam': EventType.COMPLAINED,\n88:         'unsub': EventType.UNSUBSCRIBED,\n89:         'reject': EventType.REJECTED,\n90:         # Sync events (we don't really normalize these well):\n91:         'whitelist': EventType.UNKNOWN,\n92:         'blacklist': EventType.UNKNOWN,\n93:         # Inbound events:\n94:         'inbound': EventType.INBOUND,\n95:     }\n96: \n97:     def esp_to_anymail_event(self, esp_event):\n98:         esp_type = getfirst(esp_event, ['event', 'type'], None)\n99:         event_type = self.event_types.get(esp_type, EventType.UNKNOWN)\n100:         if event_type == EventType.INBOUND:\n101:             raise AnymailConfigurationError(\n102:                 \"You seem to have set Mandrill's *inbound* webhook URL \"\n103:                 \"to Anymail's Mandrill *tracking* webhook URL.\")\n104: \n105:         try:\n106:             timestamp = datetime.fromtimestamp(esp_event['ts'], tz=utc)\n107:         except (KeyError, ValueError):\n108:             timestamp = None\n109: \n110:         try:\n111:             recipient = esp_event['msg']['email']\n112:         except KeyError:\n113:             try:\n114:                 recipient = esp_event['reject']['email']  # sync events\n115:             except KeyError:\n116:                 recipient = None\n117: \n118:         try:\n119:             mta_response = esp_event['msg']['diag']\n120:         except KeyError:\n121:             mta_response = None\n122: \n123:         try:\n124:             description = getfirst(esp_event['reject'], ['detail', 'reason'])\n125:         except KeyError:\n126:             description = None\n127: \n128:         try:\n129:             metadata = esp_event['msg']['metadata']\n130:         except KeyError:\n131:             metadata = None\n132: \n133:         try:\n134:             tags = esp_event['msg']['tags']\n135:         except KeyError:\n136:             tags = None\n137: \n138:         return AnymailTrackingEvent(\n139:             click_url=esp_event.get('url', None),\n140:             description=description,\n141:             esp_event=esp_event,\n142:             event_type=event_type,\n143:             message_id=esp_event.get('_id', None),\n144:             metadata=metadata,\n145:             mta_response=mta_response,\n146:             recipient=recipient,\n147:             reject_reason=None,  # probably map esp_event['msg']['bounce_description'], but insufficient docs\n148:             tags=tags,\n149:             timestamp=timestamp,\n150:             user_agent=esp_event.get('user_agent', None),\n151:         )",
+    "source_summary": "The url variable is sourced from either the instance's webhook_url attribute (which can be set via Django settings) or from get_request_uri(request), which constructs a URL including any basic authentication credentials present in the request.",
+    "sink_summary": "The constructed url is used as part of the signed_data for HMAC signature validation. It is also included in an error message if signature validation fails.",
+    "guard_summary": "The security control is the HMAC signature validation using webhook_key, which ensures that only requests with a valid signature (computed over the url and POST parameters) are accepted. The basic auth credentials in the URL are part of the signed data, so they must match what Mandrill used when signing.",
+    "risk_pattern": "If webhook_url is set to an attacker-controlled value, it could be used to manipulate the HMAC signature validation by changing the URL that gets signed. However, if webhook_url is not explicitly set, get_request_uri(request) is used which includes basic auth credentials from the request, making the signature dependent on those credentials.",
+    "used_variable_sources": [
+      "self.webhook_url",
+      "get_request_uri(request)"
+    ],
+    "called_function_context": [
+      "get_request_uri(request)"
+    ],
+    "enclosing_conditions": [],
+    "context_summary": "The statement determines which URL is used for HMAC signature validation. If self.webhook_url is set (potentially from Django settings), it's used directly; otherwise, get_request_uri(request) constructs the URL including any basic auth credentials present in the request.",
+    "unresolved_facts": [
+      "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+      "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  "target_cwe": {
+    "cwe_id": "CWE-22",
+    "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+    "description": "The product uses external input to construct a pathname that is intended to identify a file or directory that is located underneath a restricted parent directory, but the product does not properly neutralize special elements within the pathname that can cause the pathname to resolve to a location that is outside of the restricted directory. Common in: path_traversal, input_validation.",
+    "impact": "code execution, data access, data modification",
+    "patterns": [
+      "path_traversal",
+      "input_validation"
+    ],
+    "detection_indicators": [
+      "path_traversal",
+      "input_validation"
+    ],
+    "remediation_steps": [
+      "Validate and sanitize all file paths and names",
+      "Use canonical path resolution and access controls"
+    ],
+    "related_cwes": [
+      "CWE-706",
+      "CWE-668"
+    ]
+  },
+  "stage3_hypothesis": {
+    "cwe_id": "CWE-22",
+    "cwe_name": "Path Traversal",
+    "fit_reason": "The mechanism involves manipulation of URL in HMAC signature validation where webhook_url can be attacker-controlled, potentially leading to path traversal if the URL is used in file operations",
+    "proposal_source": "adaptive_bm25",
+    "retrieved_by_sast": true
+  }
+}

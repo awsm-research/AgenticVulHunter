@@ -1,0 +1,212 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "dbusmock/mockobject.py",
+  "changed_line": 37,
+  "statement": "def load_module(name):",
+  "change_type": "A",
+  "function_name": "load_module",
+  "operation_type": "code_execution",
+  "selection_reason": "observable input 'name' -> exact operation 'importlib.import_module(m)' -> security-sensitive effect of executing arbitrary Python code from a file path",
+  "security_relevance_score": 0.9,
+  "code_context": "1: # coding: UTF-8\n2: '''Mock D-BUS objects for test suites.'''\n3: \n4: # This program is free software; you can redistribute it and/or modify it under\n5: # the terms of the GNU Lesser General Public License as published by the Free\n6: # Software Foundation; either version 3 of the License, or (at your option) any\n7: # later version.  See http://www.gnu.org/copyleft/lgpl.html for the full text\n8: # of the license.\n9: \n10: __author__ = 'Martin Pitt'\n11: __email__ = 'martin.pitt@ubuntu.com'\n12: __copyright__ = '(c) 2012 Canonical Ltd.'\n13: __license__ = 'LGPL 3+'\n14: \n15: import time\n16: import sys\n17: import importlib\n18: \n19: # we do not use this ourselves, but mock methods often want to use this\n20: import os\n21: os  # pyflakes\n22: \n23: import dbus\n24: import dbus.service\n25: \n26: # global path -> DBusMockObject mapping\n27: objects = {}\n28: \n29: MOCK_IFACE = 'org.freedesktop.DBus.Mock'\n30: \n31: # stubs to keep code compatible with Python 2 and 3\n32: if sys.version_info[0] >= 3:\n33:     long = int\n34:     unicode = str\n35: \n36: \n37: def load_module(name):\n38:     if os.path.exists(name) and os.path.splitext(name)[1] == '.py':\n39:         sys.path.insert(0, os.path.dirname(os.path.abspath(name)))\n40:         try:\n41:             m = os.path.splitext(os.path.basename(name))[0]\n42:             module = importlib.import_module(m)\n43:         finally:\n44:             sys.path.pop(0)\n45: \n46:         return module\n47: \n48:     return importlib.import_module('dbusmock.templates.' + name)\n49: \n50: \n51: class DBusMockObject(dbus.service.Object):\n52:     '''Mock D-Bus object\n53: \n54:     This can be configured to have arbitrary methods (including code execution)\n55:     and properties via methods on the org.freedesktop.DBus.Mock interface, so\n56:     that you can control the mock from any programming language.\n57:     '''\n58: \n59:     def __init__(self, bus_name, path, interface, props, logfile=None):\n60:         '''Create a new DBusMockObject\n61: \n62:         bus_name: A dbus.service.BusName instance where the object will be put on\n63:         path: D-Bus object path\n64:         interface: Primary D-Bus interface name of this object (where\n65:                    properties and methods will be put on)\n66:         props: A property_name (string) → property (Variant) map with initial\n67:                properties on \"interface\"\n68:         logfile: When given, method calls will be logged into that file name;\n69:                  if None, logging will be written to stdout. Note that you can\n70:                  also query the called methods over D-BUS with GetCalls() and\n71:                  GetMethodCalls().\n72:         '''\n73:         super(self.__class__, self).__init__(bus_name, path)\n74: \n75:         self.bus_name = bus_name\n76:         self.interface = interface\n77:         # interface -> name -> value\n78:         self.props = {}\n79:         self.props[interface] = props\n80: \n81:         # interface -> name -> (in_signature, out_signature, code, dbus_wrapper_fn)\n82:         self.methods = {interface: {}}\n83: \n84:         if logfile:\n85:             self.logfile = open(logfile, 'w')\n86:         else:\n87:             self.logfile = None\n88:         self.call_log = []\n89: \n90:     def __del__(self):\n91:         if self.logfile:\n92:             self.logfile.close()\n93: \n94:     @dbus.service.method(dbus.PROPERTIES_IFACE,\n95:                          in_signature='ss', out_signature='v')\n96:     def Get(self, interface_name, property_name):\n97:         '''Standard D-Bus API for getting a property value'''\n98: \n99:         try:\n100:             return self.GetAll(interface_name)[property_name]\n101:         except KeyError:\n102:             raise dbus.exceptions.DBusException(\n103:                 self.interface + '.UnknownProperty',\n104:                 'no such property ' + property_name)\n105: \n106:     @dbus.service.method(dbus.PROPERTIES_IFACE,\n107:                          in_signature='s', out_signature='a{sv}')\n108:     def GetAll(self, interface_name, *args, **kwargs):\n109:         '''Standard D-Bus API for getting all property values'''\n110: \n111:         try:\n112:             return self.props[interface_name]\n113:         except KeyError:\n114:             raise dbus.exceptions.DBusException(\n115:                 self.interface + '.UnknownInterface',\n116:                 'no such interface ' + interface_name)\n117: \n118:     @dbus.service.method(dbus.PROPERTIES_IFACE,\n119:                          in_signature='ssv', out_signature='')\n120:     def Set(self, interface_name, property_name, value, *args, **kwargs):\n121:         '''Standard D-Bus API for setting a property value'''\n122: \n123:         try:\n124:             iface_props = self.props[interface_name]\n125:         except KeyError:\n126:             raise dbus.exceptions.DBusException(\n127:                 self.interface + '.UnknownInterface',\n128:                 'no such interface ' + interface_name)\n129: \n130:         if property_name not in iface_props:\n131:             raise dbus.exceptions.DBusException(\n132:                 self.interface + '.UnknownProperty',\n133:                 'no such property ' + property_name)\n134: \n135:         iface_props[property_name] = value\n136: \n137:     @dbus.service.method(MOCK_IFACE,\n138:                          in_signature='ssa{sv}a(ssss)',\n139:                          out_signature='')\n140:     def AddObject(self, path, interface, properties, methods):\n141:         '''Add a new D-Bus object to the mock\n142: \n143:         path: D-Bus object path\n144:         interface: Primary D-Bus interface name of this object (where\n145:                    properties and methods will be put on)\n146:         properties: A property_name (string) → value map with initial\n147:                     properties on \"interface\"\n148:         methods: An array of 4-tuples (name, in_sig, out_sig, code) describing\n149:                  methods to add to \"interface\"; see AddMethod() for details of\n150:                  the tuple values\n151: \n152:         Example:\n153:         dbus_proxy.AddObject('/com/example/Foo/Manager',\n154:                              'com.example.Foo.Control',\n155:                              {\n156:                                  'state': dbus.String('online', variant_level=1),\n157:                              },\n158:                              [\n159:                                  ('Start', '', '', ''),\n160:                                  ('EchoInt', 'i', 'i', 'ret = args[0]'),\n161:                                  ('GetClients', '', 'ao', 'ret = [\"/com/example/Foo/Client1\"]'),\n162:                              ])\n163:         '''\n164:         if path in objects:\n165:             raise dbus.exceptions.DBusException(\n166:                 'org.freedesktop.DBus.Mock.NameError',\n167:                 'object %s already exists' % path)\n168: \n169:         obj = DBusMockObject(self.bus_name,\n170:                              path,\n171:                              interface,\n172:                              properties)\n173:         obj.AddMethods(interface, methods)\n174: \n175:         objects[path] = obj\n176: \n177:     @dbus.service.method(MOCK_IFACE,\n178:                          in_signature='s',\n179:                          out_signature='')\n180:     def RemoveObject(self, path):\n181:         '''Remove a D-Bus object from the mock'''\n182: \n183:         try:\n184:             del objects[path]\n185:         except KeyError:\n186:             raise dbus.exceptions.DBusException(",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "The function 'load_module' accepts a user-controlled path 'name', checks if it's a .py file, and then uses importlib.import_module() on it. This allows an attacker to potentially load and execute arbitrary Python code from any location on the filesystem, which is a classic path traversal vulnerability.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-95",
+      "cwe_name": "Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+      "fit_reason": "The function 'load_module' uses importlib.import_module() to execute code from a file path provided by the user. If an attacker can control this path, they can cause arbitrary code execution, which is a form of eval injection where the evaluation happens through module loading.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-502",
+      "cwe_name": "Deserialization of Untrusted Data",
+      "fit_reason": "While not directly deserializing data, the function 'load_module' effectively loads and executes arbitrary Python code from a user-provided path. This can be seen as a form of untrusted data execution, where the code loaded is untrusted and potentially malicious.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1236",
+    "CWE-208",
+    "CWE-22",
+    "CWE-287",
+    "CWE-477",
+    "CWE-489",
+    "CWE-502",
+    "CWE-561",
+    "CWE-59",
+    "CWE-643",
+    "CWE-685",
+    "CWE-74",
+    "CWE-943",
+    "CWE-95"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "dbusmock/mockobject.py",
+      "changed_line": 37,
+      "statement": "def load_module(name):",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The function accepts a user-controlled 'name' parameter, checks if it's a .py file, and then uses importlib.import_module() on it without proper validation or restriction of the path, allowing potential code execution from any filesystem location."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The 'name' parameter is passed directly into the function and used to construct a file path. If an attacker controls this input, they can specify arbitrary paths that resolve outside of intended directories, leading to code execution."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted or modified to include proper path validation and restriction, the vulnerability would be mitigated. The current implementation allows direct use of user input in file path resolution without sanitization."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "There is no validation or sanitization of the 'name' parameter before it's used to construct a file path. The code does not check if the path is within a restricted directory, nor does it canonicalize or sanitize the input.",
+          "required_control": "Path validation and restriction",
+          "control_requirement_evidence": "CWE-22 requires that all external inputs used in constructing file paths be validated to ensure they do not resolve outside of intended directories.",
+          "existing_controls_checked": [
+            "os.path.exists(name) check - only verifies existence, not path legitimacy",
+            "os.path.splitext(name)[1] == '.py' check - only validates extension, not path traversal"
+          ],
+          "deficiency_evidence": "The function accepts arbitrary paths without validating that they are within a restricted directory. The code does not implement any mechanism to prevent path traversal attacks."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "An attacker who controls the 'name' parameter can execute arbitrary Python code from any location on the filesystem, leading to potential code execution, data access, and data modification as per CWE-22 impact."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the load_module function would not accept a user-controlled path parameter that could be used to execute arbitrary Python code from any location on the filesystem. The vulnerability would be mitigated by removing this direct path traversal mechanism.",
+      "supporting_evidence": [
+        "The function accepts 'name' as a parameter which is directly used in file path construction",
+        "importlib.import_module() is called with a potentially untrusted module name derived from user input",
+        "No validation or restriction of the path is performed before code execution"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the function is actually called with attacker-controlled input in practice",
+        "The exact reachability and impact of this vulnerability in the specific context"
+      ],
+      "review_comment": "The load_module function accepts a user-controllable 'name' parameter that can be used to execute arbitrary Python code from any filesystem location. The function does not validate or restrict paths, allowing potential path traversal attacks. To remediate, implement strict validation and restriction of file paths to prevent access outside of intended directories.",
+      "change_type": "A",
+      "raw_score": 0.7000000000000001,
+      "score": 0.7000000000000001
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "dbusmock/mockobject.py",
+      "changed_line": 37,
+      "statement": "def load_module(name):",
+      "cwe_id": "CWE-95",
+      "cwe_name": "Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The function 'load_module' uses importlib.import_module() to execute code from a file path provided by the user, which directly matches the CWE-95 mechanism of dynamically evaluating code based on user input."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The parameter 'name' is passed directly into importlib.import_module() without sanitization or validation, creating a clear path from user-controllable input to code execution. The function is called from D-Bus methods which can be invoked by external actors."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If the candidate line were reverted, the load_module function would not exist or would not allow arbitrary code execution via file paths. The patch introduces a direct path for code injection through module loading."
+        },
+        "security_control": {
+          "score": 0.9,
+          "evidence": "There is no validation or sanitization of the 'name' parameter before it is used in importlib.import_module(). The function directly uses user input to determine which module to load and execute, without any checks for malicious paths.",
+          "required_control": "Input validation and sanitization",
+          "control_requirement_evidence": "CWE-95 requires that directives in dynamically evaluated code be neutralized or properly validated before use. The absence of such controls allows arbitrary code execution.",
+          "existing_controls_checked": [
+            "No input validation or sanitization of 'name' parameter",
+            "No checks for malicious file paths or module names"
+          ],
+          "deficiency_evidence": "The function directly passes the user-provided 'name' to importlib.import_module() without any validation, allowing an attacker to load and execute arbitrary Python modules from the filesystem."
+        },
+        "concrete_impact": {
+          "score": 0.85,
+          "evidence": "An attacker who can control the 'name' parameter can cause arbitrary code execution by loading malicious Python modules from the filesystem. This directly leads to code execution, data access, and data modification as per CWE-95 impact."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the load_module function would not exist or would not allow arbitrary code execution via file paths. The patch introduces a direct path for code injection through module loading.",
+      "supporting_evidence": [
+        "The function 'load_module' uses importlib.import_module() to execute code from a file path provided by the user",
+        "The parameter 'name' is passed directly into importlib.import_module() without sanitization or validation",
+        "The function can be invoked via D-Bus methods, making it externally reachable"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "The load_module function directly uses user-provided input to import and execute Python modules without validation. An attacker can control the module path to execute arbitrary code. The patch introduces a direct code execution vulnerability by allowing unvalidated file paths to be imported via importlib.import_module(). Add input validation to prevent loading of unauthorized modules.",
+      "change_type": "A",
+      "raw_score": 0.8699999999999999,
+      "score": 0.8699999999999999
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "dbusmock/mockobject.py",
+      "changed_line": 37,
+      "statement": "def load_module(name):",
+      "cwe_id": "CWE-502",
+      "cwe_name": "Deserialization of Untrusted Data",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The function load_module executes arbitrary Python code from a file path, which is related to untrusted data execution. However, it does not perform traditional deserialization (e.g., pickle, JSON) but rather imports and executes modules directly."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The parameter 'name' is externally controlled input from the caller. The function uses this name to construct a file path and then executes code via importlib.import_module(). This creates a clear path from external input to code execution."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If the candidate line were reverted, the load_module function would not exist or would not execute arbitrary code from file paths. The patch directly introduces this dangerous behavior by allowing direct module loading and execution."
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "There is no validation or sanitization of the 'name' parameter before it's used to load a module. The code directly imports modules based on user input without checking if they are safe or trusted.",
+          "required_control": "Input validation and sanitization",
+          "control_requirement_evidence": "CWE-502 requires that untrusted data be validated before processing to prevent arbitrary code execution.",
+          "existing_controls_checked": [
+            "No checks on the 'name' parameter",
+            "No allowlist of allowed modules or paths",
+            "No sandboxing or execution restrictions"
+          ],
+          "deficiency_evidence": "The function directly uses user-provided input to determine which module to import and execute, without any validation or sanitization steps."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "The concrete impact is that an attacker can execute arbitrary Python code on the system by providing a malicious file path. This could lead to privilege escalation, data theft, or system compromise."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the load_module function would not exist, and there would be no mechanism for loading and executing arbitrary Python modules from user-provided paths.",
+      "supporting_evidence": [
+        "The function 'load_module' takes an externally controlled parameter 'name'",
+        "The code uses 'importlib.import_module(m)' to execute code from the provided path",
+        "The function allows loading of modules from arbitrary file paths via 'os.path.exists(name) and os.path.splitext(name)[1] == '.py'' check"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "The load_module function directly executes arbitrary Python code from user-provided file paths without validation. An attacker can provide a malicious .py file path to execute arbitrary code on the system. The patch introduces this vulnerability by allowing direct module loading and execution without any input sanitization or access controls.",
+      "change_type": "A",
+      "raw_score": 0.64,
+      "score": 0.64
+    }
+  ],
+  "stage4_status": "completed"
+}

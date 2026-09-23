@@ -1,0 +1,552 @@
+diff --git a/anymail/utils.py b/anymail/utils.py
+index fdda982..66c307a 100644
+--- a/anymail/utils.py
++++ b/anymail/utils.py
+@@ -1,29 +1,32 @@
++import base64
+ import mimetypes
+ from base64 import b64encode
+ from collections import Mapping, MutableMapping
+ from datetime import datetime
+ from email.mime.base import MIMEBase
+ from email.utils import formatdate, getaddresses, unquote
+ from time import mktime
+ 
+ import six
+ from django.conf import settings
+ from django.core.mail.message import sanitize_address, DEFAULT_ATTACHMENT_MIME_TYPE
+ from django.utils.encoding import force_text
+ from django.utils.functional import Promise
+ from django.utils.timezone import utc
++# noinspection PyUnresolvedReferences
++from six.moves.urllib.parse import urlsplit, urlunsplit
+ 
+ from .exceptions import AnymailConfigurationError, AnymailInvalidAddress
+ 
+ UNSET = object()  # Used as non-None default value
+ 
+ 
+ def combine(*args):
+     """
+     Combines all non-UNSET args, by shallow merging mappings and concatenating sequences
+ 
+     >>> combine({'a': 1, 'b': 2}, UNSET, {'b': 3, 'c': 4}, UNSET)
+     {'a': 1, 'b': 3, 'c': 4}
+     >>> combine([1, 2], UNSET, [3, 4], UNSET)
+     [1, 2, 3, 4]
+     >>> combine({'a': 1}, None, {'b': 2})  # None suppresses earlier args
+@@ -330,15 +333,45 @@ def force_non_lazy(obj):
+ 
+ def force_non_lazy_list(obj):
+     """Return a (shallow) copy of sequence obj, with all values forced non-lazy."""
+     try:
+         return [force_non_lazy(item) for item in obj]
+     except (AttributeError, TypeError):
+         return force_non_lazy(obj)
+ 
+ 
+ def force_non_lazy_dict(obj):
+     """Return a (deep) copy of dict obj, with all values forced non-lazy."""
+     try:
+         return {key: force_non_lazy_dict(value) for key, value in obj.items()}
+     except (AttributeError, TypeError):
+         return force_non_lazy(obj)
++
++
++def get_request_basic_auth(request):
++    """Returns HTTP basic auth string sent with request, or None.
++
++    If request includes basic auth, result is string 'username:password'.
++    """
++    try:
++        authtype, authdata = request.META['HTTP_AUTHORIZATION'].split()
++        if authtype.lower() == "basic":
++            return base64.b64decode(authdata).decode('utf-8')
++    except (IndexError, KeyError, TypeError, ValueError):
++        pass
++    return None
++
++
++def get_request_uri(request):
++    """Returns the "exact" url used to call request.
++
++    Like :func:`django.http.request.HTTPRequest.build_absolute_uri`,
++    but also inlines HTTP basic auth, if present.
++    """
++    url = request.build_absolute_uri()
++    basic_auth = get_request_basic_auth(request)
++    if basic_auth is not None:
++        # must reassemble url with auth
++        parts = urlsplit(url)
++        url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,
++                          parts.path, parts.query, parts.fragment))
++    return url
+diff --git a/anymail/webhooks/base.py b/anymail/webhooks/base.py
+index d324239..1f98bc6 100644
+--- a/anymail/webhooks/base.py
++++ b/anymail/webhooks/base.py
+@@ -1,27 +1,26 @@
+-import base64
+ import re
+-import six
+ import warnings
+ 
++import six
+ from django.http import HttpResponse
+ from django.utils.decorators import method_decorator
+ from django.views.decorators.csrf import csrf_exempt
+ from django.views.generic import View
+ 
+ from ..exceptions import AnymailInsecureWebhookWarning, AnymailWebhookValidationFailure
+-from ..utils import get_anymail_setting, collect_all_methods
++from ..utils import get_anymail_setting, collect_all_methods, get_request_basic_auth
+ 
+ 
+ class AnymailBasicAuthMixin(object):
+     """Implements webhook basic auth as mixin to AnymailBaseWebhookView."""
+ 
+     # Whether to warn if basic auth is not configured.
+     # For most ESPs, basic auth is the only webhook security,
+     # so the default is True. Subclasses can set False if
+     # they enforce other security (like signed webhooks).
+     warn_if_no_basic_auth = True
+ 
+     # List of allowable HTTP basic-auth 'user:pass' strings.
+     basic_auth = None  # (Declaring class attr allows override by kwargs in View.as_view.)
+ 
+     def __init__(self, **kwargs):
+@@ -30,40 +29,32 @@ class AnymailBasicAuthMixin(object):
+         # Allow a single string:
+         if isinstance(self.basic_auth, six.string_types):
+             self.basic_auth = [self.basic_auth]
+         if self.warn_if_no_basic_auth and len(self.basic_auth) < 1:
+             warnings.warn(
+                 "Your Anymail webhooks are insecure and open to anyone on the web. "
+                 "You should set WEBHOOK_AUTHORIZATION in your ANYMAIL settings. "
+                 "See 'Securing webhooks' in the Anymail docs.",
+                 AnymailInsecureWebhookWarning)
+         # noinspection PyArgumentList
+         super(AnymailBasicAuthMixin, self).__init__(**kwargs)
+ 
+     def validate_request(self, request):
+         """If configured for webhook basic auth, validate request has correct auth."""
+         if self.basic_auth:
+-            valid = False
+-            try:
+-                authtype, authdata = request.META['HTTP_AUTHORIZATION'].split()
+-                if authtype.lower() == "basic":
+-                    auth = base64.b64decode(authdata).decode('utf-8')
+-                    if auth in self.basic_auth:
+-                        valid = True
+-            except (IndexError, KeyError, TypeError, ValueError):
+-                valid = False
+-            if not valid:
++            basic_auth = get_request_basic_auth(request)
++            if basic_auth is None or basic_auth not in self.basic_auth:
+                 # noinspection PyUnresolvedReferences
+                 raise AnymailWebhookValidationFailure(
+                     "Missing or invalid basic auth in Anymail %s webhook" % self.esp_name)
+ 
+ 
+ # Mixin note: Django's View.__init__ doesn't cooperate with chaining,
+ # so all mixins that need __init__ must appear before View in MRO.
+ class AnymailBaseWebhookView(AnymailBasicAuthMixin, View):
+     """Base view for processing ESP event webhooks
+ 
+     ESP-specific implementations should subclass
+     and implement parse_events. They may also
+     want to implement validate_request
+     if additional security is available.
+     """
+diff --git a/anymail/webhooks/mandrill.py b/anymail/webhooks/mandrill.py
+index f3d13ce..27cf485 100644
+--- a/anymail/webhooks/mandrill.py
++++ b/anymail/webhooks/mandrill.py
+@@ -1,28 +1,28 @@
+ import json
+ from datetime import datetime
+ 
+ import hashlib
+ import hmac
+ from base64 import b64encode
+ from django.utils.crypto import constant_time_compare
+ from django.utils.timezone import utc
+ 
+ from .base import AnymailBaseWebhookView
+ from ..exceptions import AnymailWebhookValidationFailure, AnymailConfigurationError
+ from ..signals import tracking, AnymailTrackingEvent, EventType
+-from ..utils import get_anymail_setting, getfirst
++from ..utils import get_anymail_setting, getfirst, get_request_uri
+ 
+ 
+ class MandrillSignatureMixin(object):
+     """Validates Mandrill webhook signature"""
+ 
+     # These can be set from kwargs in View.as_view, or pulled from settings in init:
+     webhook_key = None  # required
+     webhook_url = None  # optional; defaults to actual url used
+ 
+     def __init__(self, **kwargs):
+         # noinspection PyUnresolvedReferences
+         esp_name = self.esp_name
+         # webhook_key is required for POST, but not for HEAD when Mandrill validates webhook url.
+         # Defer "missing setting" error until we actually try to use it in the POST...
+         webhook_key = get_anymail_setting('webhook_key', esp_name=esp_name, default=None,
+@@ -33,40 +33,42 @@ class MandrillSignatureMixin(object):
+                                                kwargs=kwargs, allow_bare=True)
+         # noinspection PyArgumentList
+         super(MandrillSignatureMixin, self).__init__(**kwargs)
+ 
+     def validate_request(self, request):
+         if self.webhook_key is None:
+             # issue deferred "missing setting" error (re-call get-setting without a default)
+             # noinspection PyUnresolvedReferences
+             get_anymail_setting('webhook_key', esp_name=self.esp_name, allow_bare=True)
+ 
+         try:
+             signature = request.META["HTTP_X_MANDRILL_SIGNATURE"]
+         except KeyError:
+             raise AnymailWebhookValidationFailure("X-Mandrill-Signature header missing from webhook POST")
+ 
+-        # Mandrill signs the exact URL plus the sorted POST params:
+-        signed_data = self.webhook_url or request.build_absolute_uri()
++        # Mandrill signs the exact URL (including basic auth, if used) plus the sorted POST params:
++        url = self.webhook_url or get_request_uri(request)
+         params = request.POST.dict()
++        signed_data = url
+         for key in sorted(params.keys()):
+             signed_data += key + params[key]
+ 
+         expected_signature = b64encode(hmac.new(key=self.webhook_key, msg=signed_data.encode('utf-8'),
+                                                 digestmod=hashlib.sha1).digest())
+         if not constant_time_compare(signature, expected_signature):
+-            raise AnymailWebhookValidationFailure("Mandrill webhook called with incorrect signature")
++            raise AnymailWebhookValidationFailure(
++                "Mandrill webhook called with incorrect signature (for url %r)" % url)
+ 
+ 
+ class MandrillBaseWebhookView(MandrillSignatureMixin, AnymailBaseWebhookView):
+     """Base view class for Mandrill webhooks"""
+ 
+     warn_if_no_basic_auth = False  # because we validate against signature
+ 
+     def parse_events(self, request):
+         esp_events = json.loads(request.POST['mandrill_events'])
+         return [self.esp_to_anymail_event(esp_event) for esp_event in esp_events]
+ 
+     def esp_to_anymail_event(self, esp_event):
+         raise NotImplementedError()
+ 
+ 
+diff --git a/tests/test_mandrill_webhooks.py b/tests/test_mandrill_webhooks.py
+index 0a72112..bfb77e2 100644
+--- a/tests/test_mandrill_webhooks.py
++++ b/tests/test_mandrill_webhooks.py
+@@ -7,45 +7,55 @@ import hashlib
+ import hmac
+ from base64 import b64encode
+ from django.core.exceptions import ImproperlyConfigured
+ from django.test import override_settings
+ from django.utils.timezone import utc
+ from mock import ANY
+ 
+ from anymail.signals import AnymailTrackingEvent
+ from anymail.webhooks.mandrill import MandrillTrackingWebhookView
+ 
+ from .webhook_cases import WebhookTestCase, WebhookBasicAuthTestsMixin
+ 
+ TEST_WEBHOOK_KEY = 'TEST_WEBHOOK_KEY'
+ 
+ 
+-def mandrill_args(events=None, url='/anymail/mandrill/tracking/', key=TEST_WEBHOOK_KEY):
++def mandrill_args(events=None,
++                  host="http://testserver/",  # Django test-client default
++                  path='/anymail/mandrill/tracking/',  # Anymail urlconf default
++                  auth="username:password",  # WebhookTestCase default
++                  key=TEST_WEBHOOK_KEY):
+     """Returns TestClient.post kwargs for Mandrill webhook call with events
+ 
+     Computes correct signature.
+     """
+     if events is None:
+         events = []
+-    url = urljoin('http://testserver/', url)
++    test_client_path = urljoin(host, path)  # https://testserver/anymail/mandrill/tracking/
++    if auth:
++        # we can get away with this simplification in these controlled tests,
++        # but don't ever construct urls like this in production code -- it's not safe!
++        full_url = test_client_path.replace("://", "://" + auth + "@")
++    else:
++        full_url = test_client_path
+     mandrill_events = json.dumps(events)
+-    signed_data = url + 'mandrill_events' + mandrill_events
++    signed_data = full_url + 'mandrill_events' + mandrill_events
+     signature = b64encode(hmac.new(key=key.encode('ascii'),
+                                    msg=signed_data.encode('utf-8'),
+                                    digestmod=hashlib.sha1).digest())
+     return {
+-        'path': url,
++        'path': test_client_path,
+         'data': {'mandrill_events': mandrill_events},
+         'HTTP_X_MANDRILL_SIGNATURE': signature,
+     }
+ 
+ 
+ class MandrillWebhookSettingsTestCase(WebhookTestCase):
+     def test_requires_webhook_key(self):
+         with self.assertRaisesRegex(ImproperlyConfigured, r'MANDRILL_WEBHOOK_KEY'):
+             self.client.post('/anymail/mandrill/tracking/',
+                              data={'mandrill_events': '[]'})
+ 
+     def test_head_does_not_require_webhook_key(self):
+         # Mandrill issues an unsigned HEAD request to verify the wehbook url.
+         # Only *after* that succeeds will Mandrill will tell you the webhook key.
+         # So make sure that HEAD request will go through without any key set:
+@@ -66,30 +76,67 @@ class MandrillWebhookSecurityTestCase(WebhookTestCase, WebhookBasicAuthTestsMixi
+     def test_verifies_correct_signature(self):
+         kwargs = mandrill_args([{'event': 'send'}])
+         response = self.client.post(**kwargs)
+         self.assertEqual(response.status_code, 200)
+ 
+     def test_verifies_missing_signature(self):
+         response = self.client.post('/anymail/mandrill/tracking/',
+                                     data={'mandrill_events': '[{"event":"send"}]'})
+         self.assertEqual(response.status_code, 400)
+ 
+     def test_verifies_bad_signature(self):
+         kwargs = mandrill_args([{'event': 'send'}], key="wrong API key")
+         response = self.client.post(**kwargs)
+         self.assertEqual(response.status_code, 400)
+ 
++    @override_settings(ANYMAIL={})  # clear WEBHOOK_AUTHORIZATION from WebhookTestCase
++    def test_no_basic_auth(self):
++        # Signature validation should work properly if you're not using basic auth
++        self.clear_basic_auth()
++        kwargs = mandrill_args([{'event': 'send'}], auth="")
++        response = self.client.post(**kwargs)
++        self.assertEqual(response.status_code, 200)
++
++    @override_settings(ANYMAIL={
++        "MANDRILL_WEBHOOK_URL": "https://abcde:12345@example.com/anymail/mandrill/tracking/",
++        "WEBHOOK_AUTHORIZATION": "abcde:12345",
++    })
++    def test_webhook_url_setting(self):
++        # If Django can't build_absolute_uri correctly (e.g., because your proxy
++        # frontend isn't setting the proxy headers correctly), you must set
++        # MANDRILL_WEBHOOK_URL to the actual public url where Mandrill calls the webhook.
++        self.set_basic_auth("abcde", "12345")
++        kwargs = mandrill_args([{'event': 'send'}], host="https://example.com/", auth="abcde:12345")
++        response = self.client.post(SERVER_NAME="127.0.0.1", **kwargs)
++        self.assertEqual(response.status_code, 200)
++
++    # override WebhookBasicAuthTestsMixin version of this test
++    @override_settings(ANYMAIL={'WEBHOOK_AUTHORIZATION': ['cred1:pass1', 'cred2:pass2']})
++    def test_supports_credential_rotation(self):
++        """You can supply a list of basic auth credentials, and any is allowed"""
++        self.set_basic_auth('cred1', 'pass1')
++        response = self.client.post(**mandrill_args(auth="cred1:pass1"))
++        self.assertEqual(response.status_code, 200)
++
++        self.set_basic_auth('cred2', 'pass2')
++        response = self.client.post(**mandrill_args(auth="cred2:pass2"))
++        self.assertEqual(response.status_code, 200)
++
++        self.set_basic_auth('baduser', 'wrongpassword')
++        response = self.client.post(**mandrill_args(auth="baduser:wrongpassword"))
++        self.assertEqual(response.status_code, 400)
++
+ 
+ @override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)
+ class MandrillTrackingTestCase(WebhookTestCase):
+ 
+     def test_head_request(self):
+         # Mandrill verifies webhooks at config time with a HEAD request
+         response = self.client.head('/anymail/mandrill/tracking/')
+         self.assertEqual(response.status_code, 200)
+ 
+     def test_post_request_invalid_json(self):
+         kwargs = mandrill_args()
+         kwargs['data'] = {'mandrill_events': "GARBAGE DATA"}
+         response = self.client.post(**kwargs)
+         self.assertEqual(response.status_code, 400)
+ 
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+index 7a9ddf4..0813930 100644
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -1,23 +1,28 @@
+ # Tests for the anymail/utils.py module
+ # (not to be confused with utilities for testing found in in tests/utils.py)
++import base64
++
+ import six
+-from django.test import SimpleTestCase
++from django.test import SimpleTestCase, RequestFactory, override_settings
+ from django.utils.translation import ugettext_lazy, string_concat
+ 
+ from anymail.exceptions import AnymailInvalidAddress
+-from anymail.utils import ParsedEmail, is_lazy, force_non_lazy, force_non_lazy_dict, force_non_lazy_list, update_deep
++from anymail.utils import (ParsedEmail,
++                           is_lazy, force_non_lazy, force_non_lazy_dict, force_non_lazy_list,
++                           update_deep,
++                           get_request_uri, get_request_basic_auth)
+ 
+ 
+ class ParsedEmailTests(SimpleTestCase):
+     """Test utils.ParsedEmail"""
+ 
+     # Anymail (and Djrill) have always used EmailMessage.encoding, which defaults to None.
+     # (Django substitutes settings.DEFAULT_ENCODING='utf-8' when converting to a mime message,
+     # but Anymail has never used that code.)
+     ADDRESS_ENCODING = None
+ 
+     def test_simple_email(self):
+         parsed = ParsedEmail("test@example.com", self.ADDRESS_ENCODING)
+         self.assertEqual(parsed.email, "test@example.com")
+         self.assertEqual(parsed.name, "")
+         self.assertEqual(parsed.address, "test@example.com")
+@@ -130,15 +135,73 @@ class UpdateDeepTests(SimpleTestCase):
+ 
+     def test_overwrites_sequences(self):
+         """Only mappings are handled recursively; sequences are considered atomic"""
+         first = {'a': [1, 2]}
+         second = {'a': [3]}
+         update_deep(first, second)
+         self.assertEqual(first, {'a': [3]})
+ 
+     def test_handles_non_dict_mappings(self):
+         """Mapping types in general are supported"""
+         from collections import OrderedDict, defaultdict
+         first = OrderedDict(a=OrderedDict(a1=1), c={'c1': 1})
+         second = defaultdict(None, a=dict(a2=2))
+         update_deep(first, second)
+         self.assertEqual(first, {'a': {'a1': 1, 'a2': 2}, 'c': {'c1': 1}})
++
++
++class RequestUtilsTests(SimpleTestCase):
++    """Test utils.get_request_* helpers"""
++
++    def setUp(self):
++        self.request_factory = RequestFactory()
++        super(RequestUtilsTests, self).setUp()
++
++    @staticmethod
++    def basic_auth(username, password):
++        """Return HTTP_AUTHORIZATION header value for basic auth with username, password"""
++        credentials = base64.b64encode("{}:{}".format(username, password).encode('utf-8')).decode('utf-8')
++        return "Basic {}".format(credentials)
++
++    def test_get_request_basic_auth(self):
++        # without auth:
++        request = self.request_factory.post('/path/to/?query',
++                                            HTTP_HOST='www.example.com',
++                                            HTTP_SCHEME='https')
++        self.assertIsNone(get_request_basic_auth(request))
++
++        # with basic auth:
++        request = self.request_factory.post('/path/to/?query',
++                                            HTTP_HOST='www.example.com',
++                                            HTTP_AUTHORIZATION=self.basic_auth('user', 'pass'))
++        self.assertEqual(get_request_basic_auth(request), "user:pass")
++
++        # with some other auth
++        request = self.request_factory.post('/path/to/?query',
++                                            HTTP_HOST='www.example.com',
++                                            HTTP_AUTHORIZATION="Bearer abcde12345")
++        self.assertIsNone(get_request_basic_auth(request))
++
++    def test_get_request_uri(self):
++        # without auth:
++        request = self.request_factory.post('/path/to/?query', secure=True,
++                                            HTTP_HOST='www.example.com')
++        self.assertEqual(get_request_uri(request),
++                         "https://www.example.com/path/to/?query")
++
++        # with basic auth:
++        request = self.request_factory.post('/path/to/?query', secure=True,
++                                            HTTP_HOST='www.example.com',
++                                            HTTP_AUTHORIZATION=self.basic_auth('user', 'pass'))
++        self.assertEqual(get_request_uri(request),
++                         "https://user:pass@www.example.com/path/to/?query")
++
++    @override_settings(SECURE_PROXY_SSL_HEADER=('HTTP_X_FORWARDED_PROTO', 'https'),
++                       USE_X_FORWARDED_HOST=True)
++    def test_get_request_uri_with_proxy(self):
++        request = self.request_factory.post('/path/to/?query', secure=False,
++                                            HTTP_HOST='web1.internal',
++                                            HTTP_X_FORWARDED_PROTO='https',
++                                            HTTP_X_FORWARDED_HOST='secret.example.com:8989',
++                                            HTTP_AUTHORIZATION=self.basic_auth('user', 'pass'))
++        self.assertEqual(get_request_uri(request),
++                         "https://user:pass@secret.example.com:8989/path/to/?query")
+diff --git a/tests/webhook_cases.py b/tests/webhook_cases.py
+index e4f8338..26fd569 100644
+--- a/tests/webhook_cases.py
++++ b/tests/webhook_cases.py
+@@ -31,30 +31,33 @@ class WebhookTestCase(AnymailTestMixin, SimpleTestCase):
+ 
+         # Install mocked signal handlers
+         self.tracking_handler = create_autospec(event_handler)
+         tracking.connect(self.tracking_handler)
+         self.addCleanup(tracking.disconnect, self.tracking_handler)
+ 
+         self.inbound_handler = create_autospec(event_handler)
+         inbound.connect(self.inbound_handler)
+         self.addCleanup(inbound.disconnect, self.inbound_handler)
+ 
+     def set_basic_auth(self, username='username', password='password'):
+         """Set basic auth for all subsequent test client requests"""
+         credentials = base64.b64encode("{}:{}".format(username, password).encode('utf-8')).decode('utf-8')
+         self.client.defaults['HTTP_AUTHORIZATION'] = "Basic {}".format(credentials)
+ 
++    def clear_basic_auth(self):
++        self.client.defaults.pop('HTTP_AUTHORIZATION', None)
++
+     def assert_handler_called_once_with(self, mockfn, *expected_args, **expected_kwargs):
+         """Verifies mockfn was called with expected_args and at least expected_kwargs.
+ 
+         Ignores *additional* actual kwargs (which might be added by Django signal dispatch).
+         (This differs from mock.assert_called_once_with.)
+ 
+         Returns the actual kwargs.
+         """
+         self.assertEqual(mockfn.call_count, 1)
+         actual_args, actual_kwargs = mockfn.call_args
+         self.assertEqual(actual_args, expected_args)
+         for key, expected_value in expected_kwargs.items():
+             if expected_value is ANY:
+                 self.assertIn(key, actual_kwargs)
+             else:
+@@ -86,31 +89,31 @@ class WebhookBasicAuthTestsMixin(object):
+         else:
+             with self.assertDoesNotWarn(AnymailInsecureWebhookWarning):
+                 response = self.call_webhook()
+         self.assertEqual(response.status_code, 200)
+ 
+     def test_verifies_basic_auth(self):
+         response = self.call_webhook()
+         self.assertEqual(response.status_code, 200)
+ 
+     def test_verifies_bad_auth(self):
+         self.set_basic_auth('baduser', 'wrongpassword')
+         response = self.call_webhook()
+         self.assertEqual(response.status_code, 400)
+ 
+     def test_verifies_missing_auth(self):
+-        del self.client.defaults['HTTP_AUTHORIZATION']
++        self.clear_basic_auth()
+         response = self.call_webhook()
+         self.assertEqual(response.status_code, 400)
+ 
+     @override_settings(ANYMAIL={'WEBHOOK_AUTHORIZATION': ['cred1:pass1', 'cred2:pass2']})
+     def test_supports_credential_rotation(self):
+         """You can supply a list of basic auth credentials, and any is allowed"""
+         self.set_basic_auth('cred1', 'pass1')
+         response = self.call_webhook()
+         self.assertEqual(response.status_code, 200)
+ 
+         self.set_basic_auth('cred2', 'pass2')
+         response = self.call_webhook()
+         self.assertEqual(response.status_code, 200)
+ 
+         self.set_basic_auth('baduser', 'wrongpassword')

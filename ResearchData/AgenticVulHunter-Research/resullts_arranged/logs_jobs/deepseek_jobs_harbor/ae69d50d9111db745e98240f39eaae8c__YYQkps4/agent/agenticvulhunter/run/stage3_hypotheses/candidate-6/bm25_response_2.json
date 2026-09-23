@@ -1,0 +1,263 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 143,
+      "statement": "Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();",
+      "change_type": "A",
+      "function_name": "BackupMain::run",
+      "operation_type": "external_command_execution",
+      "selection_reason": "executes unzip on user-controlled archive content -> potential archive extraction vulnerabilities",
+      "security_relevance_score": 0.8,
+      "code_context": "1: // Sandstorm - Personal Cloud Sandbox\n2: // Copyright (c) 2015 Sandstorm Development Group, Inc. and contributors\n3: // All rights reserved.\n4: //\n5: // Licensed under the Apache License, Version 2.0 (the \"License\");\n6: // you may not use this file except in compliance with the License.\n7: // You may obtain a copy of the License at\n8: //\n9: //   http://www.apache.org/licenses/LICENSE-2.0\n10: //\n11: // Unless required by applicable law or agreed to in writing, software\n12: // distributed under the License is distributed on an \"AS IS\" BASIS,\n13: // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: // See the License for the specific language governing permissions and\n15: // limitations under the License.\n16: \n17: #include \"backup.h\"\n18: #include \"util.h\"\n19: #include \"version.h\"\n20: #include <kj/debug.h>\n21: #include <sched.h>\n22: #include <sys/mount.h>\n23: #include <sys/syscall.h>\n24: #include <sys/stat.h>\n25: #include <sys/types.h>\n26: \n27: namespace sandstorm {\n28: \n29: class BackupMain: public AbstractMain {\n30: public:\n31:   BackupMain(kj::ProcessContext& context): context(context) {}\n32: \n33:   kj::MainFunc getMain() override {\n34:     return kj::MainBuilder(context, \"Sandstorm version \" SANDSTORM_VERSION,\n35:                            \"Backs up the grain directory in <grain> to <file>, reading the grain \"\n36:                            \"metadata struct on stdin. Or, restores the backup in <file>, \"\n37:                            \"unpacking it to <grain>, and writing the metadata to stdout. In \"\n38:                            \"backup mode, <file> can be `-` to write the data to stdout.\")\n39:         .addOption({'r', \"restore\"}, KJ_BIND_METHOD(*this, setRestore),\n40:                    \"Restore a backup, rather than create a backup.\")\n41:         .addOptionWithArg({\"root\"}, KJ_BIND_METHOD(*this, setRoot), \"<root>\",\n42:                    \"Set the \\\"root directory\\\" to map in, which contains the zip/unzip binaries.\")\n43:         .expectArg(\"<file>\", KJ_BIND_METHOD(*this, setFile))\n44:         .expectArg(\"<grain>\", KJ_BIND_METHOD(*this, run))\n45:         .build();\n46:   }\n47: \n48: private:\n49:   kj::ProcessContext& context;\n50:   bool restore = false;\n51:   kj::StringPtr filename;\n52:   kj::StringPtr root = \"\";\n53: \n54:   bool setRestore() {\n55:     restore = true;\n56:     return true;\n57:   }\n58: \n59:   bool setFile(kj::StringPtr arg) {\n60:     filename = arg;\n61:     return true;\n62:   }\n63: \n64:   bool setRoot(kj::StringPtr arg) {\n65:     root = arg;\n66:     return true;\n67:   }\n68: \n69:   void writeSetgroupsIfPresent(const char *contents) {\n70:     KJ_IF_MAYBE(fd, raiiOpenIfExists(\"/proc/self/setgroups\", O_WRONLY | O_CLOEXEC)) {\n71:       kj::FdOutputStream(kj::mv(*fd)).write(contents, strlen(contents));\n72:     }\n73:   }\n74: \n75:   void writeUserNSMap(const char *type, kj::StringPtr contents) {\n76:     kj::FdOutputStream(raiiOpen(kj::str(\"/proc/self/\", type, \"_map\").cStr(), O_WRONLY | O_CLOEXEC))\n77:         .write(contents.begin(), contents.size());\n78:   }\n79: \n80:   bool run(kj::StringPtr grainDir) {\n81:     uid_t uid = getuid();\n82:     gid_t gid = getgid();\n83: \n84:     KJ_SYSCALL(unshare(CLONE_NEWUSER | CLONE_NEWNS));\n85:     writeSetgroupsIfPresent(\"deny\\n\");\n86:     writeUserNSMap(\"uid\", kj::str(\"1000 \", uid, \" 1\\n\"));\n87:     writeUserNSMap(\"gid\", kj::str(\"1000 \", gid, \" 1\\n\"));\n88: \n89:     // Mount root read-only.\n90:     KJ_SYSCALL(mount(kj::str(root, \"/\").cStr(), \"/tmp\", nullptr,\n91:                      MS_BIND | MS_REC | MS_RDONLY, nullptr));\n92: \n93:     if (access(\"/tmp/dev/null\", F_OK) != 0) {\n94:       // Looks like we need to bind in /dev.\n95:       KJ_SYSCALL(mount(\"/dev\", \"/tmp/dev\", nullptr, MS_BIND, nullptr));\n96:     }\n97: \n98:     // Hide sensitive directories.\n99:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/proc\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n100:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/var\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n101:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/etc\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n102: \n103:     // Mount inner tmpfs.\n104:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/tmp\", \"tmpfs\", 0, \"size=8m,nr_inodes=128,mode=777\"));\n105: \n106:     // Bind in the grain's `data` (=`sandbox`).\n107:     if (restore) {\n108:       KJ_SYSCALL(mkdir(kj::str(grainDir, \"/sandbox\").cStr(), 0770));\n109:     }\n110:     KJ_SYSCALL(mkdir(\"/tmp/tmp/data\", 0700));\n111:     KJ_SYSCALL(mount(kj::str(grainDir, \"/sandbox\").cStr(), \"/tmp/tmp/data\", nullptr,\n112:                      MS_BIND | (restore ? 0 : MS_RDONLY), nullptr));\n113: \n114:     // Bind in the grain's `log`. When restoring, we discard the log.\n115:     if (!restore) {\n116:       KJ_SYSCALL(mknod(\"/tmp/tmp/log\", S_IFREG | 0600, 0));\n117:       KJ_SYSCALL(mount(kj::str(grainDir, \"/log\").cStr(), \"/tmp/tmp/log\", nullptr,\n118:                        MS_BIND | MS_RDONLY, nullptr));\n119:     }\n120: \n121:     // Bind in the file.\n122:     if (restore) {\n123:       KJ_SYSCALL(mknod(\"/tmp/tmp/file.zip\", S_IFREG | 0600, 0));\n124:       KJ_SYSCALL(mount(filename.cStr(), \"/tmp/tmp/file.zip\", nullptr, MS_BIND, nullptr));\n125:     } else if (filename != \"-\") {\n126:       // Instead of binding, just open the file and we'll compress to stdout.\n127:       KJ_SYSCALL(dup2(raiiOpen(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC), STDOUT_FILENO));\n128:     }\n129: \n130:     // Use Andy's ridiculous pivot_root trick to place ourselves into the sandbox.\n131:     // See supervisor-main.c++ for more discussion.\n132:     {\n133:       auto oldRootDir = raiiOpen(\"/\", O_RDONLY | O_DIRECTORY | O_CLOEXEC);\n134:       KJ_SYSCALL(syscall(SYS_pivot_root, \"/tmp\", \"/tmp\"));\n135:       KJ_SYSCALL(fchdir(oldRootDir));\n136:       KJ_SYSCALL(umount2(\".\", MNT_DETACH));\n137:       KJ_SYSCALL(chdir(\"/tmp\"));\n138:     }\n139: \n140:     // TODO(someday): Find a zip library that doesn't suck and use it instead of shelling out\n141:     //   to zip/unzip.\n142:     if (restore) {\n143:       Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();\n144: \n145:       // Read metadata file to stdout.\n146:       kj::FdInputStream in(raiiOpen(\"metadata\", O_RDONLY | O_CLOEXEC));\n147:       kj::FdOutputStream out(STDOUT_FILENO);\n148:       pump(in, out);\n149:     } else {\n150:       // Read stdin to metadata file.\n151:       {\n152:         kj::FdInputStream in(STDIN_FILENO);\n153:         kj::FdOutputStream out(raiiOpen(\"metadata\", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC));\n154:         pump(in, out);\n155:       }\n156: \n157:       Subprocess::Options zipOptions({\"zip\", \"-qy@\", \"-\"});\n158:       auto inPipe = Pipe::make();\n159:       zipOptions.stdin = inPipe.readEnd;\n160:       Subprocess zip(kj::mv(zipOptions));\n161:       inPipe.readEnd = nullptr;\n162: \n163:       {\n164:         kj::FdOutputStream out(kj::mv(inPipe.writeEnd));\n165:         for (auto& entry: listDirectory(\".\")) {\n166:           findFilesToZip(entry, out);\n167:         }\n168:       }\n169: \n170:       zip.waitForSuccess();\n171:     }\n172: \n173:     return true;\n174:   }\n175: \n176:   static void pump(kj::InputStream& in, kj::OutputStream& out) {\n177:     byte buffer[4096];\n178:     while (size_t n = in.tryRead(buffer, 1, sizeof(buffer))) {\n179:       out.write(buffer, n);\n180:     }\n181:   }\n182: \n183:   void findFilesToZip(kj::StringPtr path, kj::OutputStream& out) {\n184:     struct stat stats;\n185:     KJ_SYSCALL(lstat(path.cStr(), &stats));\n186:     if (S_ISREG(stats.st_mode) || S_ISLNK(stats.st_mode)) {\n187:       // Regular file or link can be zipped; write to file stream.\n188:       // If the path contains a newline, we cannot correctly pass it to `zip` since `zip` expects\n189:       // one file per line. For security reasons, we must detect and filter out these files.\n190:       // Hopefully this never happens legitimately?\n191:       if (path.findFirst('\\n') == nullptr) {\n192:         kj::ArrayPtr<const byte> pieces[2];\n193:         pieces[0] = path.asBytes();\n194:         pieces[1] = kj::StringPtr(\"\\n\").asBytes();\n195:         out.write(pieces);\n196:       } else {\n197:         KJ_LOG(ERROR, \"tried to backup file containing newlines\", path);\n198:       }\n199:     } else if (S_ISDIR(stats.st_mode)) {\n200:       // Subdirectory; enumerate contents.\n201:       for (auto& entry: listDirectory(path)) {\n202:         findFilesToZip(kj::str(path, '/', entry), out);\n203:       }\n204:     }\n205:   }\n206: };\n207: \n208: kj::Own<AbstractMain> getBackupMain(kj::ProcessContext& context) {\n209:   return kj::heap<BackupMain>(context);\n210: }\n211: \n212: } // namespace sandstorm\n213: ",
+      "source_summary": "The 'file.zip' argument comes from the 'filename' member variable set via command-line argument parsing. The 'unzip' executable is searched in PATH via Subprocess's default searchPath=true behavior.",
+      "sink_summary": "Executes unzip command with fixed arguments on user-provided archive file, extracting contents to current directory which is a sandboxed environment created via pivot_root.",
+      "guard_summary": "The command executes within a sandbox created via unshare(CLONE_NEWUSER|CLONE_NEWNS), pivot_root, and restricted mounts. However, no validation or sanitization of the archive contents occurs before extraction. The Subprocess class uses execvp() which searches PATH for the unzip binary.",
+      "risk_pattern": "Unvalidated archive extraction of user-controlled file using external unzip command within a sandboxed but potentially insufficiently isolated environment.",
+      "used_variable_sources": [
+        "filename (command-line argument)",
+        "restore (command-line flag)"
+      ],
+      "called_function_context": [
+        "Subprocess constructor uses execvp() for PATH search",
+        "waitForSuccess() waits for process completion"
+      ],
+      "enclosing_conditions": [
+        "if (restore) condition at line 142"
+      ],
+      "context_summary": "The unzip command executes during restore mode on a user-provided archive file mounted from the filesystem. The operation occurs after extensive sandbox setup including namespace isolation and filesystem restrictions.",
+      "unresolved_facts": [
+        "Whether the sandbox environment sufficiently isolates the unzip process from sensitive system resources",
+        "Whether PATH search for unzip binary could be manipulated",
+        "Whether archive contents could exploit unzip vulnerabilities or extract malicious files"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "archive extraction unzip command user-controlled file without validation",
+        "sensitive_operation": "external command execution",
+        "missing_control": "archive content validation"
+      },
+      "language": "",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 54.1832,
+          "raw_bm25_score": 54.1832,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/indirect-command-line-injection",
+          "cwe_id": "CWE-88",
+          "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 43.8229,
+          "raw_bm25_score": 43.8229,
+          "description": "Forwarding command-line arguments to a child process executed within a shell may indirectly introduce command-line injection vulnerabilities.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-088. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-088"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "fallback/cwe-59-improper-link-resolution-before-file-access-link-following",
+          "cwe_id": "CWE-59",
+          "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 32.8269,
+          "raw_bm25_score": 32.8269,
+          "description": "File access follows a symlink, hardlink, or shortcut to an unintended resource.",
+          "pattern": "cwe-59 symlink hardlink link-following symbolic-link file-link archive-extraction path-resolution file-overwrite race filesystem",
+          "remediation": "Reject unsafe links and verify resolved file targets before access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-059"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "fallback/cwe-77-improper-neutralization-of-special-elements-used-in-a-command-command-injection",
+          "cwe_id": "CWE-77",
+          "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 27.3629,
+          "raw_bm25_score": 27.3629,
+          "description": "Externally influenced data changes the syntax or meaning of a command sent to a downstream command interpreter.",
+          "pattern": "cwe-77 command-injection command-construction shell exec spawn process subprocess child_process os.system popen argument-delimiter metacharacter",
+          "remediation": "Keep external data separate from command syntax and use safe argument APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-077"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/call/wrong-named-class-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.877,
+          "raw_bm25_score": 26.877,
+          "description": "Using a named argument whose name does not correspond to a parameter of the __init__ method of the class being instantiated, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/unnecessary-use-of-cat",
+          "cwe_id": "CWE-78",
+          "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.0353,
+          "raw_bm25_score": 24.0353,
+          "description": "Using the  `cat` process to read a file is unnecessarily complex, inefficient, unportable, and can lead to subtle bugs, or even security vulnerabilities.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use safe command execution APIs with parameter arrays. Validate and sanitize command arguments against strict allowlists.",
+          "tags": [
+            "correctness",
+            "security",
+            "maintainability",
+            "external/cwe/cwe-078"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/call/wrong-number-class-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.9734,
+          "raw_bm25_score": 23.9734,
+          "description": "Using too many or too few arguments in a call to the `__init__` method of a class will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/template-object-injection",
+          "cwe_id": "CWE-94",
+          "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.4763,
+          "raw_bm25_score": 21.4763,
+          "description": "Instantiating a template using a user-controlled object is vulnerable to local file read and potential remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-073",
+            "external/cwe/cwe-094"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/conflicting-html-attribute",
+          "cwe_id": "CWE-758",
+          "cwe_name": "Reliance on Undefined, Unspecified, or Implementation-Defined Behavior",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.6902,
+          "raw_bm25_score": 20.6902,
+          "description": "If an HTML element has two attributes with the same name but different values, its behavior may be browser-dependent.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-758. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "maintainability",
+            "correctness",
+            "external/cwe/cwe-758"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/comparison-of-identical-expressions",
+          "cwe_id": "CWE-571",
+          "cwe_name": "Expression is Always True",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.2161,
+          "raw_bm25_score": 20.2161,
+          "description": "If the same expression occurs on both sides of a comparison operator, the operator is redundant, and probably indicates a mistake.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-571. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "reliability",
+            "correctness",
+            "readability",
+            "convention",
+            "external/cwe/cwe-570"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

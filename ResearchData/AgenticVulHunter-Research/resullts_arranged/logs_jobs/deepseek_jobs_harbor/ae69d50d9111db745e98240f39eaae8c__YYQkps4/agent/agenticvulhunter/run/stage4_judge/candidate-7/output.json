@@ -1,0 +1,371 @@
+{
+  "candidate_id": "candidate-7",
+  "filepath": "src/sandstorm/backend.c++",
+  "changed_line": 472,
+  "statement": "KJ_SYSCALL(linkat(AT_FDCWD, kj::str(\"/proc/self/fd/\", fd.get()).cStr(),",
+  "change_type": "A",
+  "function_name": "FileUploadStream::done",
+  "operation_type": "file_system_operation",
+  "selection_reason": "temporary file descriptor -> links to final path -> potential symlink attacks or path traversal if backupId not properly validated",
+  "security_relevance_score": 0.7,
+  "code_context": "323:       KJ_ON_SCOPE_FAILURE(if (!exists) { tryRecursivelyDelete(finalName); });\n324: \n325:       capnp::StreamFdMessageReader reader(raiiOpen(\n326:           kj::str(finalName, \"/sandstorm-manifest\"), O_RDONLY));\n327:       auto manifest = reader.getRoot<spk::Manifest>();\n328: \n329:       capnp::MessageSize sizeHint = manifest.totalSize();\n330:       sizeHint.wordCount += 8 + text.size() / sizeof(capnp::word);\n331:       auto results = context.getResults(sizeHint);\n332:       results.setAppId(trim(text));\n333:       results.setManifest(manifest);\n334:     }, [this](kj::Exception&& e) {\n335:       kj::runCatchingExceptions([&]() { recursivelyDelete(tmpdir); });\n336:       kj::throwRecoverableException(kj::mv(e));\n337:     });\n338:   }\n339: \n340: private:\n341:   kj::AutoCloseFd inputWriteFd;\n342:   kj::AutoCloseFd outputReadFd;\n343:   kj::Maybe<kj::Own<kj::AsyncOutputStream>> inputWriteEnd;\n344:   kj::Own<kj::AsyncInputStream> outputReadEnd;\n345:   kj::Promise<void> writeQueue = kj::READY_NOW;\n346:   kj::String tmpdir;\n347:   Subprocess unpackProcess;\n348:   bool saveCalled = false;\n349: \n350:   static kj::String tempDirname() {\n351:     static uint counter = 0;\n352:     return kj::str(\"/var/sandstorm/tmp/unpacking.\", time(nullptr), \".\", counter++);\n353:   }\n354: \n355:   static Subprocess startProcess(\n356:       kj::AutoCloseFd input, kj::AutoCloseFd output, kj::StringPtr outdir) {\n357:     Subprocess::Options options({\"spk\", \"unpack\", \"-\", outdir});\n358:     options.executable = \"/proc/self/exe\";\n359:     options.stdin = input;\n360:     options.stdout = output;\n361:     return Subprocess(kj::mv(options));\n362:   }\n363: };\n364: \n365: kj::Promise<void> BackendImpl::installPackage(InstallPackageContext context)  {\n366:   context.getResults().setStream(kj::heap<PackageUploadStreamImpl>(*this));\n367:   return kj::READY_NOW;\n368: }\n369: \n370: kj::Promise<void> BackendImpl::getPackage(GetPackageContext context) {\n371:   auto path = kj::str(\"/var/sandstorm/apps/\", validateId(context.getParams().getPackageId()));\n372: \n373:   capnp::StreamFdMessageReader reader(raiiOpen(\n374:       kj::str(path, \"/sandstorm-manifest\"), O_RDONLY));\n375:   auto manifest = reader.getRoot<spk::Manifest>();\n376: \n377:   kj::String appid = sandstorm::readAll(kj::str(path, \".appid\"));\n378: \n379:   capnp::MessageSize sizeHint = manifest.totalSize();\n380:   sizeHint.wordCount += 8 + appid.size() / sizeof(capnp::word);\n381:   auto results = context.getResults(sizeHint);\n382:   results.setAppId(trim(appid));\n383:   results.setManifest(manifest);\n384: \n385:   return kj::READY_NOW;\n386: }\n387: \n388: kj::Promise<void> BackendImpl::deletePackage(DeletePackageContext context) {\n389:   auto path = kj::str(\"/var/sandstorm/apps/\", validateId(context.getParams().getPackageId()));\n390:   if (access(path.cStr(), F_OK) >= 0) {\n391:     tryRecursivelyDelete(path);\n392:   }\n393:   return kj::READY_NOW;\n394: }\n395: \n396: // =======================================================================================\n397: \n398: kj::Promise<void> BackendImpl::backupGrain(BackupGrainContext context) {\n399:   auto params = context.getParams();\n400: \n401:   auto path = kj::str(\"/var/sandstorm/backups/\", params.getBackupId());\n402:   recursivelyCreateParent(path);\n403:   auto grainDir = kj::str(\"/var/sandstorm/grains/\", params.getGrainId());\n404:   Subprocess::Options processOptions({\"backup\", path, grainDir});\n405:   processOptions.executable = \"/proc/self/exe\";\n406:   auto inPipe = Pipe::make();\n407:   processOptions.stdin = inPipe.readEnd;\n408:   Subprocess process(kj::mv(processOptions));\n409:   inPipe.readEnd = nullptr;\n410: \n411:   auto metadata = params.getInfo();\n412:   auto metadataMsg = kj::heap<capnp::MallocMessageBuilder>(metadata.totalSize().wordCount + 4);\n413:   metadataMsg->setRoot(metadata);\n414:   context.releaseParams();\n415:   auto metadataStreamFd = kj::mv(inPipe.writeEnd);\n416:   auto output = ioProvider.wrapOutputFd(\n417:       metadataStreamFd, kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC);\n418:   auto promise = capnp::writeMessage(*output, *metadataMsg);\n419: \n420:   return promise.attach(kj::mv(metadataMsg), kj::mv(metadataStreamFd), kj::mv(output))\n421:       .then([KJ_MVCAP(process)]() mutable {\n422:     // TODO(cleanup): We should probably use a SubprocessSet to wait asynchronously, but that\n423:     //   means we need to use SubprocessSet everywhere...\n424:     process.waitForSuccess();\n425:   });\n426: }\n427: \n428: kj::Promise<void> BackendImpl::restoreGrain(RestoreGrainContext context) {\n429:   auto params = context.getParams();\n430: \n431:   auto path = kj::str(\"/var/sandstorm/backups/\", params.getBackupId());\n432:   auto grainDir = kj::str(\"/var/sandstorm/grains/\", params.getGrainId());\n433:   KJ_SYSCALL(mkdir(grainDir.cStr(), 0777));\n434:   Subprocess::Options processOptions({\"backup\", \"-r\", path, grainDir});\n435:   processOptions.executable = \"/proc/self/exe\";\n436:   auto outPipe = Pipe::make();\n437:   processOptions.stdout = outPipe.writeEnd;\n438:   Subprocess process(kj::mv(processOptions));\n439:   outPipe.writeEnd = nullptr;\n440: \n441:   context.releaseParams();\n442: \n443:   auto input = kj::mv(outPipe.readEnd);\n444:   auto asyncInput = ioProvider.wrapInputFd(input, kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC);\n445: \n446:   auto promise = capnp::readMessage(*asyncInput);\n447:   return promise.attach(kj::mv(input), kj::mv(asyncInput), kj::mv(process))\n448:       .then([context](kj::Own<capnp::MessageReader>&& message) mutable {\n449:     auto metadata = message->getRoot<GrainInfo>();\n450:     context.getResults(capnp::MessageSize { metadata.totalSize().wordCount + 4, 0 })\n451:         .setInfo(metadata);\n452:   });\n453: }\n454: \n455: class BackendImpl::FileUploadStream: public ByteStream::Server {\n456: public:\n457:   FileUploadStream(kj::String finalPath)\n458:       : fd(raiiOpen(dirname(finalPath), O_WRONLY | O_TMPFILE)),\n459:         finalPath(kj::mv(finalPath)) {}\n460: \n461: protected:\n462:   kj::Promise<void> write(WriteContext context) override {\n463:     auto data = context.getParams().getData();\n464:     kj::FdOutputStream(fd.get()).write(data.begin(), data.size());\n465:     return kj::READY_NOW;\n466:   }\n467: \n468:   kj::Promise<void> done(DoneContext context) override {\n469:     KJ_SYSCALL(fdatasync(fd));\n470: \n471:     // Link temporary file into filesystem.\n472:     KJ_SYSCALL(linkat(AT_FDCWD, kj::str(\"/proc/self/fd/\", fd.get()).cStr(),\n473:                       AT_FDCWD, finalPath.cStr(), AT_SYMLINK_FOLLOW));\n474:     return kj::READY_NOW;\n475:   }\n476: \n477:   kj::Promise<void> expectSize(ExpectSizeContext context) override {\n478:     // don't care\n479:     return kj::READY_NOW;\n480:   }\n481: \n482: private:\n483:   kj::AutoCloseFd fd;\n484:   kj::String finalPath;\n485: \n486:   static kj::String dirname(kj::StringPtr path) {\n487:     KJ_IF_MAYBE(pos, path.findLast('/')) {\n488:       return kj::heapString(path.slice(0, *pos));\n489:     } else {\n490:       return kj::heapString(\".\");\n491:     }\n492:   }\n493: };\n494: \n495: kj::Promise<void> BackendImpl::pump(kj::AsyncInputStream& input, ByteStream::Client stream) {\n496:   auto req = stream.writeRequest(capnp::MessageSize { 2100, 0 });\n497:   auto orphanage = capnp::Orphanage::getForMessageContaining(\n498:       kj::implicitCast<ByteStream::WriteParams::Builder>(req));\n499:   auto orphan = orphanage.newOrphan<capnp::Data>(8192);\n500:   auto buffer = orphan.get();\n501: \n502:   return input.tryRead(buffer.begin(), 1, buffer.size())\n503:       .then([&input,KJ_MVCAP(stream),KJ_MVCAP(req),KJ_MVCAP(orphan)](size_t n) mutable\n504:             -> kj::Promise<void> {\n505:     if (n == 0) {\n506:       return kj::READY_NOW;\n507:     }\n508: \n509:     orphan.truncate(n);\n510:     req.adoptData(kj::mv(orphan));\n511: \n512:     // TODO(now): Parallelize writes.\n513:     return req.send().then([&input,KJ_MVCAP(stream)](auto&&) mutable {\n514:       return pump(input, kj::mv(stream));\n515:     });\n516:   });\n517: }\n518: \n519: kj::Promise<void> BackendImpl::pump(kj::InputStream& input, ByteStream::Client stream) {\n520:   auto req = stream.writeRequest(capnp::MessageSize { 2100, 0 });\n521:   auto orphanage = capnp::Orphanage::getForMessageContaining(\n522:       kj::implicitCast<ByteStream::WriteParams::Builder>(req));\n523:   auto orphan = orphanage.newOrphan<capnp::Data>(8192);\n524:   auto buffer = orphan.get();\n525: \n526:   size_t n = input.tryRead(buffer.begin(), 1, buffer.size());\n527:   if (n == 0) {\n528:     return kj::READY_NOW;\n529:   }\n530: \n531:   orphan.truncate(n);\n532:   req.adoptData(kj::mv(orphan));\n533: \n534:   // TODO(now): Parallelize writes.\n535:   return req.send().then([&input,KJ_MVCAP(stream)](auto&&) mutable {\n536:     return pump(input, kj::mv(stream));\n537:   });\n538: }\n539: \n540: kj::Promise<void> BackendImpl::uploadBackup(UploadBackupContext context) {\n541:   auto path = kj::str(\"/var/sandstorm/backups/\", context.getParams().getBackupId());\n542:   context.releaseParams();\n543: \n544:   recursivelyCreateParent(path);\n545: \n546:   context.getResults(capnp::MessageSize { 4, 1 }).setStream(\n547:       kj::heap<FileUploadStream>(kj::mv(path)));\n548:   return kj::READY_NOW;\n549: }\n550: \n551: kj::Promise<void> BackendImpl::downloadBackup(DownloadBackupContext context) {\n552:   auto params = context.getParams();\n553:   auto path = kj::str(\"/var/sandstorm/backups/\", params.getBackupId());\n554:   auto stream = params.getStream();\n555:   context.releaseParams();\n556: \n557:   auto fd = raiiOpen(path, O_RDONLY | O_CLOEXEC);\n558:   struct stat stats;\n559:   KJ_SYSCALL(fstat(fd, &stats));\n560:   auto expectReq = stream.expectSizeRequest();\n561:   expectReq.setSize(stats.st_size);\n562:   auto expectPromise = expectReq.send();\n563: \n564:   auto file = kj::heap<kj::FdInputStream>(kj::mv(fd));\n565: \n566:   auto promise = pump(*file, kj::mv(stream));\n567:   return promise.attach(kj::mv(file), kj::mv(expectPromise));\n568: }\n569: \n570: kj::Promise<void> BackendImpl::deleteBackup(DeleteBackupContext context) {\n571:   auto path = kj::str(\"/var/sandstorm/backups/\", context.getParams().getBackupId());\n572:   while (unlink(path.cStr()) < 0) {\n573:     int error = errno;\n574:     if (error == ENOENT) {\n575:       break;\n576:     } else if (error != EINTR) {\n577:       KJ_FAIL_SYSCALL(\"unlink\", error, path);\n578:     }\n579:   }\n580:   return kj::READY_NOW;\n581: }\n582: \n583: } // namespace sandstorm\n584: ",
+  "source_summary": "backupId from RPC parameters -> path = \"/var/sandstorm/backups/\" + backupId -> finalPath in FileUploadStream constructor",
+  "sink_summary": "linkat(AT_FDCWD, \"/proc/self/fd/<fd>\", AT_FDCWD, finalPath, AT_SYMLINK_FOLLOW) creates hard link from temporary file descriptor to final path",
+  "guard_summary": "recursivelyCreateParent creates parent directories but provides no path validation; backupId is not validated with validateId like packageId is in other functions",
+  "risk_pattern": "Unvalidated backupId allows path traversal via '../' sequences, enabling arbitrary file write through symlink creation",
+  "used_variable_sources": [
+    "context.getParams().getBackupId()"
+  ],
+  "called_function_context": [
+    "FileUploadStream constructor",
+    "dirname",
+    "raiiOpen",
+    "linkat"
+  ],
+  "enclosing_conditions": [
+    "No validation on backupId parameter before path construction"
+  ],
+  "context_summary": "FileUploadStream creates O_TMPFILE in backup directory parent, then links it to final path; backupId is used directly without validation",
+  "unresolved_facts": [
+    "Whether backupId is validated elsewhere in the call chain",
+    "Whether RPC layer provides any backupId validation",
+    "Whether backupId format restrictions exist at protocol level"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "Unvalidated backupId parameter used in path construction allows '../' sequences to escape backup directory, enabling arbitrary file write via linkat",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "fit_reason": "linkat with AT_SYMLINK_FOLLOW follows symlinks in finalPath, potentially allowing symlink attacks if backupId enables path traversal",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-378",
+      "cwe_name": "Creation of Temporary File With Insecure Permissions",
+      "fit_reason": "O_TMPFILE creation in potentially attacker-controlled directory via path traversal could create temporary files with insecure permissions",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-367",
+      "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+      "fit_reason": "Potential race between directory creation and file linking operations when backupId contains path traversal sequences",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-732",
+      "cwe_name": "Incorrect Permission Assignment for Critical Resource",
+      "fit_reason": "Files created via path traversal may have incorrect permissions if written to sensitive system locations",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1236",
+    "CWE-200",
+    "CWE-22",
+    "CWE-367",
+    "CWE-378",
+    "CWE-561",
+    "CWE-563",
+    "CWE-59",
+    "CWE-676",
+    "CWE-732",
+    "CWE-829",
+    "CWE-912"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-7",
+      "filepath": "src/sandstorm/backend.c++",
+      "changed_line": 472,
+      "statement": "KJ_SYSCALL(linkat(AT_FDCWD, kj::str(\"/proc/self/fd/\", fd.get()).cStr(),",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The candidate line uses `finalPath` constructed from `backupId` in a `linkat` call. The CWE-22 mechanism is constructing a pathname from external input without proper neutralization. The demonstrated behavior is path construction and linking, but the exact traversal via '../' is not demonstrated, only the unvalidated input-to-path connection."
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "`backupId` from RPC parameters (`context.getParams().getBackupId()`) is directly used to construct `path` in `uploadBackup` (line 541). This `path` is passed to `FileUploadStream` constructor as `finalPath`. The `finalPath` is used as the target in the `linkat` call. The connection from external input to the sink (`linkat`) is concrete and demonstrated in the code."
+        },
+        "diff_causality": {
+          "score": 0.1,
+          "evidence": "The candidate line is an addition (`change_type: \"A\"`). Reverting this line would remove the linking operation entirely, preventing the file from being made permanent. However, the vulnerability mechanism (path traversal) depends on the unvalidated construction of `finalPath`, which occurs earlier in `uploadBackup` and the `FileUploadStream` constructor. The patch does not create the validation deficiency; it merely performs a linking operation using the already-constructed path."
+        },
+        "security_control": {
+          "score": 0.5,
+          "evidence": "The required control for CWE-22 is validation/sanitization of the `backupId` input to prevent directory traversal sequences (e.g., '../'). This control is required because the external input is directly concatenated into a filesystem path. The existing controls checked: `recursivelyCreateParent` (line 544) creates directories but does not validate the path. `validateId` is used for `packageId` in other functions (lines 371, 389) but not for `backupId`. The deficiency evidence is the absence of `validateId` or similar sanitization on `backupId` before path construction, as seen in `uploadBackup`. However, the evidence does not demonstrate that `backupId` actually contains traversal sequences or that downstream validation is absent; it only shows the validation is missing in this function.",
+          "required_control": "Input validation/sanitization to neutralize path traversal sequences (e.g., '../', absolute paths) in the backupId parameter before constructing the final filesystem path.",
+          "control_requirement_evidence": "CWE-22 requires that external input used in path construction is neutralized to prevent resolution outside the intended restricted directory. Here, `backupId` is concatenated directly into `/var/sandstorm/backups/` to form `finalPath`, which is used in `linkat`. Without neutralization, `backupId` like `../../etc/passwd` could cause the path to resolve outside the backups directory.",
+          "existing_controls_checked": [
+            "`recursivelyCreateParent` only ensures parent directories exist; does not validate path content.",
+            "`validateId` function is used for `packageId` in `getPackage` and `deletePackage` but not invoked for `backupId` in `uploadBackup`, `downloadBackup`, or `deleteBackup`."
+          ],
+          "deficiency_evidence": "The `backupId` parameter is used directly in string concatenation to form `path` in `uploadBackup` (line 541) without any visible validation or sanitization. The `FileUploadStream` receives this path as `finalPath`. No code in the provided evidence calls `validateId` or performs equivalent neutralization on `backupId`."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "The concrete impact is speculative. If `backupId` contains traversal sequences, the `linkat` could write a temporary file to an arbitrary location, potentially overwriting existing files. However, the evidence does not demonstrate that such an input is possible (e.g., protocol restrictions, upstream validation) or that the overwritten file would have security consequences. The impact is plausible but not established."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the `linkat` call would not execute, so the temporary file would not be linked into the filesystem. The file upload would effectively be a no-op (data written to a temporary file that is never made permanent). The path traversal vulnerability would still exist in the path construction logic, but the sink operation would be removed.",
+      "supporting_evidence": [
+        "`uploadBackup` (line 541) constructs `path` using `backupId` without visible validation.",
+        "`FileUploadStream` constructor (line 457) receives `finalPath` which is used in `linkat`.",
+        "Other functions (`getPackage`, `deletePackage`) use `validateId` on `packageId`, but `backupId` is not validated similarly."
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether `backupId` is validated elsewhere in the call chain (e.g., RPC layer, protocol definition).",
+        "Whether `backupId` has format restrictions at the protocol level that prevent traversal sequences.",
+        "Whether the parent directory `/var/sandstorm/backups/` is a safe base; if `backupId` is empty or `.`, the path might still be within the intended directory."
+      ],
+      "review_comment": "The `backupId` parameter from the RPC is used directly to construct a filesystem path without validation, similar to how `packageId` is validated in other functions. This could allow path traversal sequences to escape the intended `/var/sandstorm/backups/` directory. The `linkat` call in `FileUploadStream::done` then links a temporary file to the attacker-controlled path, potentially overwriting arbitrary files. To remediate, validate `backupId` using the existing `validateId` function (or equivalent) before constructing the path in `uploadBackup`, `downloadBackup`, and `deleteBackup`.",
+      "change_type": "A",
+      "raw_score": 0.42000000000000004,
+      "score": 0.42000000000000004
+    },
+    {
+      "candidate_id": "candidate-7",
+      "filepath": "src/sandstorm/backend.c++",
+      "changed_line": 472,
+      "statement": "KJ_SYSCALL(linkat(AT_FDCWD, kj::str(\"/proc/self/fd/\", fd.get()).cStr(),",
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The linkat call uses AT_SYMLINK_FOLLOW flag which follows symlinks in the target path, but CWE-59 requires improper resolution before file access, whereas this code creates a new link rather than accessing an existing file through a potentially malicious symlink."
+        },
+        "connection": {
+          "score": 0.45,
+          "evidence": "backupId from RPC parameters flows to finalPath construction and is used as the target for linkat, but the connection to actual symlink exploitation requires an attacker to control the backupId to create a symlink at the target location first."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this line were reverted, the temporary file would not be linked to the filesystem, preventing any potential symlink-based attacks through the backupId path."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "",
+          "required_control": "Path validation and symlink safety mechanisms",
+          "control_requirement_evidence": "CWE-59 requires proper validation to prevent symlink attacks when resolving file paths",
+          "existing_controls_checked": [
+            "recursivelyCreateParent creates directories but doesn't validate path components",
+            "No validateId function called on backupId unlike packageId in other functions"
+          ],
+          "deficiency_evidence": "backupId is used directly in path construction without validation, but the vulnerability requires an attacker to first create a symlink at the target path, which is not demonstrated"
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "The impact is speculative - an attacker would need to create a symlink at '/var/sandstorm/backups/[malicious_path]' first, then trigger this code to overwrite arbitrary files, but this prerequisite is not established."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the temporary file created with O_TMPFILE would not be linked to the filesystem at all, preventing any file system exposure and eliminating the potential for symlink-based attacks through the backupId parameter.",
+      "supporting_evidence": [
+        "linkat call uses AT_SYMLINK_FOLLOW flag which follows symlinks in the target path",
+        "backupId parameter flows directly to finalPath construction without validation",
+        "No validateId function called on backupId unlike packageId handling in other functions"
+      ],
+      "contradicting_evidence": [
+        "The code creates a new hard link rather than accessing an existing file through a symlink",
+        "O_TMPFILE creates an unnamed temporary file, reducing some attack surface",
+        "The vulnerability requires an attacker to first create a symlink at the target path"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether backupId is validated elsewhere in the RPC call chain",
+        "Whether the application's deployment context prevents symlink creation in /var/sandstorm/backups/",
+        "Whether backupId format restrictions exist at the protocol level"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.39,
+      "score": 0.39
+    },
+    {
+      "candidate_id": "candidate-7",
+      "filepath": "src/sandstorm/backend.c++",
+      "changed_line": 472,
+      "statement": "KJ_SYSCALL(linkat(AT_FDCWD, kj::str(\"/proc/self/fd/\", fd.get()).cStr(),",
+      "cwe_id": "CWE-378",
+      "cwe_name": "Creation of Temporary File With Insecure Permissions",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-378 specifically addresses temporary file creation with insecure permissions. The demonstrated code uses linkat to create a hard link from an O_TMPFILE descriptor to a final path, which is a file linking operation, not temporary file creation with permission issues."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "backupId from RPC parameters is used to construct finalPath, which is passed to FileUploadStream constructor and used in linkat operation. However, the temporary file itself is created with O_TMPFILE in dirname(finalPath) with default permissions."
+        },
+        "diff_causality": {
+          "score": 0.1,
+          "evidence": "The candidate line is part of the linking operation that moves the temporary file to its final location. Reverting this line would prevent the file from being linked but wouldn't change how the temporary file is created or its permissions."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "",
+          "required_control": "Secure temporary file creation with proper permissions and location",
+          "control_requirement_evidence": "CWE-378 requires that temporary files are created with secure permissions and in secure locations",
+          "existing_controls_checked": [
+            "O_TMPFILE flag creates anonymous temporary files",
+            "File created in dirname(finalPath) which may be attacker-controlled via path traversal"
+          ],
+          "deficiency_evidence": "The temporary file creation uses O_TMPFILE which provides some security, but the parent directory (dirname(finalPath)) may be attacker-controlled if backupId contains path traversal sequences"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "Potential for temporary file to be created in an insecure location if backupId contains path traversal, but the specific permission vulnerability of CWE-378 is not demonstrated"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the temporary file created with O_TMPFILE would remain unlinked and would be automatically deleted when the file descriptor is closed, preventing the file from being accessible at the final path.",
+      "supporting_evidence": [
+        "FileUploadStream creates temporary files using O_TMPFILE flag",
+        "backupId parameter is used directly in path construction without validation"
+      ],
+      "contradicting_evidence": [
+        "The code uses O_TMPFILE which creates anonymous temporary files with secure properties",
+        "The demonstrated operation is file linking, not temporary file creation with permission issues"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether backupId validation occurs elsewhere in the call chain",
+        "Whether O_TMPFILE provides sufficient protection against the specific CWE-378 mechanism"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.22000000000000003,
+      "score": 0.22000000000000003
+    },
+    {
+      "candidate_id": "candidate-7",
+      "filepath": "src/sandstorm/backend.c++",
+      "changed_line": 472,
+      "statement": "KJ_SYSCALL(linkat(AT_FDCWD, kj::str(\"/proc/self/fd/\", fd.get()).cStr(),",
+      "cwe_id": "CWE-367",
+      "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "The code shows file system operations but no evidence of a check-then-use pattern. The linkat operation uses O_TMPFILE which creates an unnamed temporary file, avoiding traditional TOCTOU patterns."
+        },
+        "connection": {
+          "score": 0.25,
+          "evidence": "backupId parameter flows to finalPath construction, but no concurrent access or race condition is demonstrated in the code path."
+        },
+        "diff_causality": {
+          "score": 0.2,
+          "evidence": "The added line implements file linking functionality but doesn't introduce or modify any check-then-use pattern that could create a race condition."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "atomic operations or synchronization for check-then-use patterns",
+          "control_requirement_evidence": "CWE-367 requires protection against state changes between check and use operations",
+          "existing_controls_checked": [
+            "O_TMPFILE usage avoids some race conditions by creating unnamed files"
+          ],
+          "deficiency_evidence": "No check-then-use pattern is demonstrated, so no synchronization deficiency can be established"
+        },
+        "concrete_impact": {
+          "score": 0.15,
+          "evidence": "No race condition impact is demonstrated. The code uses O_TMPFILE which is designed to avoid common file system race conditions."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the file upload functionality would be incomplete as the temporary file would not be linked to its final destination, but no race condition would be introduced or removed.",
+      "supporting_evidence": [
+        "File system operations involving temporary file creation and linking"
+      ],
+      "contradicting_evidence": [
+        "O_TMPFILE usage avoids traditional TOCTOU vulnerabilities by creating unnamed files",
+        "No check-then-use pattern is present in the code"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether concurrent access to the same backupId occurs",
+        "Whether other parts of the system create race conditions with this operation"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.17,
+      "score": 0.17
+    },
+    {
+      "candidate_id": "candidate-7",
+      "filepath": "src/sandstorm/backend.c++",
+      "changed_line": 472,
+      "statement": "KJ_SYSCALL(linkat(AT_FDCWD, kj::str(\"/proc/self/fd/\", fd.get()).cStr(),",
+      "cwe_id": "CWE-732",
+      "cwe_name": "Incorrect Permission Assignment for Critical Resource",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-732 requires demonstrating incorrect permission assignment to a critical resource. The linkat operation creates a hard link but does not show permission assignment - the file permissions are determined by the O_TMPFILE creation in the constructor, not by this linking operation."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "backupId parameter flows to finalPath construction, which is used as the target for linkat. However, the connection to permission assignment is indirect - the permissions are set when the file is created via O_TMPFILE, not during linking."
+        },
+        "diff_causality": {
+          "score": 0.25,
+          "evidence": "The linkat call creates the final file link but doesn't materially change permission assignment. The file permissions were already established when the temporary file was created in the constructor with O_TMPFILE."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "Proper permission assignment for security-critical resources",
+          "control_requirement_evidence": "CWE-732 requires that security-critical resources have appropriate permissions to prevent unauthorized access",
+          "existing_controls_checked": [
+            "O_TMPFILE creation mode (default permissions)",
+            "linkat operation (does not change permissions)"
+          ],
+          "deficiency_evidence": "No evidence of incorrect permission assignment - the file is created with standard temporary file permissions and linked without permission modification"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No concrete impact related to permission assignment is demonstrated. The primary risk appears to be path traversal, not permission issues."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the temporary file would not be linked to the final path, but the file permissions would remain unchanged from their original O_TMPFILE creation.",
+      "supporting_evidence": [
+        "backupId parameter flows to finalPath construction",
+        "linkat creates a hard link from temporary file to final path"
+      ],
+      "contradicting_evidence": [
+        "The linkat operation does not assign or modify file permissions",
+        "File permissions are determined by O_TMPFILE creation in constructor, not by linking operation",
+        "No evidence shows incorrect permission assignment to critical resources"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "What permissions O_TMPFILE creates files with by default",
+        "Whether the backup directory requires special permission considerations",
+        "Whether backupId validation exists elsewhere in the call chain"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.22000000000000003,
+      "score": 0.22000000000000003
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,302 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "lib/connie-lang.js",
+  "changed_line": 56,
+  "statement": "var v = vm.runInNewContext(m[1], {});",
+  "change_type": "A",
+  "function_name": "ExecutionInterpreter.replace",
+  "operation_type": "code_execution",
+  "selection_reason": "user-controlled configuration string -> vm.runInNewContext with empty sandbox -> arbitrary JavaScript execution",
+  "security_relevance_score": 0.9,
+  "code_context": "1: var vm = require('vm');\n2: var isPlainObject = require('lodash.isplainobject');\n3: \n4: var getValue = function(obj, key) {\n5:   var o = obj;\n6:   var keys = Array.isArray(key) ? key : key.split('.');\n7:   \n8:   for (var x = 0; x < keys.length -1; ++x) {\n9:     var k = keys[x];\n10:     if (!o[k]) return;\n11:     o = o[k];\n12:   }\n13:   \n14:   return o[keys[keys.length - 1]];\n15: };\n16: \n17: var setValue = function(obj, key, value) {\n18:   var o = obj;\n19:   var keys = Array.isArray(key) ? key : key.split('.');\n20:   \n21:   for (var x = 1; x < keys.length; ++x) {\n22:     var currentKey = keys[x];\n23:     var lastKey = keys[x - 1];\n24:     if (typeof(currentKey) === 'number') {\n25:       if (!o[lastKey]) { o[lastKey] = []; }\n26:       o = o[lastKey];\n27:     } else if (typeof(currentKey) === 'string') {\n28:       if (!o[lastKey]) { o[lastKey] = {}; }\n29:       o = o[lastKey];\n30:     } else {\n31:       throw new Error('Oopsy, key arrays should only be strings and numbers:', keys);\n32:     }\n33:   }\n34:   \n35:   o[keys[keys.length - 1]] = value;\n36:   return obj;\n37: };\n38: \n39: \n40: var EnvVarInterpreter = {\n41:   type: '$',\n42:   replace: function(value, context) {\n43:     var m = /\\$\\{([^\\}]+)\\}/.exec(value);\n44:     if (!m) return value;\n45:     return value.replace(m[0], context.env[m[1]]);\n46:   }\n47: };\n48: \n49: var ExecutionInterpreter = {\n50:   type: '#',\n51:   replace: function(value, context) {\n52:     var m = /#\\{([^\\}]+)\\}/.exec(value);\n53:     if (!m) return value;\n54:     \n55:     try {\n56:       var v = vm.runInNewContext(m[1], {});\n57:       if (m[0] === value) return v;\n58:       return value.replace(m[0], v);\n59:     } catch(err) {\n60:       throw new Error('Invalid execution [' + m[1] + ']: ' + err.message);\n61:     }\n62:   }\n63: };\n64: \n65: var ReferenceInterpreter = {\n66:   type: '@',\n67:   replace: function(value, context) {\n68:     var m = /@\\{([^\\}]+)\\}/.exec(value);\n69:     if (!m) return value;\n70:     \n71:     var v = getValue(context.config, m[1]);\n72:     if (m[0] === value) return v;\n73:     return value.replace(m[0], v);\n74:   }\n75: };\n76: \n77: var Interpreters = [ReferenceInterpreter, EnvVarInterpreter, ExecutionInterpreter];\n78: \n79: var ConnieLang = {\n80:   Interpreters: Interpreters,\n81:   InterpretersByType: Interpreters.reduce(function(o, i) {o[i.type] = i; return o;}, {}),\n82:   \n83:   getEntries: function(config) {\n84:     var entries = [];\n85:     \n86:     var iter = function(value, prefix) {\n87:       if (!prefix) prefix = [];\n88:       \n89:       if (Array.isArray(value)) {\n90:         value.forEach(function(arrValue, idx) {\n91:           iter(arrValue, prefix.concat(idx));\n92:         });\n93:       } else if (isPlainObject(value)) {\n94:         Object.keys(value).forEach(function(key) {\n95:           iter(value[key], prefix.concat(key));\n96:         });\n97:       } else {\n98:         entries.push({key: prefix, value: value});\n99:       }\n100:     };\n101:     \n102:     iter(config);\n103:     return entries;\n104:   },\n105:   \n106:   firstInnermostInterpreterFromValue: function(value) {\n107:     var start = -1;\n108:     var interpreterTypes = Object.keys(ConnieLang.InterpretersByType);\n109:     \n110:     for (var idx = 1; idx < value.length; ++idx) {\n111:       if (value[idx] === '{' && interpreterTypes.indexOf(value[idx - 1]) !== -1) {\n112:         start = idx - 1;\n113:       } else if (value[idx] === '}' && start !== -1) {\n114:         return {\n115:           type: value[start],\n116:           match: value.slice(start, idx + 1),\n117:           value: value.slice(start + 2, idx),\n118:           start: start,\n119:           end: idx + 1\n120:         };\n121:       }\n122:     }\n123:     \n124:     return null;\n125:   },\n126:   \n127:   parse: function(configObj, envObj) {\n128:     var context = {\n129:       config: configObj,\n130:       env: envObj || process.env\n131:     };\n132:     \n133:     var entries = ConnieLang.getEntries(context.config);\n134:     \n135:     // iterate until no updates have been made\n136:     var digest = function() {\n137:       var updated = false;\n138:       \n139:       entries.forEach(function(e) {\n140:         var interpreter = ConnieLang.firstInnermostInterpreterFromValue(e.value, context);\n141:         if (!interpreter) return;\n142:         \n143:         var newValue = ConnieLang.InterpretersByType[interpreter.type].replace(e.value, context);\n144:         if (newValue !== e.value) {\n145:           e.value = newValue;\n146:           updated = true;\n147:         }\n148:       });\n149:       \n150:       return updated;\n151:     };\n152:     \n153:     while(digest()) ;\n154:     \n155:     var result = {};\n156:     entries.forEach(function(e) {\n157:       setValue(result, e.key, e.value);\n158:     });\n159:     \n160:     return result;\n161:   }\n162: };\n163: \n164: module.exports = ConnieLang;",
+  "source_summary": "User-controlled configuration values containing #{...} patterns are parsed from config objects and environment variables. The content inside #{...} (m[1]) is extracted and executed.",
+  "sink_summary": "vm.runInNewContext executes arbitrary JavaScript code in a new V8 context with an empty sandbox object {}.",
+  "guard_summary": "No validation, sanitization, or restriction on the executed code. The empty sandbox provides no isolation from Node.js built-ins.",
+  "risk_pattern": "User-supplied configuration values containing JavaScript code patterns are directly executed without sandboxing restrictions.",
+  "used_variable_sources": [
+    "config object properties",
+    "environment variables"
+  ],
+  "called_function_context": [
+    "vm.runInNewContext"
+  ],
+  "enclosing_conditions": [
+    "try-catch block for error handling only"
+  ],
+  "context_summary": "ExecutionInterpreter processes values matching #{...} patterns by extracting and executing the inner JavaScript code. Used recursively during configuration parsing.",
+  "unresolved_facts": [
+    "Specific deployment context and trust boundaries for configuration sources"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-94",
+      "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+      "fit_reason": "User-controlled JavaScript code is directly executed via vm.runInNewContext without proper validation or sandboxing",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-502",
+      "cwe_name": "Deserialization of Untrusted Data",
+      "fit_reason": "Pattern matches deserialization-like behavior where user input is parsed and executed as code",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-99",
+      "cwe_name": "Improper Control of Resource Identifiers ('Resource Injection')",
+      "fit_reason": "Environment variables and configuration values are used to construct executable code",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-88",
+      "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+      "fit_reason": "Similar injection pattern but applied to code execution context rather than command arguments",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-19",
+    "CWE-200",
+    "CWE-400",
+    "CWE-502",
+    "CWE-561",
+    "CWE-563",
+    "CWE-584",
+    "CWE-643",
+    "CWE-776",
+    "CWE-79",
+    "CWE-830",
+    "CWE-88",
+    "CWE-90",
+    "CWE-94",
+    "CWE-99"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 56,
+      "statement": "var v = vm.runInNewContext(m[1], {});",
+      "cwe_id": "CWE-94",
+      "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.95,
+          "evidence": "The code directly constructs and executes JavaScript code using user-controlled input (m[1]) via vm.runInNewContext, satisfying CWE-94's definition of generating code from externally-influenced input without proper neutralization."
+        },
+        "connection": {
+          "score": 0.9,
+          "evidence": "User-controlled configuration values containing #{...} patterns are parsed, the content inside (m[1]) is extracted and directly passed to vm.runInNewContext for execution, creating a direct path from external input to code execution."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "This line is the primary code execution mechanism. If reverted, the JavaScript execution capability would be removed, preventing the code injection vulnerability."
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "The empty sandbox {} provides no isolation from Node.js built-ins, allowing full access to require(), process, and other dangerous APIs.",
+          "required_control": "Input validation/sanitization and proper sandboxing for dynamic code execution",
+          "control_requirement_evidence": "CWE-94 requires neutralizing special elements that could modify code behavior; here the entire input becomes executable code requiring validation or sandboxing",
+          "existing_controls_checked": [
+            "empty sandbox object {} provides no protection",
+            "try-catch only handles errors but doesn't prevent execution"
+          ],
+          "deficiency_evidence": "No validation of the input content, no restrictions on accessible APIs, empty sandbox allows full Node.js environment access"
+        },
+        "concrete_impact": {
+          "score": 0.85,
+          "evidence": "Arbitrary JavaScript execution with full Node.js environment access, enabling file system access, network calls, and system command execution."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code execution functionality would be removed, preventing the injection of arbitrary JavaScript code from user-controlled configuration values.",
+      "supporting_evidence": [
+        "User-controlled configuration values containing #{...} patterns are parsed and executed",
+        "vm.runInNewContext executes the extracted content (m[1]) with empty sandbox",
+        "No validation or sanitization of the executed code content",
+        "Empty sandbox provides no isolation from dangerous Node.js APIs"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Specific deployment context and trust boundaries for configuration sources"
+      ],
+      "review_comment": "The ExecutionInterpreter directly executes user-controlled JavaScript code from configuration values using vm.runInNewContext with an empty sandbox, allowing arbitrary code execution. The vulnerability occurs when #{...} patterns containing malicious code are processed without validation. Replace the dynamic code execution with a safe expression evaluator or implement strict allowlisting of permitted operations and proper sandboxing with restricted access to Node.js APIs.",
+      "change_type": "A",
+      "raw_score": 0.8699999999999999,
+      "score": 0.8699999999999999
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 56,
+      "statement": "var v = vm.runInNewContext(m[1], {});",
+      "cwe_id": "CWE-502",
+      "cwe_name": "Deserialization of Untrusted Data",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "CWE-502 specifically addresses deserialization vulnerabilities where data is converted from serialized format to objects/code. This case involves parsing and executing JavaScript code from configuration strings, which shares the pattern of converting untrusted data to executable form but is more direct code execution than traditional deserialization."
+        },
+        "connection": {
+          "score": 0.85,
+          "evidence": "User-controlled configuration values containing #{...} patterns are directly extracted (m[1]) and passed to vm.runInNewContext. The path is: config/env input → pattern matching → code extraction → direct execution."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This line is the core vulnerability mechanism - it executes the extracted JavaScript code. Reverting would prevent the arbitrary code execution entirely."
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "The empty sandbox {} provides no isolation from Node.js built-ins, allowing full access to require(), process, and other dangerous APIs.",
+          "required_control": "Input validation and sandboxing restrictions for code execution",
+          "control_requirement_evidence": "CWE-502 requires validation of untrusted data before execution. Code execution from untrusted sources requires strict sandboxing to prevent access to dangerous APIs.",
+          "existing_controls_checked": [
+            "Empty sandbox object {} provides no meaningful isolation",
+            "No validation of the executed code content"
+          ],
+          "deficiency_evidence": "The sandbox is completely empty, allowing full Node.js environment access. No validation occurs on the extracted JavaScript code before execution."
+        },
+        "concrete_impact": {
+          "score": 0.75,
+          "evidence": "Arbitrary JavaScript execution with Node.js environment access enables file system operations, network access, command execution, and privilege escalation."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the #{...} patterns would not execute JavaScript code, preventing arbitrary code execution from user-controlled configuration.",
+      "supporting_evidence": [
+        "User-controlled configuration values containing #{...} patterns are directly executed",
+        "vm.runInNewContext with empty sandbox provides no isolation from Node.js built-ins",
+        "No validation or sanitization of the executed JavaScript code"
+      ],
+      "contradicting_evidence": [
+        "This is direct code execution rather than traditional object deserialization"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Specific trust boundaries for configuration sources in deployment context",
+        "Whether configuration values are expected to contain executable code"
+      ],
+      "review_comment": "The ExecutionInterpreter directly executes JavaScript code extracted from user-controlled configuration values using vm.runInNewContext with an empty sandbox, providing no isolation from dangerous Node.js APIs. This allows arbitrary code execution if an attacker can control configuration values. Replace the empty sandbox with a properly restricted context that blocks access to require(), process, and other dangerous globals, or remove the code execution capability entirely if not required.",
+      "change_type": "A",
+      "raw_score": 0.75,
+      "score": 0.75
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 56,
+      "statement": "var v = vm.runInNewContext(m[1], {});",
+      "cwe_id": "CWE-99",
+      "cwe_name": "Improper Control of Resource Identifiers ('Resource Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-99 specifically addresses improper control of resource identifiers (like file paths, URLs, database keys), but this code executes arbitrary JavaScript code, not resource identifiers."
+        },
+        "connection": {
+          "score": 0.85,
+          "evidence": "User-controlled configuration values containing #{...} patterns are directly passed to vm.runInNewContext() via the m[1] capture group from regex matching."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If this line were removed, the arbitrary code execution capability would be eliminated. The addition creates the vulnerability."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "Input validation for resource identifiers",
+          "control_requirement_evidence": "CWE-99 requires validation of resource identifiers to prevent unauthorized resource access",
+          "existing_controls_checked": [
+            "No validation of m[1] content before execution",
+            "Empty sandbox {} provides no resource isolation"
+          ],
+          "deficiency_evidence": "The demonstrated deficiency is code execution, not resource identifier validation. The control required by CWE-99 is not applicable to this code execution mechanism."
+        },
+        "concrete_impact": {
+          "score": 0.8,
+          "evidence": "Arbitrary JavaScript execution with full Node.js environment access, enabling file system access, network calls, and system command execution."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the arbitrary JavaScript execution capability would be removed, and #{...} patterns would not be processed as executable code.",
+      "supporting_evidence": [
+        "User-controlled configuration values containing #{...} patterns are extracted and executed",
+        "vm.runInNewContext executes arbitrary JavaScript with full Node.js environment access",
+        "Empty sandbox {} provides no isolation from system resources"
+      ],
+      "contradicting_evidence": [
+        "CWE-99 specifically addresses resource identifier control, but this is arbitrary code execution",
+        "The vulnerability involves executing code, not accessing resources through identifiers"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Specific deployment context and trust boundaries for configuration sources"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.5599999999999999,
+      "score": 0.5599999999999999
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 56,
+      "statement": "var v = vm.runInNewContext(m[1], {});",
+      "cwe_id": "CWE-88",
+      "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-88 specifically addresses argument delimiters in command strings for shell/command execution. The demonstrated mechanism is direct JavaScript code execution via vm.runInNewContext, not argument injection in command strings."
+        },
+        "connection": {
+          "score": 0.85,
+          "evidence": "User-controlled configuration values containing #{...} patterns are directly extracted (m[1]) and passed to vm.runInNewContext without validation or sanitization."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If this candidate line were reverted, the JavaScript execution capability would be removed. The addition creates the direct code execution path."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "argument delimiter validation for command strings",
+          "control_requirement_evidence": "CWE-88 requires validation of argument delimiters when constructing command strings",
+          "existing_controls_checked": [
+            "no command string construction or argument parsing is demonstrated"
+          ],
+          "deficiency_evidence": "The mechanism is code execution, not command argument injection, so CWE-88 control requirements do not apply"
+        },
+        "concrete_impact": {
+          "score": 0.8,
+          "evidence": "Direct arbitrary JavaScript execution with Node.js built-in access via vm.runInNewContext with empty sandbox, enabling full system access."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the #{...} pattern would not execute JavaScript code, eliminating the arbitrary code execution vulnerability.",
+      "supporting_evidence": [
+        "User-controlled configuration values containing #{...} patterns are extracted and executed",
+        "vm.runInNewContext executes with empty sandbox providing no isolation from Node.js built-ins",
+        "No validation or sanitization of the executed code content"
+      ],
+      "contradicting_evidence": [
+        "CWE-88 specifically addresses command argument injection, but this is direct code execution via JavaScript VM",
+        "No command string construction or argument parsing is demonstrated"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Specific trust boundaries for configuration sources in deployment context"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.5700000000000001,
+      "score": 0.5700000000000001
+    }
+  ],
+  "stage4_status": "completed"
+}

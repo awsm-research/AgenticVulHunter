@@ -1,0 +1,250 @@
+diff --git a/cryptography/hazmat/primitives/kdf/hkdf.py b/cryptography/hazmat/primitives/kdf/hkdf.py
+index 44e148170..d49cc5bda 100644
+--- a/cryptography/hazmat/primitives/kdf/hkdf.py
++++ b/cryptography/hazmat/primitives/kdf/hkdf.py
+@@ -22,102 +22,115 @@ from cryptography.exceptions import (
+ from cryptography.hazmat.backends.interfaces import HMACBackend
+ from cryptography.hazmat.primitives import constant_time, hmac, interfaces
+ 
+ 
+ @utils.register_interface(interfaces.KeyDerivationFunction)
+ class HKDF(object):
+     def __init__(self, algorithm, length, salt, info, backend):
+         if not isinstance(backend, HMACBackend):
+             raise UnsupportedAlgorithm(
+                 "Backend object does not implement HMACBackend",
+                 _Reasons.BACKEND_MISSING_INTERFACE
+             )
+ 
+         self._algorithm = algorithm
+ 
+-        max_length = 255 * (algorithm.digest_size // 8)
+-
+-        if length > max_length:
+-            raise ValueError(
+-                "Can not derive keys larger than {0} octets.".format(
+-                    max_length
+-                ))
+-
+-        self._length = length
+-
+         if isinstance(salt, six.text_type):
+             raise TypeError(
+                 "Unicode-objects must be encoded before using them as a salt.")
+ 
+         if salt is None:
+             salt = b"\x00" * (self._algorithm.digest_size // 8)
+ 
+         self._salt = salt
+ 
+-        if isinstance(info, six.text_type):
+-            raise TypeError(
+-                "Unicode-objects must be encoded before using them as info.")
+-
+-        if info is None:
+-            info = b""
+-
+-        self._info = info
+         self._backend = backend
+ 
+         self._used = False
+ 
++        self._hkdf_expand = HKDFExpand(self._algorithm, length, info, backend)
++
+     def _extract(self, key_material):
+         h = hmac.HMAC(self._salt, self._algorithm, backend=self._backend)
+         h.update(key_material)
+         return h.finalize()
+ 
+-    def _expand(self, key_material):
+-        output = [b""]
+-        counter = 1
+-
+-        while (self._algorithm.digest_size // 8) * len(output) < self._length:
+-            h = hmac.HMAC(key_material, self._algorithm, backend=self._backend)
+-            h.update(output[-1])
+-            h.update(self._info)
+-            h.update(six.int2byte(counter))
+-            output.append(h.finalize())
+-            counter += 1
+-
+-        return b"".join(output)[:self._length]
+-
+     def derive(self, key_material):
+         if isinstance(key_material, six.text_type):
+             raise TypeError(
+                 "Unicode-objects must be encoded before using them as key "
+                 "material."
+             )
+ 
+         if self._used:
+             raise AlreadyFinalized
+ 
+         self._used = True
+-        return self._expand(self._extract(key_material))
++        return self._hkdf_expand.derive(self._extract(key_material))
+ 
+     def verify(self, key_material, expected_key):
+         if not constant_time.bytes_eq(self.derive(key_material), expected_key):
+             raise InvalidKey
+ 
+ 
+ @utils.register_interface(interfaces.KeyDerivationFunction)
+ class HKDFExpand(HKDF):
+     def __init__(self, algorithm, length, info, backend):
+-        HKDF.__init__(self, algorithm, length, None, info, backend)
++        if not isinstance(backend, HMACBackend):
++            raise UnsupportedAlgorithm(
++                "Backend object does not implement HMACBackend",
++                _Reasons.BACKEND_MISSING_INTERFACE
++            )
++
++        self._algorithm = algorithm
++
++        self._backend = backend
++
++        max_length = 255 * (algorithm.digest_size // 8)
++
++        if length > max_length:
++            raise ValueError(
++                "Can not derive keys larger than {0} octets.".format(
++                    max_length
++                ))
++
++        self._length = length
++
++        if isinstance(info, six.text_type):
++            raise TypeError(
++                "Unicode-objects must be encoded before using them as info.")
++
++        if info is None:
++            info = b""
++
++        self._info = info
++
++        self._used = False
++
++    def _expand(self, key_material):
++        output = [b""]
++        counter = 1
++
++        while (self._algorithm.digest_size // 8) * len(output) < self._length:
++            h = hmac.HMAC(key_material, self._algorithm, backend=self._backend)
++            h.update(output[-1])
++            h.update(self._info)
++            h.update(six.int2byte(counter))
++            output.append(h.finalize())
++            counter += 1
++
++        return b"".join(output)[:self._length]
+ 
+     def derive(self, key_material):
+         if isinstance(key_material, six.text_type):
+             raise TypeError(
+                 "Unicode-objects must be encoded before using them as key"
+                 "material."
+             )
+ 
+         if self._used:
+             raise AlreadyFinalized
+ 
+         self._used = True
+         return self._expand(key_material)
+ 
+     def verify(self, key_material, expected_key):
+diff --git a/tests/hazmat/primitives/test_hkdf.py b/tests/hazmat/primitives/test_hkdf.py
+index bee42172b..598f09f02 100644
+--- a/tests/hazmat/primitives/test_hkdf.py
++++ b/tests/hazmat/primitives/test_hkdf.py
+@@ -202,15 +202,18 @@ class TestHKDFExpand(object):
+             hkdf.derive(b"second")
+ 
+     def test_unicode_error(self, backend):
+         info = binascii.unhexlify(b"f0f1f2f3f4f5f6f7f8f9")
+         hkdf = HKDFExpand(hashes.SHA256(), 42, info, backend)
+ 
+         with pytest.raises(TypeError):
+             hkdf.derive(six.u("first"))
+ 
+ 
+ def test_invalid_backend():
+     pretend_backend = object()
+ 
+     with raises_unsupported_algorithm(_Reasons.BACKEND_MISSING_INTERFACE):
+         HKDF(hashes.SHA256(), 16, None, None, pretend_backend)
++
++    with raises_unsupported_algorithm(_Reasons.BACKEND_MISSING_INTERFACE):
++        HKDFExpand(hashes.SHA256(), 16, None, pretend_backend)
+diff --git a/tests/hazmat/primitives/utils.py b/tests/hazmat/primitives/utils.py
+index 6c3f4c95b..7cf5efd0e 100644
+--- a/tests/hazmat/primitives/utils.py
++++ b/tests/hazmat/primitives/utils.py
+@@ -14,31 +14,31 @@
+ from __future__ import absolute_import, division, print_function
+ 
+ import binascii
+ import itertools
+ import os
+ 
+ import pytest
+ 
+ from cryptography.exceptions import (
+     AlreadyFinalized, AlreadyUpdated, InvalidSignature, InvalidTag,
+     NotYetFinalized
+ )
+ from cryptography.hazmat.primitives import hashes, hmac
+ from cryptography.hazmat.primitives.asymmetric import rsa
+ from cryptography.hazmat.primitives.ciphers import Cipher
+-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
++from cryptography.hazmat.primitives.kdf.hkdf import HKDF, HKDFExpand
+ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+ 
+ from ...utils import load_vectors_from_file
+ 
+ 
+ def _load_all_params(path, file_names, param_loader):
+     all_params = []
+     for file_name in file_names:
+         all_params.extend(
+             load_vectors_from_file(os.path.join(path, file_name), param_loader)
+         )
+     return all_params
+ 
+ 
+ def generate_encrypt_test(param_loader, path, file_names, cipher_factory,
+@@ -335,34 +335,33 @@ def hkdf_derive_test(backend, algorithm, params):
+ def hkdf_extract_test(backend, algorithm, params):
+     hkdf = HKDF(
+         algorithm,
+         int(params["l"]),
+         salt=binascii.unhexlify(params["salt"]) or None,
+         info=binascii.unhexlify(params["info"]) or None,
+         backend=backend
+     )
+ 
+     prk = hkdf._extract(binascii.unhexlify(params["ikm"]))
+ 
+     assert prk == binascii.unhexlify(params["prk"])
+ 
+ 
+ def hkdf_expand_test(backend, algorithm, params):
+-    hkdf = HKDF(
++    hkdf = HKDFExpand(
+         algorithm,
+         int(params["l"]),
+-        salt=binascii.unhexlify(params["salt"]) or None,
+         info=binascii.unhexlify(params["info"]) or None,
+         backend=backend
+     )
+ 
+     okm = hkdf._expand(binascii.unhexlify(params["prk"]))
+ 
+     assert okm == binascii.unhexlify(params["okm"])
+ 
+ 
+ def generate_hkdf_test(param_loader, path, file_names, algorithm):
+     all_params = _load_all_params(path, file_names, param_loader)
+ 
+     all_tests = [hkdf_extract_test, hkdf_expand_test, hkdf_derive_test]
+ 
+     @pytest.mark.parametrize(

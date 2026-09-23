@@ -1,0 +1,229 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "src/wagtail_2fa/views.py",
+  "changed_line": 67,
+  "statement": "return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)",
+  "change_type": "A",
+  "function_name": "DeviceListView.get_queryset",
+  "operation_type": "data_retrieval",
+  "selection_reason": "unvalidated user input from URL kwargs -> database query construction -> potential unauthorized device access",
+  "security_relevance_score": 0.75,
+  "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+  "source_summary": "The user_id parameter comes from URL kwargs, which is unvalidated and directly passed to the database query. The value is converted to int in get_context_data but not validated for authorization.",
+  "sink_summary": "The TOTPDevice.objects.devices_for_user() method retrieves all confirmed TOTP devices for the specified user_id without any authorization check against the current user making the request.",
+  "guard_summary": "There are no security controls preventing a user from accessing another user's devices. The code does not verify that the requesting user has permission to view devices for the specified user_id parameter.",
+  "risk_pattern": "An attacker can enumerate or access TOTP devices belonging to any user by manipulating the user_id parameter in the URL, bypassing normal authorization checks.",
+  "used_variable_sources": [
+    "self.kwargs['user_id']"
+  ],
+  "called_function_context": [
+    "TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)"
+  ],
+  "enclosing_conditions": [],
+  "context_summary": "The DeviceListView class allows any authenticated user to view the TOTP devices of any other user by providing their user_id in the URL. The get_queryset method directly uses this unvalidated parameter without checking if the current user is authorized to access those devices.",
+  "unresolved_facts": [
+    "Whether the django-otp library's devices_for_user implementation includes any built-in authorization checks",
+    "The exact security implications of bypassing authorization in the TOTP device enumeration"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "Stage-2 evidence shows unvalidated user input from URL kwargs leads to database query without authorization check, matching the mechanism of incorrect authorization",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "fit_reason": "Stage-2 evidence shows direct access to TOTP devices for any user by manipulating URL parameter, which is a classic forced browsing vulnerability",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-264",
+      "cwe_name": "Permissions, Privileges, and Access Controls",
+      "fit_reason": "Stage-2 evidence shows lack of proper access controls when retrieving user devices, falling under legacy permissions and access control failures",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-200",
+    "CWE-208",
+    "CWE-264",
+    "CWE-327",
+    "CWE-425",
+    "CWE-628",
+    "CWE-687",
+    "CWE-863",
+    "CWE-918",
+    "CWE-943"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 67,
+      "statement": "return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code directly uses an unvalidated user ID from URL kwargs to retrieve TOTP devices without authorization check, which is the exact mechanism of incorrect authorization."
+        },
+        "connection": {
+          "score": 1.0,
+          "evidence": "The user_id parameter from self.kwargs['user_id'] flows directly into the database query via devices_for_user(), establishing a clear path from attacker-controllable input to vulnerable resource access."
+        },
+        "diff_causality": {
+          "score": 1.0,
+          "evidence": "If this line were reverted or modified to include authorization checks, the vulnerability would be eliminated. The patch directly addresses the lack of authorization by introducing a bypassable path to any user's devices."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "There is no authorization control in place to verify that the requesting user has permission to access the specified user_id's devices.",
+          "required_control": "Authorization check",
+          "control_requirement_evidence": "CWE-863 requires that authorization checks be correctly performed when accessing resources. The code must ensure that a user can only access their own devices or devices they are authorized to view.",
+          "existing_controls_checked": [
+            "No explicit authorization check in get_queryset method",
+            "No verification of current user vs requested user_id in DeviceListView"
+          ],
+          "deficiency_evidence": "The code directly passes the unvalidated user_id parameter to devices_for_user() without checking if the requesting user is authorized to access those devices. This is a complete absence of authorization control."
+        },
+        "concrete_impact": {
+          "score": 0.8,
+          "evidence": "An attacker can enumerate or access TOTP devices belonging to any user by manipulating the user_id parameter in the URL, which constitutes unauthorized access to sensitive authentication data."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would either fail to retrieve any devices or require an explicit authorization check before accessing devices_for_user. This would prevent unauthorized access to TOTP devices by other users.",
+      "supporting_evidence": [
+        "The user_id parameter comes from URL kwargs and is unvalidated",
+        "devices_for_user() method retrieves all confirmed TOTP devices for the specified user_id without authorization check",
+        "No verification that the requesting user has permission to view devices for the specified user_id"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the django-otp library's devices_for_user implementation includes any built-in authorization checks",
+        "The exact security implications of bypassing authorization in the TOTP device enumeration"
+      ],
+      "review_comment": "An attacker can enumerate or access TOTP devices belonging to any user by manipulating the user_id parameter in the URL. The code directly passes unvalidated user input to a database query without authorization verification. Add an authorization check to ensure that only the owner of the devices or an authorized administrator can access them.",
+      "change_type": "A",
+      "raw_score": 0.76,
+      "score": 0.76
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 67,
+      "statement": "return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)",
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code directly retrieves TOTP devices for any user_id provided in the URL without authorization checks, which is the exact mechanism of CWE-425 (forced browsing)."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The unvalidated user_id from self.kwargs['user_id'] is directly passed to devices_for_user(), creating a clear path from attacker-controlled input to unauthorized resource access."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this line were removed or modified to include authorization checks, the vulnerability would be mitigated. The patch directly affects the authorization enforcement for device enumeration."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "There is no authorization control in place to verify that the requesting user has permission to access devices for the specified user_id.",
+          "required_control": "Authorization check",
+          "control_requirement_evidence": "CWE-425 requires that all restricted resources be protected by appropriate authorization checks to prevent forced browsing.",
+          "existing_controls_checked": [
+            "No explicit authorization check in get_queryset() method",
+            "No user session validation against requested user_id"
+          ],
+          "deficiency_evidence": "The code directly uses self.kwargs['user_id'] without verifying that the current user is authorized to access those devices, demonstrating a clear lack of authorization control."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "An attacker can enumerate or access TOTP devices belonging to any user by manipulating the user_id parameter in the URL, which constitutes unauthorized access to sensitive authentication data."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted to include proper authorization checks (e.g., verifying that the requesting user matches the requested user_id or has admin privileges), then unauthorized device enumeration would be prevented.",
+      "supporting_evidence": [
+        "The get_queryset method directly uses self.kwargs['user_id'] without authorization verification",
+        "The TOTPDevice.objects.devices_for_user() call retrieves all confirmed devices for any provided user_id",
+        "URL parameter user_id is unvalidated and passed directly to database query"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the django-otp library's devices_for_user implementation includes any built-in authorization checks",
+        "The exact security implications of bypassing authorization in the TOTP device enumeration"
+      ],
+      "review_comment": "An attacker can access any user's TOTP devices by manipulating the user_id parameter in the URL. The code lacks authorization checks to verify that the requesting user is authorized to view those devices. Add an authorization check to ensure that only the owner or an admin can access another user's devices.",
+      "change_type": "A",
+      "raw_score": 0.6,
+      "score": 0.6
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 67,
+      "statement": "return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)",
+      "cwe_id": "CWE-264",
+      "cwe_name": "Permissions, Privileges, and Access Controls",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code directly retrieves TOTP devices for any user_id provided in the URL without enforcing access control, which is a core mechanism of CWE-264 (Permissions, Privileges, and Access Controls)."
+        },
+        "connection": {
+          "score": 1.0,
+          "evidence": "The unvalidated user_id from self.kwargs['user_id'] is directly passed to TOTPDevice.objects.devices_for_user(), creating a clear path from attacker-controllable input to access to another user's devices."
+        },
+        "diff_causality": {
+          "score": 1.0,
+          "evidence": "If this line were reverted or modified to include authorization checks, the vulnerability would be eliminated. The patch directly introduces the unauthorized access mechanism by bypassing any authorization logic."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "There is no security control in place to verify that the requesting user has permission to view devices for the specified user_id. The code assumes all authenticated users can access any user's devices.",
+          "required_control": "Authorization check",
+          "control_requirement_evidence": "CWE-264 requires that access controls be enforced at protected operations, such as retrieving another user's TOTP devices.",
+          "existing_controls_checked": [
+            "No authorization check in DeviceListView.get_queryset()",
+            "No verification of current user vs. requested user_id"
+          ],
+          "deficiency_evidence": "The code directly passes self.kwargs['user_id'] to devices_for_user without checking if the requesting user is authorized to access those devices, demonstrating a complete absence of authorization control."
+        },
+        "concrete_impact": {
+          "score": 0.8,
+          "evidence": "An attacker can enumerate or access TOTP devices belonging to any user by manipulating the user_id parameter in the URL, leading to unauthorized access and potential privilege misuse."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, either by adding an authorization check or by not passing the unvalidated user_id directly to devices_for_user, then unauthorized access to other users' TOTP devices would be prevented.",
+      "supporting_evidence": [
+        "The DeviceListView.get_queryset() method directly uses self.kwargs['user_id'] without any authorization verification",
+        "The code does not check if the requesting user is authorized to view devices for the specified user_id",
+        "The TOTPDevice.objects.devices_for_user() call retrieves all confirmed devices for the given user_id without access control"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the django-otp library's devices_for_user implementation includes any built-in authorization checks",
+        "The exact security implications of bypassing authorization in the TOTP device enumeration"
+      ],
+      "review_comment": "An authenticated user can access TOTP devices of any other user by manipulating the user_id parameter in the URL. The code lacks authorization checks to verify that the requesting user is allowed to view devices for the specified user_id. Add an authorization check to ensure that only the owner or an authorized administrator can access another user's devices.",
+      "change_type": "A",
+      "raw_score": 0.76,
+      "score": 0.76
+    }
+  ],
+  "stage4_status": "completed"
+}

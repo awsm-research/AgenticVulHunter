@@ -1,0 +1,214 @@
+{
+  "candidate_id": "candidate-4",
+  "filepath": "src/wagtail_2fa/views.py",
+  "changed_line": 111,
+  "statement": "class DeviceUpdateView(OtpRequiredMixin, UpdateView):",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "observable input/state (view class inheritance) -> exact operation (adding OtpRequiredMixin) -> security-sensitive effect (enforces OTP requirement for device update view)",
+  "security_relevance_score": 0.75,
+  "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: from wagtail_2fa.mixins import OtpRequiredMixin\n21: \n22: \n23: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n24:     template_name = \"wagtail_2fa/otp_form.html\"\n25:     form_class = forms.TokenForm\n26:     redirect_field_name = REDIRECT_FIELD_NAME\n27: \n28:     @method_decorator(sensitive_post_parameters())\n29:     @method_decorator(never_cache)\n30:     def dispatch(self, *args, **kwargs):\n31:         return super().dispatch(*args, **kwargs)\n32: \n33:     def get_form_kwargs(self):\n34:         kwargs = super().get_form_kwargs()\n35:         kwargs[\"user\"] = self.request.user\n36:         return kwargs\n37: \n38:     def get_context_data(self, *args, **kwargs):\n39:         context = super().get_context_data(*args, **kwargs)\n40:         context[self.redirect_field_name] = self.get_redirect_url()\n41:         return context\n42: \n43:     def form_valid(self, form):\n44:         otp_login(self.request, self.request.user.otp_device)\n45:         return super().form_valid(form)\n46: \n47:     def get_redirect_url(self):\n48:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n49:         redirect_to = self.request.POST.get(\n50:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n51:         )\n52:         url_is_safe = is_safe_url(\n53:             url=redirect_to,\n54:             allowed_hosts=self.get_success_url_allowed_hosts(),\n55:             require_https=self.request.is_secure(),\n56:         )\n57:         return redirect_to if url_is_safe else \"\"\n58: \n59:     def get_success_url(self):\n60:         url = self.get_redirect_url()\n61:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n62: \n63: \n64: class DeviceListView(OtpRequiredMixin, ListView):\n65:     template_name = \"wagtail_2fa/device_list.html\"\n66: \n67:     # require OTP if configured\n68:     if_configured = True\n69: \n70:     def get_queryset(self):\n71:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n72: \n73:     def get_context_data(self, **kwargs):\n74:         context = super().get_context_data(**kwargs)\n75:         context['user_id'] = int(self.kwargs['user_id'])\n76:         return context\n77: \n78: \n79: class DeviceCreateView(OtpRequiredMixin, FormView):\n80:     form_class = forms.DeviceForm\n81:     template_name = \"wagtail_2fa/device_form.html\"\n82: \n83:     # require OTP if configured\n84:     if_configured = True\n85: \n86:     def get_form_kwargs(self):\n87:         kwargs = super().get_form_kwargs()\n88:         kwargs[\"user\"] = self.request.user\n89:         kwargs[\"instance\"] = self.device\n90:         return kwargs\n91: \n92:     def form_valid(self, form):\n93:         form.save()\n94:         utils.delete_unconfirmed_devices(form.user)\n95: \n96:         if not self.request.user.is_verified():\n97:             otp_login(self.request, form.instance)\n98:         return super().form_valid(form)\n99: \n100:     def get_success_url(self):\n101:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n102: \n103:     @cached_property\n104:     def device(self):\n105:         if self.request.method.lower() == \"get\":\n106:             return utils.new_unconfirmed_device(self.request.user)\n107:         else:\n108:             return utils.get_unconfirmed_device(self.request.user)\n109: \n110: \n111: class DeviceUpdateView(OtpRequiredMixin, UpdateView):\n112:     form_class = forms.DeviceForm\n113:     template_name = \"wagtail_2fa/device_form.html\"\n114: \n115:     def get_queryset(self):\n116:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n117: \n118:     def get_form_kwargs(self):\n119:         kwargs = super().get_form_kwargs()\n120:         kwargs[\"user\"] = self.request.user\n121:         return kwargs\n122: \n123:     def get_success_url(self):\n124:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n125: \n126: \n127: class DeviceDeleteView(OtpRequiredMixin, DeleteView):\n128:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n129: \n130:     def get_queryset(self):\n131:         device = TOTPDevice.objects.get(**self.kwargs)\n132:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n133: \n134:     def get_success_url(self):\n135:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n136: \n137: \n138: class DeviceQRCodeView(OtpRequiredMixin, View):\n139:     # require OTP if configured\n140:     if_configured = True\n141: \n142:     def get(self, request):\n143:         device = utils.get_unconfirmed_device(self.request.user)\n144:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n145:         response = HttpResponse(content_type=\"image/svg+xml\")\n146:         img.save(response)\n147: \n148:         return response",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "The DeviceUpdateView inherits OtpRequiredMixin, which enforces OTP requirement. If this check is bypassed or incorrectly evaluated, it leads to incorrect authorization.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "fit_reason": "The DeviceUpdateView class is a restricted route that requires OTP. If the OTP enforcement is bypassed, an attacker could directly access this view without proper authorization.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-285",
+      "cwe_name": "Improper Authorization",
+      "fit_reason": "The inheritance of OtpRequiredMixin implies an authorization mechanism. If the OTP check is not correctly enforced, it can lead to improper authorization, allowing unauthorized access.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-208",
+    "CWE-254",
+    "CWE-285",
+    "CWE-287",
+    "CWE-311",
+    "CWE-352",
+    "CWE-425",
+    "CWE-471",
+    "CWE-561",
+    "CWE-581",
+    "CWE-628",
+    "CWE-685",
+    "CWE-687",
+    "CWE-863"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 111,
+      "statement": "class DeviceUpdateView(OtpRequiredMixin, UpdateView):",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The DeviceUpdateView class inherits from OtpRequiredMixin, which is designed to enforce OTP (One-Time Password) requirement for access. This directly aligns with the mechanism of incorrect authorization where a product performs an authorization check but does not correctly perform it."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The DeviceUpdateView class is a security-sensitive decision point that requires OTP authentication before allowing device updates. The OtpRequiredMixin ensures that only authenticated users with valid OTP tokens can access this view, establishing a clear connection between the input (user request) and the protected action (device update)."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If the DeviceUpdateView were to lose its OtpRequiredMixin inheritance, it would no longer enforce OTP authentication for device updates. This change would directly expose the device update functionality to unauthorized access, demonstrating that the patch (adding OtpRequiredMixin) materially prevents incorrect authorization."
+        },
+        "security_control": {
+          "score": 0.9,
+          "evidence": "The OtpRequiredMixin provides a strong security control by enforcing OTP authentication before allowing access to the DeviceUpdateView. This control is necessary for preventing incorrect authorization as it ensures that only users who have successfully authenticated with their OTP device can perform updates.",
+          "required_control": "OTP authentication enforcement",
+          "control_requirement_evidence": "CWE-863 requires that authorization checks be correctly performed, which in this context means enforcing OTP authentication before allowing access to sensitive operations like device updates.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin class implementation",
+            "DeviceUpdateView inheritance from OtpRequiredMixin"
+          ],
+          "deficiency_evidence": "The code demonstrates that the DeviceUpdateView correctly inherits and utilizes OtpRequiredMixin, which enforces OTP authentication. There is no deficiency in this control as it is properly implemented."
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "If incorrect authorization were to occur (e.g., if the OtpRequiredMixin was bypassed), an attacker could potentially update or modify OTP devices without proper authentication, leading to unauthorized access to user accounts. This represents a concrete security consequence of incorrect authorization."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, removing the OtpRequiredMixin from DeviceUpdateView inheritance, then users would be able to access the device update functionality without providing an OTP token, directly exposing the system to incorrect authorization where unauthorized actors could modify user's OTP devices.",
+      "supporting_evidence": [
+        "DeviceUpdateView inherits OtpRequiredMixin which enforces OTP requirement",
+        "OtpRequiredMixin is a security-sensitive control that prevents unauthorized access",
+        "The view is for updating device information, which is a sensitive operation requiring authorization"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "The DeviceUpdateView correctly inherits OtpRequiredMixin to enforce OTP authentication before allowing device updates. This prevents incorrect authorization by ensuring only authenticated users with valid OTP tokens can modify their devices. The patch adds necessary authorization control that protects against unauthorized access to sensitive device update operations.",
+      "change_type": "A",
+      "raw_score": 0.86,
+      "score": 0.86
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 111,
+      "statement": "class DeviceUpdateView(OtpRequiredMixin, UpdateView):",
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The DeviceUpdateView class inherits from OtpRequiredMixin, which is designed to enforce OTP authentication. The mechanism of bypassing this requirement would constitute a direct request vulnerability where an attacker could access the view without proper authorization."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The DeviceUpdateView is a restricted route that requires OTP authentication via OtpRequiredMixin. If the OTP enforcement is bypassed, an attacker could directly access this view without proper authorization, which aligns with CWE-425's definition of forced browsing."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "Adding OtpRequiredMixin to DeviceUpdateView introduces the OTP enforcement mechanism. If this line were reverted, the view would no longer require OTP authentication, potentially allowing unauthorized access. However, without knowing the exact change in the diff or the previous state of the class, we cannot fully assess the materiality of this change."
+        },
+        "security_control": {
+          "score": 0.9,
+          "evidence": "The OtpRequiredMixin is a security control that enforces OTP authentication for access to the DeviceUpdateView. The addition of this mixin directly addresses the vulnerability by requiring OTP verification before allowing access to the device update functionality.",
+          "required_control": "OTP authentication enforcement",
+          "control_requirement_evidence": "CWE-425 requires proper authorization enforcement on restricted URLs. The DeviceUpdateView is a restricted route that should not be accessible without proper authentication, which is enforced by OtpRequiredMixin.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin in class inheritance",
+            "DeviceUpdateView inherits from UpdateView and uses form_class"
+          ],
+          "deficiency_evidence": "The addition of OtpRequiredMixin directly prevents unauthorized access to DeviceUpdateView. Without this control, an attacker could bypass authorization and access the device update functionality."
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "If an attacker could bypass the OTP requirement for DeviceUpdateView, they could modify or delete user's TOTP devices without proper authentication, leading to potential account compromise or unauthorized access to protected resources."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the DeviceUpdateView would no longer inherit from OtpRequiredMixin, removing the OTP enforcement mechanism and potentially allowing unauthorized access to the device update functionality.",
+      "supporting_evidence": [
+        "DeviceUpdateView inherits from OtpRequiredMixin which enforces OTP authentication",
+        "The view is a restricted route that should require proper authorization",
+        "Other similar views (DeviceListView, DeviceCreateView, DeviceDeleteView, DeviceQRCodeView) also inherit from OtpRequiredMixin"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "The exact change in the diff is not provided for full causality assessment",
+        "Whether the previous state of DeviceUpdateView had OTP enforcement or not"
+      ],
+      "review_comment": "The DeviceUpdateView now requires OTP authentication via OtpRequiredMixin, preventing unauthorized access. The addition of this security control directly addresses CWE-425 by enforcing proper authorization on a restricted route. Without OTP verification, an attacker could bypass the authorization mechanism and modify user TOTP devices.",
+      "change_type": "A",
+      "raw_score": 0.8,
+      "score": 0.8
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 111,
+      "statement": "class DeviceUpdateView(OtpRequiredMixin, UpdateView):",
+      "cwe_id": "CWE-285",
+      "cwe_name": "Improper Authorization",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The candidate introduces a new view class DeviceUpdateView that inherits from OtpRequiredMixin, which is designed to enforce OTP (One-Time Password) authentication. This directly relates to authorization checks as defined in CWE-285."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The DeviceUpdateView class inherits from OtpRequiredMixin, indicating that it requires OTP verification before allowing access. However, the evidence does not explicitly show whether this requirement is enforced or bypassed in all code paths."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "The addition of OtpRequiredMixin to DeviceUpdateView introduces a new authorization control that was previously absent. If reverted, the view would no longer enforce OTP checks, potentially allowing unauthorized access to device update functionality."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The evidence shows that OtpRequiredMixin is added to DeviceUpdateView but does not demonstrate whether this control is correctly implemented or enforced. There's no explicit validation or enforcement mechanism shown in the code snippet.",
+          "required_control": "Enforcement of OTP requirement for device update operations",
+          "control_requirement_evidence": "CWE-285 requires proper authorization checks, which in this context means ensuring that only authenticated users with valid OTP tokens can perform device updates.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin is added to the class inheritance",
+            "No explicit enforcement mechanism shown in code snippet"
+          ],
+          "deficiency_evidence": "While OtpRequiredMixin is introduced, there's no concrete evidence that it's properly enforced or implemented. The patch adds a control but doesn't demonstrate its correct functioning."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "The potential impact of improper authorization could allow unauthorized users to update device settings, but the evidence does not establish whether this vulnerability is actually present or exploitable in the current implementation."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, DeviceUpdateView would no longer inherit from OtpRequiredMixin, removing the OTP enforcement mechanism. This would allow users to access the device update functionality without proper authentication, potentially leading to unauthorized modifications of device settings.",
+      "supporting_evidence": [
+        "DeviceUpdateView inherits from OtpRequiredMixin which enforces OTP requirement",
+        "Other views in the same file (DeviceListView, DeviceCreateView, DeviceDeleteView, DeviceQRCodeView) also inherit from OtpRequiredMixin"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether OtpRequiredMixin is correctly implemented and enforced in DeviceUpdateView",
+        "Whether the OTP enforcement mechanism prevents unauthorized access to device update functionality",
+        "Concrete evidence of authorization bypass or enforcement failure"
+      ],
+      "review_comment": "The addition of OtpRequiredMixin to DeviceUpdateView introduces an authorization control that requires OTP verification. However, there's insufficient evidence to confirm whether this control is properly enforced. The view inherits from OtpRequiredMixin but lacks explicit validation logic to ensure OTP requirements are met before allowing device updates. To remediate, implement explicit OTP verification within the DeviceUpdateView's get_queryset or dispatch methods to ensure only authenticated users with valid OTP tokens can perform updates.",
+      "change_type": "A",
+      "raw_score": 0.6,
+      "score": 0.6
+    }
+  ],
+  "stage4_status": "completed"
+}

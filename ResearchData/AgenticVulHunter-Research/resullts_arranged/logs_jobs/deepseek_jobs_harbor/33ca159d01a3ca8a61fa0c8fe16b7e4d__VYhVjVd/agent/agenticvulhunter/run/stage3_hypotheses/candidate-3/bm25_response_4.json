@@ -1,0 +1,265 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 71,
+      "statement": "var v = getValue(context.config, m[1]);",
+      "change_type": "A",
+      "function_name": "ReferenceInterpreter.replace",
+      "operation_type": "configuration_reference_lookup",
+      "selection_reason": "configuration string with @{...} pattern -> lookup of other configuration values -> potential circular reference or data exposure",
+      "security_relevance_score": 0.4,
+      "code_context": "1: var vm = require('vm');\n2: var isPlainObject = require('lodash.isplainobject');\n3: \n4: var getValue = function(obj, key) {\n5:   var o = obj;\n6:   var keys = Array.isArray(key) ? key : key.split('.');\n7:   \n8:   for (var x = 0; x < keys.length -1; ++x) {\n9:     var k = keys[x];\n10:     if (!o[k]) return;\n11:     o = o[k];\n12:   }\n13:   \n14:   return o[keys[keys.length - 1]];\n15: };\n16: \n17: var setValue = function(obj, key, value) {\n18:   var o = obj;\n19:   var keys = Array.isArray(key) ? key : key.split('.');\n20:   \n21:   for (var x = 1; x < keys.length; ++x) {\n22:     var currentKey = keys[x];\n23:     var lastKey = keys[x - 1];\n24:     if (typeof(currentKey) === 'number') {\n25:       if (!o[lastKey]) { o[lastKey] = []; }\n26:       o = o[lastKey];\n27:     } else if (typeof(currentKey) === 'string') {\n28:       if (!o[lastKey]) { o[lastKey] = {}; }\n29:       o = o[lastKey];\n30:     } else {\n31:       throw new Error('Oopsy, key arrays should only be strings and numbers:', keys);\n32:     }\n33:   }\n34:   \n35:   o[keys[keys.length - 1]] = value;\n36:   return obj;\n37: };\n38: \n39: \n40: var EnvVarInterpreter = {\n41:   type: '$',\n42:   replace: function(value, context) {\n43:     var m = /\\$\\{([^\\}]+)\\}/.exec(value);\n44:     if (!m) return value;\n45:     return value.replace(m[0], context.env[m[1]]);\n46:   }\n47: };\n48: \n49: var ExecutionInterpreter = {\n50:   type: '#',\n51:   replace: function(value, context) {\n52:     var m = /#\\{([^\\}]+)\\}/.exec(value);\n53:     if (!m) return value;\n54:     \n55:     try {\n56:       var v = vm.runInNewContext(m[1], {});\n57:       if (m[0] === value) return v;\n58:       return value.replace(m[0], v);\n59:     } catch(err) {\n60:       throw new Error('Invalid execution [' + m[1] + ']: ' + err.message);\n61:     }\n62:   }\n63: };\n64: \n65: var ReferenceInterpreter = {\n66:   type: '@',\n67:   replace: function(value, context) {\n68:     var m = /@\\{([^\\}]+)\\}/.exec(value);\n69:     if (!m) return value;\n70:     \n71:     var v = getValue(context.config, m[1]);\n72:     if (m[0] === value) return v;\n73:     return value.replace(m[0], v);\n74:   }\n75: };\n76: \n77: var Interpreters = [ReferenceInterpreter, EnvVarInterpreter, ExecutionInterpreter];\n78: \n79: var ConnieLang = {\n80:   Interpreters: Interpreters,\n81:   InterpretersByType: Interpreters.reduce(function(o, i) {o[i.type] = i; return o;}, {}),\n82:   \n83:   getEntries: function(config) {\n84:     var entries = [];\n85:     \n86:     var iter = function(value, prefix) {\n87:       if (!prefix) prefix = [];\n88:       \n89:       if (Array.isArray(value)) {\n90:         value.forEach(function(arrValue, idx) {\n91:           iter(arrValue, prefix.concat(idx));\n92:         });\n93:       } else if (isPlainObject(value)) {\n94:         Object.keys(value).forEach(function(key) {\n95:           iter(value[key], prefix.concat(key));\n96:         });\n97:       } else {\n98:         entries.push({key: prefix, value: value});\n99:       }\n100:     };\n101:     \n102:     iter(config);\n103:     return entries;\n104:   },\n105:   \n106:   firstInnermostInterpreterFromValue: function(value) {\n107:     var start = -1;\n108:     var interpreterTypes = Object.keys(ConnieLang.InterpretersByType);\n109:     \n110:     for (var idx = 1; idx < value.length; ++idx) {\n111:       if (value[idx] === '{' && interpreterTypes.indexOf(value[idx - 1]) !== -1) {\n112:         start = idx - 1;\n113:       } else if (value[idx] === '}' && start !== -1) {\n114:         return {\n115:           type: value[start],\n116:           match: value.slice(start, idx + 1),\n117:           value: value.slice(start + 2, idx),\n118:           start: start,\n119:           end: idx + 1\n120:         };\n121:       }\n122:     }\n123:     \n124:     return null;\n125:   },\n126:   \n127:   parse: function(configObj, envObj) {\n128:     var context = {\n129:       config: configObj,\n130:       env: envObj || process.env\n131:     };\n132:     \n133:     var entries = ConnieLang.getEntries(context.config);\n134:     \n135:     // iterate until no updates have been made\n136:     var digest = function() {\n137:       var updated = false;\n138:       \n139:       entries.forEach(function(e) {\n140:         var interpreter = ConnieLang.firstInnermostInterpreterFromValue(e.value, context);\n141:         if (!interpreter) return;\n142:         \n143:         var newValue = ConnieLang.InterpretersByType[interpreter.type].replace(e.value, context);\n144:         if (newValue !== e.value) {\n145:           e.value = newValue;\n146:           updated = true;\n147:         }\n148:       });\n149:       \n150:       return updated;\n151:     };\n152:     \n153:     while(digest()) ;\n154:     \n155:     var result = {};\n156:     entries.forEach(function(e) {\n157:       setValue(result, e.key, e.value);\n158:     });\n159:     \n160:     return result;\n161:   }\n162: };\n163: \n164: module.exports = ConnieLang;",
+      "source_summary": "Configuration values from user-provided configObj parameter in parse() function",
+      "sink_summary": "Returns the looked-up value which gets substituted into configuration strings, potentially reaching other interpreters like ExecutionInterpreter which uses vm.runInNewContext()",
+      "guard_summary": "No validation on the key path; getValue returns undefined for missing keys but doesn't prevent access to any existing keys",
+      "risk_pattern": "Unrestricted configuration reference lookup allows arbitrary property access in configuration object, enabling potential prototype pollution or access to sensitive configuration values when combined with other interpreters",
+      "used_variable_sources": [
+        "context.config",
+        "m[1] (extracted from @{...} pattern)"
+      ],
+      "called_function_context": [
+        "getValue",
+        "String.replace"
+      ],
+      "enclosing_conditions": [
+        "if (!m) return value;",
+        "if (m[0] === value) return v;"
+      ],
+      "context_summary": "ReferenceInterpreter processes @{key.path} patterns by looking up values from the configuration object using dot notation paths. The lookup is recursive and can access nested properties without restrictions.",
+      "unresolved_facts": [
+        "Whether configuration data comes from untrusted sources",
+        "Whether the configuration object contains sensitive values that should not be exposed via reference lookups"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "information disclosure through unrestricted configuration property access",
+        "source": "user-controlled configuration references",
+        "sensitive_operation": "accessing arbitrary configuration values via dot notation paths",
+        "missing_control": "no access control on which configuration properties can be referenced",
+        "impact": "information disclosure of sensitive configuration data"
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-1321-improperly-controlled-modification-of-object-prototype-attributes-prototype-poll",
+          "cwe_id": "CWE-1321",
+          "cwe_name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 43.5595,
+          "raw_bm25_score": 43.5595,
+          "description": "Attacker-controlled object keys modify Object prototype attributes.",
+          "pattern": "cwe-1321 prototype-pollution __proto__ constructor prototype object-key property-key merge assign recursive-merge",
+          "remediation": "Reject prototype keys and use schema-constrained object updates.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-1321"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/missing-x-frame-options",
+          "cwe_id": "CWE-829",
+          "cwe_name": "Inclusion of Functionality from Untrusted Control Sphere",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.3872,
+          "raw_bm25_score": 28.3872,
+          "description": "If the 'X-Frame-Options' setting is not provided, a malicious user may be able to overlay their own UI on top of the site by using an iframe.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-451",
+            "external/cwe/cwe-829"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/path-injection",
+          "cwe_id": "CWE-23",
+          "cwe_name": "Relative Path Traversal",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.4905,
+          "raw_bm25_score": 27.4905,
+          "description": "Accessing paths influenced by users can allow an attacker to access unexpected resources.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-023. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-022",
+            "external/cwe/cwe-023",
+            "external/cwe/cwe-036",
+            "external/cwe/cwe-073"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/eval-like-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.8906,
+          "raw_bm25_score": 26.8906,
+          "description": "DOM functions that act like 'eval' and execute strings as code are dangerous and impede program analysis and understanding. Consequently, they should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "readability",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/insecure-temporary-file",
+          "cwe_id": "CWE-378",
+          "cwe_name": "Creation of Temporary File With Insecure Permissions",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.6181,
+          "raw_bm25_score": 26.6181,
+          "description": "Creating a temporary file that is accessible by other users can lead to information disclosure and sometimes remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-378. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "external/cwe/cwe-377",
+            "external/cwe/cwe-378",
+            "security"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/unsafe-external-link",
+          "cwe_id": "CWE-200",
+          "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.1627,
+          "raw_bm25_score": 26.1627,
+          "description": "External links that open in a new tab or window but do not specify link type 'noopener' or 'noreferrer' are a potential security risk.",
+          "pattern": "Find code that may expose sensitive information in error messages, logs, or responses",
+          "remediation": "Implement proper access controls and avoid exposing sensitive information in responses, errors, or logs.",
+          "tags": [
+            "maintainability",
+            "security",
+            "external/cwe/cwe-200",
+            "external/cwe/cwe-1022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/conflicting-html-attribute",
+          "cwe_id": "CWE-758",
+          "cwe_name": "Reliance on Undefined, Unspecified, or Implementation-Defined Behavior",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.7112,
+          "raw_bm25_score": 25.7112,
+          "description": "If an HTML element has two attributes with the same name but different values, its behavior may be browser-dependent.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-758. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "maintainability",
+            "correctness",
+            "external/cwe/cwe-758"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/prototype-polluting-assignment",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.6349,
+          "raw_bm25_score": 25.6349,
+          "description": "Modifying an object obtained via a user-controlled property name may lead to accidental mutation of the built-in Object prototype, and possibly escalate to remote code execution or cross-site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-094",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/overwritten-property",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.0093,
+          "raw_bm25_score": 25.0093,
+          "description": "If an object literal has two properties with the same name, the second property overwrites the first one, which makes the code hard to understand and error-prone.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/type-confusion-through-parameter-tampering",
+          "cwe_id": "CWE-843",
+          "cwe_name": "Access of Resource Using Incompatible Type ('Type Confusion')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.4715,
+          "raw_bm25_score": 24.4715,
+          "description": "Sanitizing an HTTP request parameter may be ineffective if the user controls its type.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-843"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

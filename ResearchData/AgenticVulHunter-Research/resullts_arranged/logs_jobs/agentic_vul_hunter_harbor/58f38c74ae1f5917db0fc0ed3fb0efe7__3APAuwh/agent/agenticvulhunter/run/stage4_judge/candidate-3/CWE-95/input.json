@@ -1,0 +1,57 @@
+{
+  "candidate": {
+    "candidate_id": "candidate-3",
+    "filepath": "dbusmock/testcase.py",
+    "changed_line": 207,
+    "statement": "module = load_module(template)",
+    "change_type": "A",
+    "function_name": "spawn_server_template",
+    "operation_type": "code_execution",
+    "selection_reason": "observable input 'template' -> exact operation 'load_module(template)' -> security-sensitive effect of executing arbitrary Python code from a file path",
+    "security_relevance_score": 0.8,
+    "code_context": "58:     @classmethod\n59:     def tearDownClass(klass):\n60:         '''Stop private session/system buses'''\n61: \n62:         if DBusTestCase.session_bus_pid is not None:\n63:             klass.stop_dbus(DBusTestCase.session_bus_pid)\n64:             del os.environ['DBUS_SESSION_BUS_ADDRESS']\n65:             DBusTestCase.session_bus_pid = None\n66:         if DBusTestCase.system_bus_pid is not None:\n67:             klass.stop_dbus(DBusTestCase.system_bus_pid)\n68:             del os.environ['DBUS_SYSTEM_BUS_ADDRESS']\n69:             DBusTestCase.system_bus_pid = None\n70: \n71:     @classmethod\n72:     def start_dbus(klass):\n73:         '''Start a D-BUS daemon\n74: \n75:         Return (pid, address) pair.\n76: \n77:         Normally you do not need to call this directly. Use start_system_bus()\n78:         and start_session_bus() instead.\n79:         '''\n80:         out = subprocess.check_output(['dbus-launch'], universal_newlines=True)\n81:         variables = {}\n82:         for line in out.splitlines():\n83:             (k, v) = line.split('=', 1)\n84:             variables[k] = v\n85:         return (int(variables['DBUS_SESSION_BUS_PID']),\n86:                 variables['DBUS_SESSION_BUS_ADDRESS'])\n87: \n88:     @classmethod\n89:     def stop_dbus(klass, pid):\n90:         '''Stop a D-BUS daemon\n91: \n92:         Normally you do not need to call this directly. When you use\n93:         start_system_bus() and start_session_bus(), these buses are\n94:         automatically stopped in tearDownClass().\n95:         '''\n96:         signal.signal(signal.SIGTERM, signal.SIG_IGN)\n97:         timeout = 50\n98:         while timeout > 0:\n99:             try:\n100:                 os.kill(pid, signal.SIGTERM)\n101:             except OSError as e:\n102:                 if e.errno == errno.ESRCH:\n103:                     break\n104:                 else:\n105:                     raise\n106:             time.sleep(0.1)\n107:         else:\n108:             sys.stderr.write('ERROR: timed out waiting for bus process to terminate\\n')\n109:             os.kill(pid, signal.SIGKILL)\n110:             time.sleep(0.5)\n111:         signal.signal(signal.SIGTERM, signal.SIG_DFL)\n112: \n113:     @classmethod\n114:     def get_dbus(klass, system_bus=False):\n115:         '''Get dbus.bus.BusConnection() object\n116: \n117:         This is preferrable to dbus.SystemBus() and dbus.SessionBus() as those\n118:         do not get along with multiple changing local test buses.\n119:         '''\n120:         if system_bus:\n121:             if os.environ.get('DBUS_SYSTEM_BUS_ADDRESS'):\n122:                 return dbus.bus.BusConnection(os.environ['DBUS_SYSTEM_BUS_ADDRESS'])\n123:             else:\n124:                 return dbus.SystemBus()\n125:         else:\n126:             if os.environ.get('DBUS_SESSION_BUS_ADDRESS'):\n127:                 return dbus.bus.BusConnection(os.environ['DBUS_SESSION_BUS_ADDRESS'])\n128:             else:\n129:                 return dbus.SessionBus()\n130: \n131:     @classmethod\n132:     def wait_for_bus_object(klass, dest, path, system_bus=False):\n133:         '''Wait for an object to appear on D-BUS\n134: \n135:         Raise an exception if object does not appear within 5 seconds.\n136:         '''\n137:         bus = klass.get_dbus(system_bus)\n138: \n139:         timeout = 50\n140:         last_exc = None\n141:         # we check whether the name is owned first, to avoid race conditions\n142:         # with service activation; once it's owned, wait until we can actually\n143:         # call methods\n144:         while timeout > 0:\n145:             if bus.name_has_owner(dest):\n146:                 try:\n147:                     p = dbus.Interface(bus.get_object(dest, path),\n148:                                        dbus_interface=dbus.INTROSPECTABLE_IFACE)\n149:                     p.Introspect()\n150:                     break\n151:                 except dbus.exceptions.DBusException as e:\n152:                     last_exc = e\n153:                     if '.UnknownInterface' in str(e):\n154:                         break\n155:                     pass\n156: \n157:             timeout -= 1\n158:             time.sleep(0.1)\n159:         if timeout <= 0:\n160:             assert timeout > 0, 'timed out waiting for D-BUS object %s: %s' % (path, last_exc)\n161: \n162:     @classmethod\n163:     def spawn_server(klass, name, path, interface, system_bus=False, stdout=None):\n164:         '''Run a DBusMockObject instance in a separate process\n165: \n166:         The daemon will terminate automatically when the D-BUS that it connects\n167:         to goes down.  If that does not happen (e. g. you test on the actual\n168:         system/session bus), you need to kill it manually.\n169: \n170:         This function blocks until the spawned DBusMockObject is ready and\n171:         listening on the bus.\n172: \n173:         Returns the Popen object of the spawned daemon.\n174:         '''\n175:         argv = [sys.executable, '-m', 'dbusmock']\n176:         if system_bus:\n177:             argv.append('--system')\n178:         argv.append(name)\n179:         argv.append(path)\n180:         argv.append(interface)\n181: \n182:         daemon = subprocess.Popen(argv, stdout=stdout)\n183: \n184:         # wait for daemon to start up\n185:         klass.wait_for_bus_object(name, path, system_bus)\n186: \n187:         return daemon\n188: \n189:     @classmethod\n190:     def spawn_server_template(klass, template, parameters=None, stdout=None):\n191:         '''Run a D-BUS mock template instance in a separate process\n192: \n193:         This starts a D-BUS mock process and loads the given template with\n194:         (optional) parameters into it. For details about templates see\n195:         dbusmock.DBusMockObject.AddTemplate().\n196: \n197:         The daemon will terminate automatically when the D-BUS that it connects\n198:         to goes down.  If that does not happen (e. g. you test on the actual\n199:         system/session bus), you need to kill it manually.\n200: \n201:         This function blocks until the spawned DBusMockObject is ready and\n202:         listening on the bus.\n203: \n204:         Returns a pair (daemon Popen object, main dbus object).\n205:         '''\n206:         # we need the bus address from the template module\n207:         module = load_module(template)\n208:         daemon = klass.spawn_server(module.BUS_NAME, module.MAIN_OBJ,\n209:                                     module.MAIN_IFACE, module.SYSTEM_BUS, stdout)\n210: \n211:         bus = klass.get_dbus(module.SYSTEM_BUS)\n212:         obj = bus.get_object(module.BUS_NAME, module.MAIN_OBJ)\n213:         if not parameters:\n214:             parameters = dbus.Dictionary({}, signature='sv')\n215:         obj.AddTemplate(template, parameters,\n216:                         dbus_interface=MOCK_IFACE)\n217: \n218:         return (daemon, obj)\n219: \n220: # Python 2 backwards compatibility\n221: if sys.version_info[0] < 3:\n222:     import re\n223: \n224:     def assertRegex(self, value, pattern):\n225:         if not re.search(pattern, value):\n226:             raise self.failureException('%r not found in %s' % (pattern, value))\n227:     DBusTestCase.assertRegex = assertRegex",
+    "source_summary": "The 'template' parameter originates from the caller of 'spawn_server_template', which could be any test code that invokes this method. It can either be a file path to a Python module or a name of a predefined template under 'dbusmock.templates'.",
+    "sink_summary": "The loaded module is used to extract metadata such as BUS_NAME, MAIN_OBJ, MAIN_IFACE, and SYSTEM_BUS which are then used to spawn a D-BUS mock server.",
+    "guard_summary": "There are no explicit validation or sanitization checks on the 'template' parameter before it's passed to load_module. The function load_module itself performs a basic check if the path exists and is a Python file, but does not validate the content of the module.",
+    "risk_pattern": "The load_module function allows loading of arbitrary Python modules from file paths or predefined templates. If an attacker can control the 'template' parameter to point to a malicious file, they could execute arbitrary code during the import process.",
+    "used_variable_sources": [
+      "template"
+    ],
+    "called_function_context": [
+      "load_module(template)"
+    ],
+    "enclosing_conditions": [],
+    "context_summary": "The candidate statement is part of the 'spawn_server_template' method in 'testcase.py'. This method is used to spawn a D-BUS mock server using a given template. The 'template' parameter can either be a file path or a predefined template name, and it's passed directly to load_module without validation.",
+    "unresolved_facts": [
+      "Whether the 'template' parameter in the caller of 'spawn_server_template' is attacker-controlled or comes from a trusted source.",
+      "The exact content and security implications of the modules under 'dbusmock/templates/' directory."
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  "target_cwe": {
+    "cwe_id": "CWE-95",
+    "cwe_name": "Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+    "description": "The product receives input from an upstream component, but it does not neutralize or incorrectly neutralizes code syntax before using the input in a dynamic evaluation call (e.g. eval). Common in: input_validation.",
+    "impact": "code execution, data access, data modification",
+    "patterns": [
+      "input_validation"
+    ],
+    "detection_indicators": [
+      "input_validation"
+    ],
+    "remediation_steps": [
+      "Use parameterized queries and prepared statements",
+      "Implement strict input validation with whitelisting"
+    ],
+    "related_cwes": [
+      "CWE-94"
+    ]
+  },
+  "stage3_hypothesis": {
+    "cwe_id": "CWE-95",
+    "cwe_name": "Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+    "fit_reason": "The load_module function allows loading of arbitrary Python modules, which can contain malicious code that gets executed during the import process",
+    "proposal_source": "adaptive_bm25",
+    "retrieved_by_sast": true
+  }
+}

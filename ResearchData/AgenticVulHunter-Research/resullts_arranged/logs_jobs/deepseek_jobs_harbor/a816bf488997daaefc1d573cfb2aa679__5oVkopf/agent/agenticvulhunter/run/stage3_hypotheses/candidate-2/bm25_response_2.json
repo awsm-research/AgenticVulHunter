@@ -1,0 +1,270 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "jinja2/loaders.py",
+      "changed_line": 101,
+      "statement": "bucket = bcc.get_bucket(environment, name, filename, source)",
+      "change_type": "A",
+      "function_name": "BaseLoader.load",
+      "operation_type": "bytecode_cache_operation",
+      "selection_reason": "potential typo (bcc vs bbc) -> runtime error -> template loading failure",
+      "security_relevance_score": 0.6,
+      "code_context": "1: # -*- coding: utf-8 -*-\n2: \"\"\"\n3:     jinja2.loaders\n4:     ~~~~~~~~~~~~~~\n5: \n6:     Jinja loader classes.\n7: \n8:     :copyright: 2008 by Armin Ronacher.\n9:     :license: BSD, see LICENSE for more details.\n10: \"\"\"\n11: from os import path\n12: try:\n13:     from hashlib import sha1\n14: except ImportError:\n15:     from sha import new as sha1\n16: from jinja2.exceptions import TemplateNotFound\n17: from jinja2.utils import LRUCache\n18: \n19: \n20: def split_template_path(template):\n21:     \"\"\"Split a path into segments and perform a sanity check.  If it detects\n22:     '..' in the path it will raise a `TemplateNotFound` error.\n23:     \"\"\"\n24:     pieces = []\n25:     for piece in template.split('/'):\n26:         if path.sep in piece \\\n27:            or (path.altsep and path.altsep in piece) or \\\n28:            piece == path.pardir:\n29:             raise TemplateNotFound(template)\n30:         elif piece and piece != '.':\n31:             pieces.append(piece)\n32:     return pieces\n33: \n34: \n35: class BaseLoader(object):\n36:     \"\"\"Baseclass for all loaders.  Subclass this and override `get_source` to\n37:     implement a custom loading mechanism.  The environment provides a\n38:     `get_template` method that calls the loader's `load` method to get the\n39:     :class:`Template` object.\n40: \n41:     A very basic example for a loader that looks up templates on the file\n42:     system could look like this::\n43: \n44:         from jinja2 import BaseLoader, TemplateNotFound\n45:         from os.path import join, exists, getmtime\n46: \n47:         class MyLoader(BaseLoader):\n48: \n49:             def __init__(self, path):\n50:                 self.path = path\n51: \n52:             def get_source(self, environment, template):\n53:                 path = join(self.path, template)\n54:                 if not exists(path):\n55:                     raise TemplateNotFound(template)\n56:                 mtime = getmtime(path)\n57:                 with file(path) as f:\n58:                     source = f.read().decode('utf-8')\n59:                 return source, path, lambda: mtime == getmtime(path)\n60:     \"\"\"\n61: \n62:     def get_source(self, environment, template):\n63:         \"\"\"Get the template source, filename and reload helper for a template.\n64:         It's passed the environment and template name and has to return a\n65:         tuple in the form ``(source, filename, uptodate)`` or raise a\n66:         `TemplateNotFound` error if it can't locate the template.\n67: \n68:         The source part of the returned tuple must be the source of the\n69:         template as unicode string or a ASCII bytestring.  The filename should\n70:         be the name of the file on the filesystem if it was loaded from there,\n71:         otherwise `None`.  The filename is used by python for the tracebacks\n72:         if no loader extension is used.\n73: \n74:         The last item in the tuple is the `uptodate` function.  If auto\n75:         reloading is enabled it's always called to check if the template\n76:         changed.  No arguments are passed so the function must store the\n77:         old state somewhere (for example in a closure).  If it returns `False`\n78:         the template will be reloaded.\n79:         \"\"\"\n80:         raise TemplateNotFound(template)\n81: \n82:     def load(self, environment, name, globals=None):\n83:         \"\"\"Loads a template.  This method looks up the template in the cache\n84:         or loads one by calling :meth:`get_source`.  Subclasses should not\n85:         override this method as loaders working on collections of other\n86:         loaders (such as :class:`PrefixLoader` or :class:`ChoiceLoader`)\n87:         will not call this method but `get_source` directly.\n88:         \"\"\"\n89:         code = None\n90:         if globals is None:\n91:             globals = {}\n92: \n93:         # first we try to get the source for this template together\n94:         # with the filename and the uptodate function.\n95:         source, filename, uptodate = self.get_source(environment, name)\n96: \n97:         # try to load the code from the bytecode cache if there is a\n98:         # bytecode cache configured.\n99:         bbc = environment.bytecode_cache\n100:         if bbc is not None:\n101:             bucket = bcc.get_bucket(environment, name, filename, source)\n102:             code = bucket.code\n103: \n104:         # if we don't have code so far (not cached, no longer up to\n105:         # date) etc. we compile the template\n106:         if code is None:\n107:             code = environment.compile(source, name, filename)\n108: \n109:         # if the bytecode cache is available and the bucket doesn't\n110:         # have a code so far, we give the bucket the new code and put\n111:         # it back to the bytecode cache.\n112:         if bbc is not None and bucket.code is None:\n113:             bucket.code = code\n114:             bbc.set_bucket(bucket)\n115: \n116:         return environment.template_class.from_code(environment, code,\n117:                                                     globals, uptodate)\n118: \n119: \n120: class FileSystemLoader(BaseLoader):\n121:     \"\"\"Loads templates from the file system.  This loader can find templates\n122:     in folders on the file system and is the preferred way to load them.\n123: \n124:     The loader takes the path to the templates as string, or if multiple\n125:     locations are wanted a list of them which is then looked up in the\n126:     given order:\n127: \n128:     >>> loader = FileSystemLoader('/path/to/templates')\n129:     >>> loader = FileSystemLoader(['/path/to/templates', '/other/path'])\n130: \n131:     Per default the template encoding is ``'utf-8'`` which can be changed\n132:     by setting the `encoding` parameter to something else.\n133:     \"\"\"\n134: \n135:     def __init__(self, searchpath, encoding='utf-8'):\n136:         if isinstance(searchpath, basestring):\n137:             searchpath = [searchpath]\n138:         self.searchpath = list(searchpath)\n139:         self.encoding = encoding\n140: \n141:     def get_source(self, environment, template):\n142:         pieces = split_template_path(template)\n143:         for searchpath in self.searchpath:\n144:             filename = path.join(searchpath, *pieces)\n145:             if not path.isfile(filename):\n146:                 continue\n147:             f = file(filename)\n148:             try:\n149:                 contents = f.read().decode(self.encoding)\n150:             finally:\n151:                 f.close()\n152:             old = path.getmtime(filename)\n153:             return contents, filename, lambda: path.getmtime(filename) == old\n154:         raise TemplateNotFound(template)\n155: \n156: \n157: class PackageLoader(BaseLoader):\n158:     \"\"\"Load templates from python eggs or packages.  It is constructed with\n159:     the name of the python package and the path to the templates in that\n160:     package:\n161: \n162:     >>> loader = PackageLoader('mypackage', 'views')\n163: \n164:     If the package path is not given, ``'templates'`` is assumed.\n165: \n166:     Per default the template encoding is ``'utf-8'`` which can be changed\n167:     by setting the `encoding` parameter to something else.  Due to the nature\n168:     of eggs it's only possible to reload templates if the package was loaded\n169:     from the file system and not a zip file.\n170:     \"\"\"\n171: \n172:     def __init__(self, package_name, package_path='templates',\n173:                  encoding='utf-8'):\n174:         from pkg_resources import DefaultProvider, ResourceManager, get_provider\n175:         provider = get_provider(package_name)\n176:         self.encoding = encoding\n177:         self.manager = ResourceManager()\n178:         self.filesystem_bound = isinstance(provider, DefaultProvider)\n179:         self.provider = provider\n180:         self.package_path = package_path\n181: \n182:     def get_source(self, environment, template):\n183:         pieces = split_template_path(template)\n184:         p = '/'.join((self.package_path,) + tuple(pieces))\n185:         if not self.provider.has_resource(p):\n186:             raise TemplateNotFound(template)\n187: \n188:         filename = uptodate = None\n189:         if self.filesystem_bound:\n190:             filename = self.provider.get_resource_filename(self.manager, p)\n191:             mtime = path.getmtime(filename)\n192:             def uptodate():\n193:                 return path.getmtime(filename) == mtime\n194: \n195:         source = self.provider.get_resource_string(self.manager, p)\n196:         return source.decode(self.encoding), filename, uptodate\n197: \n198: \n199: class DictLoader(BaseLoader):\n200:     \"\"\"Loads a template from a python dict.  It's passed a dict of unicode\n201:     strings bound to template names.  This loader is useful for unittesting:\n202: \n203:     >>> loader = DictLoader({'index.html': 'source here'})\n204: \n205:     Because auto reloading is rarely useful this is disabled per default.\n206:     \"\"\"\n207: \n208:     def __init__(self, mapping):\n209:         self.mapping = mapping\n210: \n211:     def get_source(self, environment, template):\n212:         if template in self.mapping:\n213:             source = self.mapping[template]\n214:             return source, None, lambda: source != self.mapping[template]\n215:         raise TemplateNotFound(template)\n216: \n217: \n218: class FunctionLoader(BaseLoader):\n219:     \"\"\"A loader that is passed a function which does the loading.  The\n220:     function becomes the name of the template passed and has to return either\n221:     an unicode string with the template source, a tuple in the form ``(source,\n222:     filename, uptodatefunc)`` or `None` if the template does not exist.\n223: \n224:     >>> def load_template(name):\n225:     ...     if name == 'index.html'\n226:     ...         return '...'\n227:     ...\n228:     >>> loader = FunctionLoader(load_template)\n229: \n230:     The `uptodatefunc` is a function that is called if autoreload is enabled\n231:     and has to return `True` if the template is still up to date.  For more\n232:     details have a look at :meth:`BaseLoader.get_source` which has the same\n233:     return value.\n234:     \"\"\"\n235: \n236:     def __init__(self, load_func):\n237:         self.load_func = load_func\n238: \n239:     def get_source(self, environment, template):\n240:         rv = self.load_func(template)\n241:         if rv is None:\n242:             raise TemplateNotFound(template)\n243:         elif isinstance(rv, basestring):\n244:             return rv, None, None\n245:         return rv\n246: \n247: \n248: class PrefixLoader(BaseLoader):\n249:     \"\"\"A loader that is passed a dict of loaders where each loader is bound\n250:     to a prefix.  The prefix is delimited from the template by a slash per",
+      "source_summary": "Template source, name, and filename obtained from loader's get_source method",
+      "sink_summary": "Bytecode cache bucket retrieval for template compilation optimization",
+      "guard_summary": "Conditional check (bbc is not None) guards execution, but variable name mismatch prevents proper execution",
+      "risk_pattern": "Variable name typo (bcc instead of bbc) causes NameError at runtime, breaking template loading when bytecode cache is configured",
+      "used_variable_sources": [
+        "environment.bytecode_cache",
+        "self.get_source() return values"
+      ],
+      "called_function_context": [
+        "get_bucket method from BytecodeCache class (intended but not reached due to typo)"
+      ],
+      "enclosing_conditions": [
+        "if bbc is not None"
+      ],
+      "context_summary": "Template loading flow attempts to use bytecode cache for performance optimization, but variable reference error prevents cache functionality",
+      "unresolved_facts": [
+        "Specific impact on applications using bytecode caching configuration",
+        "Whether this affects template rendering security or only performance"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "variable name typo causes NameError at runtime, breaking template loading functionality",
+        "source": "code typo in variable reference",
+        "sensitive_operation": "template loading and bytecode cache access",
+        "missing_control": "proper variable name validation or IDE/linter detection",
+        "impact": "denial of service through template loading failure",
+        "mechanism_keywords": [
+          "typo",
+          "NameError",
+          "runtime error",
+          "variable reference"
+        ]
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/call/wrong-named-class-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.0368,
+          "raw_bm25_score": 28.0368,
+          "description": "Using a named argument whose name does not correspond to a parameter of the __init__ method of the class being instantiated, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/call/wrong-number-class-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.9515,
+          "raw_bm25_score": 19.9515,
+          "description": "Using too many or too few arguments in a call to the `__init__` method of a class will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/unused-global-variable",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.6462,
+          "raw_bm25_score": 19.6462,
+          "description": "Global variable is defined but not used",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "useless-code",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "fallback/cwe-863-incorrect-authorization",
+          "cwe_id": "CWE-863",
+          "cwe_name": "Incorrect Authorization",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 17.5004,
+          "raw_bm25_score": 17.5004,
+          "description": "An authorization check exists but evaluates access incorrectly.",
+          "pattern": "cwe-863 incorrect-authorization authorization-check permission-check role-check ownership-check acl-check access-decision bypass",
+          "remediation": "Evaluate authorization from trusted server-side identity and policy state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-863"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/exit-from-finally",
+          "cwe_id": "CWE-584",
+          "cwe_name": "Return Inside Finally Block",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.089,
+          "raw_bm25_score": 15.089,
+          "description": "Using a Break or Return statement in a finally block causes the Try-finally block to exit, discarding the exception.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-584. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "error-handling",
+            "correctness",
+            "external/cwe/cwe-584"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/template-injection",
+          "cwe_id": "CWE-74",
+          "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 14.623,
+          "raw_bm25_score": 14.623,
+          "description": "Using user-controlled data to create a template can lead to remote code execution or cross site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized APIs and separate data from control instructions. Validate input format and escape special characters.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-074"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/timing-attack-against-header-value",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 14.3596,
+          "raw_bm25_score": 14.3596,
+          "description": "Use of a non-constant-time verification routine to check the value of an HTTP header, possibly allowing a timing attack to infer the header's expected value.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208",
+            "experimental"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/redos",
+          "cwe_id": "CWE-400",
+          "cwe_name": "Uncontrolled Resource Consumption",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 13.8532,
+          "raw_bm25_score": 13.8532,
+          "description": "A regular expression that requires exponential time to match certain inputs can be a performance bottleneck, and may be vulnerable to denial-of-service attacks.",
+          "pattern": "Look for operations that can consume excessive resources without proper limits or controls",
+          "remediation": "Implement resource consumption limits: memory limits, CPU time limits, connection limits. Use rate limiting and implement proper resource cleanup mechanisms.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1333",
+            "external/cwe/cwe-730",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/empty-except",
+          "cwe_id": "CWE-390",
+          "cwe_name": "Detection of Error Condition Without Action",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 13.6466,
+          "raw_bm25_score": 13.6466,
+          "description": "Except doesn't do anything and has no comment",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-390. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "error-handling",
+            "external/cwe/cwe-390"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/equals-hash-mismatch",
+          "cwe_id": "CWE-581",
+          "cwe_name": "Object Model Violation: Just One of Equals and Hashcode Defined",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 12.5995,
+          "raw_bm25_score": 12.5995,
+          "description": "Defining a hash operation without defining equality may be a mistake.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-581. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-581"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

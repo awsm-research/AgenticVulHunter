@@ -1,0 +1,310 @@
+{
+  "candidate_id": "candidate-5",
+  "filepath": "index.js",
+  "changed_line": 100,
+  "statement": "const metadata = new IntegrityMetadata(string, opts)",
+  "change_type": "A",
+  "function_name": "_parse",
+  "operation_type": "security_sensitive_parsing",
+  "selection_reason": "parsing options -> strict mode propagation -> affects all SRI parsing operations",
+  "security_relevance_score": 0.6,
+  "code_context": "1: 'use strict'\n2: \n3: const crypto = require('crypto')\n4: const Transform = require('stream').Transform\n5: \n6: const SPEC_ALGORITHMS = ['sha256', 'sha384', 'sha512']\n7: \n8: const BASE64_REGEX = /[a-z0-9+/]+(?:=?=?)/i\n9: const SRI_REGEX = /^([^-]+)-([^?]+)([?\\S*]*)$/\n10: const STRICT_SRI_REGEX = /^([^-]+)-([A-Za-z0-9+/]+(?:=?=?))([?\\x21-\\x7E]*)$/\n11: const VCHAR_REGEX = /[\\x21-\\x7E]+/\n12: \n13: class IntegrityMetadata {\n14:   constructor (metadata, opts) {\n15:     const strict = !!(opts && opts.strict)\n16:     this.source = metadata.trim()\n17:     // 3.1. Integrity metadata\n18:     // https://w3c.github.io/webappsec-subresource-integrity/#integrity-metadata-description\n19:     const match = this.source.match(\n20:       strict\n21:       ? STRICT_SRI_REGEX\n22:       : SRI_REGEX\n23:     )\n24:     if (!match) { return }\n25:     if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }\n26:     this.algorithm = match[1]\n27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)\n194:     checker.on('error', reject)\n195:     checker.on('verified', algo => {\n196:       resolve(algo)\n197:     })\n198:   })\n199: }\n200: \n201: module.exports.createCheckerStream = createCheckerStream\n202: function createCheckerStream (sri, opts) {\n203:   opts = opts || {}\n204:   sri = parse(sri, opts)\n205:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n206:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n207:     return pickAlgorithm(acc, algo) || acc\n208:   })\n209:   const digests = sri[algorithm].map(m => m.digest)\n210:   const hash = crypto.createHash(algorithm)\n211:   const stream = new Transform({\n212:     transform: function (chunk, enc, cb) {\n213:       hash.update(chunk, enc)\n214:       cb(null, chunk, enc)\n215:     },\n216:     flush: function (cb) {\n217:       const digest = hash.digest('base64')\n218:       if (digests.some(d => d === digest)) {\n219:         stream.emit('verified', algorithm)\n220:         return cb()\n221:       } else {\n222:         const err = new Error(`${algorithm} integrity checksum failed`)\n223:         err.code = 'EBADCHECKSUM'\n224:         err.found = digest\n225:         err.expected = digests\n226:         err.algorithm = algorithm\n227:         return cb(err)\n228:       }\n229:     }\n230:   })\n231:   return stream\n232: }\n233: \n234: function getPrioritizedHash (algo1, algo2) {\n235:   return algo1\n236: }",
+  "source_summary": "The 'string' parameter comes from splitting user-provided SRI integrity strings (from checkData/checkStream calls) by whitespace. The 'opts' parameter is passed through from external calls and controls strict mode validation.",
+  "sink_summary": "Parsed metadata flows to cryptographic hash verification in checkData (line 182) and createCheckerStream (line 210), where it determines which hash algorithm to use and what digest values to compare against.",
+  "guard_summary": "Strict mode (opts.strict) enforces: 1) Only SPEC_ALGORITHMS allowed, 2) STRICT_SRI_REGEX pattern matching, 3) Base64 format validation in toString(). Non-strict mode uses more permissive SRI_REGEX. Invalid metadata returns empty/null values preventing downstream use.",
+  "risk_pattern": "Strict mode propagation affects SRI parsing validation - strict mode enforces W3C spec compliance while non-strict allows broader input acceptance, potentially affecting hash algorithm selection and digest validation security.",
+  "used_variable_sources": [
+    "integrity parameter from parse() calls",
+    "opts parameter from external API calls"
+  ],
+  "called_function_context": [
+    "IntegrityMetadata constructor validates and parses SRI strings",
+    "crypto.createHash uses parsed algorithm for digest computation"
+  ],
+  "enclosing_conditions": [
+    "if (metadata.algorithm && metadata.digest) guards downstream usage",
+    "strict mode condition in constructor affects regex selection and algorithm validation"
+  ],
+  "context_summary": "The IntegrityMetadata constructor parses Subresource Integrity strings, with strict mode enforcing W3C specification compliance for algorithm selection and format validation, affecting downstream cryptographic verification.",
+  "unresolved_facts": [
+    "Specific call sites and data sources for the 'integrity' parameter in real usage",
+    "Whether external callers properly validate or sanitize SRI input before passing to parse functions"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "fit_reason": "Inconsistent validation between strict/non-strict modes allows different SRI string parsing, potentially bypassing intended security controls for algorithm selection",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-327",
+      "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+      "fit_reason": "Non-strict mode may allow non-standard algorithms to be parsed and used in cryptographic operations, bypassing strict mode restrictions",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-328",
+      "cwe_name": "Use of Weak Hash",
+      "fit_reason": "Parsing inconsistency could allow weak hash algorithms to be accepted in non-strict mode when they would be rejected in strict mode",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-134",
+      "cwe_name": "Use of Externally-Controlled Format String",
+      "fit_reason": "User-controlled SRI strings are parsed with different validation rules, potentially affecting the format interpretation and downstream security decisions",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-134",
+    "CWE-20",
+    "CWE-327",
+    "CWE-328",
+    "CWE-367",
+    "CWE-483",
+    "CWE-676",
+    "CWE-829",
+    "CWE-835",
+    "CWE-843",
+    "CWE-93",
+    "CWE-942"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "index.js",
+      "changed_line": 100,
+      "statement": "const metadata = new IntegrityMetadata(string, opts)",
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.3,
+          "evidence": "The candidate line creates an IntegrityMetadata object, which performs validation (strict vs non-strict regex, algorithm allowlist). However, CWE-20 requires that input validation is missing or incorrect. Here, validation exists and is configurable via opts.strict. The demonstrated behavior is a configurable validation mechanism, not a clear absence or flaw."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The 'string' input originates from splitting user-provided SRI integrity strings (integrity.trim().split(/\\s+/)). This is externally controlled input. It flows directly into the IntegrityMetadata constructor for parsing, and the parsed algorithm/digest are used downstream in cryptographic verification (checkData line 182, createCheckerStream line 210)."
+        },
+        "diff_causality": {
+          "score": 0.1,
+          "evidence": "The candidate line is an addition ('A'). Reverting it would remove the creation of the IntegrityMetadata object, breaking the parsing entirely. The patch adds the parsing/validation mechanism; it does not materially create, expose, remove, weaken, or modify an existing validation control. It is the introduction of the validation logic itself."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The required control for SRI parsing is validation of the integrity string format, algorithm, and digest encoding. The control is present and configurable (strict vs non-strict). The deficiency evidence is weak: non-strict mode uses a more permissive regex (SRI_REGEX) and does not restrict algorithms to SPEC_ALGORITHMS. However, this is a documented, intentional mode, not a demonstrated bypass or missing control. Downstream, the parsed algorithm is used directly in crypto.createHash; no further validation of the algorithm string is shown, but the crypto module may reject unknown algorithms.",
+          "required_control": "Validation of SRI string format, algorithm allowlist, and base64 digest encoding.",
+          "control_requirement_evidence": "SRI strings from external sources must be validated to ensure they specify a supported hash algorithm and a correctly formatted digest to prevent algorithm confusion or injection into cryptographic operations.",
+          "existing_controls_checked": [
+            "IntegrityMetadata constructor validates via regex (strict or non-strict) and, in strict mode, checks algorithm against SPEC_ALGORITHMS. Downstream, crypto.createHash will use the parsed algorithm string."
+          ],
+          "deficiency_evidence": "Non-strict mode uses a permissive regex and does not restrict algorithms, potentially allowing non-standard algorithms. However, this is a design choice for compatibility, not a demonstrated security flaw. The crypto module may inherently restrict supported algorithms."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "A concrete security consequence is not demonstrated. The potential impact is speculative: if non-strict parsing allows a malicious algorithm string that crypto.createHash accepts but behaves unexpectedly, or if digest format issues cause verification bypass. However, no evidence shows such a bypass or impact. The primary consequence is a difference in validation strictness, which may affect compatibility, not a proven vulnerability."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the IntegrityMetadata object would not be created, breaking the parsing loop in _parse. The function would return an empty Integrity object, causing all SRI parsing to fail. This addition introduces the validation/parsing logic; it does not modify an existing security control.",
+      "supporting_evidence": [
+        "The 'string' input is derived from user-provided integrity strings (integrity.trim().split(/\\s+/)).",
+        "The parsed algorithm flows directly to crypto.createHash in checkData and createCheckerStream.",
+        "Validation behavior differs based on opts.strict: strict mode enforces SPEC_ALGORITHMS and STRICT_SRI_REGEX; non-strict mode uses permissive SRI_REGEX."
+      ],
+      "contradicting_evidence": [
+        "The candidate is an addition, not a modification of existing validation. It introduces the validation mechanism itself.",
+        "The code includes validation (regex matching, algorithm check in strict mode). CWE-20 typically addresses missing or incorrect validation; here validation is present and configurable.",
+        "Downstream usage is guarded by 'if (metadata.algorithm && metadata.digest)', preventing use of invalid metadata."
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether external callers properly set opts.strict based on security requirements.",
+        "Whether the crypto module rejects unknown algorithm strings passed to crypto.createHash, which would mitigate algorithm injection.",
+        "Specific attack scenarios where non-strict parsing leads to a security bypass (e.g., algorithm confusion, digest encoding issues)."
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.36,
+      "score": 0.36
+    },
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "index.js",
+      "changed_line": 100,
+      "statement": "const metadata = new IntegrityMetadata(string, opts)",
+      "cwe_id": "CWE-327",
+      "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code allows parsing of SRI strings that may specify cryptographic algorithms, but does not directly implement or select the cryptographic algorithms itself - it passes algorithm names to Node.js crypto module"
+        },
+        "connection": {
+          "score": 0.45,
+          "evidence": "User-provided SRI strings containing algorithm names flow from parse() calls through IntegrityMetadata constructor to crypto.createHash() calls in checkData (line 182) and createCheckerStream (line 210)"
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The added line creates IntegrityMetadata objects that parse algorithm names from SRI strings, but the actual cryptographic algorithm selection happens downstream in crypto.createHash() calls"
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "",
+          "required_control": "Algorithm allowlist validation for cryptographic operations",
+          "control_requirement_evidence": "CWE-327 requires preventing use of broken/risky algorithms through proper validation",
+          "existing_controls_checked": [
+            "Strict mode restricts to SPEC_ALGORITHMS ['sha256', 'sha384', 'sha512'] in constructor (line 25) and toString() (line 39)"
+          ],
+          "deficiency_evidence": "Non-strict mode bypasses algorithm validation, but the deficiency is speculative as the evidence doesn't show actual use of weak algorithms or bypass of Node.js crypto security"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No evidence of actual weak algorithm usage or cryptographic compromise - impact depends on external input and Node.js crypto module behavior"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, SRI strings would not be parsed into IntegrityMetadata objects, preventing any algorithm name extraction and downstream cryptographic operations entirely.",
+      "supporting_evidence": [
+        "IntegrityMetadata constructor parses algorithm names from SRI strings (lines 26, 102)",
+        "Parsed algorithm names flow to crypto.createHash() calls (lines 128, 157, 182, 210)",
+        "Non-strict mode uses permissive SRI_REGEX while strict mode restricts to SPEC_ALGORITHMS"
+      ],
+      "contradicting_evidence": [
+        "Node.js crypto.createHash() has its own algorithm validation and may reject unknown/weak algorithms",
+        "The code uses standard algorithms (sha256, sha384, sha512) by default in fromData and fromStream functions"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether external callers provide SRI strings with weak algorithm names",
+        "Whether Node.js crypto module would accept and use any algorithm name parsed from SRI strings",
+        "Actual cryptographic impact of algorithm name parsing without demonstration of weak algorithm usage"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.33,
+      "score": 0.33
+    },
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "index.js",
+      "changed_line": 100,
+      "statement": "const metadata = new IntegrityMetadata(string, opts)",
+      "cwe_id": "CWE-328",
+      "cwe_name": "Use of Weak Hash",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-328 requires actual use of a weak hash algorithm in cryptographic operations. The candidate line only parses metadata and does not perform any hash computation. The code uses crypto.createHash with algorithms from SPEC_ALGORITHMS (sha256, sha384, sha512) which are not weak."
+        },
+        "connection": {
+          "score": 0.25,
+          "evidence": "The parsed metadata flows to hash verification functions (checkData line 182, createCheckerStream line 210), but the algorithm selection is constrained to SPEC_ALGORITHMS or user-provided algorithms list, not attacker-controlled weak algorithms."
+        },
+        "diff_causality": {
+          "score": 0.1,
+          "evidence": "The candidate line is an addition that creates metadata parsing. Reverting it would prevent parsing entirely, but this doesn't relate to introducing or enabling weak hash usage since the cryptographic operations use predefined or validated algorithms."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "validation of hash algorithm strength",
+          "control_requirement_evidence": "CWE-328 requires ensuring only cryptographically strong hash algorithms are used",
+          "existing_controls_checked": [
+            "SPEC_ALGORITHMS validation in strict mode (line 25)",
+            "algorithm selection from predefined lists (lines 123, 145)"
+          ],
+          "deficiency_evidence": "No evidence that weak algorithms are accepted or used; the code restricts to strong algorithms or user-specified lists"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No evidence of weak hash algorithm usage or security bypass. The code uses standard cryptographic algorithms and validates inputs in strict mode."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, SRI metadata parsing would fail entirely, preventing any hash verification rather than enabling weak hash usage.",
+      "supporting_evidence": [
+        "The code includes SPEC_ALGORITHMS validation in strict mode (line 25)",
+        "Hash operations use crypto.createHash with validated algorithms"
+      ],
+      "contradicting_evidence": [
+        "The cryptographic operations use strong algorithms (sha256, sha384, sha512) from SPEC_ALGORITHMS",
+        "Strict mode explicitly validates against weak algorithms",
+        "No evidence of MD5, SHA1, or other weak hash usage in the code"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether external callers can provide weak algorithms through opts.algorithms",
+        "Specific hash algorithms used in real-world deployments"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.15999999999999998,
+      "score": 0.15999999999999998
+    },
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "index.js",
+      "changed_line": 100,
+      "statement": "const metadata = new IntegrityMetadata(string, opts)",
+      "cwe_id": "CWE-134",
+      "cwe_name": "Use of Externally-Controlled Format String",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-134 specifically requires format string functions (printf-style) where user input controls format specifiers. This code parses SRI metadata strings using regex patterns, not format string functions."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "User-provided SRI integrity strings flow directly into IntegrityMetadata constructor via the 'string' parameter, which is split from the 'integrity' input parameter in _parse function"
+        },
+        "diff_causality": {
+          "score": 0.1,
+          "evidence": "The candidate line is an addition, but it's part of normal SRI parsing functionality. Reverting would remove SRI parsing capability entirely rather than fix a vulnerability"
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "Input validation for format string functions",
+          "control_requirement_evidence": "CWE-134 requires validation when user input controls format specifiers in printf-style functions",
+          "existing_controls_checked": [
+            "regex pattern matching (SRI_REGEX/STRICT_SRI_REGEX)",
+            "strict mode validation for algorithm whitelisting"
+          ],
+          "deficiency_evidence": "No format string functions are used; this is SRI metadata parsing, not format string interpretation"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No format string vulnerability impact demonstrated. The parsing affects hash algorithm selection and digest validation, but not format string interpretation"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the _parse function would fail to create IntegrityMetadata objects, breaking all SRI parsing functionality entirely.",
+      "supporting_evidence": [
+        "User-controlled 'integrity' parameter flows to 'string' parameter in IntegrityMetadata constructor",
+        "Different validation paths exist based on strict mode (opts.strict) affecting regex pattern matching"
+      ],
+      "contradicting_evidence": [
+        "No format string functions (printf, sprintf, etc.) are used in the code",
+        "The parsing uses regex patterns and object construction, not format string interpretation",
+        "SRI metadata format is fixed (algorithm-digest[?options]), not a flexible format string"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether any downstream code uses format string functions with parsed SRI components",
+        "Specific real-world usage patterns of the parsed metadata"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.25,
+      "score": 0.25
+    }
+  ],
+  "stage4_status": "completed"
+}

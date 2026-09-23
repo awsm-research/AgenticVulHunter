@@ -1,0 +1,216 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "src/wagtail_2fa/views.py",
+  "changed_line": 124,
+  "statement": "device = TOTPDevice.objects.get(**self.kwargs)",
+  "change_type": "A",
+  "function_name": "DeviceDeleteView.get_queryset",
+  "operation_type": "data_retrieval",
+  "selection_reason": "unvalidated user input from URL kwargs -> database query construction -> potential unauthorized device access",
+  "security_relevance_score": 0.85,
+  "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "The code directly retrieves a device using URL kwargs without verifying that the user has authorization to access that specific device, matching the mechanism of incorrect authorization check.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "fit_reason": "The code allows direct access to device deletion by URL parameters without proper authorization checks, enabling forced browsing to unauthorized devices.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "fit_reason": "The lack of access control verification when retrieving a device based on user-provided kwargs leads to potential unauthorized access to devices.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-20",
+    "CWE-200",
+    "CWE-22",
+    "CWE-264",
+    "CWE-284",
+    "CWE-285",
+    "CWE-359",
+    "CWE-425",
+    "CWE-601",
+    "CWE-643",
+    "CWE-77",
+    "CWE-79",
+    "CWE-863",
+    "CWE-89",
+    "CWE-90",
+    "CWE-943"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 124,
+      "statement": "device = TOTPDevice.objects.get(**self.kwargs)",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code retrieves a TOTP device directly from URL kwargs without verifying that the user has authorization to access that specific device, which is the core mechanism of incorrect authorization."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "URL kwargs are externally controlled input (user_id and device_id) that are used directly in a database query. The path from URL parameters to device access is direct and unvalidated, establishing clear reachability from attacker-controlled input to the vulnerable operation."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted to use proper authorization checks (e.g., verifying that the device belongs to the current user), the vulnerability would be eliminated. The patch directly addresses the root cause of unauthorized device access."
+        },
+        "security_control": {
+          "score": 0.9,
+          "evidence": "The code lacks a necessary authorization control. It retrieves a device using only URL parameters without verifying that the requesting user owns or is authorized to access that device.",
+          "required_control": "Authorization check",
+          "control_requirement_evidence": "CWE-863 requires that authorization checks be correctly performed when an actor attempts to access a resource. This code does not perform such a check before accessing the device.",
+          "existing_controls_checked": [
+            "No explicit authorization validation in DeviceDeleteView.get_queryset()",
+            "The TOTPDevice.objects.devices_for_user() call in line 125 is bypassed by the direct retrieval in line 124"
+          ],
+          "deficiency_evidence": "The code directly retrieves a device using self.kwargs without verifying that the user_id in kwargs corresponds to the current user. This allows any authenticated user to potentially delete any device if they know its ID."
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "An attacker with knowledge of a valid device ID could delete another user's device, leading to loss of access for that user. This represents a concrete authorization bypass with impact on user account security and access control."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would need to first verify that the requesting user is authorized to access the device before retrieving it. This would prevent unauthorized deletion of devices by users who do not own them.",
+      "supporting_evidence": [
+        "URL parameters (user_id and device_id) are used directly in TOTPDevice.objects.get(**self.kwargs)",
+        "The code does not validate that the device belongs to the current user before allowing access",
+        "The get_queryset method retrieves a device without authorization verification, then uses devices_for_user() which is bypassed"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "An authenticated user can delete any TOTP device by knowing its ID through URL parameters. The code retrieves a device directly from URL kwargs without verifying ownership, allowing unauthorized access. Add authorization check to ensure the requesting user owns the device before deletion.",
+      "change_type": "A",
+      "raw_score": 0.8400000000000001,
+      "score": 0.8400000000000001
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 124,
+      "statement": "device = TOTPDevice.objects.get(**self.kwargs)",
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The code directly retrieves a TOTPDevice using URL kwargs without verifying if the user has authorization to access that specific device, which aligns with the mechanism of forced browsing."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The device is retrieved from self.kwargs which contains URL parameters (user_id and id). The connection shows that an attacker could manipulate these parameters to access devices they shouldn't have access to, but the exact path of control is not fully demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "If this line were reverted or modified to include proper authorization checks, it would prevent unauthorized device access via direct URL requests, indicating that the patch materially addresses the vulnerability."
+        },
+        "security_control": {
+          "score": 0.85,
+          "evidence": "The code lacks an authorization check before retrieving the device. The required control is proper authorization enforcement to ensure users can only access their own devices.",
+          "required_control": "Authorization enforcement",
+          "control_requirement_evidence": "CWE-425 requires that all restricted resources be protected by appropriate authorization checks to prevent forced browsing.",
+          "existing_controls_checked": [
+            "devices_for_user() method in get_queryset() which is called after device retrieval",
+            "The check occurs too late in the process, after device has already been retrieved"
+          ],
+          "deficiency_evidence": "The code retrieves a device using self.kwargs directly without verifying that the requesting user owns or is authorized to access that device. The authorization check happens later in get_queryset() but only after the device has already been fetched."
+        },
+        "concrete_impact": {
+          "score": 0.65,
+          "evidence": "An attacker could potentially delete another user's device by manipulating URL parameters, leading to unauthorized access or denial of service. The impact is concrete but depends on the attacker having knowledge of valid device IDs."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, and proper authorization checks were enforced before retrieving the device, then attackers would not be able to directly access devices they don't own via URL parameters, thereby preventing forced browsing attacks.",
+      "supporting_evidence": [
+        "The code retrieves a TOTPDevice using URL kwargs without checking if the user owns that device",
+        "The get_queryset method in DeviceDeleteView uses devices_for_user() but only after retrieving the device directly",
+        "URL parameters (user_id and id) are used directly to fetch the device object"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the devices_for_user() method properly enforces user ownership",
+        "The exact mechanism by which an attacker would exploit this vulnerability in practice"
+      ],
+      "review_comment": "The DeviceDeleteView retrieves a device directly from URL parameters without verifying user authorization. An attacker could manipulate URL parameters to delete another user's device. The authorization check occurs too late in the process, after the device has already been retrieved. Add an authorization check before device retrieval to ensure users can only access their own devices.",
+      "change_type": "A",
+      "raw_score": 0.72,
+      "score": 0.72
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 124,
+      "statement": "device = TOTPDevice.objects.get(**self.kwargs)",
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The code directly retrieves a TOTPDevice using user-provided kwargs without verifying that the requesting user has authorization to access that specific device, which aligns with CWE-284's mechanism of improper access control."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "The device ID is passed via URL kwargs and used directly in a database query. The user's authorization to access the device is not verified before retrieval, creating a clear path from input to unauthorized resource access."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If this line were reverted to check user ownership or authorization before device retrieval, it would prevent unauthorized access to devices. The patch directly addresses the access control gap by bypassing proper authorization checks."
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "The code lacks a security control to verify that the requesting user owns or is authorized to access the device being retrieved. No validation, authorization check, or ownership verification is performed before the database query.",
+          "required_control": "Authorization verification",
+          "control_requirement_evidence": "CWE-284 requires that access to resources be restricted to authorized actors. The code must verify that the user requesting a device has proper authorization to access it.",
+          "existing_controls_checked": [
+            "No explicit authorization check in get_queryset method",
+            "No ownership verification before device retrieval"
+          ],
+          "deficiency_evidence": "The line directly retrieves a device using self.kwargs without checking if the current user is authorized to access that device, demonstrating a clear lack of authorization control."
+        },
+        "concrete_impact": {
+          "score": 0.65,
+          "evidence": "An attacker could potentially retrieve any device by manipulating URL parameters, leading to unauthorized access to another user's two-factor authentication device, which could allow account takeover or bypass of security controls."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, and proper authorization checks were implemented before retrieving the device (e.g., verifying that the device belongs to the requesting user), then unauthorized access to devices would be prevented.",
+      "supporting_evidence": [
+        "User-provided kwargs are used directly in database query without authorization verification",
+        "The get_queryset method retrieves a device using self.kwargs without checking ownership",
+        "No validation of user permissions or device ownership before access"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the patch actually implements proper authorization checks (not explicitly shown in code snippet)",
+        "Whether downstream validation prevents exploitation of this vulnerability"
+      ],
+      "review_comment": "The DeviceDeleteView.get_queryset method retrieves a device using user-provided kwargs without verifying that the requesting user owns or is authorized to access that device. This allows potential unauthorized access to devices. The patch should implement proper authorization checks before retrieving the device, such as verifying that the device belongs to the current user.",
+      "change_type": "A",
+      "raw_score": 0.78,
+      "score": 0.78
+    }
+  ],
+  "stage4_status": "completed"
+}

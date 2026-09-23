@@ -1,0 +1,62 @@
+{
+  "candidate": {
+    "candidate_id": "candidate-1",
+    "filepath": "lib/ldapauth.js",
+    "changed_line": 135,
+    "statement": "var searchFilter = self.opts.searchFilter.replace(/{{username}}/g, username);",
+    "change_type": "A",
+    "function_name": "LdapAuth.prototype._findUser",
+    "operation_type": "ldap_search_filter_interpolation",
+    "selection_reason": "externally controlled username -> replace all occurrences of placeholder with user input -> constructs LDAP search filter used in sensitive authentication query",
+    "security_relevance_score": 0.8,
+    "code_context": "1: /**\n2:  * Copyright 2011 (c) Trent Mick.\n3:  *\n4:  * LDAP auth.\n5:  *\n6:  * Usage:\n7:  *    var LdapAuth = require('ldapauth');\n8:  *    var auth = new LdapAuth({url: 'ldaps://ldap.example.com:663', ...});\n9:  *    ...\n10:  *    auth.authenticate(username, password, function (err, user) { ... });\n11:  *    ...\n12:  *    auth.close(function (err) { ... })\n13:  */\n14: \n15: var assert = require('assert');\n16: var bcrypt = require('bcrypt');\n17: var ldap = require('ldapjs');\n18: var debug = console.warn;\n19: var format = require('util').format;\n20: \n21: \n22: \n23: /**\n24:  * Create an LDAP auth class. Primary usage is the `.authenticate` method.\n25:  *\n26:  * @param opts {Object} Config options. Keys (required, unless says\n27:  *      otherwise) are:\n28:  *    url {String} E.g. 'ldaps://ldap.example.com:663'\n29:  *    adminDn {String} E.g. 'uid=myapp,ou=users,o=example.com'\n30:  *    adminPassword {String} Password for adminDn.\n31:  *    searchBase {String} The base DN from which to search for users by\n32:  *        username. E.g. 'ou=users,o=example.com'\n33:  *    searchFilter {String} LDAP search filter with which to find a user by\n34:  *        username, e.g. '(uid={{username}})'. Use the literal '{{username}}'\n35:  *        to have the given username be interpolated in for the LDAP\n36:  *        search.\n37:  *    log4js {Module} Optional. The require'd log4js module to use for logging.\n38:  *        logging. If given this will result in TRACE-level logging for\n39:  *        ldapauth.\n40:  *    verbose {Boolean} Optional, default false. If `log4js` is also given,\n41:  *        this will add TRACE-level logging for ldapjs (quite verbose).\n42:  *    cache {Boolean} Optional, default false. If true, then up to 100\n43:  *        credentials at a time will be cached for 5 minutes.\n44:  *    timeout {Integer} Optional, default Infinity. How long the client should\n45:  *        let operations live for before timing out.\n46:  *    connectTimeout {Integer} Optional, default is up to the OS. How long the\n47:  *        client should wait before timing out on TCP connections.\n48:  *    tlsOptions {Object} Additional options passed to the TLS connection layer\n49:  *        when connecting via ldaps://. See\n50:  *        http://nodejs.org/api/tls.html#tls_tls_connect_options_callback\n51:  *        for available options\n52:  */\n53: function LdapAuth(opts) {\n54:   this.opts = opts;\n55:   assert.ok(opts.url);\n56:   assert.ok(opts.adminDn);\n57:   assert.ok(opts.searchBase);\n58:   assert.ok(opts.searchFilter);\n59: \n60:   this.log = opts.log4js && opts.log4js.getLogger('ldapauth');\n61: \n62:   if (opts.cache) {\n63:     var Cache = require('./cache');\n64:     this.userCache = new Cache(100, 300, this.log, 'user');\n65:   }\n66: \n67:   var clientOpts = {url: opts.url};\n68:   if (opts.log4js && opts.verbose) {\n69:     clientOpts.log4js = opts.log4js;\n70:   }\n71:   if (opts.timeout) {\n72:     clientOpts.timeout = opts.timeout;\n73:   }\n74:   if (opts.connectTimeout) {\n75:     clientOpts.connectTimeout = opts.connectTimeout;\n76:   }\n77:   if (opts.tlsOptions) {\n78:     clientOpts.tlsOptions = opts.tlsOptions;\n79:   }\n80:   this._adminClient = ldap.createClient(clientOpts);\n81:   this._adminBound = false;\n82:   this._userClient = ldap.createClient(clientOpts);\n83: \n84:   this._salt = bcrypt.genSaltSync();\n85: }\n86: \n87: \n88: LdapAuth.prototype.close = function (callback) {\n89:   if (! this._adminBound) {\n90:     callback()\n91:   } else {\n92:     this._adminClient.unbind(function (err) {\n93:       callback(err);\n94:     });\n95:   }\n96: }\n97: \n98: \n99: /**\n100:  * Ensure that `this._adminClient` is bound.\n101:  */\n102: LdapAuth.prototype._adminBind = function (callback) {\n103:   if (this._adminBound) {\n104:     return callback();\n105:   }\n106:   var self = this;\n107:   this._adminClient.bind(this.opts.adminDn, this.opts.adminPassword,\n108:                          function (err) {\n109:     if (err) {\n110:       self.log && self.log.trace('ldap authenticate: bind error: %s', err);\n111:       return callback(err);\n112:     }\n113:     return callback();\n114:   });\n115: }\n116: \n117: \n118: /**\n119:  * Find the user record for the given username.\n120:  *\n121:  * @param username {String}\n122:  * @param callback {Function} `function (err, user)`. If no such user is\n123:  *    found but no error processing, then `user` is undefined.\n124:  *\n125:  */\n126: LdapAuth.prototype._findUser = function (username, callback) {\n127:   var self = this;\n128:   if (!username) {\n129:     return callback(\"empty username\");\n130:   }\n131:   self._adminBind(function (err) {\n132:     if (err)\n133:       return callback(err);\n134: \n135:     var searchFilter = self.opts.searchFilter.replace(/{{username}}/g, username);\n136:     var opts = {filter: searchFilter, scope: 'sub'};\n137:     self._adminClient.search(self.opts.searchBase, opts,\n138:                              function (err, result) {\n139:       if (err) {\n140:         self.log && self.log.trace('ldap authenticate: search error: %s', err);\n141:         return callback(err);\n142:       }\n143:       var items = [];\n144:       result.on('searchEntry', function (entry) {\n145:         items.push(entry.object);\n146:       });\n147:       result.on('error', function (err) {\n148:         self.log && self.log.trace(\n149:           'ldap authenticate: search error event: %s', err);\n150:         return callback(err);\n151:       });\n152:       result.on('end', function (result) {\n153:         if (result.status !== 0) {\n154:           var err = 'non-zero status from LDAP search: ' + result.status;\n155:           self.log && self.log.trace('ldap authenticate: %s', err);\n156:           return callback(err);\n157:         }\n158:         switch (items.length) {\n159:         case 0:\n160:           return callback();\n161:         case 1:\n162:           return callback(null, items[0])\n163:         default:\n164:           return callback(format(\n165:             'unexpected number of matches (%s) for \"%s\" username',\n166:             items.length, username));\n167:         }\n168:       });\n169:     });\n170:   });\n171: }\n172: \n173: \n174: /**\n175:  *\n176:  */\n177: LdapAuth.prototype.authenticate = function (username, password, callback) {\n178:   var self = this;\n179: \n180:   if (self.opts.cache) {\n181:     // Check cache. 'cached' is `{password: <hashed-password>, user: <user>}`.\n182:     var cached = self.userCache.get(username);\n183:     if (cached && bcrypt.compareSync(password, cached.password)) {\n184:       return callback(null, cached.user)\n185:     }\n186:   }\n187: \n188:   // 1. Find the user DN in question.\n189:   self._findUser(username, function (err, user) {\n190:     if (err)\n191:       return callback(err);\n192:     if (!user)\n193:       return callback(format('no such user: \"%s\"', username));\n194:     // 2. Attempt to bind as that user to check password.\n195:     self._userClient.bind(user.dn, password, function (err) {\n196:       if (err) {\n197:         self.log && self.log.trace('ldap authenticate: bind error: %s', err);\n198:         return callback(err);\n199:       }\n200:       if (self.opts.cache) {\n201:         bcrypt.hash(password, self._salt, function (err, hash) {\n202:           self.userCache.set(username, {password: hash, user: user});\n203:           return callback(null, user);\n204:         });\n205:       } else {\n206:         return callback(null, user);\n207:       }\n208:     });\n209:   });\n210: }\n211: \n212: \n213: \n214: module.exports = LdapAuth;",
+    "source_summary": "username parameter from authenticate() function, which receives external user input; searchFilter template from configuration options",
+    "sink_summary": "LDAP search operation via self._adminClient.search() with interpolated filter",
+    "guard_summary": "No LDAP-specific escaping or validation of username before interpolation; only basic empty check on username",
+    "risk_pattern": "User-controlled username directly interpolated into LDAP search filter without escaping special LDAP filter characters, allowing LDAP injection",
+    "used_variable_sources": [
+      "username (function parameter from authenticate)",
+      "self.opts.searchFilter (configuration)"
+    ],
+    "called_function_context": [
+      "self._adminClient.search() - ldapjs library function"
+    ],
+    "enclosing_conditions": [
+      "if (!username) check for empty username only"
+    ],
+    "context_summary": "Username from external authentication request is directly substituted into LDAP search filter template using string replacement, then used in sensitive LDAP directory search operation",
+    "unresolved_facts": [
+      "Whether ldapjs library performs any automatic escaping of LDAP filter special characters",
+      "Whether searchFilter configuration typically contains validation patterns",
+      "Whether there are external validation layers before authenticate() is called"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  "target_cwe": {
+    "cwe_id": "CWE-116",
+    "cwe_name": "Improper Encoding or Escaping of Output",
+    "description": "The product prepares a structured message for communication with another component, but encoding or escaping of the data is either missing or done incorrectly. As a result, the intended structure of the message is not preserved.",
+    "impact": "other vulnerability impact",
+    "patterns": [
+      "other"
+    ],
+    "detection_indicators": [
+      "other"
+    ],
+    "remediation_steps": [
+      "Follow secure coding practices and security guidelines",
+      "Implement defense-in-depth security measures"
+    ],
+    "related_cwes": [
+      "CWE-707",
+      "CWE-74"
+    ]
+  },
+  "stage3_hypothesis": {
+    "cwe_id": "CWE-116",
+    "cwe_name": "Improper Encoding or Escaping of Output",
+    "fit_reason": "General encoding failure: missing proper escaping of special characters before inclusion in LDAP search filter output",
+    "proposal_source": "adaptive_bm25",
+    "retrieved_by_sast": true
+  }
+}

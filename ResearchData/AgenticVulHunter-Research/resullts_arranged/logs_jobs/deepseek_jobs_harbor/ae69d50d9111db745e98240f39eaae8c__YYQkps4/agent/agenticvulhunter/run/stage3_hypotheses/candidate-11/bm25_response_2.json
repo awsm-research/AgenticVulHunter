@@ -1,0 +1,266 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-11",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 185,
+      "statement": "KJ_SYSCALL(lstat(path.cStr(), &stats));",
+      "change_type": "A",
+      "function_name": "BackupMain::findFilesToZip",
+      "operation_type": "filesystem_stat_operation",
+      "selection_reason": "user-controlled path -> lstat call -> potential symlink or path traversal",
+      "security_relevance_score": 0.6,
+      "code_context": "36:                            \"metadata struct on stdin. Or, restores the backup in <file>, \"\n37:                            \"unpacking it to <grain>, and writing the metadata to stdout. In \"\n38:                            \"backup mode, <file> can be `-` to write the data to stdout.\")\n39:         .addOption({'r', \"restore\"}, KJ_BIND_METHOD(*this, setRestore),\n40:                    \"Restore a backup, rather than create a backup.\")\n41:         .addOptionWithArg({\"root\"}, KJ_BIND_METHOD(*this, setRoot), \"<root>\",\n42:                    \"Set the \\\"root directory\\\" to map in, which contains the zip/unzip binaries.\")\n43:         .expectArg(\"<file>\", KJ_BIND_METHOD(*this, setFile))\n44:         .expectArg(\"<grain>\", KJ_BIND_METHOD(*this, run))\n45:         .build();\n46:   }\n47: \n48: private:\n49:   kj::ProcessContext& context;\n50:   bool restore = false;\n51:   kj::StringPtr filename;\n52:   kj::StringPtr root = \"\";\n53: \n54:   bool setRestore() {\n55:     restore = true;\n56:     return true;\n57:   }\n58: \n59:   bool setFile(kj::StringPtr arg) {\n60:     filename = arg;\n61:     return true;\n62:   }\n63: \n64:   bool setRoot(kj::StringPtr arg) {\n65:     root = arg;\n66:     return true;\n67:   }\n68: \n69:   void writeSetgroupsIfPresent(const char *contents) {\n70:     KJ_IF_MAYBE(fd, raiiOpenIfExists(\"/proc/self/setgroups\", O_WRONLY | O_CLOEXEC)) {\n71:       kj::FdOutputStream(kj::mv(*fd)).write(contents, strlen(contents));\n72:     }\n73:   }\n74: \n75:   void writeUserNSMap(const char *type, kj::StringPtr contents) {\n76:     kj::FdOutputStream(raiiOpen(kj::str(\"/proc/self/\", type, \"_map\").cStr(), O_WRONLY | O_CLOEXEC))\n77:         .write(contents.begin(), contents.size());\n78:   }\n79: \n80:   bool run(kj::StringPtr grainDir) {\n81:     uid_t uid = getuid();\n82:     gid_t gid = getgid();\n83: \n84:     KJ_SYSCALL(unshare(CLONE_NEWUSER | CLONE_NEWNS));\n85:     writeSetgroupsIfPresent(\"deny\\n\");\n86:     writeUserNSMap(\"uid\", kj::str(\"1000 \", uid, \" 1\\n\"));\n87:     writeUserNSMap(\"gid\", kj::str(\"1000 \", gid, \" 1\\n\"));\n88: \n89:     // Mount root read-only.\n90:     KJ_SYSCALL(mount(kj::str(root, \"/\").cStr(), \"/tmp\", nullptr,\n91:                      MS_BIND | MS_REC | MS_RDONLY, nullptr));\n92: \n93:     if (access(\"/tmp/dev/null\", F_OK) != 0) {\n94:       // Looks like we need to bind in /dev.\n95:       KJ_SYSCALL(mount(\"/dev\", \"/tmp/dev\", nullptr, MS_BIND, nullptr));\n96:     }\n97: \n98:     // Hide sensitive directories.\n99:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/proc\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n100:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/var\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n101:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/etc\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n102: \n103:     // Mount inner tmpfs.\n104:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/tmp\", \"tmpfs\", 0, \"size=8m,nr_inodes=128,mode=777\"));\n105: \n106:     // Bind in the grain's `data` (=`sandbox`).\n107:     if (restore) {\n108:       KJ_SYSCALL(mkdir(kj::str(grainDir, \"/sandbox\").cStr(), 0770));\n109:     }\n110:     KJ_SYSCALL(mkdir(\"/tmp/tmp/data\", 0700));\n111:     KJ_SYSCALL(mount(kj::str(grainDir, \"/sandbox\").cStr(), \"/tmp/tmp/data\", nullptr,\n112:                      MS_BIND | (restore ? 0 : MS_RDONLY), nullptr));\n113: \n114:     // Bind in the grain's `log`. When restoring, we discard the log.\n115:     if (!restore) {\n116:       KJ_SYSCALL(mknod(\"/tmp/tmp/log\", S_IFREG | 0600, 0));\n117:       KJ_SYSCALL(mount(kj::str(grainDir, \"/log\").cStr(), \"/tmp/tmp/log\", nullptr,\n118:                        MS_BIND | MS_RDONLY, nullptr));\n119:     }\n120: \n121:     // Bind in the file.\n122:     if (restore) {\n123:       KJ_SYSCALL(mknod(\"/tmp/tmp/file.zip\", S_IFREG | 0600, 0));\n124:       KJ_SYSCALL(mount(filename.cStr(), \"/tmp/tmp/file.zip\", nullptr, MS_BIND, nullptr));\n125:     } else if (filename != \"-\") {\n126:       // Instead of binding, just open the file and we'll compress to stdout.\n127:       KJ_SYSCALL(dup2(raiiOpen(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC), STDOUT_FILENO));\n128:     }\n129: \n130:     // Use Andy's ridiculous pivot_root trick to place ourselves into the sandbox.\n131:     // See supervisor-main.c++ for more discussion.\n132:     {\n133:       auto oldRootDir = raiiOpen(\"/\", O_RDONLY | O_DIRECTORY | O_CLOEXEC);\n134:       KJ_SYSCALL(syscall(SYS_pivot_root, \"/tmp\", \"/tmp\"));\n135:       KJ_SYSCALL(fchdir(oldRootDir));\n136:       KJ_SYSCALL(umount2(\".\", MNT_DETACH));\n137:       KJ_SYSCALL(chdir(\"/tmp\"));\n138:     }\n139: \n140:     // TODO(someday): Find a zip library that doesn't suck and use it instead of shelling out\n141:     //   to zip/unzip.\n142:     if (restore) {\n143:       Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();\n144: \n145:       // Read metadata file to stdout.\n146:       kj::FdInputStream in(raiiOpen(\"metadata\", O_RDONLY | O_CLOEXEC));\n147:       kj::FdOutputStream out(STDOUT_FILENO);\n148:       pump(in, out);\n149:     } else {\n150:       // Read stdin to metadata file.\n151:       {\n152:         kj::FdInputStream in(STDIN_FILENO);\n153:         kj::FdOutputStream out(raiiOpen(\"metadata\", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC));\n154:         pump(in, out);\n155:       }\n156: \n157:       Subprocess::Options zipOptions({\"zip\", \"-qy@\", \"-\"});\n158:       auto inPipe = Pipe::make();\n159:       zipOptions.stdin = inPipe.readEnd;\n160:       Subprocess zip(kj::mv(zipOptions));\n161:       inPipe.readEnd = nullptr;\n162: \n163:       {\n164:         kj::FdOutputStream out(kj::mv(inPipe.writeEnd));\n165:         for (auto& entry: listDirectory(\".\")) {\n166:           findFilesToZip(entry, out);\n167:         }\n168:       }\n169: \n170:       zip.waitForSuccess();\n171:     }\n172: \n173:     return true;\n174:   }\n175: \n176:   static void pump(kj::InputStream& in, kj::OutputStream& out) {\n177:     byte buffer[4096];\n178:     while (size_t n = in.tryRead(buffer, 1, sizeof(buffer))) {\n179:       out.write(buffer, n);\n180:     }\n181:   }\n182: \n183:   void findFilesToZip(kj::StringPtr path, kj::OutputStream& out) {\n184:     struct stat stats;\n185:     KJ_SYSCALL(lstat(path.cStr(), &stats));\n186:     if (S_ISREG(stats.st_mode) || S_ISLNK(stats.st_mode)) {\n187:       // Regular file or link can be zipped; write to file stream.\n188:       // If the path contains a newline, we cannot correctly pass it to `zip` since `zip` expects\n189:       // one file per line. For security reasons, we must detect and filter out these files.\n190:       // Hopefully this never happens legitimately?\n191:       if (path.findFirst('\\n') == nullptr) {\n192:         kj::ArrayPtr<const byte> pieces[2];\n193:         pieces[0] = path.asBytes();\n194:         pieces[1] = kj::StringPtr(\"\\n\").asBytes();\n195:         out.write(pieces);\n196:       } else {\n197:         KJ_LOG(ERROR, \"tried to backup file containing newlines\", path);\n198:       }\n199:     } else if (S_ISDIR(stats.st_mode)) {\n200:       // Subdirectory; enumerate contents.\n201:       for (auto& entry: listDirectory(path)) {\n202:         findFilesToZip(kj::str(path, '/', entry), out);\n203:       }\n204:     }\n205:   }\n206: };\n207: \n208: kj::Own<AbstractMain> getBackupMain(kj::ProcessContext& context) {\n209:   return kj::heap<BackupMain>(context);\n210: }\n211: \n212: } // namespace sandstorm\n213: ",
+      "source_summary": "Path originates from listDirectory(\".\") after chdir(\"/tmp\") in sandbox environment. Entries are directory names filtered to exclude \".\" and \"..\".",
+      "sink_summary": "lstat() follows symlinks to get file status, used to decide if file should be added to zip archive or if directory should be recursively enumerated.",
+      "guard_summary": "listDirectory filters \".\" and \"..\". Paths containing newlines are filtered. Sandbox uses namespace isolation with pivot_root and read-only mounts. No symlink traversal protection in lstat call.",
+      "risk_pattern": "lstat on directory entries follows symlinks without validation, potentially allowing stat of files outside intended backup scope or inclusion of external files via symlinks.",
+      "used_variable_sources": [
+        "listDirectory(\".\") returns filtered directory entries",
+        "recursive concatenation: kj::str(path, '/', entry)"
+      ],
+      "called_function_context": [
+        "listDirectory() from util.c++",
+        "KJ_SYSCALL macro for error handling"
+      ],
+      "enclosing_conditions": [
+        "if (S_ISREG(stats.st_mode) || S_ISLNK(stats.st_mode))",
+        "else if (S_ISDIR(stats.st_mode))",
+        "if (path.findFirst('\\n') == nullptr)"
+      ],
+      "context_summary": "In backup mode (not restore), enumerates current directory (\"/tmp\" after pivot_root) recursively, calling lstat on each entry to determine file type for zip archive creation.",
+      "unresolved_facts": [
+        "Whether symlinks can exist in mounted directories at /tmp",
+        "Exact directory structure at /tmp during backup execution",
+        "If backup should be from /tmp or from grain data directory /tmp/tmp/data"
+      ],
+      "retrieval_query": {
+        "source": "directory listing",
+        "sensitive_operation": "lstat on path",
+        "missing_control": "symlink validation",
+        "mechanism_keywords": "symlink traversal link following"
+      },
+      "language": "",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-59-improper-link-resolution-before-file-access-link-following",
+          "cwe_id": "CWE-59",
+          "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 57.8244,
+          "raw_bm25_score": 57.8244,
+          "description": "File access follows a symlink, hardlink, or shortcut to an unintended resource.",
+          "pattern": "cwe-59 symlink hardlink link-following symbolic-link file-link archive-extraction path-resolution file-overwrite race filesystem",
+          "remediation": "Reject unsafe links and verify resolved file targets before access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-059"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 51.3582,
+          "raw_bm25_score": 51.3582,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/unsafe-external-link",
+          "cwe_id": "CWE-200",
+          "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 36.2122,
+          "raw_bm25_score": 36.2122,
+          "description": "External links that open in a new tab or window but do not specify link type 'noopener' or 'noreferrer' are a potential security risk.",
+          "pattern": "Find code that may expose sensitive information in error messages, logs, or responses",
+          "remediation": "Implement proper access controls and avoid exposing sensitive information in responses, errors, or logs.",
+          "tags": [
+            "maintainability",
+            "security",
+            "external/cwe/cwe-200",
+            "external/cwe/cwe-1022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/eval-like-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.5397,
+          "raw_bm25_score": 26.5397,
+          "description": "DOM functions that act like 'eval' and execute strings as code are dangerous and impede program analysis and understanding. Consequently, they should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "readability",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/yield-outside-generator",
+          "cwe_id": "CWE-758",
+          "cwe_name": "Reliance on Undefined, Unspecified, or Implementation-Defined Behavior",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.9288,
+          "raw_bm25_score": 23.9288,
+          "description": "'yield' should only be used in generator functions.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-758. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "language-features",
+            "external/cwe/cwe-758"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/case-sensitive-middleware-path",
+          "cwe_id": "CWE-178",
+          "cwe_name": "Improper Handling of Case Sensitivity",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.1831,
+          "raw_bm25_score": 23.1831,
+          "description": "Middleware with case-sensitive paths do not protect endpoints with case-insensitive paths.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-178"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/insecure-download",
+          "cwe_id": "CWE-829",
+          "cwe_name": "Inclusion of Functionality from Untrusted Control Sphere",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.6822,
+          "raw_bm25_score": 22.6822,
+          "description": "Downloading executables and other sensitive files over an insecure connection opens up for potential man-in-the-middle attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-829"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/misleading-indentation-of-dangling-else",
+          "cwe_id": "CWE-483",
+          "cwe_name": "Incorrect Block Delimitation",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.3981,
+          "raw_bm25_score": 21.3981,
+          "description": "The 'else' clause of an 'if' statement should be aligned with the 'if' it belongs to.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-483. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "readability",
+            "statistical",
+            "non-attributable"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.3482,
+          "raw_bm25_score": 21.3482,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/function-declaration-conflict",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.5437,
+          "raw_bm25_score": 20.5437,
+          "description": "If two functions with the same name are declared in the same scope, one of the declarations overrides the other without warning. This makes the code hard to read and maintain, and may even lead to platform-dependent behavior.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,183 @@
+diff --git a/assets/orient.jpg b/assets/orient.jpg
+new file mode 100644
+index 0000000..7e6f240
+Binary files /dev/null and b/assets/orient.jpg differ
+diff --git a/index.js b/index.js
+index 199b923..c254016 100644
+--- a/index.js
++++ b/index.js
+@@ -1,51 +1,53 @@
++/*jshint laxbreak:true */
++
+ var exec = require('child_process').exec, child;
+ 
+ module.exports = function(path, opts, cb) {
+   if (!cb) {
+     cb = opts;
+     opts = {};
+   }
+ 
+   var cmd = module.exports.cmd(path, opts);
+   opts.timeout = opts.timeout || 5000;
+ 
+   exec(cmd, opts, function(e, stdout, stderr) {
+     if (e) { return cb(e); }
+     if (stderr) { return cb(new Error(stderr)); }
+ 
+-    return cb(null, module.exports.parse(path, stdout));
++    return cb(null, module.exports.parse(path, stdout, opts));
+   });
+ };
+ 
+ module.exports.cmd = function(path, opts) {
+   opts = opts || {};
+   var format = [
+     'name=%[name]',
+     'size=%[size]',
+     'format=%m',
+     'colorspace=%[colorspace]',
+     'height=%[height]',
+     'width=%[width]',
+     'orientation=%[orientation]',
+     (opts.exif ? '%[exif:*]' : '')
+   ].join("\n");
+ 
+   return 'identify -format "' + format + '" ' + path;
+ };
+ 
+-module.exports.parse = function(path, stdout) {
++module.exports.parse = function(path, stdout, opts) {
+   var lines = stdout.split('\n');
+   var ret = {path: path};
+   var i;
+ 
+   for (i = 0; i < lines.length; i++) {
+     if (lines[i]) {
+       lines[i] = lines[i].split('=');
+ 
+       // Parse exif metadata keys
+       if (lines[i][0].substr(0, 5) === 'exif:') {
+         if (!ret.exif) {
+           ret.exif = {};
+         }
+ 
+         ret.exif[lines[i][0].substr(5)] = lines[i][1];
+@@ -60,17 +62,28 @@ module.exports.parse = function(path, stdout) {
+   if (ret.width) { ret.width = parseInt(ret.width, 10); }
+   if (ret.height) { ret.height = parseInt(ret.height, 10); }
+ 
+   if (ret.size && ret.size.substr(ret.size.length - 2) === "BB") {
+     ret.size = ret.size.substr(0, ret.size.length - 1);
+   }
+ 
+   if (ret.colorspace && ret.colorspace === 'sRGB') {
+     ret.colorspace = 'RGB';
+   }
+ 
+   if (ret.orientation === 'Undefined') {
+     ret.orientation = '';
+   }
+ 
++  if (opts && opts.autoOrient
++      && ( ret.orientation === 'LeftTop'
++        || ret.orientation === 'RightTop'
++        || ret.orientation === 'LeftBottom'
++        || ret.orientation === 'RightBottom')) {
++
++    ret.width  = ret.width + ret.height;
++    ret.height = ret.width - ret.height;
++    ret.width  = ret.width - ret.height;
++  }
++
+   return ret;
+ };
+diff --git a/test.js b/test.js
+index 100f1f0..abda81b 100644
+--- a/test.js
++++ b/test.js
+@@ -56,30 +56,57 @@ describe('metadata.parse()', function() {
+ 
+   it('returns RGB for sRGB colorspace', function() {
+     assert.deepEqual(metadata.parse(path, 'colorspace=sRGB'), {
+       path: path,
+       colorspace: 'RGB'
+     });
+   });
+ 
+   it('return "" for Undefined orientation', function() {
+     assert.deepEqual(metadata.parse(path, 'orientation=Undefined'), {
+       path: path,
+       orientation: ''
+     });
+   });
+ 
++  it('returns height and widt for auto-orient', function() {
++    var meta = 'width=100\nheight=150\norientation=';
++    var opts = {autoOrient: true};
++
++    var orientation = [
++      'TopLeft', 'TopRight', 'BottomRight', 'BottomLeft',
++      'LeftTop', 'RightTop', 'RightBottom', 'LeftBottom'
++    ];
++
++    for (var i = 0; i < 4; i++) {
++      assert.deepEqual(metadata.parse(path, meta + orientation[i], opts), {
++        height: 150,
++        width: 100,
++        path: path,
++        orientation: orientation[i]
++      });
++    }
++
++    for (var j = 4; j < 8; j++) {
++      assert.deepEqual(metadata.parse(path, meta + orientation[j], opts), {
++        height: 100,
++        width: 150,
++        path: path,
++        orientation: orientation[j]
++      });
++    }
++  });
+ });
+ 
+ describe('metadata()', function() {
+   it('returns metadata for image', function(done) {
+     metadata('./assets/image.jpg', { exif: false }, function(err, data) {
+       assert.ifError(err);
+ 
+       assert.equal(data.path, './assets/image.jpg');
+       assert.equal(data.name, '');
+       assert.equal(data.size, '4.296MB');
+       assert.equal(data.format, 'JPEG');
+       assert.equal(data.colorspace, 'RGB');
+       assert.equal(data.height, 3456);
+       assert.equal(data.width, 5184);
+ 
+@@ -108,16 +135,27 @@ describe('metadata()', function() {
+       assert.equal(data.width, 5184);
+ 
+       // Ok, I give up. For some reason there is this inconsistency between
+       // ImageMagick identify versions which yilds undefined/empty string for
+       // the orientation on the CI server. I can not find any reference on this
+       // issue which is why this test will not be run on the CI server.
+       if (!process.env.CI) { assert.equal(data.orientation, 'TopLeft'); }
+ 
+       assert.equal(typeof data.exif, 'object');
+       assert.equal(Object.keys(data.exif).length, 36);
+       assert.equal(data.exif.ApertureValue, '37/8');
+ 
+       done();
+     });
+   });
++
++  it('returns correct height and width for auto-orient', function(done) {
++    metadata('./assets/orient.jpg', { autoOrient: true }, function(err, data) {
++      assert.ifError(err);
++
++      assert.equal(data.height, 3264);
++      assert.equal(data.width, 2448);
++
++      done();
++    });
++  });
+ });

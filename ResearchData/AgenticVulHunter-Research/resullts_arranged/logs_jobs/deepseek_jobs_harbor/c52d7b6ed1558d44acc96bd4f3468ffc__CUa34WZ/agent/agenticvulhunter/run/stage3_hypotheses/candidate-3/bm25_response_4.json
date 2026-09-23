@@ -1,0 +1,261 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "beaker/session.py",
+      "changed_line": 352,
+      "statement": "if not crypto.has_aes and encrypt_key:",
+      "change_type": "A",
+      "function_name": "__init__",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "Encryption key presence -> check for AES library availability -> decides whether to raise error or proceed with encryption",
+      "security_relevance_score": 0.6,
+      "code_context": "203:         self.was_invalidated = True\n204:         self._create_id()\n205:         self.load()\n206:     \n207:     def load(self):\n208:         \"Loads the data from this session from persistent storage\"\n209:         self.namespace = self.namespace_class(self.id,\n210:             data_dir=self.data_dir, digest_filenames=False,\n211:             **self.namespace_args)\n212:         now = time.time()\n213:         self.request['set_cookie'] = True\n214:         \n215:         self.namespace.acquire_read_lock()\n216:         timed_out = False\n217:         try:\n218:             self.clear()\n219:             try:\n220:                 session_data = self.namespace['session']\n221: \n222:                 # Memcached always returns a key, its None when its not\n223:                 # present\n224:                 if session_data is None:\n225:                     session_data = {\n226:                         '_creation_time':now,\n227:                         '_accessed_time':now\n228:                     }\n229:                     self.is_new = True\n230:             except (KeyError, TypeError):\n231:                 session_data = {\n232:                     '_creation_time':now,\n233:                     '_accessed_time':now\n234:                 }\n235:                 self.is_new = True\n236:             \n237:             if self.timeout is not None and \\\n238:                now - session_data['_accessed_time'] > self.timeout:\n239:                 timed_out= True\n240:             else:\n241:                 # Properly set the last_accessed time, which is different\n242:                 # than the *currently* _accessed_time\n243:                 if self.is_new or '_accessed_time' not in session_data:\n244:                     self.last_accessed = None\n245:                 else:\n246:                     self.last_accessed = session_data['_accessed_time']\n247:                 \n248:                 # Update the current _accessed_time\n249:                 session_data['_accessed_time'] = now\n250:                 self.update(session_data)\n251:                 self.accessed_dict = session_data.copy()                \n252:         finally:\n253:             self.namespace.release_read_lock()\n254:         if timed_out:\n255:             self.invalidate()\n256:     \n257:     def save(self, accessed_only=False):\n258:         \"\"\"Saves the data for this session to persistent storage\n259:         \n260:         If accessed_only is True, then only the original data loaded\n261:         at the beginning of the request will be saved, with the updated\n262:         last accessed time.\n263:         \n264:         \"\"\"\n265:         # Look to see if its a new session that was only accessed\n266:         # Don't save it under that case\n267:         if accessed_only and self.is_new:\n268:             return None\n269:         \n270:         if not hasattr(self, 'namespace'):\n271:             self.namespace = self.namespace_class(\n272:                                     self.id, \n273:                                     data_dir=self.data_dir,\n274:                                     digest_filenames=False, \n275:                                     **self.namespace_args)\n276:         \n277:         self.namespace.acquire_write_lock()\n278:         try:\n279:             if accessed_only:\n280:                 data = dict(self.accessed_dict.items())\n281:             else:\n282:                 data = dict(self.items())\n283:             \n284:             # Save the data\n285:             if not data and 'session' in self.namespace:\n286:                 del self.namespace['session']\n287:             else:\n288:                 self.namespace['session'] = data\n289:         finally:\n290:             self.namespace.release_write_lock()\n291:         if self.is_new:\n292:             self.request['set_cookie'] = True\n293:     \n294:     def revert(self):\n295:         \"\"\"Revert the session to its original state from its first\n296:         access in the request\"\"\"\n297:         self.clear()\n298:         self.update(self.accessed_dict)\n299:     \n300:     # TODO: I think both these methods should be removed.  They're from\n301:     # the original mod_python code i was ripping off but they really\n302:     # have no use here.\n303:     def lock(self):\n304:         \"\"\"Locks this session against other processes/threads.  This is\n305:         automatic when load/save is called.\n306:         \n307:         ***use with caution*** and always with a corresponding 'unlock'\n308:         inside a \"finally:\" block, as a stray lock typically cannot be\n309:         unlocked without shutting down the whole application.\n310: \n311:         \"\"\"\n312:         self.namespace.acquire_write_lock()\n313: \n314:     def unlock(self):\n315:         \"\"\"Unlocks this session against other processes/threads.  This\n316:         is automatic when load/save is called.\n317: \n318:         ***use with caution*** and always within a \"finally:\" block, as\n319:         a stray lock typically cannot be unlocked without shutting down\n320:         the whole application.\n321: \n322:         \"\"\"\n323:         self.namespace.release_write_lock()\n324: \n325: class CookieSession(Session):\n326:     \"\"\"Pure cookie-based session\n327:     \n328:     Options recognized when using cookie-based sessions are slightly\n329:     more restricted than general sessions.\n330:     \n331:     ``key``\n332:         The name the cookie should be set to.\n333:     ``timeout``\n334:         How long session data is considered valid. This is used \n335:         regardless of the cookie being present or not to determine\n336:         whether session data is still valid.\n337:     ``encrypt_key``\n338:         The key to use for the session encryption, if not provided the\n339:         session will not be encrypted.\n340:     ``validate_key``\n341:         The key used to sign the encrypted session\n342:     ``cookie_domain``\n343:         Domain to use for the cookie.\n344:     ``secure``\n345:         Whether or not the cookie should only be sent over SSL.\n346:     \n347:     \"\"\"\n348:     def __init__(self, request, key='beaker.session.id', timeout=None,\n349:                  cookie_expires=True, cookie_domain=None, encrypt_key=None,\n350:                  validate_key=None, secure=False, **kwargs):\n351:         \n352:         if not crypto.has_aes and encrypt_key:\n353:             raise InvalidCryptoBackendError(\"No AES library is installed, can't generate \"\n354:                                   \"encrypted cookie-only Session.\")\n355:         \n356:         self.request = request\n357:         self.key = key\n358:         self.timeout = timeout\n359:         self.cookie_expires = cookie_expires\n360:         self.encrypt_key = encrypt_key\n361:         self.validate_key = validate_key\n362:         self.request['set_cookie'] = False\n363:         self.secure = secure\n364:         self._domain = cookie_domain\n365:         self._path = '/'\n366:         \n367:         try:\n368:             cookieheader = request['cookie']\n369:         except KeyError:\n370:             cookieheader = ''\n371:         \n372:         if validate_key is None:\n373:             raise BeakerException(\"No validate_key specified for Cookie only \"\n374:                                   \"Session.\")\n375:         \n376:         try:\n377:             self.cookie = SignedCookie(validate_key, input=cookieheader)\n378:         except Cookie.CookieError:\n379:             self.cookie = SignedCookie(validate_key, input=None)\n380:         \n381:         self['_id'] = self._make_id()\n382:         self.is_new = True\n383:         \n384:         # If we have a cookie, load it\n385:         if self.key in self.cookie and self.cookie[self.key].value is not None:\n386:             self.is_new = False\n387:             try:\n388:                 self.update(self._decrypt_data())\n389:             except:\n390:                 pass\n391:             if self.timeout is not None and time.time() - \\\n392:                self['_accessed_time'] > self.timeout:\n393:                 self.clear()\n394:             self.accessed_dict = self.copy()\n395:             self._create_cookie()\n396:     \n397:     def created(self):\n398:         return self['_creation_time']\n399:     created = property(created)\n400:     \n401:     def id(self):\n402:         return self['_id']\n403:     id = property(id)\n404: \n405:     def _set_domain(self, domain):\n406:         self['_domain'] = domain\n407:         self._domain = domain\n408:         \n409:     def _get_domain(self, domain):\n410:         return self._domain\n411:     \n412:     domain = property(_get_domain, _set_domain)\n413:     \n414:     def _set_path(self, path):\n415:         self['_path'] = path\n416:         self._path = path\n417:     \n418:     def _get_path(self, domain):\n419:         return self._path\n420:     \n421:     path = property(_get_path, _set_path)\n422: \n423:     def _encrypt_data(self):\n424:         \"\"\"Serialize, encipher, and base64 the session dict\"\"\"\n425:         if self.encrypt_key:\n426:             nonce = b64encode(os.urandom(40))[:8]\n427:             encrypt_key = crypto.generateCryptoKeys(self.encrypt_key,\n428:                                              self.validate_key + nonce, 1)\n429:             data = pickle.dumps(self.copy(), 2)\n430:             return nonce + b64encode(crypto.aesEncrypt(data, encrypt_key))\n431:         else:\n432:             data = pickle.dumps(self.copy(), 2)\n433:             return b64encode(data)\n434:     \n435:     def _decrypt_data(self):\n436:         \"\"\"Bas64, decipher, then un-serialize the data for the session\n437:         dict\"\"\"\n438:         if self.encrypt_key:\n439:             nonce = self.cookie[self.key].value[:8]\n440:             encrypt_key = crypto.generateCryptoKeys(self.encrypt_key,\n441:                                              self.validate_key + nonce, 1)\n442:             payload = b64decode(self.cookie[self.key].value[8:])\n443:             data = crypto.aesDecrypt(payload, encrypt_key)\n444:             return pickle.loads(data)\n445:         else:\n446:             data = b64decode(self.cookie[self.key].value)\n447:             return pickle.loads(data)\n448:     \n449:     def _make_id(self):\n450:         return md5(md5(\n451:             \"%f%s%f%s\" % (time.time(), id({}), random.random(), getpid())\n452:             ).hexdigest()\n453:         ).hexdigest()\n454:     \n455:     def save(self, accessed_only=False):\n456:         \"\"\"Saves the data for this session to persistent storage\"\"\"\n457:         if accessed_only and self.is_new:\n458:             return\n459:         if accessed_only:\n460:             self.clear()\n461:             self.update(self.accessed_dict)\n462:         self._create_cookie()\n463:     \n464:     def expire(self):\n465:         \"\"\"Delete the 'expires' attribute on this Session, if any.\"\"\"\n466:         \n467:         self.pop('_expires', None)\n468:         \n469:     def _create_cookie(self):\n470:         if '_creation_time' not in self:\n471:             self['_creation_time'] = time.time()\n472:         if '_id' not in self:\n473:             self['_id'] = self._make_id()\n474:         self['_accessed_time'] = time.time()\n475:         \n476:         if self.cookie_expires is not True:\n477:             if self.cookie_expires is False:\n478:                 expires = datetime.fromtimestamp( 0x7FFFFFFF )\n479:             elif isinstance(self.cookie_expires, timedelta):\n480:                 expires = datetime.today() + self.cookie_expires\n481:             elif isinstance(self.cookie_expires, datetime):\n482:                 expires = self.cookie_expires\n483:             else:\n484:                 raise ValueError(\"Invalid argument for cookie_expires: %s\"\n485:                                  % repr(self.cookie_expires))\n486:             self['_expires'] = expires\n487:         elif '_expires' in self:\n488:             expires = self['_expires']\n489:         else:\n490:             expires = None\n491: \n492:         val = self._encrypt_data()\n493:         if len(val) > 4064:\n494:             raise BeakerException(\"Cookie value is too long to store\")\n495:         \n496:         self.cookie[self.key] = val\n497:         if '_domain' in self:\n498:             self.cookie[self.key]['domain'] = self['_domain']\n499:         elif self._domain:\n500:             self.cookie[self.key]['domain'] = self._domain\n501:         if self.secure:",
+      "source_summary": "encrypt_key parameter passed to CookieSession constructor; crypto.has_aes determined by availability of pycrypto or jcecrypto modules",
+      "sink_summary": "Raises InvalidCryptoBackendError preventing encrypted cookie session creation when AES unavailable",
+      "guard_summary": "Check prevents attempting to use encryption when crypto backend lacks AES support; error raised before any encryption operations",
+      "risk_pattern": "Missing library detection prevents runtime errors during encryption/decryption; ensures encryption only used when supported",
+      "used_variable_sources": [
+        "encrypt_key (constructor parameter)",
+        "crypto.has_aes (module-level flag)"
+      ],
+      "called_function_context": [
+        "crypto.has_aes attribute check"
+      ],
+      "enclosing_conditions": [
+        "CookieSession.__init__ method",
+        "encrypt_key is truthy"
+      ],
+      "context_summary": "Check in CookieSession constructor validates AES availability before allowing encrypted cookie sessions; prevents runtime failures in _encrypt_data/_decrypt_data",
+      "unresolved_facts": [
+        "Specific callers of CookieSession and their encrypt_key sources",
+        "Whether encrypt_key could be attacker-controlled",
+        "Exact failure behavior if check absent and encryption attempted without AES"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "Improper check or validation of required dependencies before performing security-sensitive operations",
+        "sensitive_operation": "cryptographic operations (AES encryption/decryption)",
+        "missing_control": "proper validation that required cryptographic library is available",
+        "impact": "runtime errors or fallback to insecure behavior",
+        "mechanism_keywords": [
+          "improper validation",
+          "dependency check",
+          "missing dependency",
+          "cryptographic operations"
+        ]
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/weak-symmetric-encryption",
+          "cwe_id": "CWE-327",
+          "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 33.4843,
+          "raw_bm25_score": 33.4843,
+          "description": "Finds uses of symmetric cryptography algorithms that are weak, obsolete, or otherwise unaccepted. The key lengths allowed are 128, 192, and 256 bits. These are all the key lengths supported by AES, so any application of AES is considered acceptable.",
+          "pattern": "Identify usage of weak or deprecated cryptographic algorithms and practices",
+          "remediation": "Use modern cryptographic algorithms and proper key management. Avoid deprecated algorithms and implement proper random number generation.",
+          "tags": [
+            "external/cwe/cwe-327"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/client-exposed-cookie",
+          "cwe_id": "CWE-1004",
+          "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.5996,
+          "raw_bm25_score": 25.5996,
+          "description": "Cookies without the `HttpOnly` attribute set can be accessed by JS scripts, making them more vulnerable to XSS attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Set HttpOnly flag on session cookies to prevent JavaScript access. Also use Secure and SameSite attributes.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1004"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/call/wrong-named-class-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.0977,
+          "raw_bm25_score": 24.0977,
+          "description": "Using a named argument whose name does not correspond to a parameter of the __init__ method of the class being instantiated, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "fallback/cwe-310-cryptographic-issues",
+          "cwe_id": "CWE-310",
+          "cwe_name": "Cryptographic Issues",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 23.3035,
+          "raw_bm25_score": 23.3035,
+          "description": "Legacy category for cryptographic design or implementation weaknesses.",
+          "pattern": "cwe-310 cryptography cipher encryption decryption tls ssl certificate hash randomness key cryptographic-protocol",
+          "remediation": "Use approved cryptographic algorithms, protocols, keys, and certificate validation.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-310"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "fallback/cwe-311-missing-encryption-of-sensitive-data",
+          "cwe_id": "CWE-311",
+          "cwe_name": "Missing Encryption of Sensitive Data",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 23.2039,
+          "raw_bm25_score": 23.2039,
+          "description": "Sensitive data is stored or transmitted without required encryption.",
+          "pattern": "cwe-311 missing-encryption cleartext plaintext sensitive-data unencrypted storage transmission tls data-at-rest data-in-transit",
+          "remediation": "Encrypt sensitive data in transit and at rest.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-311"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/insecure-cookie",
+          "cwe_id": "CWE-614",
+          "cwe_name": "Sensitive Cookie in HTTPS Session Without 'Secure' Attribute",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.4768,
+          "raw_bm25_score": 21.4768,
+          "description": "Insecure cookies may be sent in cleartext, which makes them vulnerable to interception.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Set Secure flag on cookies transmitted over HTTPS. Also implement HttpOnly and SameSite attributes for session cookies.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-614"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "fallback/cwe-255-credentials-management-errors",
+          "cwe_id": "CWE-255",
+          "cwe_name": "Credentials Management Errors",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 20.5778,
+          "raw_bm25_score": 20.5778,
+          "description": "Legacy category for insecure credential creation, storage, validation, or handling.",
+          "pattern": "cwe-255 credential-management password token secret credential storage rotation validation authentication-secret",
+          "remediation": "Protect credentials throughout storage, validation, transport, and rotation.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-255"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/empty-except",
+          "cwe_id": "CWE-390",
+          "cwe_name": "Detection of Error Condition Without Action",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.7158,
+          "raw_bm25_score": 19.7158,
+          "description": "Except doesn't do anything and has no comment",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-390. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "error-handling",
+            "external/cwe/cwe-390"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/weak-crypto-key",
+          "cwe_id": "CWE-326",
+          "cwe_name": "Inadequate Encryption Strength",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.3618,
+          "raw_bm25_score": 19.3618,
+          "description": "Use of a cryptographic key that is too small may allow the encryption to be broken.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use modern cryptographic algorithms and proper key management. Avoid deprecated algorithms and implement proper random number generation.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-326"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-471-modification-of-assumed-immutable-data-maid",
+          "cwe_id": "CWE-471",
+          "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 18.5497,
+          "raw_bm25_score": 18.5497,
+          "description": "Security-critical data assumed immutable can be modified by an attacker.",
+          "pattern": "cwe-471 assumed-immutable immutable-data hidden-field cookie reverse-dns attacker-modified trusted-value mutable security-decision",
+          "remediation": "Do not trust client-modifiable values as immutable security state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-471"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

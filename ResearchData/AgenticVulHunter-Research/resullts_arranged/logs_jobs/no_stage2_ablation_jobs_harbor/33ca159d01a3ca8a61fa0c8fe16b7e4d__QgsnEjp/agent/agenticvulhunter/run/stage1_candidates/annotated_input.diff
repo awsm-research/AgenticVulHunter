@@ -1,0 +1,408 @@
+@@ -0,0 +1 @@
+[A,.gitignore,1] node_modules
+@@ -0,0 +1 @@
+[A,.jshintignore,1] node_modules
+@@ -0,0 +1,3 @@
+[A,.travis.yml,1] language: node_js
+[A,.travis.yml,2] node_js:
+[A,.travis.yml,3]   - "0.10"
+@@ -0,0 +1,28 @@
+[A,README.md,1] # connie-lang
+[A,README.md,2] 
+[A,README.md,3] Configuration language for [connie](https://github.com/mattinsler/connie).
+[A,README.md,4] 
+[A,README.md,5] ## Installation
+[A,README.md,6] 
+[A,README.md,7] ```bash
+[A,README.md,8] $ npm install --save connie-lang
+[A,README.md,9] ```
+[A,README.md,10] 
+[A,README.md,11] ## Usage
+[A,README.md,12] 
+[A,README.md,13] ```javascript
+[A,README.md,14] var ConnieLang = require('connie-lang');
+[A,README.md,15] 
+[A,README.md,16] var config = ConnieLang.parse({
+[A,README.md,17]   common: {
+[A,README.md,18]     domain: 'mattinsler.com'
+[A,README.md,19]   },
+[A,README.md,20]   endpoints: {
+[A,README.md,21]     api: 'api.@{common.domain}'
+[A,README.md,22]   },
+[A,README.md,23]   server: {
+[A,README.md,24]     port: '#{${PORT} || 3000}'
+[A,README.md,25]   }
+[A,README.md,26] }, process.env);
+[A,README.md,27] 
+[A,README.md,28] ```
+@@ -0,0 +1,164 @@
+[A,lib/connie-lang.js,1] var vm = require('vm');
+[A,lib/connie-lang.js,2] var isPlainObject = require('lodash.isplainobject');
+[A,lib/connie-lang.js,3] 
+[A,lib/connie-lang.js,4] var getValue = function(obj, key) {
+[A,lib/connie-lang.js,5]   var o = obj;
+[A,lib/connie-lang.js,6]   var keys = Array.isArray(key) ? key : key.split('.');
+[A,lib/connie-lang.js,7]   
+[A,lib/connie-lang.js,8]   for (var x = 0; x < keys.length -1; ++x) {
+[A,lib/connie-lang.js,9]     var k = keys[x];
+[A,lib/connie-lang.js,10]     if (!o[k]) return;
+[A,lib/connie-lang.js,11]     o = o[k];
+[A,lib/connie-lang.js,12]   }
+[A,lib/connie-lang.js,13]   
+[A,lib/connie-lang.js,14]   return o[keys[keys.length - 1]];
+[A,lib/connie-lang.js,15] };
+[A,lib/connie-lang.js,16] 
+[A,lib/connie-lang.js,17] var setValue = function(obj, key, value) {
+[A,lib/connie-lang.js,18]   var o = obj;
+[A,lib/connie-lang.js,19]   var keys = Array.isArray(key) ? key : key.split('.');
+[A,lib/connie-lang.js,20]   
+[A,lib/connie-lang.js,21]   for (var x = 1; x < keys.length; ++x) {
+[A,lib/connie-lang.js,22]     var currentKey = keys[x];
+[A,lib/connie-lang.js,23]     var lastKey = keys[x - 1];
+[A,lib/connie-lang.js,24]     if (typeof(currentKey) === 'number') {
+[A,lib/connie-lang.js,25]       if (!o[lastKey]) { o[lastKey] = []; }
+[A,lib/connie-lang.js,26]       o = o[lastKey];
+[A,lib/connie-lang.js,27]     } else if (typeof(currentKey) === 'string') {
+[A,lib/connie-lang.js,28]       if (!o[lastKey]) { o[lastKey] = {}; }
+[A,lib/connie-lang.js,29]       o = o[lastKey];
+[A,lib/connie-lang.js,30]     } else {
+[A,lib/connie-lang.js,31]       throw new Error('Oopsy, key arrays should only be strings and numbers:', keys);
+[A,lib/connie-lang.js,32]     }
+[A,lib/connie-lang.js,33]   }
+[A,lib/connie-lang.js,34]   
+[A,lib/connie-lang.js,35]   o[keys[keys.length - 1]] = value;
+[A,lib/connie-lang.js,36]   return obj;
+[A,lib/connie-lang.js,37] };
+[A,lib/connie-lang.js,38] 
+[A,lib/connie-lang.js,39] 
+[A,lib/connie-lang.js,40] var EnvVarInterpreter = {
+[A,lib/connie-lang.js,41]   type: '$',
+[A,lib/connie-lang.js,42]   replace: function(value, context) {
+[A,lib/connie-lang.js,43]     var m = /\$\{([^\}]+)\}/.exec(value);
+[A,lib/connie-lang.js,44]     if (!m) return value;
+[A,lib/connie-lang.js,45]     return value.replace(m[0], context.env[m[1]]);
+[A,lib/connie-lang.js,46]   }
+[A,lib/connie-lang.js,47] };
+[A,lib/connie-lang.js,48] 
+[A,lib/connie-lang.js,49] var ExecutionInterpreter = {
+[A,lib/connie-lang.js,50]   type: '#',
+[A,lib/connie-lang.js,51]   replace: function(value, context) {
+[A,lib/connie-lang.js,52]     var m = /#\{([^\}]+)\}/.exec(value);
+[A,lib/connie-lang.js,53]     if (!m) return value;
+[A,lib/connie-lang.js,54]     
+[A,lib/connie-lang.js,55]     try {
+[A,lib/connie-lang.js,56]       var v = vm.runInNewContext(m[1], {});
+[A,lib/connie-lang.js,57]       if (m[0] === value) return v;
+[A,lib/connie-lang.js,58]       return value.replace(m[0], v);
+[A,lib/connie-lang.js,59]     } catch(err) {
+[A,lib/connie-lang.js,60]       throw new Error('Invalid execution [' + m[1] + ']: ' + err.message);
+[A,lib/connie-lang.js,61]     }
+[A,lib/connie-lang.js,62]   }
+[A,lib/connie-lang.js,63] };
+[A,lib/connie-lang.js,64] 
+[A,lib/connie-lang.js,65] var ReferenceInterpreter = {
+[A,lib/connie-lang.js,66]   type: '@',
+[A,lib/connie-lang.js,67]   replace: function(value, context) {
+[A,lib/connie-lang.js,68]     var m = /@\{([^\}]+)\}/.exec(value);
+[A,lib/connie-lang.js,69]     if (!m) return value;
+[A,lib/connie-lang.js,70]     
+[A,lib/connie-lang.js,71]     var v = getValue(context.config, m[1]);
+[A,lib/connie-lang.js,72]     if (m[0] === value) return v;
+[A,lib/connie-lang.js,73]     return value.replace(m[0], v);
+[A,lib/connie-lang.js,74]   }
+[A,lib/connie-lang.js,75] };
+[A,lib/connie-lang.js,76] 
+[A,lib/connie-lang.js,77] var Interpreters = [ReferenceInterpreter, EnvVarInterpreter, ExecutionInterpreter];
+[A,lib/connie-lang.js,78] 
+[A,lib/connie-lang.js,79] var ConnieLang = {
+[A,lib/connie-lang.js,80]   Interpreters: Interpreters,
+[A,lib/connie-lang.js,81]   InterpretersByType: Interpreters.reduce(function(o, i) {o[i.type] = i; return o;}, {}),
+[A,lib/connie-lang.js,82]   
+[A,lib/connie-lang.js,83]   getEntries: function(config) {
+[A,lib/connie-lang.js,84]     var entries = [];
+[A,lib/connie-lang.js,85]     
+[A,lib/connie-lang.js,86]     var iter = function(value, prefix) {
+[A,lib/connie-lang.js,87]       if (!prefix) prefix = [];
+[A,lib/connie-lang.js,88]       
+[A,lib/connie-lang.js,89]       if (Array.isArray(value)) {
+[A,lib/connie-lang.js,90]         value.forEach(function(arrValue, idx) {
+[A,lib/connie-lang.js,91]           iter(arrValue, prefix.concat(idx));
+[A,lib/connie-lang.js,92]         });
+[A,lib/connie-lang.js,93]       } else if (isPlainObject(value)) {
+[A,lib/connie-lang.js,94]         Object.keys(value).forEach(function(key) {
+[A,lib/connie-lang.js,95]           iter(value[key], prefix.concat(key));
+[A,lib/connie-lang.js,96]         });
+[A,lib/connie-lang.js,97]       } else {
+[A,lib/connie-lang.js,98]         entries.push({key: prefix, value: value});
+[A,lib/connie-lang.js,99]       }
+[A,lib/connie-lang.js,100]     };
+[A,lib/connie-lang.js,101]     
+[A,lib/connie-lang.js,102]     iter(config);
+[A,lib/connie-lang.js,103]     return entries;
+[A,lib/connie-lang.js,104]   },
+[A,lib/connie-lang.js,105]   
+[A,lib/connie-lang.js,106]   firstInnermostInterpreterFromValue: function(value) {
+[A,lib/connie-lang.js,107]     var start = -1;
+[A,lib/connie-lang.js,108]     var interpreterTypes = Object.keys(ConnieLang.InterpretersByType);
+[A,lib/connie-lang.js,109]     
+[A,lib/connie-lang.js,110]     for (var idx = 1; idx < value.length; ++idx) {
+[A,lib/connie-lang.js,111]       if (value[idx] === '{' && interpreterTypes.indexOf(value[idx - 1]) !== -1) {
+[A,lib/connie-lang.js,112]         start = idx - 1;
+[A,lib/connie-lang.js,113]       } else if (value[idx] === '}' && start !== -1) {
+[A,lib/connie-lang.js,114]         return {
+[A,lib/connie-lang.js,115]           type: value[start],
+[A,lib/connie-lang.js,116]           match: value.slice(start, idx + 1),
+[A,lib/connie-lang.js,117]           value: value.slice(start + 2, idx),
+[A,lib/connie-lang.js,118]           start: start,
+[A,lib/connie-lang.js,119]           end: idx + 1
+[A,lib/connie-lang.js,120]         };
+[A,lib/connie-lang.js,121]       }
+[A,lib/connie-lang.js,122]     }
+[A,lib/connie-lang.js,123]     
+[A,lib/connie-lang.js,124]     return null;
+[A,lib/connie-lang.js,125]   },
+[A,lib/connie-lang.js,126]   
+[A,lib/connie-lang.js,127]   parse: function(configObj, envObj) {
+[A,lib/connie-lang.js,128]     var context = {
+[A,lib/connie-lang.js,129]       config: configObj,
+[A,lib/connie-lang.js,130]       env: envObj || process.env
+[A,lib/connie-lang.js,131]     };
+[A,lib/connie-lang.js,132]     
+[A,lib/connie-lang.js,133]     var entries = ConnieLang.getEntries(context.config);
+[A,lib/connie-lang.js,134]     
+[A,lib/connie-lang.js,135]     // iterate until no updates have been made
+[A,lib/connie-lang.js,136]     var digest = function() {
+[A,lib/connie-lang.js,137]       var updated = false;
+[A,lib/connie-lang.js,138]       
+[A,lib/connie-lang.js,139]       entries.forEach(function(e) {
+[A,lib/connie-lang.js,140]         var interpreter = ConnieLang.firstInnermostInterpreterFromValue(e.value, context);
+[A,lib/connie-lang.js,141]         if (!interpreter) return;
+[A,lib/connie-lang.js,142]         
+[A,lib/connie-lang.js,143]         var newValue = ConnieLang.InterpretersByType[interpreter.type].replace(e.value, context);
+[A,lib/connie-lang.js,144]         if (newValue !== e.value) {
+[A,lib/connie-lang.js,145]           e.value = newValue;
+[A,lib/connie-lang.js,146]           updated = true;
+[A,lib/connie-lang.js,147]         }
+[A,lib/connie-lang.js,148]       });
+[A,lib/connie-lang.js,149]       
+[A,lib/connie-lang.js,150]       return updated;
+[A,lib/connie-lang.js,151]     };
+[A,lib/connie-lang.js,152]     
+[A,lib/connie-lang.js,153]     while(digest()) ;
+[A,lib/connie-lang.js,154]     
+[A,lib/connie-lang.js,155]     var result = {};
+[A,lib/connie-lang.js,156]     entries.forEach(function(e) {
+[A,lib/connie-lang.js,157]       setValue(result, e.key, e.value);
+[A,lib/connie-lang.js,158]     });
+[A,lib/connie-lang.js,159]     
+[A,lib/connie-lang.js,160]     return result;
+[A,lib/connie-lang.js,161]   }
+[A,lib/connie-lang.js,162] };
+[A,lib/connie-lang.js,163] 
+[A,lib/connie-lang.js,164] module.exports = ConnieLang;
+@@ -0,0 +1,28 @@
+[A,package.json,1] {
+[A,package.json,2]   "name": "connie-lang",
+[A,package.json,3]   "description": "Configuration language for connie",
+[A,package.json,4]   "version": "0.0.1",
+[A,package.json,5]   "homepage": "https://github.com/mattinsler/connie-lang",
+[A,package.json,6]   "repository": {
+[A,package.json,7]     "type": "git",
+[A,package.json,8]     "url": "git://github.com/mattinsler/connie-lang.git"
+[A,package.json,9]   },
+[A,package.json,10]   "bugs": {
+[A,package.json,11]     "url": "https://github.com/mattinsler/connie-lang/issues"
+[A,package.json,12]   },
+[A,package.json,13]   "main": "lib/connie-lang",
+[A,package.json,14]   "scripts": {
+[A,package.json,15]     "test": "mocha"
+[A,package.json,16]   },
+[A,package.json,17]   "engines": {
+[A,package.json,18]     "node": ">= 0.10.0"
+[A,package.json,19]   },
+[A,package.json,20]   "dependencies": {
+[A,package.json,21]     "lodash.isplainobject": "^2.4.1"
+[A,package.json,22]   },
+[A,package.json,23]   "devDependencies": {
+[A,package.json,24]     "mocha": "^2.0.1",
+[A,package.json,25]     "mocha-jshint": "0.0.9"
+[A,package.json,26]   },
+[A,package.json,27]   "keywords": ["configuration", "connie"]
+[A,package.json,28] }
+@@ -0,0 +1 @@
+[A,test/jshint.js,1] require('mocha-jshint')();
+@@ -0,0 +1,174 @@
+[A,test/test-connie-lang.js,1] var assert = require('assert');
+[A,test/test-connie-lang.js,2] var ConnieLang = require('../');
+[A,test/test-connie-lang.js,3] 
+[A,test/test-connie-lang.js,4] describe('ConnieLang', function() {
+[A,test/test-connie-lang.js,5]   describe('getEntries', function() {
+[A,test/test-connie-lang.js,6]     it('should return entries for nested objects', function() {
+[A,test/test-connie-lang.js,7]       var entries = ConnieLang.getEntries({
+[A,test/test-connie-lang.js,8]         foo: 'bar',
+[A,test/test-connie-lang.js,9]         bar: {
+[A,test/test-connie-lang.js,10]           baz: {
+[A,test/test-connie-lang.js,11]             a: {
+[A,test/test-connie-lang.js,12]               b: 'c',
+[A,test/test-connie-lang.js,13]               c: 'd',
+[A,test/test-connie-lang.js,14]               d: ['e', 'f', 'g']
+[A,test/test-connie-lang.js,15]             }
+[A,test/test-connie-lang.js,16]           }
+[A,test/test-connie-lang.js,17]         }
+[A,test/test-connie-lang.js,18]       });
+[A,test/test-connie-lang.js,19]       
+[A,test/test-connie-lang.js,20]       assert.deepEqual(entries, [
+[A,test/test-connie-lang.js,21]         {key: ['foo'], value: 'bar'},
+[A,test/test-connie-lang.js,22]         {key: ['bar', 'baz', 'a', 'b'], value: 'c'},
+[A,test/test-connie-lang.js,23]         {key: ['bar', 'baz', 'a', 'c'], value: 'd'},
+[A,test/test-connie-lang.js,24]         {key: ['bar', 'baz', 'a', 'd', 0], value: 'e'},
+[A,test/test-connie-lang.js,25]         {key: ['bar', 'baz', 'a', 'd', 1], value: 'f'},
+[A,test/test-connie-lang.js,26]         {key: ['bar', 'baz', 'a', 'd', 2], value: 'g'}
+[A,test/test-connie-lang.js,27]       ]);
+[A,test/test-connie-lang.js,28]     });
+[A,test/test-connie-lang.js,29]     
+[A,test/test-connie-lang.js,30]     it('should return entries for an array', function() {
+[A,test/test-connie-lang.js,31]       var entries = ConnieLang.getEntries([
+[A,test/test-connie-lang.js,32]         'foo',
+[A,test/test-connie-lang.js,33]         {bar: 'baz'}
+[A,test/test-connie-lang.js,34]       ]);
+[A,test/test-connie-lang.js,35]       
+[A,test/test-connie-lang.js,36]       assert.deepEqual(entries, [
+[A,test/test-connie-lang.js,37]         {key: [0], value: 'foo'},
+[A,test/test-connie-lang.js,38]         {key: [1, 'bar'], value: 'baz'}
+[A,test/test-connie-lang.js,39]       ]);
+[A,test/test-connie-lang.js,40]     });
+[A,test/test-connie-lang.js,41]   });
+[A,test/test-connie-lang.js,42]   
+[A,test/test-connie-lang.js,43]   describe('firstInnermostInterpreterFromValue', function() {
+[A,test/test-connie-lang.js,44]     it('should return null when no interpreters are found', function() {
+[A,test/test-connie-lang.js,45]       var interpreter = ConnieLang.firstInnermostInterpreterFromValue('foobar');
+[A,test/test-connie-lang.js,46]       assert.equal(interpreter, null);
+[A,test/test-connie-lang.js,47]     });
+[A,test/test-connie-lang.js,48] 
+[A,test/test-connie-lang.js,49]     it('should handle complex values', function() {
+[A,test/test-connie-lang.js,50]       var value = '#{parseInt(${PORT})} @{foo.bar}';
+[A,test/test-connie-lang.js,51] 
+[A,test/test-connie-lang.js,52]       var interpreter = ConnieLang.firstInnermostInterpreterFromValue(value);
+[A,test/test-connie-lang.js,53]       assert.deepEqual(interpreter, {
+[A,test/test-connie-lang.js,54]         type: '$',
+[A,test/test-connie-lang.js,55]         match: '${PORT}',
+[A,test/test-connie-lang.js,56]         value: 'PORT',
+[A,test/test-connie-lang.js,57]         start: 11,
+[A,test/test-connie-lang.js,58]         end: 18
+[A,test/test-connie-lang.js,59]       });
+[A,test/test-connie-lang.js,60] 
+[A,test/test-connie-lang.js,61]       value = value.slice(0, interpreter.start) + value.slice(interpreter.end);
+[A,test/test-connie-lang.js,62]       // '#{parseInt()} @{foo.bar}'
+[A,test/test-connie-lang.js,63]       interpreter = ConnieLang.firstInnermostInterpreterFromValue(value);
+[A,test/test-connie-lang.js,64]       assert.deepEqual(interpreter, {
+[A,test/test-connie-lang.js,65]         type: '#',
+[A,test/test-connie-lang.js,66]         match: '#{parseInt()}',
+[A,test/test-connie-lang.js,67]         value: 'parseInt()',
+[A,test/test-connie-lang.js,68]         start: 0,
+[A,test/test-connie-lang.js,69]         end: 13
+[A,test/test-connie-lang.js,70]       });
+[A,test/test-connie-lang.js,71]       
+[A,test/test-connie-lang.js,72]       value = value.slice(0, interpreter.start) + value.slice(interpreter.end);
+[A,test/test-connie-lang.js,73]       // ' @{foo.bar}'
+[A,test/test-connie-lang.js,74]       interpreter = ConnieLang.firstInnermostInterpreterFromValue(value);
+[A,test/test-connie-lang.js,75]       assert.deepEqual(interpreter, {
+[A,test/test-connie-lang.js,76]         type: '@',
+[A,test/test-connie-lang.js,77]         match: '@{foo.bar}',
+[A,test/test-connie-lang.js,78]         value: 'foo.bar',
+[A,test/test-connie-lang.js,79]         start: 1,
+[A,test/test-connie-lang.js,80]         end: 11
+[A,test/test-connie-lang.js,81]       });
+[A,test/test-connie-lang.js,82]     });
+[A,test/test-connie-lang.js,83]   });
+[A,test/test-connie-lang.js,84] 
+[A,test/test-connie-lang.js,85]   describe('parse', function() {
+[A,test/test-connie-lang.js,86]     it('should parse environment variables correctly', function() {
+[A,test/test-connie-lang.js,87]       var config = ConnieLang.parse({
+[A,test/test-connie-lang.js,88]         a: 'PORT',
+[A,test/test-connie-lang.js,89]         b: {
+[A,test/test-connie-lang.js,90]           c: {
+[A,test/test-connie-lang.js,91]             d: 'e',
+[A,test/test-connie-lang.js,92]             e: '${@{a}}'
+[A,test/test-connie-lang.js,93]           }
+[A,test/test-connie-lang.js,94]         },
+[A,test/test-connie-lang.js,95]         p: '#{parseInt(${PORT})}'
+[A,test/test-connie-lang.js,96]       }, {
+[A,test/test-connie-lang.js,97]         PORT: '3000'
+[A,test/test-connie-lang.js,98]       });
+[A,test/test-connie-lang.js,99] 
+[A,test/test-connie-lang.js,100]       assert.deepEqual(config, {
+[A,test/test-connie-lang.js,101]         a: 'PORT',
+[A,test/test-connie-lang.js,102]         b: {
+[A,test/test-connie-lang.js,103]           c: {
+[A,test/test-connie-lang.js,104]             d: 'e',
+[A,test/test-connie-lang.js,105]             e: '3000'
+[A,test/test-connie-lang.js,106]           }
+[A,test/test-connie-lang.js,107]         },
+[A,test/test-connie-lang.js,108]         p: 3000
+[A,test/test-connie-lang.js,109]       });
+[A,test/test-connie-lang.js,110]     });
+[A,test/test-connie-lang.js,111] 
+[A,test/test-connie-lang.js,112]     it('should report errors on invalid execution', function() {
+[A,test/test-connie-lang.js,113]       var fn = function() {
+[A,test/test-connie-lang.js,114]         ConnieLang.parse({
+[A,test/test-connie-lang.js,115]           foo: '#{parseInt(FOOBAR || 4)}'
+[A,test/test-connie-lang.js,116]         });
+[A,test/test-connie-lang.js,117]       };
+[A,test/test-connie-lang.js,118] 
+[A,test/test-connie-lang.js,119]       assert.throws(fn, Error);
+[A,test/test-connie-lang.js,120]     });
+[A,test/test-connie-lang.js,121] 
+[A,test/test-connie-lang.js,122]     it('should parse inside of arrays', function() {
+[A,test/test-connie-lang.js,123]       var config = ConnieLang.parse({
+[A,test/test-connie-lang.js,124]         bar: 'hey',
+[A,test/test-connie-lang.js,125]         arr: [
+[A,test/test-connie-lang.js,126]           {foo: '@{bar}'},
+[A,test/test-connie-lang.js,127]           {bar: '#{parseInt(${FOOBAR} || 4)}'},
+[A,test/test-connie-lang.js,128]           '${PORT}'
+[A,test/test-connie-lang.js,129]         ]
+[A,test/test-connie-lang.js,130]       }, {
+[A,test/test-connie-lang.js,131]         PORT: '3000'
+[A,test/test-connie-lang.js,132]       });
+[A,test/test-connie-lang.js,133] 
+[A,test/test-connie-lang.js,134]       assert.deepEqual(config, {
+[A,test/test-connie-lang.js,135]         bar: 'hey',
+[A,test/test-connie-lang.js,136]         arr: [
+[A,test/test-connie-lang.js,137]           {foo: 'hey'},
+[A,test/test-connie-lang.js,138]           {bar: 4},
+[A,test/test-connie-lang.js,139]           '3000'
+[A,test/test-connie-lang.js,140]         ]
+[A,test/test-connie-lang.js,141]       });
+[A,test/test-connie-lang.js,142]     });
+[A,test/test-connie-lang.js,143] 
+[A,test/test-connie-lang.js,144]     it('should parse env inside of execution', function() {
+[A,test/test-connie-lang.js,145]       var config = ConnieLang.parse({
+[A,test/test-connie-lang.js,146]         a: '#{5 + parseInt(${ITERATIONS})}',
+[A,test/test-connie-lang.js,147]         b: '#{"hello ${NAME}"}'
+[A,test/test-connie-lang.js,148]       }, {
+[A,test/test-connie-lang.js,149]         ITERATIONS: 8,
+[A,test/test-connie-lang.js,150]         NAME: 'Matt'
+[A,test/test-connie-lang.js,151]       });
+[A,test/test-connie-lang.js,152] 
+[A,test/test-connie-lang.js,153]       assert.deepEqual(config, {
+[A,test/test-connie-lang.js,154]         a: 13,
+[A,test/test-connie-lang.js,155]         b: 'hello Matt'
+[A,test/test-connie-lang.js,156]       });
+[A,test/test-connie-lang.js,157]     });
+[A,test/test-connie-lang.js,158] 
+[A,test/test-connie-lang.js,159]     it('should parse execution inside of env', function() {
+[A,test/test-connie-lang.js,160]       var config = ConnieLang.parse({
+[A,test/test-connie-lang.js,161]         a: '${FOO_#{"BAR"}}',
+[A,test/test-connie-lang.js,162]         b: '${FOO_#{"BAZ"}}'
+[A,test/test-connie-lang.js,163]       }, {
+[A,test/test-connie-lang.js,164]         FOO_BAR: 'hello',
+[A,test/test-connie-lang.js,165]         FOO_BAZ: 'world'
+[A,test/test-connie-lang.js,166]       });
+[A,test/test-connie-lang.js,167] 
+[A,test/test-connie-lang.js,168]       assert.deepEqual(config, {
+[A,test/test-connie-lang.js,169]         a: 'hello',
+[A,test/test-connie-lang.js,170]         b: 'world'
+[A,test/test-connie-lang.js,171]       });
+[A,test/test-connie-lang.js,172]     });
+[A,test/test-connie-lang.js,173]   });
+[A,test/test-connie-lang.js,174] });

@@ -1,0 +1,300 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "lib/localvalidator.ts",
+  "changed_line": 104,
+  "statement": "this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"",
+  "change_type": "A",
+  "function_name": "isValidSlpTxid",
+  "operation_type": "error_message_construction",
+  "selection_reason": "SLP parsing exception -> error message construction -> potential information disclosure through error messages",
+  "security_relevance_score": 0.7,
+  "code_context": "1: import BITBOX from 'bitbox-sdk/lib/bitbox-sdk';\n2: import { SlpValidator, Slp } from './slp';\n3: import { SlpTransactionType, SlpTransactionDetails } from './slpjs';\n4: import * as bitcore from 'bitcore-lib-cash';\n5: import { BitcoreTransaction } from './global';\n6: import BigNumber from 'bignumber.js';\n7: import axios from 'axios';\n8: \n9: export interface Validation { hex: string|null; validity: boolean|null; parents: Parent[], details: SlpTransactionDetails|null, invalidReason: string|null } \n10: export type GetRawTransactionsAsync = (txid: string[]) => Promise<string[]|null>;\n11: \n12: const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))\n13: \n14: interface Parent {\n15:     txid: string;\n16:     versionType: number;\n17:     valid: boolean|null;\n18:     inputQty: BigNumber|null;\n19: }\n20: \n21: export class LocalValidator implements SlpValidator {\n22:     BITBOX: BITBOX;\n23:     cachedRawTransactions: { [txid: string]: string }\n24:     cachedValidations: { [txid: string]: Validation }\n25:     getRawTransactions: GetRawTransactionsAsync;\n26:     slp: Slp;\n27: \n28:     constructor(BITBOX: BITBOX, getRawTransactions: GetRawTransactionsAsync) {\n29:         this.BITBOX = BITBOX;\n30:         this.getRawTransactions = getRawTransactions;\n31:         this.slp = new Slp(BITBOX);\n32:         this.cachedValidations = {};\n33:         this.cachedRawTransactions = {};\n34:     }\n35: \n36:     addValidationFromStore(hex: string, isValid: boolean) {\n37:         let id = (<Buffer>this.BITBOX.Crypto.sha256(this.BITBOX.Crypto.sha256(Buffer.from(hex, 'hex'))).reverse()).toString('hex');\n38:         if(!this.cachedValidations[id])\n39:             this.cachedValidations[id] = { hex: hex, validity: isValid, parents: [], details: null, invalidReason: null }\n40:         if(!this.cachedRawTransactions[id])\n41:             this.cachedRawTransactions[id] = hex;\n42:     }\n43:     \n44:     async waitForParentValidationProcessing(txid: string) {\n45:         // TODO: Add some timeout?\n46:         let cached: Validation = this.cachedValidations[txid];\n47: \n48:         while(true) {\n49:             let slpParentCount = cached.parents.length;\n50:             let count = 0;\n51:             cached.parents.forEach(p => {\n52:                 let parent = this.cachedValidations[p.txid];\n53:                 if(parent) {\n54:                     if(typeof parent.validity === 'boolean')\n55:                         count += 1;\n56:                 }\n57:             });\n58:             if(count === slpParentCount && typeof cached.validity === 'boolean')\n59:                 break\n60:             await sleep(200);\n61:         }\n62:     }\n63: \n64:     async waitForTransactionPreProcessing(txid: string){\n65:         // TODO: Add some timeout?\n66:         while(true) {\n67:             if(this.cachedValidations[txid].hex && this.cachedValidations[txid].details)\n68:                 break\n69:             await sleep(200);\n70:         }\n71:         //await sleep(100); // short wait to make sure parent's properties gets set first.\n72:         return\n73:     }\n74: \n75:     async getRawTransaction(txid: string) {\n76:         if(this.cachedRawTransactions[txid])\n77:             return this.cachedRawTransactions[txid];\n78:         this.cachedRawTransactions[txid] = (await this.getRawTransactions([txid]))[0]\n79:         if(this.cachedRawTransactions[txid])\n80:             return this.cachedRawTransactions[txid];\n81:         return null;\n82:     }\n83: \n84:     async isValidSlpTxid(txid: string) {\n85:         if(txid && !this.cachedValidations[txid]) {\n86:             this.cachedValidations[txid] = { hex: null, validity: null, parents: [], details: null, invalidReason: null }\n87:             this.cachedValidations[txid].hex = await this.getRawTransaction(txid);\n88:         }\n89: \n90:         // Check to see how we should proceed based on the validation-cache state\n91:         if(!this.cachedValidations[txid].hex)\n92:             await this.waitForTransactionPreProcessing(txid);\n93:         if(typeof this.cachedValidations[txid].validity === 'boolean')\n94:             return this.cachedValidations[txid].validity;\n95:         if(this.cachedValidations[txid].details)\n96:             await this.waitForParentValidationProcessing(txid);\n97: \n98:         // Check SLP message validity\n99:         let txn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[txid].hex)\n100:         let slpmsg: SlpTransactionDetails;\n101:         try {\n102:             slpmsg = this.cachedValidations[txid].details = this.slp.parseSlpOutputScript(txn.outputs[0]._scriptBuffer)\n103:         } catch(e) {\n104:             this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"\n105:             return this.cachedValidations[txid].validity = false;\n106:         }\n107: \n108:         // Check DAG validity\n109:         if(slpmsg.transactionType === SlpTransactionType.GENESIS) {\n110:             return this.cachedValidations[txid].validity = true;\n111:         } \n112:         else if (slpmsg.transactionType === SlpTransactionType.MINT) {\n113:             for(let i = 0; i < txn.inputs.length; i++) {\n114:                 let input_txid = txn.inputs[i].prevTxId.toString('hex')\n115:                 let input_txhex = await this.getRawTransaction(input_txid)\n116:                 if (input_txhex) {\n117:                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);\n118:                     try {\n119:                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)\n120:                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)\n121:                             input_slpmsg.tokenIdHex = input_txid;\n122:                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {\n123:                             if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {\n124:                                 if(txn.inputs[i].outputIndex === input_slpmsg.batonVout)\n125:                                     this.cachedValidations[txid].parents.push({ txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType ,valid: null, inputQty: null })\n126:                             }\n127:                         }\n128:                     } catch(_) {}\n129:                 }\n130:             }\n131:             if(this.cachedValidations[txid].parents.length !== 1) {\n132:                 this.cachedValidations[txid].invalidReason = \"MINT transaction must have 1 valid baton parent.\"\n133:                 return this.cachedValidations[txid].validity = false;\n134:             }\n135:         }\n136:         else if(slpmsg.transactionType === SlpTransactionType.SEND) {\n137:             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))\n138:             let tokenInQty = new BigNumber(0);\n139:             for(let i = 0; i < txn.inputs.length; i++) {\n140:                 let input_txid = txn.inputs[i].prevTxId.toString('hex')\n141:                 let input_txhex = await this.getRawTransaction(input_txid)\n142:                 if (input_txhex) {\n143:                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);\n144:                     try {\n145:                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)\n146:                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)\n147:                             input_slpmsg.tokenIdHex = input_txid;\n148:                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {\n149:                             if(input_slpmsg.transactionType === SlpTransactionType.SEND) {\n150:                                 tokenInQty = tokenInQty.plus(input_slpmsg.sendOutputs[txn.inputs[i].outputIndex])\n151:                                 this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.sendOutputs[txn.inputs[i].outputIndex] })\n152:                             }\n153:                             else if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {\n154:                                 if(txn.inputs[i].outputIndex === 1)\n155:                                     tokenInQty = tokenInQty.plus(input_slpmsg.genesisOrMintQuantity)\n156:                                     this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.genesisOrMintQuantity })\n157:                             }\n158:                         }\n159:                     } catch(_) {}\n160:                 }\n161:             }\n162:             \n163:             // Check token inputs are greater than token outputs (includes valid and invalid inputs)\n164:             if(tokenOutQty.isGreaterThan(tokenInQty)) {\n165:                 this.cachedValidations[txid].invalidReason = \"Token outputs are greater than possible token inputs.\"\n166:                 return this.cachedValidations[txid].validity = false;\n167:             }\n168:         }\n169: \n170:         // Set validity validation-cache for parents, and handle MINT condition with no valid input\n171:         for(let i = 0; i < this.cachedValidations[txid].parents.length; i++) {\n172:             let valid = await this.isValidSlpTxid(this.cachedValidations[txid].parents[i].txid)\n173:             this.cachedValidations[txid].parents.find(p => p.txid === this.cachedValidations[txid].parents[i].txid).valid = valid;\n174:             if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.MINT && !valid) {\n175:                 this.cachedValidations[txid].invalidReason = \"MINT transaction with invalid baton parent.\"\n176:                 return this.cachedValidations[txid].validity = false;\n177:             }\n178:         }\n179: \n180:         // Check valid inputs are greater than token outputs\n181:         if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {\n182:             let validInputQty = this.cachedValidations[txid].parents.reduce((t, v) => { return v.valid ? t.plus(v.inputQty) : t }, new BigNumber(0));\n183:             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))\n184:             if(tokenOutQty.isGreaterThan(validInputQty)) {\n185:                 this.cachedValidations[txid].invalidReason = \"Token outputs are greater than valid token inputs.\"\n186:                 return this.cachedValidations[txid].validity = false;\n187:             }\n188:         }\n189: \n190:         // Check versionType is not different from any valid parent\n191:         if(this.cachedValidations[txid].parents.filter(p => p.valid).length > 0) {\n192:             let validVersionType = this.cachedValidations[txid].parents.find(p => p.valid).versionType;\n193:             if(this.cachedValidations[txid].details.versionType !== validVersionType) {\n194:                 this.cachedValidations[txid].invalidReason = \"SLP version/type mismatch from valid parent.\"\n195:                 return this.cachedValidations[txid].validity = false;\n196:             }\n197:         } \n198:         // For case with 0 token SEND with no valid parents, must check GENESIS validity / versionType.\n199:         else if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {\n200:             let slpmsg = this.cachedValidations[txid].details\n201:             let valid = await this.isValidSlpTxid(slpmsg.tokenIdHex);\n202:             if(valid) {\n203:                 let genesisTxn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[slpmsg.tokenIdHex].hex)\n204:                 let genesisMsg = this.slp.parseSlpOutputScript(genesisTxn.outputs[0]._scriptBuffer)\n205:                 if(genesisMsg.versionType !== slpmsg.versionType) {\n206:                     this.cachedValidations[txid].invalidReason = \"SLP version/type mismatch from valid GENESIS.\"\n207:                     return this.cachedValidations[txid].validity = false;\n208:                 }\n209:             } else {\n210:                 this.cachedValidations[txid].invalidReason = \"SEND has 0 outputs, but has invalid token GENESIS.\"\n211:                 console.log(this.cachedValidations[slpmsg.tokenIdHex].invalidReason)\n212:                 return this.cachedValidations[txid].validity = false;\n213:             }\n214:         }\n215: \n216:         return this.cachedValidations[txid].validity = true;\n217:     }\n218: \n219:     async validateSlpTransactions(txids: string[]): Promise<string[]> {\n220:         let res = [];\n221:         for (let i = 0; i < txids.length; i++) {\n222:             res.push((await this.isValidSlpTxid) ? txids[i] : '')\n223:         }\n224:         return res.filter((id: string) => id.length > 0);\n225:     }\n226: }",
+  "source_summary": "Exception 'e' from slp.parseSlpOutputScript() which parses Bitcoin transaction output scripts containing SLP protocol data",
+  "sink_summary": "Stored in cachedValidations[txid].invalidReason, potentially exposed through validateSlpTransactions() which returns transaction IDs but may expose error details elsewhere",
+  "guard_summary": "No sanitization of exception message before embedding in error string; exception messages contain parsing failure details from SLP protocol validation",
+  "risk_pattern": "Raw exception messages from SLP protocol parser embedded in error strings without sanitization, potentially exposing internal parsing details",
+  "used_variable_sources": [
+    "e.message from parseSlpOutputScript exceptions"
+  ],
+  "called_function_context": [
+    "slp.parseSlpOutputScript() throws various Error('...') for malformed SLP data"
+  ],
+  "enclosing_conditions": [
+    "try-catch block around SLP parsing operation"
+  ],
+  "context_summary": "Exception caught during SLP OP_RETURN parsing in transaction validation flow, message embedded directly in error reason stored in cache",
+  "unresolved_facts": [
+    "Whether cachedValidations[txid].invalidReason is ever exposed to external callers beyond validateSlpTransactions return value",
+    "Whether exception messages contain sensitive system or protocol details"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-534",
+      "cwe_name": "Information Exposure Through Debug Log Files",
+      "fit_reason": "Exception messages from SLP parsing embedded in error strings without sanitization, potentially exposing internal parsing details similar to debug information exposure",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "fit_reason": "Raw exception messages from SLP protocol parsing embedded in error strings without proper handling or transformation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-93",
+      "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+      "fit_reason": "Exception messages embedded in error strings without neutralization, though mechanism focus is more on information exposure than injection",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-668",
+      "cwe_name": "Exposure of Resource to Wrong Sphere",
+      "fit_reason": "Internal parsing error details potentially exposed beyond intended trust boundary through error message storage",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-125",
+    "CWE-1321",
+    "CWE-19",
+    "CWE-255",
+    "CWE-310",
+    "CWE-311",
+    "CWE-425",
+    "CWE-471",
+    "CWE-534",
+    "CWE-59",
+    "CWE-668",
+    "CWE-77",
+    "CWE-863",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 104,
+      "statement": "this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"",
+      "cwe_id": "CWE-534",
+      "cwe_name": "Information Exposure Through Debug Log Files",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-534 is deprecated and specifically concerns exposure through debug log files. The candidate stores an error message in an internal cache field, not a debug log file. The mechanism is error-message construction, not logging to a file."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The exception message `e.message` from `slp.parseSlpOutputScript()` is directly concatenated into a string and stored in `cachedValidations[txid].invalidReason`. This is a direct connection from the parsing exception (source) to the stored error string (sink)."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "The candidate line is the addition that creates the error message containing the raw exception. If reverted, the `invalidReason` would not be set with the detailed parsing error message at this catch site, leaving it null or set elsewhere with a generic message."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "The required control for preventing information disclosure in error messages is sanitization or generic error messages. The deficiency is the absence of sanitization; the raw `e.message` is embedded. However, the connection to a true 'debug log file' (CWE-534's exact mechanism) is unsupported.",
+          "required_control": "Sanitization of exception messages or use of generic error messages before storage in a potentially exposed field.",
+          "control_requirement_evidence": "To prevent information disclosure, error messages exposed to users should not contain internal parsing details, stack traces, or system information that could aid an attacker.",
+          "existing_controls_checked": [
+            "The `invalidReason` field is stored in an internal cache object. No downstream exposure control (e.g., filtering before output) is demonstrated in the provided evidence."
+          ],
+          "deficiency_evidence": "The code directly concatenates `e.message` without sanitization. The exact content of `e.message` is not shown, but based on the function name `parseSlpOutputScript`, it likely contains details about SLP parsing failures."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No evidence demonstrates that `invalidReason` is ever exposed to external users, logged to a file, or transmitted. The potential impact is speculative. The `validateSlpTransactions` method returns transaction IDs, not the error details."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the `invalidReason` field for this specific parsing error would not be set with the detailed exception message. It might remain null or be set to a generic message elsewhere, reducing the amount of internal parsing detail stored in the cache.",
+      "supporting_evidence": [
+        "Exception `e` from `slp.parseSlpOutputScript()` is caught and its `message` property is directly embedded into a string stored in `cachedValidations[txid].invalidReason`."
+      ],
+      "contradicting_evidence": [
+        "CWE-534 is deprecated and specifically targets debug log files. The candidate stores data in a memory cache field, not a log file. No file I/O or logging API is present."
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether `cachedValidations[txid].invalidReason` is ever exposed to external callers (e.g., via an API or log).",
+        "Whether the exception messages contain sensitive system or protocol details that would constitute an information disclosure."
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.42000000000000004,
+      "score": 0.42000000000000004
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 104,
+      "statement": "this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"",
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.25,
+          "evidence": "CWE-19 is a broad category covering data processing weaknesses. The code processes exception messages by embedding them in error strings, which could be considered a data handling issue, but this is not the core mechanism of CWE-19."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "The exception message from SLP parsing (source) is directly connected to the cached error message storage (sink) via string concatenation. The path is: parseSlpOutputScript exception → catch block → error message construction → cache storage."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "This line is an addition that creates the mechanism for storing detailed error messages containing raw exception content. If reverted, error messages would not contain the specific parsing exception details."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "",
+          "required_control": "Input validation and sanitization for exception messages before external exposure",
+          "control_requirement_evidence": "Exception messages may contain sensitive parsing details that should not be exposed to external callers",
+          "existing_controls_checked": [
+            "No sanitization of e.message before embedding in error string",
+            "Exception messages flow directly from parsing failures to cache storage"
+          ],
+          "deficiency_evidence": "The code lacks validation or sanitization of exception messages before embedding them in error strings, potentially exposing internal parsing details"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No evidence demonstrates that cached error messages are actually exposed to external callers. The validateSlpTransactions method only returns transaction IDs, not error details."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, error messages for SLP parsing failures would not contain the specific exception details, potentially reducing information disclosure risk if these messages are exposed.",
+      "supporting_evidence": [
+        "Exception message from slp.parseSlpOutputScript() is directly embedded in error string without sanitization",
+        "Error message is stored in cachedValidations cache which could potentially be exposed"
+      ],
+      "contradicting_evidence": [
+        "CWE-19 is a legacy category, not a specific vulnerability mechanism",
+        "No evidence shows cached error messages are actually exposed to external callers"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether cachedValidations[txid].invalidReason is ever exposed to external callers beyond validateSlpTransactions return value",
+        "Whether exception messages contain sensitive system or protocol details that would constitute information disclosure",
+        "Whether there are other code paths that access and expose the cached error messages"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.35,
+      "score": 0.35
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 104,
+      "statement": "this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"",
+      "cwe_id": "CWE-93",
+      "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-93 specifically addresses CRLF injection where CRLF sequences are used as special elements for line/record separation. The demonstrated behavior is error message construction with unsanitized exception messages, not CRLF sequence injection."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "Exception message 'e.message' from SLP parsing is directly embedded into the error string stored in cachedValidations[txid].invalidReason. This is reachable through the validation cache."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this candidate line were reverted, exception messages would not be embedded in error strings, eliminating the potential information exposure mechanism."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "No CRLF neutralization control is implemented, but CWE-93 requires CRLF sequences to be used as special elements, which is not demonstrated.",
+          "required_control": "CRLF sequence neutralization when CRLF is used as a special element",
+          "control_requirement_evidence": "CWE-93 requires CRLF sequences to be neutralized when they are used as record separators or line terminators",
+          "existing_controls_checked": [
+            "No CRLF-specific validation or neutralization is present"
+          ],
+          "deficiency_evidence": "The code does not use CRLF as special elements, so CRLF neutralization is not required for this CWE mechanism"
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Potential information exposure through error messages, but CRLF injection impact (data modification through injected control sequences) is not demonstrated."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, exception messages from SLP parsing failures would not be embedded in error strings stored in the validation cache, preventing potential information disclosure of parsing details.",
+      "supporting_evidence": [
+        "Exception message 'e.message' is directly concatenated into error string without sanitization",
+        "Error string is stored in cachedValidations[txid].invalidReason which may be exposed to callers"
+      ],
+      "contradicting_evidence": [
+        "CWE-93 requires CRLF sequences to be used as special elements (line/record separators), but the code shows error message construction, not CRLF-based data separation",
+        "The demonstrated behavior is information exposure, not CRLF injection leading to data modification"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether cachedValidations[txid].invalidReason is exposed to external callers in a way that would enable CRLF injection attacks",
+        "Whether exception messages contain CRLF sequences that could be exploited as control characters"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.32,
+      "score": 0.32
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 104,
+      "statement": "this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"",
+      "cwe_id": "CWE-668",
+      "cwe_name": "Exposure of Resource to Wrong Sphere",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code stores internal parsing error details in a cache that may be accessible beyond the intended validation boundary, but CWE-668 typically involves more explicit resource exposure across trust boundaries"
+        },
+        "connection": {
+          "score": 0.25,
+          "evidence": "Exception message from SLP parsing is connected to cached error storage, but external exposure path through validateSlpTransactions() is not demonstrated - it only returns transaction IDs, not error details"
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "If this line were reverted, parsing errors would not be stored with detailed exception messages, reducing potential information exposure"
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "No sanitization of exception messages before storage",
+          "required_control": "Error message sanitization to prevent internal details exposure",
+          "control_requirement_evidence": "CWE-668 requires preventing unintended exposure of internal resources/details",
+          "existing_controls_checked": [
+            "validateSlpTransactions() only returns transaction IDs, not error details"
+          ],
+          "deficiency_evidence": "Exception messages containing parsing details are stored unsanitized, but no evidence demonstrates they cross a trust boundary"
+        },
+        "concrete_impact": {
+          "score": 0.15,
+          "evidence": "No demonstrated exposure path shows these error messages reach external users; validateSlpTransactions returns only transaction IDs"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, parsing errors would still be caught and validation would fail, but detailed exception messages would not be stored in the cache.",
+      "supporting_evidence": [
+        "Exception messages from SLP parsing are embedded directly into error strings without sanitization",
+        "Error details are stored in cachedValidations which persists beyond the immediate validation context"
+      ],
+      "contradicting_evidence": [
+        "validateSlpTransactions() method only returns transaction IDs, not error details",
+        "No evidence shows cached error messages are exposed to external callers"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether cachedValidations[txid].invalidReason is ever exposed through other methods or interfaces",
+        "Whether exception messages contain sensitive system or protocol details that would constitute a security risk if exposed"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.32999999999999996,
+      "score": 0.32999999999999996
+    }
+  ],
+  "stage4_status": "completed"
+}

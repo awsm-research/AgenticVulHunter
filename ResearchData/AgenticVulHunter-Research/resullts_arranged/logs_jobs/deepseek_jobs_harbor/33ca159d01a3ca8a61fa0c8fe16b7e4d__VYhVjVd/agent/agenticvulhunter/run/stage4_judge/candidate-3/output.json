@@ -1,0 +1,305 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "lib/connie-lang.js",
+  "changed_line": 71,
+  "statement": "var v = getValue(context.config, m[1]);",
+  "change_type": "A",
+  "function_name": "ReferenceInterpreter.replace",
+  "operation_type": "configuration_reference_lookup",
+  "selection_reason": "configuration string with @{...} pattern -> lookup of other configuration values -> potential circular reference or data exposure",
+  "security_relevance_score": 0.4,
+  "code_context": "1: var vm = require('vm');\n2: var isPlainObject = require('lodash.isplainobject');\n3: \n4: var getValue = function(obj, key) {\n5:   var o = obj;\n6:   var keys = Array.isArray(key) ? key : key.split('.');\n7:   \n8:   for (var x = 0; x < keys.length -1; ++x) {\n9:     var k = keys[x];\n10:     if (!o[k]) return;\n11:     o = o[k];\n12:   }\n13:   \n14:   return o[keys[keys.length - 1]];\n15: };\n16: \n17: var setValue = function(obj, key, value) {\n18:   var o = obj;\n19:   var keys = Array.isArray(key) ? key : key.split('.');\n20:   \n21:   for (var x = 1; x < keys.length; ++x) {\n22:     var currentKey = keys[x];\n23:     var lastKey = keys[x - 1];\n24:     if (typeof(currentKey) === 'number') {\n25:       if (!o[lastKey]) { o[lastKey] = []; }\n26:       o = o[lastKey];\n27:     } else if (typeof(currentKey) === 'string') {\n28:       if (!o[lastKey]) { o[lastKey] = {}; }\n29:       o = o[lastKey];\n30:     } else {\n31:       throw new Error('Oopsy, key arrays should only be strings and numbers:', keys);\n32:     }\n33:   }\n34:   \n35:   o[keys[keys.length - 1]] = value;\n36:   return obj;\n37: };\n38: \n39: \n40: var EnvVarInterpreter = {\n41:   type: '$',\n42:   replace: function(value, context) {\n43:     var m = /\\$\\{([^\\}]+)\\}/.exec(value);\n44:     if (!m) return value;\n45:     return value.replace(m[0], context.env[m[1]]);\n46:   }\n47: };\n48: \n49: var ExecutionInterpreter = {\n50:   type: '#',\n51:   replace: function(value, context) {\n52:     var m = /#\\{([^\\}]+)\\}/.exec(value);\n53:     if (!m) return value;\n54:     \n55:     try {\n56:       var v = vm.runInNewContext(m[1], {});\n57:       if (m[0] === value) return v;\n58:       return value.replace(m[0], v);\n59:     } catch(err) {\n60:       throw new Error('Invalid execution [' + m[1] + ']: ' + err.message);\n61:     }\n62:   }\n63: };\n64: \n65: var ReferenceInterpreter = {\n66:   type: '@',\n67:   replace: function(value, context) {\n68:     var m = /@\\{([^\\}]+)\\}/.exec(value);\n69:     if (!m) return value;\n70:     \n71:     var v = getValue(context.config, m[1]);\n72:     if (m[0] === value) return v;\n73:     return value.replace(m[0], v);\n74:   }\n75: };\n76: \n77: var Interpreters = [ReferenceInterpreter, EnvVarInterpreter, ExecutionInterpreter];\n78: \n79: var ConnieLang = {\n80:   Interpreters: Interpreters,\n81:   InterpretersByType: Interpreters.reduce(function(o, i) {o[i.type] = i; return o;}, {}),\n82:   \n83:   getEntries: function(config) {\n84:     var entries = [];\n85:     \n86:     var iter = function(value, prefix) {\n87:       if (!prefix) prefix = [];\n88:       \n89:       if (Array.isArray(value)) {\n90:         value.forEach(function(arrValue, idx) {\n91:           iter(arrValue, prefix.concat(idx));\n92:         });\n93:       } else if (isPlainObject(value)) {\n94:         Object.keys(value).forEach(function(key) {\n95:           iter(value[key], prefix.concat(key));\n96:         });\n97:       } else {\n98:         entries.push({key: prefix, value: value});\n99:       }\n100:     };\n101:     \n102:     iter(config);\n103:     return entries;\n104:   },\n105:   \n106:   firstInnermostInterpreterFromValue: function(value) {\n107:     var start = -1;\n108:     var interpreterTypes = Object.keys(ConnieLang.InterpretersByType);\n109:     \n110:     for (var idx = 1; idx < value.length; ++idx) {\n111:       if (value[idx] === '{' && interpreterTypes.indexOf(value[idx - 1]) !== -1) {\n112:         start = idx - 1;\n113:       } else if (value[idx] === '}' && start !== -1) {\n114:         return {\n115:           type: value[start],\n116:           match: value.slice(start, idx + 1),\n117:           value: value.slice(start + 2, idx),\n118:           start: start,\n119:           end: idx + 1\n120:         };\n121:       }\n122:     }\n123:     \n124:     return null;\n125:   },\n126:   \n127:   parse: function(configObj, envObj) {\n128:     var context = {\n129:       config: configObj,\n130:       env: envObj || process.env\n131:     };\n132:     \n133:     var entries = ConnieLang.getEntries(context.config);\n134:     \n135:     // iterate until no updates have been made\n136:     var digest = function() {\n137:       var updated = false;\n138:       \n139:       entries.forEach(function(e) {\n140:         var interpreter = ConnieLang.firstInnermostInterpreterFromValue(e.value, context);\n141:         if (!interpreter) return;\n142:         \n143:         var newValue = ConnieLang.InterpretersByType[interpreter.type].replace(e.value, context);\n144:         if (newValue !== e.value) {\n145:           e.value = newValue;\n146:           updated = true;\n147:         }\n148:       });\n149:       \n150:       return updated;\n151:     };\n152:     \n153:     while(digest()) ;\n154:     \n155:     var result = {};\n156:     entries.forEach(function(e) {\n157:       setValue(result, e.key, e.value);\n158:     });\n159:     \n160:     return result;\n161:   }\n162: };\n163: \n164: module.exports = ConnieLang;",
+  "source_summary": "Configuration values from user-provided configObj parameter in parse() function",
+  "sink_summary": "Returns the looked-up value which gets substituted into configuration strings, potentially reaching other interpreters like ExecutionInterpreter which uses vm.runInNewContext()",
+  "guard_summary": "No validation on the key path; getValue returns undefined for missing keys but doesn't prevent access to any existing keys",
+  "risk_pattern": "Unrestricted configuration reference lookup allows arbitrary property access in configuration object, enabling potential prototype pollution or access to sensitive configuration values when combined with other interpreters",
+  "used_variable_sources": [
+    "context.config",
+    "m[1] (extracted from @{...} pattern)"
+  ],
+  "called_function_context": [
+    "getValue",
+    "String.replace"
+  ],
+  "enclosing_conditions": [
+    "if (!m) return value;",
+    "if (m[0] === value) return v;"
+  ],
+  "context_summary": "ReferenceInterpreter processes @{key.path} patterns by looking up values from the configuration object using dot notation paths. The lookup is recursive and can access nested properties without restrictions.",
+  "unresolved_facts": [
+    "Whether configuration data comes from untrusted sources",
+    "Whether the configuration object contains sensitive values that should not be exposed via reference lookups"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-1321",
+      "cwe_name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+      "fit_reason": "User-controlled key paths in getValue function can access prototype properties leading to prototype pollution",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-79",
+      "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+      "fit_reason": "Prototype pollution can escalate to XSS via modification of built-in object prototypes",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-200",
+      "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+      "fit_reason": "Unrestricted configuration property access can disclose sensitive configuration values",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-23",
+      "cwe_name": "Relative Path Traversal",
+      "fit_reason": "Dot notation path traversal in getValue function allows accessing arbitrary nested properties",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1321",
+    "CWE-178",
+    "CWE-200",
+    "CWE-23",
+    "CWE-378",
+    "CWE-563",
+    "CWE-571",
+    "CWE-676",
+    "CWE-758",
+    "CWE-79",
+    "CWE-829",
+    "CWE-843",
+    "CWE-94",
+    "CWE-99"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 71,
+      "statement": "var v = getValue(context.config, m[1]);",
+      "cwe_id": "CWE-1321",
+      "cwe_name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-1321 requires modification of prototype attributes, but this code only performs property lookup without modification. The getValue function reads properties but does not modify the object prototype."
+        },
+        "connection": {
+          "score": 0.25,
+          "evidence": "User-controlled input (m[1] from @{...} patterns) connects to property lookup, but there's no demonstrated path to prototype modification. The lookup accesses existing properties but doesn't modify object prototypes."
+        },
+        "diff_causality": {
+          "score": 0.2,
+          "evidence": "The added line enables property lookup functionality, but doesn't materially create prototype pollution. Reverting would disable reference lookups but wouldn't affect prototype modification capabilities."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "input validation to prevent prototype property access",
+          "control_requirement_evidence": "Prototype pollution requires controls to prevent access to __proto__, constructor, prototype properties",
+          "existing_controls_checked": [
+            "getValue function has no property access restrictions"
+          ],
+          "deficiency_evidence": "No validation prevents access to prototype properties, but the demonstrated operation is property lookup, not modification"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No demonstrated modification of object prototype attributes. The code reads properties but doesn't show prototype pollution impact."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, configuration reference lookups using @{...} patterns would not function, but prototype modification capabilities would remain unchanged since this is a read-only operation.",
+      "supporting_evidence": [
+        "User-controlled key paths (m[1]) can access arbitrary properties via dot notation",
+        "No validation restricts access to prototype-related properties like __proto__"
+      ],
+      "contradicting_evidence": [
+        "The getValue function only performs property lookup, not modification",
+        "No code path demonstrates prototype attribute modification",
+        "The operation returns values but doesn't alter object prototypes"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether configuration data comes from untrusted sources",
+        "Whether downstream code uses looked-up values to modify object prototypes",
+        "Whether the configuration object structure allows prototype property access"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.16,
+      "score": 0.16
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 71,
+      "statement": "var v = getValue(context.config, m[1]);",
+      "cwe_id": "CWE-79",
+      "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "The code performs configuration value lookup without web page generation context. CWE-79 specifically requires output to a web page served to users, which is absent from this configuration parsing library."
+        },
+        "connection": {
+          "score": 0.15,
+          "evidence": "User input from configuration can flow through getValue() to string replacement, but there's no demonstrated path to web page output. The code operates on configuration objects, not HTML/JavaScript contexts."
+        },
+        "diff_causality": {
+          "score": 0.3,
+          "evidence": "The added line enables configuration reference resolution, but this doesn't create XSS mechanisms. It adds property lookup functionality within a configuration parsing system."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "No XSS-specific controls are relevant since this isn't web page generation code.",
+          "required_control": "HTML/JavaScript output encoding for web contexts",
+          "control_requirement_evidence": "CWE-79 requires controls that prevent script injection in web page output",
+          "existing_controls_checked": [
+            "No web output encoding controls present (not applicable)"
+          ],
+          "deficiency_evidence": "The code doesn't handle web page generation, so XSS controls are not applicable to this mechanism"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No web page generation or user-serving context exists to support XSS impact. The code processes configuration objects internally."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, configuration references using @{...} syntax would not be resolved, but this doesn't affect XSS since no web output is generated.",
+      "supporting_evidence": [
+        "Configuration values can be referenced and substituted using dot notation paths"
+      ],
+      "contradicting_evidence": [
+        "No web page generation or HTML/JavaScript output context exists",
+        "The code operates on configuration objects, not user-facing web content"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether configuration data is eventually used in web page generation (not demonstrated in evidence)",
+        "Whether this library is used in web application contexts"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.16999999999999998,
+      "score": 0.16999999999999998
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 71,
+      "statement": "var v = getValue(context.config, m[1]);",
+      "cwe_id": "CWE-200",
+      "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.3,
+          "evidence": "CWE-200 requires exposure of sensitive information to unauthorized actors. The candidate enables property lookup in a configuration object, but there is no evidence that the configuration contains sensitive information or that the lookup results are exposed to unauthorized actors. The mechanism is property access, not information exposure."
+        },
+        "connection": {
+          "score": 0.25,
+          "evidence": "The connection is speculative: user-provided configObj → @{key.path} patterns → getValue lookup → returned value. However, there is no evidence that: 1) configObj contains sensitive information, 2) the lookup result is exposed to unauthorized actors, or 3) the lookup path (m[1]) is attacker-controlled. The path is from configuration strings, but their source is not established."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If this candidate line were reverted, the @{...} reference interpreter would not function—no configuration property lookups would occur. The patch materially creates the property lookup mechanism for configuration references."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "The required control for CWE-200 is access control/authorization to prevent unauthorized exposure of sensitive information. No evidence establishes that sensitive information exists in the configuration or that authorization checks are missing. The getValue function accesses any property without restriction, but this is a property access mechanism, not an information exposure control deficiency.",
+          "required_control": "Access control/authorization to restrict exposure of sensitive configuration values",
+          "control_requirement_evidence": "CWE-200 requires that sensitive information is not exposed to unauthorized actors. If the configuration contains sensitive values, access to them should be restricted.",
+          "existing_controls_checked": [
+            "No access control on configuration property lookups via getValue",
+            "No validation of which properties can be accessed via @{...} patterns"
+          ],
+          "deficiency_evidence": "No access control exists for property lookups, but there is no evidence that the configuration contains sensitive information requiring protection. The deficiency is unsupported without evidence of sensitive data."
+        },
+        "concrete_impact": {
+          "score": 0.15,
+          "evidence": "No concrete security consequence is demonstrated. The impact is speculative: if configuration contains secrets and @{...} patterns can be controlled, secrets might be exposed. However, neither sensitive data nor attacker control is established."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the ReferenceInterpreter would not perform property lookups for @{...} patterns, breaking the configuration reference feature entirely.",
+      "supporting_evidence": [
+        "The getValue function accesses any property in context.config without restriction based on the dot-notation path from m[1]."
+      ],
+      "contradicting_evidence": [
+        "The code shows no evidence that context.config contains sensitive information or that lookup results are exposed to unauthorized actors. The parse function returns the fully resolved configuration to the caller, but the caller's authorization is not established."
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether configuration data (configObj) comes from untrusted sources",
+        "Whether the configuration object contains sensitive values that should not be exposed via reference lookups",
+        "Whether @{...} patterns can be attacker-controlled",
+        "Whether lookup results are exposed to unauthorized actors"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.36,
+      "score": 0.36
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 71,
+      "statement": "var v = getValue(context.config, m[1]);",
+      "cwe_id": "CWE-23",
+      "cwe_name": "Relative Path Traversal",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-23 specifically addresses filesystem path traversal using sequences like '..' to escape restricted directories. This code performs object property traversal using dot notation, which is semantically different from filesystem path traversal."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "User input from configuration strings (m[1]) containing dot notation paths is directly passed to getValue() function, which traverses the configuration object structure using the provided path."
+        },
+        "diff_causality": {
+          "score": 0.3,
+          "evidence": "The added line enables property lookup functionality, but the vulnerability mechanism (if any) exists in the getValue function's property traversal logic, not specifically in this addition."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "Path traversal validation for filesystem paths",
+          "control_requirement_evidence": "CWE-23 requires validation to prevent escaping restricted directories via path traversal sequences",
+          "existing_controls_checked": [
+            "No filesystem path validation present as this operates on JavaScript objects, not filesystem paths"
+          ],
+          "deficiency_evidence": "The code operates on JavaScript object properties, not filesystem paths, so filesystem path traversal controls are irrelevant to this operation"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No filesystem access is demonstrated; the operation is confined to JavaScript object property access within the configuration object."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the ReferenceInterpreter would not be able to look up configuration values using dot notation paths, but this would break legitimate functionality rather than fix a security issue.",
+      "supporting_evidence": [
+        "Dot notation path parsing in getValue function allows traversing nested object properties",
+        "User-controlled input (m[1]) directly controls the traversal path"
+      ],
+      "contradicting_evidence": [
+        "CWE-23 specifically addresses filesystem path traversal, not JavaScript object property traversal",
+        "No filesystem operations are involved in the demonstrated path"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether the configuration object contains sensitive data that should be protected from arbitrary property access",
+        "Whether this property traversal could lead to prototype pollution or other object manipulation vulnerabilities"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.23000000000000004,
+      "score": 0.23000000000000004
+    }
+  ],
+  "stage4_status": "completed"
+}

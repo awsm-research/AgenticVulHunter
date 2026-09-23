@@ -1,0 +1,310 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "index.js",
+  "changed_line": 44,
+  "statement": "this.digest.match(BASE64_REGEX) &&",
+  "change_type": "A",
+  "function_name": "IntegrityMetadata.toString",
+  "operation_type": "security_sensitive_validation",
+  "selection_reason": "strict mode option -> base64 format validation -> enforces stricter digest format requirements",
+  "security_relevance_score": 0.7,
+  "code_context": "1: 'use strict'\n2: \n3: const crypto = require('crypto')\n4: const Transform = require('stream').Transform\n5: \n6: const SPEC_ALGORITHMS = ['sha256', 'sha384', 'sha512']\n7: \n8: const BASE64_REGEX = /[a-z0-9+/]+(?:=?=?)/i\n9: const SRI_REGEX = /^([^-]+)-([^?]+)([?\\S*]*)$/\n10: const STRICT_SRI_REGEX = /^([^-]+)-([A-Za-z0-9+/]+(?:=?=?))([?\\x21-\\x7E]*)$/\n11: const VCHAR_REGEX = /[\\x21-\\x7E]+/\n12: \n13: class IntegrityMetadata {\n14:   constructor (metadata, opts) {\n15:     const strict = !!(opts && opts.strict)\n16:     this.source = metadata.trim()\n17:     // 3.1. Integrity metadata\n18:     // https://w3c.github.io/webappsec-subresource-integrity/#integrity-metadata-description\n19:     const match = this.source.match(\n20:       strict\n21:       ? STRICT_SRI_REGEX\n22:       : SRI_REGEX\n23:     )\n24:     if (!match) { return }\n25:     if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }\n26:     this.algorithm = match[1]\n27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)",
+  "source_summary": "digest values come from parsed SRI metadata strings via constructor, or from crypto hash computations in fromData/fromStream functions",
+  "sink_summary": "serialized integrity strings used in Subresource Integrity (SRI) validation for resource integrity checking",
+  "guard_summary": "Strict mode validation includes: algorithm whitelist (SPEC_ALGORITHMS), base64 format validation (BASE64_REGEX), and visual character validation for options (VCHAR_REGEX)",
+  "risk_pattern": "Added base64 format validation in strict mode to enforce proper digest encoding, preventing malformed SRI metadata that could bypass integrity checks",
+  "used_variable_sources": [
+    "this.digest from constructor parsing",
+    "BASE64_REGEX constant"
+  ],
+  "called_function_context": [
+    "String.prototype.match"
+  ],
+  "enclosing_conditions": [
+    "opts && opts.strict",
+    "SPEC_ALGORITHMS.some(x => x === this.algorithm)",
+    "(this.options || []).every(opt => opt.match(VCHAR_REGEX))"
+  ],
+  "context_summary": "The validation is part of strict mode SRI metadata serialization, ensuring digests conform to base64 standards when strict validation is enabled",
+  "unresolved_facts": [
+    "Specific attack scenarios that could exploit non-strict base64 validation",
+    "Whether the original non-strict validation was actually exploitable in practice"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "fit_reason": "Added base64 regex validation addresses improper validation of cryptographic digest format in SRI integrity checking",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-327",
+      "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+      "fit_reason": "Base64 format validation ensures proper encoding of cryptographic digests, preventing integrity bypass",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-310",
+      "cwe_name": "Cryptographic Issues",
+      "fit_reason": "Strict base64 validation addresses cryptographic implementation weakness in SRI integrity protection",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "fit_reason": "Legacy category covering improper handling of structured cryptographic data formats",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-116",
+    "CWE-1321",
+    "CWE-134",
+    "CWE-19",
+    "CWE-20",
+    "CWE-310",
+    "CWE-327",
+    "CWE-328",
+    "CWE-400",
+    "CWE-561",
+    "CWE-571",
+    "CWE-625",
+    "CWE-676",
+    "CWE-730",
+    "CWE-88"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "index.js",
+      "changed_line": 44,
+      "statement": "this.digest.match(BASE64_REGEX) &&",
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The added validation directly addresses improper input validation by enforcing base64 format requirements for cryptographic digests in SRI metadata"
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "Digest values come from parsed SRI metadata strings (constructor) or crypto hash computations (fromData/fromStream), and are used in integrity checking operations that protect against resource tampering"
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "The patch adds base64 format validation that was previously missing in strict mode, materially strengthening the validation chain"
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "The required control is format validation for cryptographic digests to prevent malformed SRI metadata that could bypass integrity checks",
+          "required_control": "Base64 format validation for cryptographic digests in SRI metadata",
+          "control_requirement_evidence": "CWE-20 requires proper input validation for security-sensitive data; SRI digests must be valid base64 to ensure proper cryptographic verification",
+          "existing_controls_checked": [
+            "Algorithm whitelist validation (SPEC_ALGORITHMS)",
+            "Option character validation (VCHAR_REGEX)",
+            "Downstream crypto hash verification"
+          ],
+          "deficiency_evidence": "The patch adds missing base64 validation that was absent in the strict mode validation chain, preventing potential bypass through malformed digest encoding"
+        },
+        "concrete_impact": {
+          "score": 0.65,
+          "evidence": "Malformed base64 digests could potentially bypass SRI integrity checks, allowing compromised resources to be loaded despite integrity protection"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would not validate base64 format of digests, potentially allowing malformed digest values to pass through the integrity checking pipeline.",
+      "supporting_evidence": [
+        "Added base64 regex validation in strict mode for digest format enforcement",
+        "Digest values are used in cryptographic integrity verification (checkData, checkStream)",
+        "Validation is part of a comprehensive strict mode that includes algorithm whitelisting and option character validation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Specific attack vectors that could exploit non-strict base64 validation in SRI contexts",
+        "Whether downstream crypto libraries would reject malformed base64 digests before integrity verification"
+      ],
+      "review_comment": "The patch adds necessary base64 format validation for cryptographic digests in strict mode SRI processing. Digest values parsed from external SRI metadata or generated internally must conform to proper base64 encoding to ensure reliable integrity verification. Without this validation, malformed digests could potentially bypass integrity checks, compromising the security guarantee of subresource integrity protection. Ensure all digest values undergo this base64 validation when strict mode is enabled.",
+      "change_type": "A",
+      "raw_score": 0.7899999999999999,
+      "score": 0.7899999999999999
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "index.js",
+      "changed_line": 44,
+      "statement": "this.digest.match(BASE64_REGEX) &&",
+      "cwe_id": "CWE-327",
+      "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-327 requires use of a broken/risky cryptographic algorithm. The candidate validates base64 format of already-computed digests, not the cryptographic algorithm selection or implementation."
+        },
+        "connection": {
+          "score": 0.2,
+          "evidence": "Digest values come from crypto hash computations or parsed metadata, but the validation only checks format, not cryptographic strength"
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The patch adds base64 format validation in strict mode, which could prevent malformed digest processing"
+        },
+        "security_control": {
+          "score": 0.15,
+          "evidence": "",
+          "required_control": "Use of strong cryptographic algorithms and proper key management",
+          "control_requirement_evidence": "CWE-327 requires ensuring cryptographic algorithms are not broken or risky",
+          "existing_controls_checked": [
+            "SHA-256/384/512 algorithms from SPEC_ALGORITHMS whitelist"
+          ],
+          "deficiency_evidence": "The patch adds format validation, not cryptographic algorithm validation. The actual hash algorithms used remain unchanged and are already restricted to strong algorithms."
+        },
+        "concrete_impact": {
+          "score": 0.15,
+          "evidence": "No evidence of broken cryptography; impact relates to integrity validation bypass through malformed input, not cryptographic weakness"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would not validate base64 format of digests, potentially allowing malformed digest strings to pass validation.",
+      "supporting_evidence": [
+        "Added base64 format validation for digest strings in strict mode",
+        "Digest values are used in Subresource Integrity validation"
+      ],
+      "contradicting_evidence": [
+        "The cryptographic algorithms (SHA-256/384/512) are strong and not broken",
+        "The validation checks format, not cryptographic algorithm selection or implementation",
+        "No evidence of weak cryptography being used or enabled"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether malformed base64 digests could actually bypass SRI validation",
+        "Specific attack scenarios exploiting base64 format issues"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.2,
+      "score": 0.2
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "index.js",
+      "changed_line": 44,
+      "statement": "this.digest.match(BASE64_REGEX) &&",
+      "cwe_id": "CWE-310",
+      "cwe_name": "Cryptographic Issues",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.25,
+          "evidence": "CWE-310 is a broad category covering cryptographic implementation weaknesses. The added base64 validation relates to encoding validation for cryptographic digests, but doesn't demonstrate a specific cryptographic flaw like weak algorithms, key management, or implementation errors."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "The digest value comes from parsed SRI metadata strings and is used in integrity checking. The validation connects externally provided digest strings to the integrity verification process when strict mode is enabled."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "If this candidate line were reverted, strict mode would not validate base64 format, allowing potentially malformed digests to pass through the integrity checking pipeline when strict validation is requested."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "",
+          "required_control": "Input validation for cryptographic digest encoding format",
+          "control_requirement_evidence": "CWE-310 requires proper validation of cryptographic inputs to prevent encoding-related vulnerabilities",
+          "existing_controls_checked": [
+            "algorithm whitelist validation",
+            "options character validation"
+          ],
+          "deficiency_evidence": "The patch adds missing base64 format validation that was absent in non-strict mode, but the evidence doesn't demonstrate how malformed base64 could actually bypass downstream cryptographic verification"
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "The impact is speculative - while malformed base64 could potentially affect parsing or comparison, the evidence doesn't demonstrate how this would lead to actual integrity bypass or confidentiality loss in the cryptographic verification process."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would not validate base64 format for digests, potentially allowing non-standard base64 encodings to pass through the integrity metadata serialization process when strict validation is explicitly requested.",
+      "supporting_evidence": [
+        "Added base64 validation in strict mode for cryptographic digest strings",
+        "Digest values are used in SRI integrity checking for resource validation",
+        "Validation is part of comprehensive strict mode security controls"
+      ],
+      "contradicting_evidence": [
+        "CWE-310 typically addresses cryptographic algorithm weaknesses, key management, or implementation flaws, not encoding format validation",
+        "The base64 validation is optional (strict mode only) and doesn't affect default behavior"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether malformed base64 digests could actually bypass downstream hash comparison",
+        "Specific attack vectors that exploit non-strict base64 validation",
+        "Impact of malformed base64 on the actual cryptographic verification process"
+      ],
+      "review_comment": "The patch adds base64 format validation for digest strings in strict mode, ensuring proper encoding when strict SRI validation is requested. This improves input validation but addresses encoding format rather than core cryptographic weaknesses. The validation helps prevent malformed metadata from passing through the integrity checking pipeline when strict mode is explicitly enabled.",
+      "change_type": "A",
+      "raw_score": 0.51,
+      "score": 0.51
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "index.js",
+      "changed_line": 44,
+      "statement": "this.digest.match(BASE64_REGEX) &&",
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-19 is a legacy category covering general data processing errors, not a specific vulnerability mechanism. The demonstrated behavior is specific validation of base64 format in SRI metadata, which doesn't align with CWE-19's broad scope."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "Digest values come from parsed SRI metadata strings or crypto hash computations, and the validation connects to SRI integrity checking operations. However, no specific attacker-controlled input path is demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "The patch adds base64 format validation in strict mode. If reverted, strict mode would not validate digest base64 encoding, potentially allowing malformed digests to pass validation."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "",
+          "required_control": "Input validation for base64-encoded digest format",
+          "control_requirement_evidence": "SRI integrity checking requires properly formatted base64 digests to function correctly",
+          "existing_controls_checked": [
+            "Algorithm whitelist validation",
+            "Visual character validation for options"
+          ],
+          "deficiency_evidence": "The patch adds missing base64 format validation that was absent in strict mode, strengthening the overall validation chain"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No concrete security impact is demonstrated. The change improves validation robustness but no evidence shows actual bypass scenarios or security consequences from the previous state."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would not validate base64 format of digests, potentially allowing malformed base64 strings to pass SRI validation when strict mode is enabled.",
+      "supporting_evidence": [
+        "Added base64 format validation using BASE64_REGEX in strict mode",
+        "Validation is part of comprehensive SRI metadata serialization with algorithm whitelist and option validation"
+      ],
+      "contradicting_evidence": [
+        "CWE-19 is a legacy category, not a specific vulnerability mechanism",
+        "No evidence of actual security impact or exploitability from the previous validation state"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether malformed base64 digests could actually bypass SRI validation",
+        "Specific attack scenarios that could exploit the previous validation gap",
+        "Downstream handling of malformed digests in SRI implementations"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.31999999999999995,
+      "score": 0.31999999999999995
+    }
+  ],
+  "stage4_status": "completed"
+}

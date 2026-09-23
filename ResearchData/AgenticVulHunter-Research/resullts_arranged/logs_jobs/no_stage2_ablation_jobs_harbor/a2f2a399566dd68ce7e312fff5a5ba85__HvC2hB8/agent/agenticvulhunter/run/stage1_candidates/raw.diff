@@ -1,0 +1,444 @@
+diff --git a/django/contrib/auth/views.py b/django/contrib/auth/views.py
+index 2562a639b7ab..8514345d0061 100644
+--- a/django/contrib/auth/views.py
++++ b/django/contrib/auth/views.py
+@@ -7,7 +7,7 @@
+ from django.core.urlresolvers import reverse
+ from django.http import HttpResponseRedirect, QueryDict
+ from django.template.response import TemplateResponse
+-from django.utils.http import base36_to_int
++from django.utils.http import base36_to_int, is_safe_url
+ from django.utils.translation import ugettext as _
+ from django.shortcuts import resolve_url
+ from django.views.decorators.debug import sensitive_post_parameters
+@@ -37,18 +37,12 @@ def login(request, template_name='registration/login.html',
+     if request.method == "POST":
+         form = authentication_form(data=request.POST)
+         if form.is_valid():
+-            # Use default setting if redirect_to is empty
+-            if not redirect_to:
+-                redirect_to = settings.LOGIN_REDIRECT_URL
+-            redirect_to = resolve_url(redirect_to)
+-
+-            netloc = urlparse(redirect_to)[1]
+-            # Heavier security check -- don't allow redirection to a different
+-            # host.
+-            if netloc and netloc != request.get_host():
++
++            # Ensure the user-originating redirection url is safe.
++            if not is_safe_url(url=redirect_to, host=request.get_host()):
+                 redirect_to = resolve_url(settings.LOGIN_REDIRECT_URL)
+ 
+-            # Okay, security checks complete. Log the user in.
++            # Okay, security check complete. Log the user in.
+             auth_login(request, form.get_user())
+ 
+             if request.session.test_cookie_worked():
+@@ -82,27 +76,27 @@ def logout(request, next_page=None,
+     Logs out the user and displays 'You are logged out' message.
+     """
+     auth_logout(request)
+-    redirect_to = request.REQUEST.get(redirect_field_name, '')
+-    if redirect_to:
+-        netloc = urlparse(redirect_to)[1]
++
++    if redirect_field_name in request.REQUEST:
++        next_page = request.REQUEST[redirect_field_name]
+         # Security check -- don't allow redirection to a different host.
+-        if not (netloc and netloc != request.get_host()):
+-            return HttpResponseRedirect(redirect_to)
++        if not is_safe_url(url=next_page, host=request.get_host()):
++            next_page = request.path
+ 
+-    if next_page is None:
+-        current_site = get_current_site(request)
+-        context = {
+-            'site': current_site,
+-            'site_name': current_site.name,
+-            'title': _('Logged out')
+-        }
+-        if extra_context is not None:
+-            context.update(extra_context)
+-        return TemplateResponse(request, template_name, context,
+-                                current_app=current_app)
+-    else:
++    if next_page:
+         # Redirect to this page until the session has been cleared.
+-        return HttpResponseRedirect(next_page or request.path)
++        return HttpResponseRedirect(next_page)
++
++    current_site = get_current_site(request)
++    context = {
++        'site': current_site,
++        'site_name': current_site.name,
++        'title': _('Logged out')
++    }
++    if extra_context is not None:
++        context.update(extra_context)
++    return TemplateResponse(request, template_name, context,
++        current_app=current_app)
+ 
+ 
+ def logout_then_login(request, login_url=None, current_app=None, extra_context=None):
+diff --git a/django/contrib/comments/views/comments.py b/django/contrib/comments/views/comments.py
+index 27d5a48ac601..7c02b21b6a5c 100644
+--- a/django/contrib/comments/views/comments.py
++++ b/django/contrib/comments/views/comments.py
+@@ -44,9 +44,6 @@ def post_comment(request, next=None, using=None):
+         if not data.get('email', ''):
+             data["email"] = request.user.email
+ 
+-    # Check to see if the POST data overrides the view's next argument.
+-    next = data.get("next", next)
+-
+     # Look up the object we're trying to comment about
+     ctype = data.get("content_type")
+     object_pk = data.get("object_pk")
+@@ -100,7 +97,7 @@ def post_comment(request, next=None, using=None):
+             template_list, {
+                 "comment": form.data.get("comment", ""),
+                 "form": form,
+-                "next": next,
++                "next": data.get("next", next),
+             },
+             RequestContext(request, {})
+         )
+@@ -131,7 +128,8 @@ def post_comment(request, next=None, using=None):
+         request=request
+     )
+ 
+-    return next_redirect(data, next, comment_done, c=comment._get_pk_val())
++    return next_redirect(request, fallback=next or 'comments-comment-done',
++        c=comment._get_pk_val())
+ 
+ comment_done = confirmation_view(
+     template="comments/posted.html",
+diff --git a/django/contrib/comments/views/moderation.py b/django/contrib/comments/views/moderation.py
+index 39933e75c80b..31bb98fa633a 100644
+--- a/django/contrib/comments/views/moderation.py
++++ b/django/contrib/comments/views/moderation.py
+@@ -10,7 +10,6 @@
+ from django.views.decorators.csrf import csrf_protect
+ 
+ 
+-
+ @csrf_protect
+ @login_required
+ def flag(request, comment_id, next=None):
+@@ -27,7 +26,8 @@ def flag(request, comment_id, next=None):
+     # Flag on POST
+     if request.method == 'POST':
+         perform_flag(request, comment)
+-        return next_redirect(request.POST.copy(), next, flag_done, c=comment.pk)
++        return next_redirect(request, fallback=next or 'comments-flag-done',
++            c=comment.pk)
+ 
+     # Render a form on GET
+     else:
+@@ -54,7 +54,8 @@ def delete(request, comment_id, next=None):
+     if request.method == 'POST':
+         # Flag the comment as deleted instead of actually deleting it.
+         perform_delete(request, comment)
+-        return next_redirect(request.POST.copy(), next, delete_done, c=comment.pk)
++        return next_redirect(request, fallback=next or 'comments-delete-done',
++            c=comment.pk)
+ 
+     # Render a form on GET
+     else:
+@@ -81,7 +82,8 @@ def approve(request, comment_id, next=None):
+     if request.method == 'POST':
+         # Flag the comment as approved.
+         perform_approve(request, comment)
+-        return next_redirect(request.POST.copy(), next, approve_done, c=comment.pk)
++        return next_redirect(request, fallback=next or 'comments-approve-done',
++            c=comment.pk)
+ 
+     # Render a form on GET
+     else:
+diff --git a/django/contrib/comments/views/utils.py b/django/contrib/comments/views/utils.py
+index abaed68560a5..79f637623203 100644
+--- a/django/contrib/comments/views/utils.py
++++ b/django/contrib/comments/views/utils.py
+@@ -9,25 +9,26 @@
+     from urllib import urlencode
+ 
+ from django.http import HttpResponseRedirect
+-from django.core import urlresolvers
+-from django.shortcuts import render_to_response
++from django.shortcuts import render_to_response, resolve_url
+ from django.template import RequestContext
+ from django.core.exceptions import ObjectDoesNotExist
+ from django.contrib import comments
++from django.utils.http import is_safe_url
+ 
+-def next_redirect(data, default, default_view, **get_kwargs):
++def next_redirect(request, fallback, **get_kwargs):
+     """
+     Handle the "where should I go next?" part of comment views.
+ 
+-    The next value could be a kwarg to the function (``default``), or a
+-    ``?next=...`` GET arg, or the URL of a given view (``default_view``). See
++    The next value could be a
++    ``?next=...`` GET arg or the URL of a given view (``fallback``). See
+     the view modules for examples.
+ 
+     Returns an ``HttpResponseRedirect``.
+     """
+-    next = data.get("next", default)
+-    if next is None:
+-        next = urlresolvers.reverse(default_view)
++    next = request.POST.get('next')
++    if not is_safe_url(url=next, host=request.get_host()):
++        next = resolve_url(fallback)
++
+     if get_kwargs:
+         if '#' in next:
+             tmp = next.rsplit('#', 1)
+diff --git a/django/utils/http.py b/django/utils/http.py
+index 1c3b0039b51c..0ab519880427 100644
+--- a/django/utils/http.py
++++ b/django/utils/http.py
+@@ -227,3 +227,15 @@ def same_origin(url1, url2):
+     """
+     p1, p2 = urllib_parse.urlparse(url1), urllib_parse.urlparse(url2)
+     return (p1.scheme, p1.hostname, p1.port) == (p2.scheme, p2.hostname, p2.port)
++
++def is_safe_url(url, host=None):
++    """
++    Return ``True`` if the url is a safe redirection (i.e. it doesn't point to
++    a different host).
++
++    Always returns ``False`` on an empty url.
++    """
++    if not url:
++        return False
++    netloc = urllib_parse.urlparse(url)[1]
++    return not netloc or netloc == host
+diff --git a/django/views/i18n.py b/django/views/i18n.py
+index c1d456d66711..c87e3a82db1f 100644
+--- a/django/views/i18n.py
++++ b/django/views/i18n.py
+@@ -9,6 +9,7 @@
+ from django.utils.encoding import smart_text
+ from django.utils.formats import get_format_modules, get_format
+ from django.utils._os import upath
++from django.utils.http import is_safe_url
+ from django.utils import six
+ 
+ def set_language(request):
+@@ -22,11 +23,11 @@ def set_language(request):
+     redirect to the page in the request (the 'next' parameter) without changing
+     any state.
+     """
+-    next = request.REQUEST.get('next', None)
+-    if not next:
+-        next = request.META.get('HTTP_REFERER', None)
+-    if not next:
+-        next = '/'
++    next = request.REQUEST.get('next')
++    if not is_safe_url(url=next, host=request.get_host()):
++        next = request.META.get('HTTP_REFERER')
++        if not is_safe_url(url=next, host=request.get_host()):
++            next = '/'
+     response = http.HttpResponseRedirect(next)
+     if request.method == 'POST':
+         lang_code = request.POST.get('language', None)
+diff --git a/tests/regressiontests/comment_tests/tests/comment_view_tests.py b/tests/regressiontests/comment_tests/tests/comment_view_tests.py
+index 429f3b2bf281..5c1954026d06 100644
+--- a/tests/regressiontests/comment_tests/tests/comment_view_tests.py
++++ b/tests/regressiontests/comment_tests/tests/comment_view_tests.py
+@@ -222,6 +222,13 @@ def testCommentNext(self):
+         match = re.search(r"^http://testserver/somewhere/else/\?c=\d+$", location)
+         self.assertTrue(match != None, "Unexpected redirect location: %s" % location)
+ 
++        data["next"] = "http://badserver/somewhere/else/"
++        data["comment"] = "This is another comment with an unsafe next url"
++        response = self.client.post("/post/", data)
++        location = response["Location"]
++        match = post_redirect_re.match(location)
++        self.assertTrue(match != None, "Unsafe redirection to: %s" % location)
++
+     def testCommentDoneView(self):
+         a = Article.objects.get(pk=1)
+         data = self.getValidData(a)
+diff --git a/tests/regressiontests/comment_tests/tests/moderation_view_tests.py b/tests/regressiontests/comment_tests/tests/moderation_view_tests.py
+index 2ada20a66222..c7574193ee6a 100644
+--- a/tests/regressiontests/comment_tests/tests/moderation_view_tests.py
++++ b/tests/regressiontests/comment_tests/tests/moderation_view_tests.py
+@@ -4,7 +4,6 @@
+ from django.contrib.comments import signals
+ from django.contrib.comments.models import Comment, CommentFlag
+ from django.contrib.contenttypes.models import ContentType
+-from django.conf import settings
+ 
+ from . import CommentTestCase
+ 
+@@ -30,6 +29,30 @@ def testFlagPost(self):
+         self.assertEqual(c.flags.filter(flag=CommentFlag.SUGGEST_REMOVAL).count(), 1)
+         return c
+ 
++    def testFlagPostNext(self):
++        """
++        POST the flag view, explicitly providing a next url.
++        """
++        comments = self.createSomeComments()
++        pk = comments[0].pk
++        self.client.login(username="normaluser", password="normaluser")
++        response = self.client.post("/flag/%d/" % pk, {'next': "/go/here/"})
++        self.assertEqual(response["Location"],
++            "http://testserver/go/here/?c=1")
++
++    def testFlagPostUnsafeNext(self):
++        """
++        POSTing to the flag view with an unsafe next url will ignore the
++        provided url when redirecting.
++        """
++        comments = self.createSomeComments()
++        pk = comments[0].pk
++        self.client.login(username="normaluser", password="normaluser")
++        response = self.client.post("/flag/%d/" % pk,
++            {'next': "http://elsewhere/bad"})
++        self.assertEqual(response["Location"],
++            "http://testserver/flagged/?c=%d" % pk)
++
+     def testFlagPostTwice(self):
+         """Users don't get to flag comments more than once."""
+         c = self.testFlagPost()
+@@ -49,7 +72,7 @@ def testFlagAnon(self):
+     def testFlaggedView(self):
+         comments = self.createSomeComments()
+         pk = comments[0].pk
+-        response = self.client.get("/flagged/", data={"c":pk})
++        response = self.client.get("/flagged/", data={"c": pk})
+         self.assertTemplateUsed(response, "comments/flagged.html")
+ 
+     def testFlagSignals(self):
+@@ -101,6 +124,33 @@ def testDeletePost(self):
+         self.assertTrue(c.is_removed)
+         self.assertEqual(c.flags.filter(flag=CommentFlag.MODERATOR_DELETION, user__username="normaluser").count(), 1)
+ 
++    def testDeletePostNext(self):
++        """
++        POSTing the delete view will redirect to an explicitly provided a next
++        url.
++        """
++        comments = self.createSomeComments()
++        pk = comments[0].pk
++        makeModerator("normaluser")
++        self.client.login(username="normaluser", password="normaluser")
++        response = self.client.post("/delete/%d/" % pk, {'next': "/go/here/"})
++        self.assertEqual(response["Location"],
++            "http://testserver/go/here/?c=1")
++
++    def testDeletePostUnsafeNext(self):
++        """
++        POSTing to the delete view with an unsafe next url will ignore the
++        provided url when redirecting.
++        """
++        comments = self.createSomeComments()
++        pk = comments[0].pk
++        makeModerator("normaluser")
++        self.client.login(username="normaluser", password="normaluser")
++        response = self.client.post("/delete/%d/" % pk,
++            {'next': "http://elsewhere/bad"})
++        self.assertEqual(response["Location"],
++            "http://testserver/deleted/?c=%d" % pk)
++
+     def testDeleteSignals(self):
+         def receive(sender, **kwargs):
+             received_signals.append(kwargs.get('signal'))
+@@ -116,13 +166,13 @@ def receive(sender, **kwargs):
+     def testDeletedView(self):
+         comments = self.createSomeComments()
+         pk = comments[0].pk
+-        response = self.client.get("/deleted/", data={"c":pk})
++        response = self.client.get("/deleted/", data={"c": pk})
+         self.assertTemplateUsed(response, "comments/deleted.html")
+ 
+ class ApproveViewTests(CommentTestCase):
+ 
+     def testApprovePermissions(self):
+-        """The delete view should only be accessible to 'moderators'"""
++        """The approve view should only be accessible to 'moderators'"""
+         comments = self.createSomeComments()
+         pk = comments[0].pk
+         self.client.login(username="normaluser", password="normaluser")
+@@ -134,7 +184,7 @@ def testApprovePermissions(self):
+         self.assertEqual(response.status_code, 200)
+ 
+     def testApprovePost(self):
+-        """POSTing the delete view should mark the comment as removed"""
++        """POSTing the approve view should mark the comment as removed"""
+         c1, c2, c3, c4 = self.createSomeComments()
+         c1.is_public = False; c1.save()
+ 
+@@ -146,6 +196,36 @@ def testApprovePost(self):
+         self.assertTrue(c.is_public)
+         self.assertEqual(c.flags.filter(flag=CommentFlag.MODERATOR_APPROVAL, user__username="normaluser").count(), 1)
+ 
++    def testApprovePostNext(self):
++        """
++        POSTing the approve view will redirect to an explicitly provided a next
++        url.
++        """
++        c1, c2, c3, c4 = self.createSomeComments()
++        c1.is_public = False; c1.save()
++
++        makeModerator("normaluser")
++        self.client.login(username="normaluser", password="normaluser")
++        response = self.client.post("/approve/%d/" % c1.pk,
++            {'next': "/go/here/"})
++        self.assertEqual(response["Location"],
++            "http://testserver/go/here/?c=1")
++
++    def testApprovePostUnsafeNext(self):
++        """
++        POSTing to the approve view with an unsafe next url will ignore the
++        provided url when redirecting.
++        """
++        c1, c2, c3, c4 = self.createSomeComments()
++        c1.is_public = False; c1.save()
++
++        makeModerator("normaluser")
++        self.client.login(username="normaluser", password="normaluser")
++        response = self.client.post("/approve/%d/" % c1.pk,
++            {'next': "http://elsewhere/bad"})
++        self.assertEqual(response["Location"],
++            "http://testserver/approved/?c=%d" % c1.pk)
++
+     def testApproveSignals(self):
+         def receive(sender, **kwargs):
+             received_signals.append(kwargs.get('signal'))
+diff --git a/tests/regressiontests/views/tests/i18n.py b/tests/regressiontests/views/tests/i18n.py
+index f1f5b175c8ac..b1dc8808a1bc 100644
+--- a/tests/regressiontests/views/tests/i18n.py
++++ b/tests/regressiontests/views/tests/i18n.py
+@@ -25,13 +25,28 @@ class I18NTests(TestCase):
+     """ Tests django views in django/views/i18n.py """
+ 
+     def test_setlang(self):
+-        """The set_language view can be used to change the session language"""
++        """
++        The set_language view can be used to change the session language.
++
++        The user is redirected to the 'next' argument if provided.
++        """
+         for lang_code, lang_name in settings.LANGUAGES:
+             post_data = dict(language=lang_code, next='/views/')
+             response = self.client.post('/views/i18n/setlang/', data=post_data)
+             self.assertRedirects(response, 'http://testserver/views/')
+             self.assertEqual(self.client.session['django_language'], lang_code)
+ 
++    def test_setlang_unsafe_next(self):
++        """
++        The set_language view only redirects to the 'next' argument if it is
++        "safe".
++        """
++        lang_code, lang_name = settings.LANGUAGES[0]
++        post_data = dict(language=lang_code, next='//unsafe/redirection/')
++        response = self.client.post('/views/i18n/setlang/', data=post_data)
++        self.assertEqual(response['Location'], 'http://testserver/')
++        self.assertEqual(self.client.session['django_language'], lang_code)
++
+     def test_setlang_reversal(self):
+         self.assertEqual(reverse('set_language'), '/views/i18n/setlang/')

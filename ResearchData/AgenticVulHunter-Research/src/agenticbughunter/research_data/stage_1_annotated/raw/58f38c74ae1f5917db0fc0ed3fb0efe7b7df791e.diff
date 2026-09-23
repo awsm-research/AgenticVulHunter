@@ -1,0 +1,286 @@
+diff --git a/NEWS b/NEWS
+index e8f3454..7ef10a1 100644
+--- a/NEWS
++++ b/NEWS
+@@ -1,19 +1,22 @@
+ 0.6 (UNRELEASED)
+ ----------------
+  - Emit MethodCalled() signal on the DBusMock interface, as an alternative way
+    of verifying method calls. Thanks Lars Uebernickel.
++ - DBusMockObject.AddTemplate() and DBusTestCase.spawn_server_template() can
++   now load local templates by specifying a path to a *.py file as template
++   name. Thanks Lucas De Marchi.
+ 
+ 0.5 (2013-02-03)
+ ----------------
+  - upower template: Change LidIsClosed property default value to False.
+  - Add polkitd template. (LP: #1112551)
+ 
+ 0.4.0 (2013-01-21)
+ ------------------
+  - Add GetCalls(), GetMethodCalls() and ClearCalls() methods on the mock D-BUS
+    interface to query the call log, for cases where parsing stdout is
+    inconvenient. Thanks to Robert Bruce Park for the patch! (LP: #1099483)
+  - Document how to keep internal state in AddMethod().
+  - Add template for gnome-screensaver. Thanks to Bastien Nocera!
+  - Fix logging of signal arguments to have the same format as method call
+    arguments.
+diff --git a/dbusmock/mockobject.py b/dbusmock/mockobject.py
+index 2b96de0..b7ddbd5 100644
+--- a/dbusmock/mockobject.py
++++ b/dbusmock/mockobject.py
+@@ -22,30 +22,44 @@ os  # pyflakes
+ 
+ import dbus
+ import dbus.service
+ 
+ # global path -> DBusMockObject mapping
+ objects = {}
+ 
+ MOCK_IFACE = 'org.freedesktop.DBus.Mock'
+ 
+ # stubs to keep code compatible with Python 2 and 3
+ if sys.version_info[0] >= 3:
+     long = int
+     unicode = str
+ 
+ 
++def load_module(name):
++    if os.path.exists(name) and os.path.splitext(name)[1] == '.py':
++        sys.path.insert(0, os.path.dirname(os.path.abspath(name)))
++        try:
++            m = os.path.splitext(os.path.basename(name))[0]
++            module = importlib.import_module(m)
++        finally:
++            sys.path.pop(0)
++
++        return module
++
++    return importlib.import_module('dbusmock.templates.' + name)
++
++
+ class DBusMockObject(dbus.service.Object):
+     '''Mock D-Bus object
+ 
+     This can be configured to have arbitrary methods (including code execution)
+     and properties via methods on the org.freedesktop.DBus.Mock interface, so
+     that you can control the mock from any programming language.
+     '''
+ 
+     def __init__(self, bus_name, path, interface, props, logfile=None):
+         '''Create a new DBusMockObject
+ 
+         bus_name: A dbus.service.BusName instance where the object will be put on
+         path: D-Bus object path
+         interface: Primary D-Bus interface name of this object (where
+                    properties and methods will be put on)
+@@ -280,41 +294,42 @@ class DBusMockObject(dbus.service.Object):
+         for k, v in properties.items():
+             self.AddProperty(interface, k, v)
+ 
+     @dbus.service.method(MOCK_IFACE,
+                          in_signature='sa{sv}',
+                          out_signature='')
+     def AddTemplate(self, template, parameters):
+         '''Load a template into the mock.
+ 
+         python-dbusmock ships a set of standard mocks for common system
+         services such as UPower and NetworkManager. With these the actual tests
+         become a lot simpler, as they only have to set up the particular
+         properties for the tests, and not the skeleton of common properties,
+         interfaces, and methods.
+ 
+-        template: Name of the template to load. See "pydoc dbusmock.templates"
+-                  for a list of available templates, and
++        template: Name of the template to load or the full path to a *.py file
++                  for custom templates. See "pydoc dbusmock.templates" for a
++                  list of available templates from python-dbusmock package, and
+                   "pydoc dbusmock.templates.NAME" for documentation about
+                   template NAME.
+         parameters: A parameter (string) → value (variant) map, for
+                     parameterizing templates. Each template can define their
+                     own, see documentation of that particular template for
+                     details.
+         '''
+         try:
+-            module = importlib.import_module('dbusmock.templates.' + template)
++            module = load_module(template)
+         except ImportError as e:
+             raise dbus.exceptions.DBusException('Cannot add template %s: %s' % (template, str(e)))
+ 
+         # pick out all D-BUS service methods and add them to our interface
+         for symbol in dir(module):
+             fn = getattr(module, symbol)
+             if '_dbus_interface' in dir(fn):
+                 setattr(self.__class__, symbol, fn)
+ 
+         if parameters is None:
+             parameters = {}
+ 
+         module.load(self, parameters)
+ 
+     @dbus.service.method(MOCK_IFACE,
+diff --git a/dbusmock/testcase.py b/dbusmock/testcase.py
+index ec74a75..3ee8339 100644
+--- a/dbusmock/testcase.py
++++ b/dbusmock/testcase.py
+@@ -7,35 +7,34 @@
+ # later version.  See http://www.gnu.org/copyleft/lgpl.html for the full text
+ # of the license.
+ 
+ __author__ = 'Martin Pitt'
+ __email__ = 'martin.pitt@ubuntu.com'
+ __copyright__ = '(c) 2012 Canonical Ltd.'
+ __license__ = 'LGPL 3+'
+ 
+ import time
+ import sys
+ import unittest
+ import subprocess
+ import signal
+ import os
+ import errno
+-import importlib
+ 
+ import dbus
+ 
+-from dbusmock.mockobject import MOCK_IFACE
++from dbusmock.mockobject import MOCK_IFACE, load_module
+ 
+ 
+ class DBusTestCase(unittest.TestCase):
+     '''Base class for D-BUS mock tests.
+ 
+     This provides some convenience API to start/stop local D-Buses, so that you
+     can run a private local session and/or system bus to run mocks on.
+ 
+     This also provides a spawn_server() static method to run the D-Bus mock
+     server in a separate process.
+     '''
+     session_bus_pid = None
+     system_bus_pid = None
+ 
+     @classmethod
+@@ -193,31 +192,31 @@ class DBusTestCase(unittest.TestCase):
+ 
+         This starts a D-BUS mock process and loads the given template with
+         (optional) parameters into it. For details about templates see
+         dbusmock.DBusMockObject.AddTemplate().
+ 
+         The daemon will terminate automatically when the D-BUS that it connects
+         to goes down.  If that does not happen (e. g. you test on the actual
+         system/session bus), you need to kill it manually.
+ 
+         This function blocks until the spawned DBusMockObject is ready and
+         listening on the bus.
+ 
+         Returns a pair (daemon Popen object, main dbus object).
+         '''
+         # we need the bus address from the template module
+-        module = importlib.import_module('dbusmock.templates.' + template)
++        module = load_module(template)
+         daemon = klass.spawn_server(module.BUS_NAME, module.MAIN_OBJ,
+                                     module.MAIN_IFACE, module.SYSTEM_BUS, stdout)
+ 
+         bus = klass.get_dbus(module.SYSTEM_BUS)
+         obj = bus.get_object(module.BUS_NAME, module.MAIN_OBJ)
+         if not parameters:
+             parameters = dbus.Dictionary({}, signature='sv')
+         obj.AddTemplate(template, parameters,
+                         dbus_interface=MOCK_IFACE)
+ 
+         return (daemon, obj)
+ 
+ # Python 2 backwards compatibility
+ if sys.version_info[0] < 3:
+     import re
+diff --git a/tests/test_api.py b/tests/test_api.py
+index cff69f5..27ea401 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -2,30 +2,31 @@
+ 
+ # This program is free software; you can redistribute it and/or modify it under
+ # the terms of the GNU Lesser General Public License as published by the Free
+ # Software Foundation; either version 3 of the License, or (at your option) any
+ # later version.  See http://www.gnu.org/copyleft/lgpl.html for the full text
+ # of the license.
+ 
+ __author__ = 'Martin Pitt'
+ __email__ = 'martin.pitt@ubuntu.com'
+ __copyright__ = '(c) 2012 Canonical Ltd.'
+ __license__ = 'LGPL 3+'
+ 
+ import unittest
+ import sys
+ import tempfile
++import subprocess
+ 
+ import dbus
+ import dbus.mainloop.glib
+ 
+ import dbusmock
+ 
+ from gi.repository import GLib
+ 
+ dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+ 
+ 
+ class TestAPI(dbusmock.DBusTestCase):
+     '''Test dbus-mock API'''
+ 
+     @classmethod
+@@ -487,18 +488,53 @@ assert args[2] == 5
+             loop.quit()
+ 
+         self.dbus_mock.AddMethod('', 'Do', 's', '', '')
+         self.dbus_mock.connect_to_signal('MethodCalled', method_called)
+         self.assertEqual(self.dbus_test.Do('foo'), None)
+ 
+         GLib.timeout_add(5000, loop.quit)
+         loop.run()
+ 
+         self.assertEqual(len(caught_signals), 1)
+         method, args = caught_signals[0]
+         self.assertEqual(method, 'Do')
+         self.assertEqual(len(args), 1)
+         self.assertEqual(args[0], 'foo')
+ 
++
++class TestTemplates(dbusmock.DBusTestCase):
++    '''Test template API'''
++
++    @classmethod
++    def setUpClass(klass):
++        klass.start_session_bus()
++
++    def test_local(self):
++        '''Load a local template *.py file'''
++
++        with tempfile.NamedTemporaryFile(prefix='answer_', suffix='.py') as my_template:
++            my_template.write(b'''import dbus
++BUS_NAME = 'universe.Ultimate'
++MAIN_OBJ = '/'
++MAIN_IFACE = 'universe.Ultimate'
++SYSTEM_BUS = False
++
++def load(mock, parameters):
++    mock.AddMethods(MAIN_IFACE, [('Answer', '', 'i', 'ret = 42')])
++''')
++            my_template.flush()
++            (p_mock, dbus_ultimate) = self.spawn_server_template(
++                my_template.name, stdout=subprocess.PIPE)
++
++        try:
++            self.assertEqual(dbus_ultimate.Answer(), 42)
++        finally:
++            p_mock.terminate()
++            p_mock.wait()
++
++    def test_local_nonexisting(self):
++        self.assertRaises(ImportError, self.spawn_server_template, '/non/existing.py')
++
++
+ if __name__ == '__main__':
+     # avoid writing to stderr
+     unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout, verbosity=2))

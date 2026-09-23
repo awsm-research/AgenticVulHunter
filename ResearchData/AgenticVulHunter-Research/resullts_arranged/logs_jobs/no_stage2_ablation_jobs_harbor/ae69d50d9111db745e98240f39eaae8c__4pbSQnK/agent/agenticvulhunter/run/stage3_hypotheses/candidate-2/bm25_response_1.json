@@ -1,0 +1,230 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 55,
+      "statement": "_id: Random.id(),",
+      "change_type": "A",
+      "function_name": "",
+      "operation_type": "token_generation",
+      "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+      "security_relevance_score": 0.8,
+      "code_context": "1: // Sandstorm - Personal Cloud Sandbox\n2: // Copyright (c) 2014 Sandstorm Development Group, Inc. and contributors\n3: // All rights reserved.\n4: //\n5: // Licensed under the Apache License, Version 2.0 (the \"License\");\n6: // you may not use this file except in compliance with the License.\n7: // You may obtain a copy of the License at\n8: //\n9: //   http://www.apache.org/licenses/LICENSE-2.0\n10: //\n11: // Unless required by applicable law or agreed to in writing, software\n12: // distributed under the License is distributed on an \"AS IS\" BASIS,\n13: // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: // See the License for the specific language governing permissions and\n15: // limitations under the License.\n16: \n17: var ChildProcess = Npm.require(\"child_process\");\n18: var Future = Npm.require(\"fibers/future\");\n19: var Promise = Npm.require(\"es6-promise\").Promise;\n20: var Capnp = Npm.require(\"capnp\");\n21: \n22: var GrainInfo = Capnp.importSystem(\"sandstorm/grain.capnp\").GrainInfo;\n23: \n24: var TOKEN_CLEANUP_MINUTES = 15;\n25: var TOKEN_CLEANUP_TIMER = TOKEN_CLEANUP_MINUTES * 60 * 1000;\n26: \n27: function cleanupToken(tokenId) {\n28:   check(tokenId, String);\n29:   waitPromise(sandstormBackend.deleteBackup(tokenId));\n30:   FileTokens.remove({_id: tokenId});\n31: }\n32: \n33: Meteor.startup(function () {\n34:   // Cleanup tokens every TOKEN_CLEANUP_MINUTES\n35:   Meteor.setInterval(function () {\n36:     var queryDate = new Date(Date.now() - TOKEN_CLEANUP_TIMER);\n37: \n38:     FileTokens.find({timestamp: {$lt: queryDate}}).forEach(function (token) {\n39:       cleanupToken(token._id);\n40:     });\n41:   }, TOKEN_CLEANUP_TIMER);\n42: });\n43: \n44: Meteor.methods({\n45:   backupGrain: function (grainId) {\n46:     check(grainId, String);\n47:     var grain = Grains.findOne(grainId);\n48:     if (!grain || !this.userId || grain.userId !== this.userId) {\n49:       throw new Meteor.Error(403, \"Unauthorized\", \"User is not the owner of this grain\");\n50:     }\n51: \n52:     this.unblock();\n53: \n54:     var token = {\n55:       _id: Random.id(),\n56:       timestamp: new Date(),\n57:       name: grain.title\n58:     };\n59: \n60:     // TODO(soon): does the grain need to be offline?\n61: \n62:     var grainInfo = _.pick(grain, \"appId\", \"appVersion\", \"title\");\n63: \n64:     FileTokens.insert(token);\n65:     waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));\n66: \n67:     return token._id;\n68:   },\n69: \n70:   restoreGrain: function (tokenId) {\n71:     check(tokenId, String);\n72:     var token = FileTokens.findOne(tokenId);\n73:     if (!token || !isSignedUpOrDemo()) {\n74:       throw new Meteor.Error(403, \"Unauthorized\",\n75:           \"Token was not found, or user cannot create grains\");\n76:     }\n77: \n78:     this.unblock();\n79: \n80:     var grainId = Random.id(22);\n81: \n82:     try {\n83:       var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;\n84:       if (!grainInfo.appId) {\n85:           throw new Meteor.Error(500, \"Metadata object for uploaded grain has no AppId\");\n86:       }\n87: \n88:       var action = UserActions.findOne({appId: grainInfo.appId, userId: this.userId});\n89:       if (!action) {\n90:         throw new Meteor.Error(500,\n91:                                \"App id for uploaded grain not installed\",\n92:                                \"App Id: \" + grainInfo.appId);\n93:       }\n94:       if (action.appVersion < grainInfo.appVersion) {\n95:         throw new Meteor.Error(500,\n96:                                \"App version for uploaded grain is newer than any \" +\n97:                                \"installed version. You need to upgrade your app first\",\n98:                                \"New version: \" + grainInfo.appVersion +\n99:                                \", Old version: \" + action.appVersion);\n100:       }\n101: \n102:       Grains.insert({\n103:         _id: grainId,\n104:         packageId: action.packageId,\n105:         appId: action.appId,\n106:         appVersion: action.appVersion,\n107:         userId: this.userId,\n108:         title: grainInfo.title,\n109:         private: true\n110:       });\n111:     } finally {\n112:       cleanupToken(tokenId);\n113:     }\n114: \n115:     return grainId;\n116:   },\n117: });\n118: \n119: Router.map(function () {\n120:   this.route(\"downloadBackup\", {\n121:     where: \"server\",\n122:     path: \"/downloadBackup/:tokenId\",\n123:     action: function () {\n124:       var token = FileTokens.findOne(this.params.tokenId);\n125:       var response = this.response;\n126:       if (!token) {\n127:         response.writeHead(404, {\"Content-Type\": \"text/plain\"});\n128:         return response.end(\"File does not exist\");\n129:       }\n130: \n131:       var started = false;\n132:       var filename = (token.name.replace(/[\"\\n]/g, \"\") || \"backup\") + \".zip\";\n133:       var sawEnd = false;\n134: \n135:       var stream = {\n136:         expectSize: function (size) {\n137:           if (!started) {\n138:             started = true;\n139:             response.writeHead(200, {\n140:               \"Content-Length\": size,\n141:               \"Content-Type\": \"application/zip\",\n142:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n143:             });\n144:           }\n145:         },\n146:         write: function (data) {\n147:           if (!started) {\n148:             started = true;\n149:             response.writeHead(200, {\n150:               \"Content-Type\": \"application/zip\",\n151:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n152:             });\n153:           }\n154:           response.write(data);\n155:         },\n156:         done: function (data) {\n157:           if (!started) {\n158:             started = true;\n159:             response.writeHead(200, {\n160:               \"Content-Length\": 0,\n161:               \"Content-Type\": \"application/zip\",\n162:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n163:             });\n164:           }\n165:           sawEnd = true;\n166:           response.end();\n167:         }\n168:       };\n169: \n170:       waitPromise(sandstormBackend.downloadBackup(this.params.tokenId, stream));\n171: \n172:       if (!sawEnd) {\n173:         console.error(\"backend failed to call done() when downloading backup\");\n174:         if (!started) {\n175:           throw new Meteor.Error(500, \"backend failed to produce data\");\n176:         }\n177:         response.end();\n178:       }\n179: \n180:       cleanupToken(this.params.tokenId);\n181:     }\n182:   });\n183: \n184:   this.route(\"uploadBackup\", {\n185:     where: \"server\",\n186:     path: \"/uploadBackup\",\n187:     action: function () {\n188:       if (this.request.method === \"POST\") {\n189:         var request = this.request;\n190:         try {\n191:           var token = {\n192:             _id: Random.id(),\n193:             timestamp: new Date()\n194:           };\n195:           var stream = sandstormBackend.uploadBackup(token._id).stream;\n196: \n197:           FileTokens.insert(token);\n198: \n199:           waitPromise(new Promise(function (resolve, reject) {\n200:             request.on(\"data\", function (data) {\n201:               stream.write(data);\n202:             });\n203:             request.on(\"end\", function () {\n204:               resolve(stream.done());",
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/missing-token-validation",
+          "cwe_id": "CWE-352",
+          "cwe_name": "Cross-Site Request Forgery (CSRF)",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 8.5192,
+          "raw_bm25_score": 8.5192,
+          "description": "Using cookies without CSRF protection may allow malicious websites to submit requests on behalf of the user.",
+          "pattern": "Find state-changing operations that lack CSRF protection mechanisms",
+          "remediation": "Implement CSRF tokens for all state-changing operations. Use SameSite cookie attributes and validate the Origin/Referer headers.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-352"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/malformed-html-id",
+          "cwe_id": "CWE-758",
+          "cwe_name": "Reliance on Undefined, Unspecified, or Implementation-Defined Behavior",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 8.2683,
+          "raw_bm25_score": 8.2683,
+          "description": "If the id of an HTML attribute is malformed, its interpretation may be browser-dependent.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-758. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-758"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/predictable-token",
+          "cwe_id": "CWE-340",
+          "cwe_name": "Generation of Predictable Numbers or Identifiers",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.3469,
+          "raw_bm25_score": 7.3469,
+          "description": "Tokens used for sensitive tasks, such as, password recovery, and email confirmation, should not use predictable values.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-340"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/biased-cryptographic-random",
+          "cwe_id": "CWE-327",
+          "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.1239,
+          "raw_bm25_score": 7.1239,
+          "description": "Some mathematical operations on random numbers can cause bias in the results and compromise security.",
+          "pattern": "Identify usage of weak or deprecated cryptographic algorithms and practices",
+          "remediation": "Use modern cryptographic algorithms and proper key management. Avoid deprecated algorithms and implement proper random number generation.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-327"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/file-system-race",
+          "cwe_id": "CWE-367",
+          "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 6.1238,
+          "raw_bm25_score": 6.1238,
+          "description": "Separately checking the state of a file before operating on it may allow an attacker to modify the file between the two operations.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-367"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/insecure-randomness",
+          "cwe_id": "CWE-338",
+          "cwe_name": "Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 6.0599,
+          "raw_bm25_score": 6.0599,
+          "description": "Using a cryptographically weak pseudo-random number generator to generate a security-sensitive value may allow an attacker to predict what value will be generated.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use cryptographically secure random number generators (SecureRandom, os.urandom, crypto.getRandomValues) instead of predictable PRNGs.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-338"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/index-out-of-bounds",
+          "cwe_id": "CWE-193",
+          "cwe_name": "Off-by-one Error",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 5.8758,
+          "raw_bm25_score": 5.8758,
+          "description": "An array index is compared to be less than or equal to the 'length' property, and then used in an indexing operation that could be out of bounds.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-193. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "logic",
+            "language-features"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "fallback/cwe-255-credentials-management-errors",
+          "cwe_id": "CWE-255",
+          "cwe_name": "Credentials Management Errors",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.8712,
+          "raw_bm25_score": 5.8712,
+          "description": "Legacy category for insecure credential creation, storage, validation, or handling.",
+          "pattern": "cwe-255 credential-management password token secret credential storage rotation validation authentication-secret",
+          "remediation": "Protect credentials throughout storage, validation, transport, and rotation.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-255"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "fallback/cwe-697-incorrect-comparison",
+          "cwe_id": "CWE-697",
+          "cwe_name": "Incorrect Comparison",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.753,
+          "raw_bm25_score": 5.753,
+          "description": "A security-relevant comparison checks the wrong, incomplete, or non-canonical value.",
+          "pattern": "cwe-697 incorrect-comparison equality compare comparator mismatch canonicalization hostname url signature token partial-comparison substring",
+          "remediation": "Compare canonical complete values with the intended security predicate.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-697"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-534-information-exposure-through-debug-log-files",
+          "cwe_id": "CWE-534",
+          "cwe_name": "Information Exposure Through Debug Log Files",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.5952,
+          "raw_bm25_score": 5.5952,
+          "description": "Sensitive information is written to debug or diagnostic log files.",
+          "pattern": "cwe-534 debug-log diagnostic-log verbose-log sensitive-log password token credential secret exception stacktrace logging",
+          "remediation": "Redact secrets and disable sensitive diagnostic logging.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-534"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

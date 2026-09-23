@@ -1,0 +1,292 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "src/wagtail_2fa/views.py",
+  "changed_line": 124,
+  "statement": "device = TOTPDevice.objects.get(**self.kwargs)",
+  "change_type": "A",
+  "function_name": "DeviceDeleteView.get_queryset",
+  "operation_type": "data_retrieval",
+  "selection_reason": "unvalidated user input from URL kwargs -> database query construction -> potential unauthorized device access",
+  "security_relevance_score": 0.85,
+  "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+  "source_summary": "The device is retrieved from the database using TOTPDevice.objects.get() with **self.kwargs as parameters. The kwargs come from URL routing and contain the primary key (pk) of the device to be deleted, which is extracted from the URL pattern r\"^2fa/devices/(?P<pk>\\d+)/remove$\".",
+  "sink_summary": "The retrieved device's user is used to filter devices for the current user with TOTPDevice.objects.devices_for_user(device.user, confirmed=True) to ensure only the owner can delete their own device.",
+  "guard_summary": "There is a guard in place that ensures only devices belonging to the current user can be accessed. The get_queryset method first retrieves the device using self.kwargs (which contains the pk from URL), then uses device.user to filter devices for the current user, ensuring authorization control.",
+  "risk_pattern": "The code directly passes URL parameters to a database query without explicit validation of whether the requesting user owns the device being accessed. While there is an authorization check in place, it's indirect and relies on the device's user field matching the current user.",
+  "used_variable_sources": [
+    "self.kwargs"
+  ],
+  "called_function_context": [
+    "TOTPDevice.objects.get(**self.kwargs)",
+    "TOTPDevice.objects.devices_for_user(device.user, confirmed=True)"
+  ],
+  "enclosing_conditions": [],
+  "context_summary": "The DeviceDeleteView inherits from Django's DeleteView and implements a get_queryset method. The URL pattern for this view expects a pk parameter in the URL path. The method first retrieves a device using the provided kwargs (which contain the pk), then uses that device's user to filter devices for the current user, ensuring only the owner can delete their own device.",
+  "unresolved_facts": [
+    "The exact validation mechanism for ensuring self.kwargs contains only allowed parameters before being passed to TOTPDevice.objects.get()",
+    "Whether there are additional access controls or authentication checks beyond what's shown in the code"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "fit_reason": "The code retrieves a device using user-provided parameters without explicit validation of ownership, then performs a secondary authorization check. This pattern matches CWE-284's description of access-control policy being missing or incorrectly enforced.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-264",
+      "cwe_name": "Permissions, Privileges, and Access Controls",
+      "fit_reason": "The mechanism involves a failure in authorization enforcement where the initial database query doesn't validate that the user has permission to access the requested resource, falling under the legacy category for permissions and privileges failures.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "fit_reason": "User input from URL kwargs is directly passed to a database query without validation or sanitization, creating potential for exploitation through malformed inputs.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "fit_reason": "The URL pattern allows direct access to device deletion endpoints, and the code doesn't adequately prevent unauthorized access to devices that don't belong to the requesting user.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-20",
+    "CWE-254",
+    "CWE-264",
+    "CWE-284",
+    "CWE-285",
+    "CWE-425",
+    "CWE-628",
+    "CWE-643",
+    "CWE-730",
+    "CWE-74",
+    "CWE-770"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 124,
+      "statement": "device = TOTPDevice.objects.get(**self.kwargs)",
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code retrieves a device using TOTPDevice.objects.get(**self.kwargs) where kwargs come from URL parameters, directly matching the mechanism of CWE-284: improper access control due to lack of validation or enforcement of access restrictions."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "URL parameters (self.kwargs) are passed directly to a database query without explicit validation that the requesting user owns the device. The connection is demonstrated through the URL pattern r\"^2fa/devices/(?P<pk>\\d+)/remove$\" which provides the pk, and the subsequent authorization check using device.user."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted to a more restrictive access control mechanism (e.g., checking user ownership before retrieval), it would materially change the vulnerability. The patch adds an indirect authorization check but does not prevent the initial unvalidated parameter usage."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "The code performs a secondary authorization check using TOTPDevice.objects.devices_for_user(device.user, confirmed=True), but this is insufficient because the initial retrieval bypasses explicit ownership validation. The required control is explicit validation of user ownership before database access.",
+          "required_control": "Explicit validation that the requesting user owns the device being accessed",
+          "control_requirement_evidence": "CWE-284 requires proper access control enforcement, which includes validating that the actor has appropriate permissions before accessing a resource. The code retrieves a device using unvalidated parameters and only checks ownership afterward.",
+          "existing_controls_checked": [
+            "TOTPDevice.objects.devices_for_user(device.user, confirmed=True) - used for authorization after retrieval",
+            "URL routing with pk parameter - provides device identifier from user input"
+          ],
+          "deficiency_evidence": "The code retrieves a device using self.kwargs (containing URL-provided pk) without validating that the current user owns that device. The subsequent authorization check is too late in the process and relies on the device's user field, which could be manipulated if the initial retrieval was not properly restricted."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "An attacker could potentially delete another user's device by manipulating the pk parameter in the URL, as long as they know or guess a valid device ID. The impact is unauthorized access to another user's two-factor authentication device."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted to a more secure implementation that explicitly validates ownership before retrieving the device (e.g., by checking if self.kwargs['pk'] belongs to the current user), then unauthorized device deletion would be prevented.",
+      "supporting_evidence": [
+        "URL pattern r\"^2fa/devices/(?P<pk>\\d+)/remove$\" provides pk parameter directly from URL",
+        "TOTPDevice.objects.get(**self.kwargs) retrieves device using unvalidated parameters",
+        "Subsequent authorization check uses device.user to filter devices for current user"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "The exact validation mechanism for ensuring self.kwargs contains only allowed parameters before being passed to TOTPDevice.objects.get()",
+        "Whether there are additional access controls or authentication checks beyond what's shown in the code"
+      ],
+      "review_comment": "The DeviceDeleteView retrieves a device using URL-provided parameters without explicit validation of ownership. While a subsequent authorization check exists, it occurs after the potentially dangerous database retrieval. An attacker could delete another user's device by manipulating the pk parameter in the URL. Add explicit validation that the current user owns the device before retrieving it from the database.",
+      "change_type": "A",
+      "raw_score": 0.76,
+      "score": 0.76
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 124,
+      "statement": "device = TOTPDevice.objects.get(**self.kwargs)",
+      "cwe_id": "CWE-264",
+      "cwe_name": "Permissions, Privileges, and Access Controls",
+      "cwe_relationship": "family_compatible",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.6,
+          "evidence": "The code retrieves a device using unvalidated user input from URL kwargs, which is a form of access control failure. However, the mechanism is not exactly CWE-264 but rather a specific authorization bypass that falls under this broader category."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The URL parameters (self.kwargs) are directly passed to TOTPDevice.objects.get() without validation, creating a path where an attacker could potentially access devices they don't own if the pk in kwargs is manipulated."
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "If this line were reverted or modified to include proper authorization checks (e.g., verifying that the device belongs to the current user before retrieval), it would materially change the vulnerability by preventing unauthorized access."
+        },
+        "security_control": {
+          "score": 0.65,
+          "evidence": "The code attempts to enforce authorization by using device.user in a subsequent query, but this is insufficient because the initial retrieval does not validate that the user has permission to access the device specified by kwargs.",
+          "required_control": "Authorization check before resource access",
+          "control_requirement_evidence": "CWE-264 requires enforcement of access control mechanisms at protected operations. The initial database query should verify that the requesting user is authorized to access the requested resource.",
+          "existing_controls_checked": [
+            "TOTPDevice.objects.devices_for_user(device.user, confirmed=True) - This check occurs after device retrieval but does not prevent unauthorized access during the initial retrieval step."
+          ],
+          "deficiency_evidence": "The code retrieves a device using only URL parameters without verifying that the current user owns the device. The subsequent authorization check is too late in the process and doesn't prevent an attacker from accessing any device if they know its primary key."
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "An attacker could potentially delete another user's device by manipulating the URL parameter (pk) to point to a device owned by someone else, leading to unauthorized access or privilege misuse."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, and proper authorization checks were enforced before retrieving the device from the database, then unauthorized access to devices would be prevented. The vulnerability would be mitigated because the initial retrieval step would validate that the requesting user has permission to access the requested resource.",
+      "supporting_evidence": [
+        "The code directly passes URL parameters (self.kwargs) to TOTPDevice.objects.get() without validation",
+        "URL pattern expects a pk parameter in the URL path for device deletion",
+        "The subsequent authorization check occurs after device retrieval, making it insufficient"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "The exact validation mechanism for ensuring self.kwargs contains only allowed parameters before being passed to TOTPDevice.objects.get()",
+        "Whether there are additional access controls or authentication checks beyond what's shown in the code"
+      ],
+      "review_comment": "The DeviceDeleteView retrieves a device using unvalidated URL parameters, allowing potential unauthorized access. The authorization check occurs after retrieval, which is insufficient. Add validation to ensure that the user requesting deletion owns the device before retrieving it from the database.",
+      "change_type": "A",
+      "raw_score": 0.6899999999999998,
+      "score": 0.6899999999999998
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 124,
+      "statement": "device = TOTPDevice.objects.get(**self.kwargs)",
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The code directly passes URL parameters (self.kwargs) to TOTPDevice.objects.get(**self.kwargs), which is a database query construction using unvalidated user input. This matches the CWE-20 mechanism of improper input validation where inputs are not validated before being used in data operations."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "URL parameters from self.kwargs (containing device pk) are directly passed to database query without validation. The connection is demonstrated through the URL routing pattern r\"^2fa/devices/(?P<pk>\\d+)/remove$\" which extracts pk and passes it to get()."
+        },
+        "diff_causality": {
+          "score": 0.65,
+          "evidence": "If this line were reverted, the database query would not be constructed from unvalidated kwargs. The patch introduces a direct data retrieval path that bypasses input validation, making the vulnerability possible."
+        },
+        "security_control": {
+          "score": 0.75,
+          "evidence": "The required control is input validation/sanitization before database query construction. This control is demonstrably missing - there's no validation of self.kwargs contents before passing to get().",
+          "required_control": "Input validation/sanitization",
+          "control_requirement_evidence": "CWE-20 requires that inputs be validated before use in data operations to prevent exploitation through malformed inputs.",
+          "existing_controls_checked": [
+            "URL routing pattern validation (only checks for digit format)",
+            "Authorization check via devices_for_user() method"
+          ],
+          "deficiency_evidence": "While there's an authorization check, the input validation is missing. The URL pattern only validates that pk is a digit but does not validate that the device belongs to the current user or that the user has permission to delete it."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "The impact is potential unauthorized device access or modification. While there's an authorization check, the lack of input validation means an attacker could potentially pass malformed inputs that might bypass some protections or cause unexpected behavior."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the database query would not be constructed directly from unvalidated URL parameters. The vulnerability would be mitigated because there would be no direct path for user input to be used in a database query without validation.",
+      "supporting_evidence": [
+        "URL pattern r\"^2fa/devices/(?P<pk>\\d+)/remove$\" extracts pk parameter",
+        "self.kwargs contains the pk from URL routing",
+        "TOTPDevice.objects.get(**self.kwargs) directly uses unvalidated input",
+        "The code does not validate that self.kwargs contains only allowed parameters"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "The exact validation mechanism for ensuring self.kwargs contains only allowed parameters before being passed to TOTPDevice.objects.get()",
+        "Whether there are additional access controls or authentication checks beyond what's shown in the code"
+      ],
+      "review_comment": "The code directly passes URL parameters to a database query without input validation, creating a CWE-20 vulnerability. The device deletion endpoint accepts a pk parameter from URL kwargs and uses it directly in TOTPDevice.objects.get(**self.kwargs). While there is an authorization check, the lack of input validation means that malformed inputs could potentially be exploited. Add explicit validation to ensure only expected parameters are passed to the database query.",
+      "change_type": "A",
+      "raw_score": 0.71,
+      "score": 0.71
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 124,
+      "statement": "device = TOTPDevice.objects.get(**self.kwargs)",
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The code directly retrieves a device using URL parameters (self.kwargs) without validating if the requesting user owns that device, which aligns with CWE-425's mechanism of inadequate authorization enforcement on restricted resources."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "URL parameters from self.kwargs are passed directly to TOTPDevice.objects.get(), and the device's user is later used for authorization checks, indicating a connection between input and access control, though not fully demonstrated as attacker-controlled."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted to use a more secure method (e.g., filtering by user_id from request.user), it would prevent unauthorized device access, demonstrating that the change materially affects the vulnerability."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The authorization check is indirect and relies on device.user matching current user; there's no explicit validation of kwargs parameters or enforcement that only the owner can delete their own device.",
+          "required_control": "Explicit validation of ownership before device access",
+          "control_requirement_evidence": "CWE-425 requires proper authorization enforcement to prevent unauthorized access to restricted resources, which is not adequately implemented here.",
+          "existing_controls_checked": [
+            "TOTPDevice.objects.devices_for_user(device.user, confirmed=True) - used for filtering but after device retrieval",
+            "URL routing pattern - allows direct access via pk parameter"
+          ],
+          "deficiency_evidence": "The code retrieves a device using raw URL parameters without validating that the requesting user owns the device, creating a potential bypass of authorization checks."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "An attacker could potentially delete another user's device by manipulating the pk parameter in the URL, leading to unauthorized access and potential account compromise."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, and a more secure approach was used such as explicitly validating that the device belongs to the current user before retrieval, then unauthorized device deletion would be prevented.",
+      "supporting_evidence": [
+        "URL pattern expects pk parameter in URL path for device deletion",
+        "TOTPDevice.objects.get(**self.kwargs) directly uses URL parameters without validation",
+        "Authorization check occurs after device retrieval using device.user"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether there are additional access controls or authentication checks beyond what's shown in the code",
+        "The exact validation mechanism for ensuring self.kwargs contains only allowed parameters before being passed to TOTPDevice.objects.get()"
+      ],
+      "review_comment": "The DeviceDeleteView retrieves devices directly from URL parameters without validating ownership, allowing potential unauthorized device deletion. The authorization check occurs after retrieval, creating a window where an attacker could manipulate the pk parameter to access another user's device. Add explicit validation that the requesting user owns the device before allowing deletion.",
+      "change_type": "A",
+      "raw_score": 0.64,
+      "score": 0.64
+    }
+  ],
+  "stage4_status": "completed"
+}

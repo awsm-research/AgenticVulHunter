@@ -1,0 +1,255 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "qutebrowser/browser/history.py",
+      "changed_line": 109,
+      "statement": ".format(earliest, latest))",
+      "change_type": "A",
+      "function_name": "entries_between",
+      "operation_type": "sql_query_construction",
+      "selection_reason": "User-controlled earliest/latest parameters -> direct string interpolation into SQL query -> SQL injection vulnerability",
+      "security_relevance_score": 0.9,
+      "code_context": "1: # vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:\n2: \n3: # Copyright 2015-2017 Florian Bruhin (The Compiler) <mail@qutebrowser.org>\n4: #\n5: # This file is part of qutebrowser.\n6: #\n7: # qutebrowser is free software: you can redistribute it and/or modify\n8: # it under the terms of the GNU General Public License as published by\n9: # the Free Software Foundation, either version 3 of the License, or\n10: # (at your option) any later version.\n11: #\n12: # qutebrowser is distributed in the hope that it will be useful,\n13: # but WITHOUT ANY WARRANTY; without even the implied warranty of\n14: # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n15: # GNU General Public License for more details.\n16: #\n17: # You should have received a copy of the GNU General Public License\n18: # along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.\n19: \n20: \"\"\"Simple history which gets written to disk.\"\"\"\n21: \n22: import time\n23: \n24: from PyQt5.QtCore import pyqtSlot, QUrl\n25: \n26: from qutebrowser.commands import cmdutils\n27: from qutebrowser.utils import utils, objreg, log, qtutils, usertypes, message\n28: from qutebrowser.misc import objects, sql\n29: \n30: \n31: class Entry:\n32: \n33:     \"\"\"A single entry in the web history.\n34: \n35:     Attributes:\n36:         atime: The time the page was accessed.\n37:         url: The URL which was accessed as QUrl.\n38:         redirect: If True, don't show this entry in completion\n39:     \"\"\"\n40: \n41:     def __init__(self, atime, url, title, redirect=False):\n42:         self.atime = float(atime)\n43:         self.url = url\n44:         self.title = title\n45:         self.redirect = redirect\n46:         qtutils.ensure_valid(url)\n47: \n48:     def __repr__(self):\n49:         return utils.get_repr(self, constructor=True, atime=self.atime,\n50:                               url=self.url_str(), title=self.title,\n51:                               redirect=self.redirect)\n52: \n53:     def __str__(self):\n54:         atime = str(int(self.atime))\n55:         if self.redirect:\n56:             atime += '-r'  # redirect flag\n57:         elems = [atime, self.url_str()]\n58:         if self.title:\n59:             elems.append(self.title)\n60:         return ' '.join(elems)\n61: \n62:     def __eq__(self, other):\n63:         return (self.atime == other.atime and\n64:                 self.title == other.title and\n65:                 self.url == other.url and\n66:                 self.redirect == other.redirect)\n67: \n68:     def url_str(self):\n69:         \"\"\"Get the URL as a lossless string.\"\"\"\n70:         return self.url.toString(QUrl.FullyEncoded | QUrl.RemovePassword)\n71: \n72: \n73: class WebHistory(sql.SqlTable):\n74: \n75:     \"\"\"The global history of visited pages.\"\"\"\n76: \n77:     def __init__(self, parent=None):\n78:         super().__init__(\"History\", ['url', 'title', 'atime', 'redirect'],\n79:                          parent=parent)\n80: \n81:     def __repr__(self):\n82:         return utils.get_repr(self, length=len(self))\n83: \n84:     def __contains__(self, url):\n85:         return self.contains('url', url)\n86: \n87:     def _add_entry(self, entry):\n88:         \"\"\"Add an entry to the in-memory database.\"\"\"\n89:         self.insert([entry.url_str(), entry.title, int(entry.atime),\n90:                      entry.redirect])\n91: \n92:     def get_recent(self):\n93:         \"\"\"Get the most recent history entries.\"\"\"\n94:         return self.select(sort_by='atime', sort_order='desc', limit=100)\n95: \n96:     def entries_between(self, earliest, latest):\n97:         \"\"\"Iterate non-redirect, non-qute entries between two timestamps.\n98: \n99:         Args:\n100:             earliest: Omit timestamps earlier than this.\n101:             latest: Omit timestamps later than this.\n102:         \"\"\"\n103:         result = sql.run_query('SELECT * FROM History '\n104:                                'where not redirect '\n105:                                'and not url like \"qute://%\" '\n106:                                'and atime > {} '\n107:                                'and atime <= {} '\n108:                                'ORDER BY atime desc'\n109:                                .format(earliest, latest))\n110:         while result.next():\n111:             rec = result.record()\n112:             yield self.Entry(*[rec.value(i) for i in range(rec.count())])\n113: \n114:     @cmdutils.register(name='history-clear', instance='web-history')\n115:     def clear(self, force=False):\n116:         \"\"\"Clear all browsing history.\n117: \n118:         Note this only clears the global history\n119:         (e.g. `~/.local/share/qutebrowser/history` on Linux) but not cookies,\n120:         the back/forward history of a tab, cache or other persistent data.\n121: \n122:         Args:\n123:             force: Don't ask for confirmation.\n124:         \"\"\"\n125:         if force:\n126:             self._do_clear()\n127:         else:\n128:             message.confirm_async(self._do_clear, title=\"Clear all browsing \"\n129:                                 \"history?\")\n130: \n131:     def _do_clear(self):\n132:         self.delete_all()\n133: \n134:     @pyqtSlot(QUrl, QUrl, str)\n135:     def add_from_tab(self, url, requested_url, title):\n136:         \"\"\"Add a new history entry as slot, called from a BrowserTab.\"\"\"\n137:         if url.scheme() == 'data' or requested_url.scheme() == 'data':\n138:             return\n139:         if url.isEmpty():\n140:             # things set via setHtml\n141:             return\n142: \n143:         no_formatting = QUrl.UrlFormattingOption(0)\n144:         if (requested_url.isValid() and\n145:                 not requested_url.matches(url, no_formatting)):\n146:             # If the url of the page is different than the url of the link\n147:             # originally clicked, save them both.\n148:             self.add_url(requested_url, title, redirect=True)\n149:         self.add_url(url, title)\n150: \n151:     def add_url(self, url, title=\"\", *, redirect=False, atime=None):\n152:         \"\"\"Called via add_from_tab when a URL should be added to the history.\n153: \n154:         Args:\n155:             url: A url (as QUrl) to add to the history.\n156:             redirect: Whether the entry was redirected to another URL\n157:                       (hidden in completion)\n158:             atime: Override the atime used to add the entry\n159:         \"\"\"\n160:         if not url.isValid():  # pragma: no cover\n161:             # the no cover pragma is a WORKAROUND for this not being covered in\n162:             # old Qt versions.\n163:             log.misc.warning(\"Ignoring invalid URL being added to history\")\n164:             return\n165: \n166:         if atime is None:\n167:             atime = time.time()\n168:         entry = Entry(atime, url, title, redirect=redirect)\n169:         self._add_entry(entry)\n170: \n171:     def _parse_entry(self, line):\n172:         \"\"\"Parse a history line like '12345 http://example.com title'.\"\"\"\n173:         data = line.split(maxsplit=2)\n174:         if len(data) == 2:\n175:             atime, url = data\n176:             title = \"\"\n177:         elif len(data) == 3:\n178:             atime, url, title = data\n179:         else:\n180:             raise ValueError(\"2 or 3 fields expected\")\n181: \n182:         url = QUrl(url)\n183:         if not url.isValid():\n184:             raise ValueError(\"Invalid URL: {}\".format(url.errorString()))\n185: \n186:         # https://github.com/qutebrowser/qutebrowser/issues/670\n187:         atime = atime.lstrip('\\0')\n188: \n189:         if '-' in atime:\n190:             atime, flags = atime.split('-')\n191:         else:\n192:             flags = ''\n193: \n194:         if not set(flags).issubset('r'):\n195:             raise ValueError(\"Invalid flags {!r}\".format(flags))\n196: \n197:         redirect = 'r' in flags\n198: \n199:         return (url, title, float(atime), bool(redirect))\n200: \n201:     def read(self, path):\n202:         \"\"\"Import a text file into the sql database.\"\"\"\n203:         with open(path, 'r', encoding='utf-8') as f:\n204:             rows = []\n205:             for (i, line) in enumerate(f):\n206:                 line = line.strip()\n207:                 if not line:\n208:                     continue\n209:                 try:\n210:                     row = self._parse_entry(line.strip())\n211:                     rows.append(row)\n212:                 except ValueError:\n213:                     raise Exception('Failed to parse line #{} of {}: \"{}\"'\n214:                                     .format(i, path, line))\n215:         self.insert_batch(rows)\n216: \n217: \n218: def init(parent=None):\n219:     \"\"\"Initialize the web history.\n220: \n221:     Args:\n222:         parent: The parent to use for WebHistory.\n223:     \"\"\"\n224:     history = WebHistory(parent=parent)\n225:     objreg.register('web-history', history)\n226: \n227:     if objects.backend == usertypes.Backend.QtWebKit:\n228:         from qutebrowser.browser.webkit import webkithistory\n229:         webkithistory.init(history)",
+      "source_summary": "earliest and latest parameters come from qute://history URL query parameter 'start_time' via QUrlQuery(url).queryItemValue(\"start_time\"), which is converted to float but then directly interpolated into SQL query",
+      "sink_summary": "SQL query execution via sql.run_query() with direct string interpolation of user-controlled parameters into SQL string",
+      "guard_summary": "start_time parameter is validated with float() conversion which catches non-numeric values, but no SQL injection protection; sql.run_query supports parameterized queries via 'values' parameter but it's not used here",
+      "risk_pattern": "User-controlled URL query parameter directly interpolated into SQL query string without parameterization, allowing SQL injection if numeric validation is bypassed",
+      "used_variable_sources": [
+        "start_time from qute://history URL query parameter"
+      ],
+      "called_function_context": [
+        "sql.run_query() with string interpolation instead of parameter binding"
+      ],
+      "enclosing_conditions": [
+        "float() conversion validates numeric input but doesn't prevent SQL injection"
+      ],
+      "context_summary": "The entries_between method constructs SQL queries by directly interpolating user-controlled timestamp parameters into the query string instead of using parameter binding, despite sql.run_query supporting safe parameterized queries",
+      "unresolved_facts": [
+        "Whether float() conversion provides sufficient protection against SQL injection in all cases",
+        "Whether there are other callers of entries_beyond besides qute://history handler"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "Numeric parameter SQL injection via string interpolation bypassing type conversion validation",
+        "source": "user-controlled numeric parameters",
+        "sensitive_operation": "SQL query construction with format()",
+        "missing_control": "parameterized queries for numeric values",
+        "impact": "SQL injection despite numeric validation",
+        "mechanism_keywords": "numeric SQL injection type conversion bypass"
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 34.5039,
+          "raw_bm25_score": 34.5039,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/sql-injection",
+          "cwe_id": "CWE-89",
+          "cwe_name": "Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.3056,
+          "raw_bm25_score": 28.3056,
+          "description": "Building a SQL query from user-controlled sources is vulnerable to insertion of malicious SQL code by the user.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized queries or prepared statements. Never build SQL queries using string operations with user input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-089"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/nosql-injection",
+          "cwe_id": "CWE-943",
+          "cwe_name": "Improper Neutralization of Special Elements in Data Query Logic",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.5435,
+          "raw_bm25_score": 26.5435,
+          "description": "Building a NoSQL query from user-controlled sources is vulnerable to insertion of malicious NoSQL code by the user.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-943"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/timing-attack-against-header-value",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.5708,
+          "raw_bm25_score": 22.5708,
+          "description": "Use of a non-constant-time verification routine to check the value of an HTTP header, possibly allowing a timing attack to infer the header's expected value.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208",
+            "experimental"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/call/wrong-named-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.9312,
+          "raw_bm25_score": 20.9312,
+          "description": "Using a named argument whose name does not correspond to a parameter of the called function or method, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/ldap-injection",
+          "cwe_id": "CWE-90",
+          "cwe_name": "Improper Neutralization of Special Elements used in an LDAP Query ('LDAP Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.5447,
+          "raw_bm25_score": 20.5447,
+          "description": "Building an LDAP query from user-controlled sources is vulnerable to insertion of malicious LDAP code by the user.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized LDAP queries and escape special characters. Validate input format and use LDAP libraries with injection protection.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-090"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/template-injection",
+          "cwe_id": "CWE-74",
+          "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.1389,
+          "raw_bm25_score": 20.1389,
+          "description": "Using user-controlled data to create a template can lead to remote code execution or cross site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized APIs and separate data from control instructions. Validate input format and escape special characters.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-074"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/log-injection",
+          "cwe_id": "CWE-117",
+          "cwe_name": "Improper Output Neutralization for Logs",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.0549,
+          "raw_bm25_score": 20.0549,
+          "description": "Building log entries from user-controlled data is vulnerable to insertion of forged log entries by a malicious user.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-117"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/empty-except",
+          "cwe_id": "CWE-390",
+          "cwe_name": "Detection of Error Condition Without Action",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.1728,
+          "raw_bm25_score": 19.1728,
+          "description": "Except doesn't do anything and has no comment",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-390. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "error-handling",
+            "external/cwe/cwe-390"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 18.1467,
+          "raw_bm25_score": 18.1467,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

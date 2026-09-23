@@ -1,0 +1,241 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "glance/api/v1/images.py",
+  "changed_line": 767,
+  "statement": "safe_delete_from_backend(image['location'],",
+  "change_type": "A",
+  "function_name": "delete",
+  "operation_type": "security_sensitive_resource_operation",
+  "selection_reason": "observable image location -> delete operation execution -> potential unauthorized data removal from storage backend",
+  "security_relevance_score": 0.85,
+  "code_context": "618: \n619:         image_meta = self._handle_source(req, id, image_meta, image_data)\n620: \n621:         location_uri = image_meta.get('location')\n622:         if location_uri:\n623:             self.update_store_acls(req, id, location_uri, public=is_public)\n624: \n625:         # Prevent client from learning the location, as it\n626:         # could contain security credentials\n627:         image_meta.pop('location', None)\n628: \n629:         return {'image_meta': image_meta}\n630: \n631:     @utils.mutating\n632:     def update(self, req, id, image_meta, image_data):\n633:         \"\"\"\n634:         Updates an existing image with the registry.\n635: \n636:         :param request: The WSGI/Webob Request object\n637:         :param id: The opaque image identifier\n638: \n639:         :retval Returns the updated image information as a mapping\n640:         \"\"\"\n641:         self._enforce(req, 'modify_image')\n642:         is_public = image_meta.get('is_public')\n643:         if is_public:\n644:             self._enforce(req, 'publicize_image')\n645: \n646:         orig_image_meta = self.get_image_meta_or_404(req, id)\n647:         orig_status = orig_image_meta['status']\n648: \n649:         # The default behaviour for a PUT /images/<IMAGE_ID> is to\n650:         # override any properties that were previously set. This, however,\n651:         # leads to a number of issues for the common use case where a caller\n652:         # registers an image with some properties and then almost immediately\n653:         # uploads an image file along with some more properties. Here, we\n654:         # check for a special header value to be false in order to force\n655:         # properties NOT to be purged. However we also disable purging of\n656:         # properties if an image file is being uploaded...\n657:         purge_props = req.headers.get('x-glance-registry-purge-props', True)\n658:         purge_props = (utils.bool_from_string(purge_props) and\n659:                        image_data is None)\n660: \n661:         if image_data is not None and orig_status != 'queued':\n662:             raise HTTPConflict(_(\"Cannot upload to an unqueued image\"))\n663: \n664:         # Only allow the Location|Copy-From fields to be modified if the\n665:         # image is in queued status, which indicates that the user called\n666:         # POST /images but originally supply neither a Location|Copy-From\n667:         # field NOR image data\n668:         location = self._external_source(image_meta, req)\n669:         reactivating = orig_status != 'queued' and location\n670:         activating = orig_status == 'queued' and (location or image_data)\n671: \n672:         # Make image public in the backend store (if implemented)\n673:         orig_or_updated_loc = location or orig_image_meta.get('location', None)\n674:         if orig_or_updated_loc:\n675:             self.update_store_acls(req, id, orig_or_updated_loc,\n676:                                    public=is_public)\n677: \n678:         if reactivating:\n679:             msg = _(\"Attempted to update Location field for an image \"\n680:                     \"not in queued status.\")\n681:             raise HTTPBadRequest(explanation=msg,\n682:                                  request=req,\n683:                                  content_type=\"text/plain\")\n684: \n685:         try:\n686:             if location:\n687:                 image_meta['size'] = self._get_size(req.context, image_meta,\n688:                                                     location)\n689: \n690:             image_meta = registry.update_image_metadata(req.context,\n691:                                                         id,\n692:                                                         image_meta,\n693:                                                         purge_props)\n694: \n695:             if activating:\n696:                 image_meta = self._handle_source(req, id, image_meta,\n697:                                                  image_data)\n698: \n699:         except exception.Invalid, e:\n700:             msg = (_(\"Failed to update image metadata. Got error: %(e)s\")\n701:                    % locals())\n702:             for line in msg.split('\\n'):\n703:                 LOG.error(line)\n704:             self.notifier.error('image.update', msg)\n705:             raise HTTPBadRequest(explanation=msg,\n706:                                  request=req,\n707:                                  content_type=\"text/plain\")\n708:         except exception.NotFound, e:\n709:             msg = (\"Failed to find image to update: %(e)s\" % locals())\n710:             for line in msg.split('\\n'):\n711:                 LOG.info(line)\n712:             self.notifier.info('image.update', msg)\n713:             raise HTTPNotFound(explanation=msg,\n714:                                request=req,\n715:                                content_type=\"text/plain\")\n716:         except exception.Forbidden, e:\n717:             msg = (\"Forbidden to update image: %(e)s\" % locals())\n718:             for line in msg.split('\\n'):\n719:                 LOG.info(line)\n720:             self.notifier.info('image.update', msg)\n721:             raise HTTPForbidden(explanation=msg,\n722:                                 request=req,\n723:                                 content_type=\"text/plain\")\n724:         else:\n725:             self.notifier.info('image.update', image_meta)\n726: \n727:         # Prevent client from learning the location, as it\n728:         # could contain security credentials\n729:         image_meta.pop('location', None)\n730: \n731:         return {'image_meta': image_meta}\n732: \n733:     @utils.mutating\n734:     def delete(self, req, id):\n735:         \"\"\"\n736:         Deletes the image and all its chunks from the Glance\n737: \n738:         :param req: The WSGI/Webob Request object\n739:         :param id: The opaque image identifier\n740: \n741:         :raises HttpBadRequest if image registry is invalid\n742:         :raises HttpNotFound if image or any chunk is not available\n743:         :raises HttpUnauthorized if image or any chunk is not\n744:                 deleteable by the requesting user\n745:         \"\"\"\n746:         self._enforce(req, 'delete_image')\n747: \n748:         image = self.get_image_meta_or_404(req, id)\n749:         if image['protected']:\n750:             msg = _(\"Image is protected\")\n751:             LOG.debug(msg)\n752:             raise HTTPForbidden(explanation=msg,\n753:                                 request=req,\n754:                                 content_type=\"text/plain\")\n755: \n756:         # The image's location field may be None in the case\n757:         # of a saving or queued image, therefore don't ask a backend\n758:         # to delete the image if the backend doesn't yet store it.\n759:         # See https://bugs.launchpad.net/glance/+bug/747799\n760:         try:\n761:             if image['location']:\n762:                 if CONF.delayed_delete:\n763:                     schedule_delayed_delete_from_backend(image['location'], id)\n764:                     registry.update_image_metadata(req.context, id,\n765:                                                   {'status': 'pending_delete'})\n766:                 else:\n767:                     safe_delete_from_backend(image['location'],\n768:                                              req.context, id)\n769:                     registry.update_image_metadata(req.context, id,\n770:                                                    {'status': 'deleted'})\n771:             registry.delete_image_metadata(req.context, id)\n772:         except exception.NotFound, e:\n773:             msg = (\"Failed to find image to delete: %(e)s\" % locals())\n774:             for line in msg.split('\\n'):\n775:                 LOG.info(line)\n776:             self.notifier.info('image.delete', msg)\n777:             raise HTTPNotFound(explanation=msg,\n778:                                request=req,\n779:                                content_type=\"text/plain\")\n780:         except exception.Forbidden, e:\n781:             msg = (\"Forbidden to delete image: %(e)s\" % locals())\n782:             for line in msg.split('\\n'):\n783:                 LOG.info(line)\n784:             self.notifier.info('image.delete', msg)\n785:             raise HTTPForbidden(explanation=msg,\n786:                                 request=req,\n787:                                 content_type=\"text/plain\")\n788:         else:\n789:             self.notifier.info('image.delete', image)\n790: \n791:     def get_store_or_400(self, request, scheme):\n792:         \"\"\"\n793:         Grabs the storage backend for the supplied store name\n794:         or raises an HTTPBadRequest (400) response\n795: \n796:         :param request: The WSGI/Webob Request object\n797:         :param scheme: The backend store scheme\n798: \n799:         :raises HTTPNotFound if store does not exist\n800:         \"\"\"\n801:         try:\n802:             return get_store_from_scheme(request.context, scheme)\n803:         except exception.UnknownScheme:\n804:             msg = _(\"Store for scheme %s not found\")\n805:             LOG.error(msg % scheme)\n806:             raise HTTPBadRequest(explanation=msg,\n807:                                  request=request,\n808:                                  content_type='text/plain')\n809: \n810:     def verify_scheme_or_exit(self, scheme):\n811:         \"\"\"\n812:         Verifies availability of the storage backend for the\n813:         given scheme or exits\n814: \n815:         :param scheme: The backend store scheme\n816:         \"\"\"\n817:         try:\n818:             get_store_from_scheme(context.RequestContext(), scheme)\n819:         except exception.UnknownScheme:\n820:             msg = _(\"Store for scheme %s not found\")\n821:             LOG.error(msg % scheme)\n822:             # message on stderr will only be visible if started directly via\n823:             # bin/glance-api, as opposed to being daemonized by glance-control\n824:             sys.stderr.write(msg % scheme)\n825:             sys.exit(255)\n826: \n827: \n828: class ImageDeserializer(wsgi.JSONRequestDeserializer):\n829:     \"\"\"Handles deserialization of specific controller method requests.\"\"\"\n830: \n831:     def _deserialize(self, request):\n832:         result = {}\n833:         try:\n834:             result['image_meta'] = utils.get_image_meta_from_headers(request)\n835:         except exception.Invalid:\n836:             image_size_str = request.headers['x-image-meta-size']\n837:             msg = _(\"Incoming image size of %s was not convertible to \"\n838:                     \"an integer.\") % image_size_str\n839:             raise HTTPBadRequest(explanation=msg, request=request)\n840: \n841:         image_meta = result['image_meta']\n842:         if request.content_length:\n843:             image_size = request.content_length\n844:         elif 'size' in image_meta:\n845:             image_size = image_meta['size']\n846:         else:\n847:             image_size = None\n848: \n849:         data = request.body_file if self.has_body(request) else None\n850: \n851:         if image_size is None and data is not None:\n852:             data = utils.LimitingReader(data, CONF.image_size_cap)\n853: \n854:             #NOTE(bcwaldon): this is a hack to make sure the downstream code\n855:             # gets the correct image data\n856:             request.body_file = data\n857: \n858:         elif image_size > CONF.image_size_cap:\n859:             max_image_size = CONF.image_size_cap\n860:             msg = _(\"Denying attempt to upload image larger than %d bytes.\")\n861:             LOG.warn(msg % max_image_size)\n862:             raise HTTPBadRequest(explanation=msg % max_image_size,\n863:                                  request=request)\n864: \n865:         result['image_data'] = data\n866:         return result\n867: \n868:     def create(self, request):\n869:         return self._deserialize(request)\n870: \n871:     def update(self, request):\n872:         return self._deserialize(request)\n873: \n874: \n875: class ImageSerializer(wsgi.JSONResponseSerializer):\n876:     \"\"\"Handles serialization of specific controller method responses.\"\"\"\n877: \n878:     def __init__(self):\n879:         self.notifier = notifier.Notifier()\n880: \n881:     def _inject_location_header(self, response, image_meta):\n882:         location = self._get_image_location(image_meta)\n883:         response.headers['Location'] = location\n884: \n885:     def _inject_checksum_header(self, response, image_meta):\n886:         response.headers['ETag'] = image_meta['checksum']\n887: \n888:     def _inject_image_meta_headers(self, response, image_meta):\n889:         \"\"\"\n890:         Given a response and mapping of image metadata, injects\n891:         the Response with a set of HTTP headers for the image\n892:         metadata. Each main image metadata field is injected\n893:         as a HTTP header with key 'x-image-meta-<FIELD>' except\n894:         for the properties field, which is further broken out\n895:         into a set of 'x-image-meta-property-<KEY>' headers\n896: \n897:         :param response: The Webob Response object\n898:         :param image_meta: Mapping of image metadata\n899:         \"\"\"\n900:         headers = utils.image_meta_to_http_headers(image_meta)\n901: \n902:         for k, v in headers.items():\n903:             response.headers[k] = v\n904: \n905:     def _get_image_location(self, image_meta):\n906:         \"\"\"Build a relative url to reach the image defined by image_meta.\"\"\"\n907:         return \"/v1/images/%s\" % image_meta['id']\n908: \n909:     def meta(self, response, result):\n910:         image_meta = result['image_meta']\n911:         self._inject_image_meta_headers(response, image_meta)\n912:         self._inject_location_header(response, image_meta)\n913:         self._inject_checksum_header(response, image_meta)\n914:         return response\n915: \n916:     def show(self, response, result):",
+  "source_summary": "The image location comes from the registry metadata retrieved by get_image_meta_or_404 function. The location field contains a URI that points to the storage backend where the image data is stored.",
+  "sink_summary": "The safe_delete_from_backend function deletes image data from the storage backend specified by the URI in image['location']. It calls delete_from_backend which ultimately invokes the store's delete method.",
+  "guard_summary": "The deletion operation is guarded by authorization checks (self._enforce(req, 'delete_image')) and a protection check (if image['protected']). However, there are no additional validation or sanitization of the location URI before passing it to the backend deletion function. The deletion only occurs if image['location'] is truthy.",
+  "risk_pattern": "The system allows deletion of images from storage backends based on location URIs retrieved from registry metadata without sufficient validation of those URIs, potentially allowing deletion of data from unauthorized or unexpected storage locations.",
+  "used_variable_sources": [
+    "image['location']"
+  ],
+  "called_function_context": [
+    "safe_delete_from_backend(image['location'], req.context, id)",
+    "delete_from_backend(context, uri, **kwargs)",
+    "store.delete(loc)"
+  ],
+  "enclosing_conditions": [
+    "if image['location']: (line 761)",
+    "if CONF.delayed_delete: (line 762)"
+  ],
+  "context_summary": "In the delete method of the ImageController class, when an image is deleted, if the image has a location field (indicating it's stored in a backend), the system attempts to delete the image data from that backend. The deletion can either happen immediately or be scheduled for later depending on the CONF.delayed_delete configuration setting.",
+  "unresolved_facts": [
+    "The exact validation/sanitization performed on image['location'] before being passed to safe_delete_from_backend",
+    "Whether the location URI is validated against allowed schemes or storage backends",
+    "The specific implementation details of store.delete() method in different backend stores"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Path Traversal",
+      "fit_reason": "The mechanism involves deletion from a storage backend using a URI from registry metadata without validation of the URI scheme or storage location, which aligns with path traversal vulnerabilities where untrusted paths are used without proper restrictions.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "fit_reason": "The system allows deletion of data from arbitrary storage locations based on registry metadata without sufficient authorization checks or validation of the storage location, representing improper access control to backend resources.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "The deletion operation relies on image location from registry metadata without validating that the location is authorized for deletion, which could allow incorrect authorization decisions.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1236",
+    "CWE-179",
+    "CWE-208",
+    "CWE-22",
+    "CWE-284",
+    "CWE-315",
+    "CWE-471",
+    "CWE-497",
+    "CWE-628",
+    "CWE-685",
+    "CWE-863",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 767,
+      "statement": "safe_delete_from_backend(image['location'],",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The code directly uses image['location'] (a URI from registry metadata) to delete data from a backend store without validating the URI scheme or storage location, which matches the CWE-22 mechanism of improper limitation of pathname to restricted directory."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The image['location'] value comes from registry metadata and is directly passed to safe_delete_from_backend() without validation. The connection path is: registry metadata -> image['location'] -> delete operation in backend store."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted, the deletion from backend would not occur for images with location. The patch introduces the call to safe_delete_from_backend() which enables the path traversal vulnerability by allowing unvalidated URIs to be passed to backend stores."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "No validation or sanitization of image['location'] URI is performed before passing it to safe_delete_from_backend(). The required control is URI scheme validation and storage location restriction, which are missing.",
+          "required_control": "URI scheme validation and storage location restriction",
+          "control_requirement_evidence": "CWE-22 requires that pathnames be limited to restricted directories by validating the input paths. Without such validation, an attacker could provide a malicious URI that points outside of intended storage locations.",
+          "existing_controls_checked": [
+            "Authorization check (self._enforce(req, 'delete_image'))",
+            "Protected image check (if image['protected'])",
+            "Configuration-based delayed delete flag (CONF.delayed_delete)"
+          ],
+          "deficiency_evidence": "The authorization and protection checks do not validate the location URI. The delayed_delete configuration does not prevent path traversal - it only changes when deletion occurs. No validation of the URI scheme or allowed storage backends is performed."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "A malicious user could potentially delete data from unauthorized storage locations if they can control the image['location'] field in registry metadata, leading to unauthorized data removal from backend stores."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the safe_delete_from_backend() call would not be executed, preventing deletion of image data from any backend store. The image would be marked as deleted in the registry but no actual data removal would occur.",
+      "supporting_evidence": [
+        "The code directly passes image['location'] to safe_delete_from_backend() without validation",
+        "Registry metadata contains location URIs that point to storage backends",
+        "The deletion operation occurs in backend stores via delete_from_backend() -> store.delete()",
+        "No URI scheme or storage location validation is performed before deletion"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "The exact validation/sanitization performed on image['location'] before being passed to safe_delete_from_backend",
+        "Whether the location URI is validated against allowed schemes or storage backends",
+        "The specific implementation details of store.delete() method in different backend stores"
+      ],
+      "review_comment": "An attacker who can modify registry metadata could specify a malicious location URI that points to unauthorized storage locations, enabling deletion of data outside of intended directories. The system should validate the URI scheme and storage location before allowing deletion operations.",
+      "change_type": "A",
+      "raw_score": 0.64,
+      "score": 0.64
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 767,
+      "statement": "safe_delete_from_backend(image['location'],",
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The candidate demonstrates deletion of image data from backend storage based on location URI from registry metadata, which is a form of access control bypass. However, the mechanism is not exactly matching CWE-284's definition of improper access control to resources, as it's more about unauthorized data removal than access control to the system itself."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The image location URI from registry metadata (image['location']) is directly passed to safe_delete_from_backend function without validation or authorization checks against the storage backend. The path is: get_image_meta_or_404 -> image['location'] -> safe_delete_from_backend."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted, the deletion of image data from backend storage would not occur for images with location URIs. The patch introduces the direct call to delete from backend storage based on registry metadata without additional access control checks."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "The system has basic authorization checks (self._enforce(req, 'delete_image')) but lacks validation or sanitization of the location URI before deletion. The required control is validation/sanitization of storage location URIs to ensure they are authorized for deletion.",
+          "required_control": "validation/sanitization of storage location URIs",
+          "control_requirement_evidence": "CWE-284 requires proper access control to prevent unauthorized access to resources. In this case, the resource is backend storage data, and the access control mechanism should validate that the URI points to an authorized storage location.",
+          "existing_controls_checked": [
+            "self._enforce(req, 'delete_image') - authorization check for image deletion",
+            "image['protected'] check - prevents deletion of protected images"
+          ],
+          "deficiency_evidence": "The system does not validate that the URI in image['location'] points to an authorized storage location. It directly passes the URI to backend delete functions without checking if the user has authorization to delete from that specific backend location."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "The concrete impact is unauthorized data removal from storage backends. If an attacker can manipulate image metadata to point to a different authorized backend, they could potentially delete data from unauthorized locations. However, the exact impact depends on whether the URI validation is bypassable and what storage backends are accessible."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, image data would not be deleted from backend storage even when an image has a location field. The deletion operation would be skipped entirely for images with location URIs.",
+      "supporting_evidence": [
+        "The code directly passes image['location'] to safe_delete_from_backend without validation",
+        "Authorization checks exist but only for the registry metadata, not for the backend storage access",
+        "The system allows deletion of data from arbitrary storage locations based on registry metadata"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "The exact validation/sanitization performed on image['location'] before being passed to safe_delete_from_backend",
+        "Whether the location URI is validated against allowed schemes or storage backends",
+        "The specific implementation details of store.delete() method in different backend stores"
+      ],
+      "review_comment": "The system allows deletion of image data from backend storage based on location URIs retrieved from registry metadata without sufficient validation. An attacker could potentially manipulate the location field to point to unauthorized storage locations, enabling unauthorized data removal. The patch introduces direct backend deletion without validating that the URI points to an authorized storage location. Implement validation of the location URI against allowed schemes or storage backends before allowing deletion.",
+      "change_type": "A",
+      "raw_score": 0.6,
+      "score": 0.6
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 767,
+      "statement": "safe_delete_from_backend(image['location'],",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The code demonstrates incorrect authorization where the system deletes image data from a backend store based on location URI retrieved from registry metadata without validating that the deletion is authorized for that specific location. This matches CWE-863's mechanism of performing an authorization check that does not correctly perform the check."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The image location URI comes from registry metadata (image['location']) and is directly passed to safe_delete_from_backend function. There is a clear path from the retrieved location to the backend deletion operation, but there's no explicit validation or authorization check of the location URI itself before deletion."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted, the deletion of image data from the backend store would not occur based on the location URI. The patch introduces the direct call to safe_delete_from_backend with the location, which is the core mechanism enabling the potential incorrect authorization behavior."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "The system has basic authorization checks (self._enforce(req, 'delete_image')) and protection checks (if image['protected']), but lacks validation of the location URI itself. The required control is validation/sanitization of the location URI to ensure it's authorized for deletion. This control is missing - there's no check that the location points to an authorized backend or scheme.",
+          "required_control": "Validation/sanitization of image location URI before backend deletion",
+          "control_requirement_evidence": "CWE-863 requires proper authorization checks, which in this context means validating that the location URI is authorized for deletion. Without such validation, the system performs authorization checks that do not correctly perform the check.",
+          "existing_controls_checked": [
+            "self._enforce(req, 'delete_image') - only checks user permissions, not location authorization",
+            "if image['protected'] - prevents deletion of protected images but doesn't validate location"
+          ],
+          "deficiency_evidence": "The code directly passes image['location'] to safe_delete_from_backend without validating that the URI is authorized for deletion. There's no check against allowed schemes, storage backends, or authorization for the specific location being deleted."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "The concrete impact is that an attacker could potentially cause unauthorized data removal from storage backends if they can manipulate the image location field in registry metadata to point to a backend they shouldn't be able to delete from. However, the exact impact depends on whether the location validation is bypassable and what backends are accessible."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the system would not attempt to delete image data from any backend store based on the location URI retrieved from registry metadata. The deletion operation would be skipped entirely when image['location'] is truthy, and only the registry metadata cleanup would occur.",
+      "supporting_evidence": [
+        "The code directly passes image['location'] to safe_delete_from_backend without validation",
+        "Authorization checks exist but only validate user permissions, not location authorization",
+        "The location URI comes from registry metadata which could potentially be manipulated by an attacker"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the location URI is validated against allowed schemes or storage backends",
+        "The specific implementation details of store.delete() method in different backend stores"
+      ],
+      "review_comment": "The system deletes image data from backend stores based on location URIs from registry metadata without validating that those locations are authorized for deletion. This creates an incorrect authorization scenario where an attacker could potentially delete data from unauthorized storage locations if they can manipulate the image location field. The fix should validate that the location URI points to an authorized backend before allowing deletion.",
+      "change_type": "A",
+      "raw_score": 0.7000000000000001,
+      "score": 0.7000000000000001
+    }
+  ],
+  "stage4_status": "completed"
+}

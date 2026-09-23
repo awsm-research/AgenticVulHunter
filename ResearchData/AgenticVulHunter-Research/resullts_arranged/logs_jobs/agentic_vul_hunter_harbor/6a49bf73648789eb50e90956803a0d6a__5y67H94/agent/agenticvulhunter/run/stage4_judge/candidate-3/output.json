@@ -1,0 +1,230 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "lib/send.js",
+  "changed_line": 409,
+  "statement": "if (upPathRegexp.test(path)) {",
+  "change_type": "A",
+  "function_name": "SendStream.prototype.pipe",
+  "operation_type": "path_validation",
+  "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+  "security_relevance_score": 0.75,
+  "code_context": "260: \n261: SendStream.prototype.removeContentHeaderFields = function(){\n262:   var res = this.res;\n263:   Object.keys(res._headers).forEach(function(field){\n264:     if (0 == field.indexOf('content')) {\n265:       res.removeHeader(field);\n266:     }\n267:   });\n268: };\n269: \n270: /**\n271:  * Respond with 304 not modified.\n272:  *\n273:  * @api private\n274:  */\n275: \n276: SendStream.prototype.notModified = function(){\n277:   var res = this.res;\n278:   debug('not modified');\n279:   this.removeContentHeaderFields();\n280:   res.statusCode = 304;\n281:   res.end();\n282: };\n283: \n284: /**\n285:  * Raise error that headers already sent.\n286:  *\n287:  * @api private\n288:  */\n289: \n290: SendStream.prototype.headersAlreadySent = function headersAlreadySent(){\n291:   var err = new Error('Can\\'t set headers after they are sent.');\n292:   debug('headers already sent');\n293:   this.error(500, err);\n294: };\n295: \n296: /**\n297:  * Check if the request is cacheable, aka\n298:  * responded with 2xx or 304 (see RFC 2616 section 14.2{5,6}).\n299:  *\n300:  * @return {Boolean}\n301:  * @api private\n302:  */\n303: \n304: SendStream.prototype.isCachable = function(){\n305:   var res = this.res;\n306:   return (res.statusCode >= 200 && res.statusCode < 300) || 304 == res.statusCode;\n307: };\n308: \n309: /**\n310:  * Handle stat() error.\n311:  *\n312:  * @param {Error} err\n313:  * @api private\n314:  */\n315: \n316: SendStream.prototype.onStatError = function(err){\n317:   var notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR'];\n318:   if (~notfound.indexOf(err.code)) return this.error(404, err);\n319:   this.error(500, err);\n320: };\n321: \n322: /**\n323:  * Check if the cache is fresh.\n324:  *\n325:  * @return {Boolean}\n326:  * @api private\n327:  */\n328: \n329: SendStream.prototype.isFresh = function(){\n330:   return fresh(this.req.headers, this.res._headers);\n331: };\n332: \n333: /**\n334:  * Check if the range is fresh.\n335:  *\n336:  * @return {Boolean}\n337:  * @api private\n338:  */\n339: \n340: SendStream.prototype.isRangeFresh = function isRangeFresh(){\n341:   var ifRange = this.req.headers['if-range'];\n342: \n343:   if (!ifRange) return true;\n344: \n345:   return ~ifRange.indexOf('\"')\n346:     ? ~ifRange.indexOf(this.res._headers['etag'])\n347:     : Date.parse(this.res._headers['last-modified']) <= Date.parse(ifRange);\n348: };\n349: \n350: /**\n351:  * Redirect to `path`.\n352:  *\n353:  * @param {String} path\n354:  * @api private\n355:  */\n356: \n357: SendStream.prototype.redirect = function(path){\n358:   if (listenerCount(this, 'directory') !== 0) {\n359:     return this.emit('directory');\n360:   }\n361: \n362:   if (this.hasTrailingSlash()) return this.error(403);\n363:   var res = this.res;\n364:   path += '/';\n365:   res.statusCode = 301;\n366:   res.setHeader('Content-Type', 'text/html; charset=utf-8');\n367:   res.setHeader('Location', path);\n368:   res.end('Redirecting to <a href=\"' + escapeHtml(path) + '\">' + escapeHtml(path) + '</a>\\n');\n369: };\n370: \n371: /**\n372:  * Pipe to `res.\n373:  *\n374:  * @param {Stream} res\n375:  * @return {Stream} res\n376:  * @api public\n377:  */\n378: \n379: SendStream.prototype.pipe = function(res){\n380:   var self = this\n381:     , args = arguments\n382:     , root = this._root;\n383: \n384:   // references\n385:   this.res = res;\n386: \n387:   // decode the path\n388:   var path = utils.decode(this.path)\n389:   if (path === -1) return this.error(400)\n390: \n391:   // null byte(s)\n392:   if (~path.indexOf('\\0')) return this.error(400);\n393: \n394:   var parts\n395:   if (root !== null) {\n396:     // join / normalize from optional root dir\n397:     path = normalize(join(root, path))\n398: \n399:     // malicious path\n400:     if (path.substr(0, root.length) !== root) {\n401:       debug('malicious path \"%s\"', path)\n402:       return this.error(403)\n403:     }\n404: \n405:     // explode path parts\n406:     parts = path.substr(root.length + 1).split(sep)\n407:   } else {\n408:     // \"..\" is malicious without \"root\"\n409:     if (upPathRegexp.test(path)) {\n410:       debug('malicious path \"%s\"', path)\n411:       return this.error(403)\n412:     }\n413: \n414:     // explode path parts\n415:     parts = normalize(path).split(sep)\n416: \n417:     // resolve the path\n418:     path = resolve(path)\n419:   }\n420: \n421:   // dotfile handling\n422:   if (containsDotFile(parts)) {\n423:     var access = this._hidden\n424:       ? 'allow'\n425:       : 'ignore'\n426: \n427:     debug('%s dotfile \"%s\"', access, path)\n428:     switch (access) {\n429:       case 'allow':\n430:         break\n431:       case 'ignore':\n432:       default:\n433:         return this.error(404)\n434:     }\n435:   }\n436: \n437:   // index file support\n438:   if (this._index.length && this.hasTrailingSlash()) {\n439:     this.sendIndex(path);\n440:     return res;\n441:   }\n442: \n443:   debug('stat \"%s\"', path);\n444:   fs.stat(path, function(err, stat){\n445:     if (err) return self.onStatError(err);\n446:     if (stat.isDirectory()) return self.redirect(self.path);\n447:     self.emit('file', path, stat);\n448:     self.send(path, stat);\n449:   });\n450: \n451:   return res;\n452: };\n453: \n454: /**\n455:  * Transfer `path`.\n456:  *\n457:  * @param {String} path\n458:  * @api public\n459:  */\n460: \n461: SendStream.prototype.send = function(path, stat){\n462:   var options = this.options;\n463:   var len = stat.size;\n464:   var res = this.res;\n465:   var req = this.req;\n466:   var ranges = req.headers.range;\n467:   var offset = options.start || 0;\n468: \n469:   if (res._header) {\n470:     // impossible to send now\n471:     return this.headersAlreadySent();\n472:   }\n473: \n474:   debug('pipe \"%s\"', path)\n475: \n476:   // set header fields\n477:   this.setHeader(path, stat);\n478: \n479:   // set content-type\n480:   this.type(path);\n481: \n482:   // conditional GET support\n483:   if (this.isConditionalGET()\n484:     && this.isCachable()\n485:     && this.isFresh()) {\n486:     return this.notModified();\n487:   }\n488: \n489:   // adjust len to start/end options\n490:   len = Math.max(0, len - offset);\n491:   if (options.end !== undefined) {\n492:     var bytes = options.end - offset + 1;\n493:     if (len > bytes) len = bytes;\n494:   }\n495: \n496:   // Range support\n497:   if (ranges) {\n498:     ranges = parseRange(len, ranges);\n499: \n500:     // If-Range support\n501:     if (!this.isRangeFresh()) {\n502:       debug('range stale');\n503:       ranges = -2;\n504:     }\n505: \n506:     // unsatisfiable\n507:     if (-1 == ranges) {\n508:       debug('range unsatisfiable');\n509:       res.setHeader('Content-Range', 'bytes */' + stat.size);\n510:       return this.error(416);\n511:     }\n512: \n513:     // valid (syntactically invalid/multiple ranges are treated as a regular response)\n514:     if (-2 != ranges && ranges.length === 1) {\n515:       debug('range %j', ranges);\n516: \n517:       options.start = offset + ranges[0].start;\n518:       options.end = offset + ranges[0].end;\n519: \n520:       // Content-Range\n521:       res.statusCode = 206;\n522:       res.setHeader('Content-Range', 'bytes '\n523:         + ranges[0].start\n524:         + '-'\n525:         + ranges[0].end\n526:         + '/'\n527:         + len);\n528:       len = options.end - options.start + 1;\n529:     }\n530:   }\n531: \n532:   // content-length\n533:   res.setHeader('Content-Length', len);\n534: \n535:   // HEAD support\n536:   if ('HEAD' == req.method) return res.end();\n537: \n538:   this.stream(path, options);\n539: };\n540: \n541: /**\n542:  * Transfer index for `path`.\n543:  *\n544:  * @param {String} path\n545:  * @api private\n546:  */\n547: SendStream.prototype.sendIndex = function sendIndex(path){\n548:   var i = -1;\n549:   var self = this;\n550: \n551:   function next(err){\n552:     if (++i >= self._index.length) {\n553:       if (err) return self.onStatError(err);\n554:       return self.error(404);\n555:     }\n556: \n557:     var p = path + self._index[i];\n558: ",
+  "source_summary": "The path variable comes from utils.decode(this.path) on line 388, where this.path is an input parameter to the SendStream function that likely originates from user-controlled request data.",
+  "sink_summary": "This condition leads to an error response with status code 403 (Forbidden) when a malicious path is detected. The error is handled by the error method which likely sends an HTTP error response.",
+  "guard_summary": "The guard is a regular expression check using upPathRegexp that detects paths containing '..' sequences that could indicate directory traversal attempts. This validation is effective for preventing directory traversal when root is null, but it's bypassed when root is set (lines 394-403).",
+  "risk_pattern": "Directory traversal vulnerability in path validation. The check for '..' patterns only occurs when root is null, allowing potential traversal attacks when a root directory is specified.",
+  "used_variable_sources": [
+    "path"
+  ],
+  "called_function_context": [],
+  "enclosing_conditions": [
+    "if (root !== null) { ... } else { ... }"
+  ],
+  "context_summary": "The code validates paths for directory traversal attempts. When root is not specified, it checks if the path contains '..' patterns using upPathRegexp. However, when root is specified, this check is bypassed and only a simple prefix check against root is performed, which may be insufficient to prevent all traversal attacks.",
+  "unresolved_facts": [
+    "The exact source of this.path is not fully traced to determine if it's directly user-controlled",
+    "Whether the path validation with root specified is sufficient to prevent all directory traversal attacks"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Path Traversal",
+      "fit_reason": "Stage-2 evidence shows insufficient path validation when root directory is specified, allowing directory traversal attacks via '..' sequences. The zipslip rule (CWE-22) directly matches this mechanism.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-843",
+      "cwe_name": "Access of Resource Using Incompatible Type ('Type Confusion')",
+      "fit_reason": "The path validation logic shows potential type confusion issues where user-controlled input may not be properly validated before being used in file operations.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-807",
+      "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+      "fit_reason": "The code makes security decisions based on path validation that is bypassed when root is specified, relying on untrusted input without proper validation.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1004",
+    "CWE-20",
+    "CWE-200",
+    "CWE-22",
+    "CWE-561",
+    "CWE-571",
+    "CWE-643",
+    "CWE-754",
+    "CWE-807",
+    "CWE-829",
+    "CWE-835",
+    "CWE-843"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/send.js",
+      "changed_line": 409,
+      "statement": "if (upPathRegexp.test(path)) {",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code demonstrates the exact CWE-22 mechanism: improper limitation of pathname to a restricted directory. The path traversal vulnerability occurs when root is specified, where upPathRegexp validation is bypassed and only prefix checking against root is performed, allowing paths like '/root/../../../etc/passwd' to access files outside the intended directory."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The path variable originates from utils.decode(this.path) which comes from user-controlled request data (as indicated by source_summary). The vulnerable condition is directly connected to the file system operation that occurs later in the code, where the path is used to access files via fs.stat()."
+        },
+        "diff_causality": {
+          "score": 1.0,
+          "evidence": "If this line were reverted, the upPathRegexp check would be applied consistently regardless of whether root is specified or not. This would prevent directory traversal attacks by ensuring that '..' patterns are always validated, even when a root directory is set."
+        },
+        "security_control": {
+          "score": 0.9,
+          "evidence": "The required control is path validation for '..' sequences. The code has an insufficient control: upPathRegexp validation is only applied when root is null (line 409), but not when root is specified (lines 394-403). This creates a bypass where directory traversal attacks can succeed when root is set.",
+          "required_control": "Validation of path components to prevent directory traversal",
+          "control_requirement_evidence": "CWE-22 requires that all external input used to construct file paths be validated to ensure they do not contain sequences that allow access outside a restricted directory.",
+          "existing_controls_checked": [
+            "upPathRegexp test on path (only when root is null)",
+            "prefix check against root (when root is specified)"
+          ],
+          "deficiency_evidence": "The prefix check against root (line 400) does not prevent all traversal attacks. For example, a path like '/root/../etc/passwd' would pass the prefix check but still access files outside the root directory."
+        },
+        "concrete_impact": {
+          "score": 0.8,
+          "evidence": "The concrete impact is that an attacker can perform directory traversal attacks when a root directory is specified, allowing access to files outside the intended restricted directory. This could lead to unauthorized data access or potentially code execution if the application has access to sensitive system files."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the upPathRegexp check would be applied consistently regardless of whether root is specified or not. This would prevent directory traversal attacks by ensuring that '..' patterns are always validated, even when a root directory is set.",
+      "supporting_evidence": [
+        "The path variable comes from user-controlled request data via utils.decode(this.path)",
+        "upPathRegexp validation is only applied when root is null (line 409)",
+        "When root is specified, only prefix checking against root is performed (lines 394-403)",
+        "The vulnerable code path leads to fs.stat() which can access arbitrary files"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "The exact source of this.path is not fully traced to determine if it's directly user-controlled",
+        "Whether the path validation with root specified is sufficient to prevent all directory traversal attacks"
+      ],
+      "review_comment": "The code allows directory traversal when a root directory is specified because upPathRegexp validation is bypassed. An attacker can exploit this by crafting paths that pass the prefix check but still access files outside the intended directory. Add consistent path validation for '..' sequences regardless of root setting.",
+      "change_type": "A",
+      "raw_score": 0.9,
+      "score": 0.9
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/send.js",
+      "changed_line": 409,
+      "statement": "if (upPathRegexp.test(path)) {",
+      "cwe_id": "CWE-843",
+      "cwe_name": "Access of Resource Using Incompatible Type ('Type Confusion')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "The demonstrated behavior involves path validation and directory traversal checks, not type confusion issues where a resource is accessed using an incompatible type."
+        },
+        "connection": {
+          "score": 0.0,
+          "evidence": "There is no evidence that the path variable or any related resource is being used with an incompatible type. The vulnerability shown is in path validation, not type handling."
+        },
+        "diff_causality": {
+          "score": 0.0,
+          "evidence": "The change at line 409 is a path validation check, which does not relate to type confusion. Reverting this line would not address a type confusion issue."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "No security control related to type confusion is present or missing in the demonstrated code.",
+          "required_control": "none established",
+          "control_requirement_evidence": "CWE-843 requires controls to ensure resources are accessed using compatible types, which is not demonstrated in this path validation scenario.",
+          "existing_controls_checked": [],
+          "deficiency_evidence": "No evidence of type confusion or incompatible type usage in the code."
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "The demonstrated vulnerability is a directory traversal issue, not a type confusion issue that would lead to memory vulnerabilities."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the path validation for '..' patterns when root is specified would be removed, potentially allowing directory traversal attacks. However, this does not address or create a type confusion vulnerability.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "The code demonstrates path validation for directory traversal but does not show any resource access using incompatible types",
+        "CWE-843 requires memory-related type confusion issues, which are not present in the path validation logic"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "The exact source of this.path is not fully traced to determine if it's directly user-controlled",
+        "Whether the path validation with root specified is sufficient to prevent all directory traversal attacks"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.0,
+      "score": 0.0
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "lib/send.js",
+      "changed_line": 409,
+      "statement": "if (upPathRegexp.test(path)) {",
+      "cwe_id": "CWE-807",
+      "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code makes a security decision (error 403) based on path validation that relies on untrusted input, where the validation is bypassed when root is specified, directly matching CWE-807's mechanism of relying on untrusted inputs in security decisions."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The path variable originates from utils.decode(this.path) which comes from user-controlled request data (as indicated by source_summary). The security decision is made directly based on this input, establishing a clear connection between untrusted input and the security-sensitive action."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted, the upPathRegexp check would be removed entirely when root is not null, meaning that path traversal attacks could proceed without any validation in those cases. The patch adds a condition to bypass the check only when root is specified, which changes the security behavior."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "The control in question is input validation for path traversal attempts. While there is some validation (the prefix check against root), it's insufficient to prevent all traversal attacks when root is specified, and the bypass of upPathRegexp validation creates a security gap.",
+          "required_control": "Comprehensive path traversal validation",
+          "control_requirement_evidence": "CWE-807 requires that security decisions not rely on untrusted inputs without proper validation. The code makes a security decision based on path input without sufficient validation when root is specified.",
+          "existing_controls_checked": [
+            "upPathRegexp check (bypassed when root is set)",
+            "prefix check against root directory",
+            "null byte validation"
+          ],
+          "deficiency_evidence": "The upPathRegexp check is bypassed when root is specified, allowing potentially malicious paths containing '..' to pass through without proper validation. The prefix check alone is insufficient to prevent all directory traversal attacks."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "The concrete impact is that directory traversal attacks can succeed when a root directory is specified, allowing attackers to access files outside the intended directory. This occurs because the path validation is bypassed in this specific code path."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the upPathRegexp check would be removed entirely when root is not null, meaning that path traversal attacks could proceed without any validation in those cases. The patch adds a condition to bypass the check only when root is specified, which changes the security behavior.",
+      "supporting_evidence": [
+        "The path variable comes from user-controlled request data (utils.decode(this.path))",
+        "The code makes a security decision (error 403) based on path validation that relies on untrusted input",
+        "When root is not null, the upPathRegexp check is bypassed and only prefix checking against root is performed",
+        "This bypass allows directory traversal attacks to succeed when root is specified"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "The exact source of this.path is not fully traced to determine if it's directly user-controlled",
+        "Whether the path validation with root specified is sufficient to prevent all directory traversal attacks"
+      ],
+      "review_comment": "The code makes a security decision based on path input without sufficient validation when root is specified. The upPathRegexp check is bypassed in this case, allowing potential directory traversal attacks. A comprehensive path validation should be applied regardless of whether root is set to prevent attackers from crafting malicious paths that could access unauthorized files.",
+      "change_type": "A",
+      "raw_score": 0.76,
+      "score": 0.76
+    }
+  ],
+  "stage4_status": "completed"
+}

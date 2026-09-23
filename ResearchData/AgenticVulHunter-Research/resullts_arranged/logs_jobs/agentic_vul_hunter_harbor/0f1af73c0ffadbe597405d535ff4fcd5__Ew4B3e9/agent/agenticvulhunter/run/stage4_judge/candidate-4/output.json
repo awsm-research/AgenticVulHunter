@@ -1,0 +1,231 @@
+{
+  "candidate_id": "candidate-4",
+  "filepath": "src/wagtail_2fa/views.py",
+  "changed_line": 71,
+  "statement": "context['user_id'] = int(self.kwargs['user_id'])",
+  "change_type": "A",
+  "function_name": "DeviceListView.get_context_data",
+  "operation_type": "data_transformation",
+  "selection_reason": "unvalidated user input from URL kwargs -> context variable assignment -> potential unauthorized device access",
+  "security_relevance_score": 0.7,
+  "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: \n21: \n22: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n23:     template_name = \"wagtail_2fa/otp_form.html\"\n24:     form_class = forms.TokenForm\n25:     redirect_field_name = REDIRECT_FIELD_NAME\n26: \n27:     @method_decorator(sensitive_post_parameters())\n28:     @method_decorator(never_cache)\n29:     def dispatch(self, *args, **kwargs):\n30:         return super().dispatch(*args, **kwargs)\n31: \n32:     def get_form_kwargs(self):\n33:         kwargs = super().get_form_kwargs()\n34:         kwargs[\"user\"] = self.request.user\n35:         return kwargs\n36: \n37:     def get_context_data(self, *args, **kwargs):\n38:         context = super().get_context_data(*args, **kwargs)\n39:         context[self.redirect_field_name] = self.get_redirect_url()\n40:         return context\n41: \n42:     def form_valid(self, form):\n43:         otp_login(self.request, self.request.user.otp_device)\n44:         return super().form_valid(form)\n45: \n46:     def get_redirect_url(self):\n47:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n48:         redirect_to = self.request.POST.get(\n49:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n50:         )\n51:         url_is_safe = is_safe_url(\n52:             url=redirect_to,\n53:             allowed_hosts=self.get_success_url_allowed_hosts(),\n54:             require_https=self.request.is_secure(),\n55:         )\n56:         return redirect_to if url_is_safe else \"\"\n57: \n58:     def get_success_url(self):\n59:         url = self.get_redirect_url()\n60:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n61: \n62: \n63: class DeviceListView(ListView):\n64:     template_name = \"wagtail_2fa/device_list.html\"\n65: \n66:     def get_queryset(self):\n67:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n68: \n69:     def get_context_data(self, **kwargs):\n70:         context = super(DeviceListView, self).get_context_data(**kwargs)\n71:         context['user_id'] = int(self.kwargs['user_id'])\n72:         return context\n73: \n74: \n75: class DeviceCreateView(FormView):\n76:     form_class = forms.DeviceForm\n77:     template_name = \"wagtail_2fa/device_form.html\"\n78: \n79:     def get_form_kwargs(self):\n80:         kwargs = super().get_form_kwargs()\n81:         kwargs[\"user\"] = self.request.user\n82:         kwargs[\"instance\"] = self.device\n83:         return kwargs\n84: \n85:     def form_valid(self, form):\n86:         form.save()\n87:         utils.delete_unconfirmed_devices(form.user)\n88: \n89:         if not self.request.user.is_verified():\n90:             otp_login(self.request, form.instance)\n91:         return super().form_valid(form)\n92: \n93:     def get_success_url(self):\n94:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n95: \n96:     @cached_property\n97:     def device(self):\n98:         if self.request.method.lower() == \"get\":\n99:             return utils.new_unconfirmed_device(self.request.user)\n100:         else:\n101:             return utils.get_unconfirmed_device(self.request.user)\n102: \n103: \n104: class DeviceUpdateView(UpdateView):\n105:     form_class = forms.DeviceForm\n106:     template_name = \"wagtail_2fa/device_form.html\"\n107: \n108:     def get_queryset(self):\n109:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n110: \n111:     def get_form_kwargs(self):\n112:         kwargs = super().get_form_kwargs()\n113:         kwargs[\"user\"] = self.request.user\n114:         return kwargs\n115: \n116:     def get_success_url(self):\n117:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n118: \n119: \n120: class DeviceDeleteView(DeleteView):\n121:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n122: \n123:     def get_queryset(self):\n124:         device = TOTPDevice.objects.get(**self.kwargs)\n125:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n126: \n127:     def get_success_url(self):\n128:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n129: \n130: \n131: class DeviceQRCodeView(View):\n132:     def get(self, request):\n133:         device = utils.get_unconfirmed_device(self.request.user)\n134:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n135:         response = HttpResponse(content_type=\"image/svg+xml\")\n136:         img.save(response)\n137: \n138:         return response",
+  "source_summary": "The user_id value comes from URL kwargs, which is unvalidated input directly from the HTTP request path.",
+  "sink_summary": "The transformed user_id is stored in the context dictionary and will be passed to the template for rendering. No direct security-sensitive operation occurs here.",
+  "guard_summary": "There are no validation or authorization checks on the user_id value before it's converted to an integer and stored in context. The int() conversion itself does not provide security validation.",
+  "risk_pattern": "Unvalidated user input from URL path parameters is directly used to access user-specific data without authentication or authorization verification, potentially allowing users to view devices belonging to other users if the devices_for_user method does not properly validate ownership.",
+  "used_variable_sources": [
+    "self.kwargs['user_id']"
+  ],
+  "called_function_context": [
+    "TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)"
+  ],
+  "enclosing_conditions": [],
+  "context_summary": "The DeviceListView class handles device listing for users. The get_queryset method directly uses user_id from URL kwargs to fetch devices, while get_context_data stores the same user_id in context. The int() conversion is performed on user-provided input without validation.",
+  "unresolved_facts": [
+    "Whether TOTPDevice.objects.devices_for_user properly validates that the provided user_id belongs to the authenticated user making the request",
+    "Whether the application enforces authorization checks before allowing access to devices belonging to other users"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "fit_reason": "The mechanism matches exactly: unvalidated user input from URL path parameters allows direct access to restricted route without required authorization, enabling potential unauthorized device access",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "The mechanism matches: lack of proper authorization check on user_id before accessing user-specific data via devices_for_user method, allowing users to potentially view devices belonging to other users",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "The mechanism matches: although not traditional path traversal, the unvalidated user_id parameter could be manipulated to traverse to unauthorized user resources in the context of device access",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-179",
+    "CWE-20",
+    "CWE-208",
+    "CWE-22",
+    "CWE-23",
+    "CWE-425",
+    "CWE-563",
+    "CWE-628",
+    "CWE-685",
+    "CWE-732",
+    "CWE-74",
+    "CWE-863"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 71,
+      "statement": "context['user_id'] = int(self.kwargs['user_id'])",
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The code directly uses unvalidated user input from URL kwargs['user_id'] to set context['user_id'], which is a core mechanism of CWE-425 (Direct Request). The user_id is extracted from the HTTP request path without authorization checks."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "There is a clear connection between the unvalidated input (self.kwargs['user_id']) and the vulnerable operation (context['user_id'] assignment). However, the path to impact is not fully demonstrated as it depends on whether downstream methods properly enforce authorization."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted, the user_id would not be stored in context, potentially preventing unauthorized access through direct URL manipulation. The patch directly introduces the vulnerability by adding unvalidated input to context."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "The code lacks proper authorization checks before using the user_id value. No validation or authentication is performed on the user_id before it's used in context, which is required for CWE-425.",
+          "required_control": "Authorization check",
+          "control_requirement_evidence": "CWE-425 requires that all restricted URLs, scripts, or files enforce appropriate authorization to prevent unauthorized access.",
+          "existing_controls_checked": [
+            "No explicit authorization check on user_id before storing in context",
+            "No session or authentication verification for the user_id value"
+          ],
+          "deficiency_evidence": "The code directly assigns int(self.kwargs['user_id']) to context without verifying that the requesting user has permission to access the specified user's devices. This bypasses necessary authorization controls."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "There is a plausible impact path: an attacker could manipulate the user_id in the URL to access other users' devices if the downstream TOTPDevice.objects.devices_for_user method does not properly validate ownership. However, this depends on unverified assumptions about authorization enforcement."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the user_id would not be stored in context, removing a potential vector for unauthorized device access through direct URL manipulation.",
+      "supporting_evidence": [
+        "The code directly assigns int(self.kwargs['user_id']) to context without validation",
+        "URL parameters are used as-is without authorization checks",
+        "The mechanism matches CWE-425's definition of unvalidated input leading to restricted resource access"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether TOTPDevice.objects.devices_for_user properly validates that the provided user_id belongs to the authenticated user making the request",
+        "Whether the application enforces authorization checks before allowing access to devices belonging to other users"
+      ],
+      "review_comment": "The code directly assigns unvalidated user input from URL path parameters to context, creating a potential for unauthorized device access. The application should verify that the requesting user has permission to access the specified user's devices before storing user_id in context. Implement authorization checks on user_id before using it to access restricted resources.",
+      "change_type": "A",
+      "raw_score": 0.66,
+      "score": 0.66
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 71,
+      "statement": "context['user_id'] = int(self.kwargs['user_id'])",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The code directly uses unvalidated user input from URL kwargs to access user-specific data without proper authorization checks, which aligns with the CWE-863 mechanism of incorrect authorization."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "There is a clear path from self.kwargs['user_id'] (external input) to context['user_id'] and then to TOTPDevice.objects.devices_for_user() call in get_queryset method, which accesses user-specific data."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were removed, the user_id would not be stored in context, and potentially the authorization check would need to be performed elsewhere or differently. The patch directly introduces the unvalidated assignment."
+        },
+        "security_control": {
+          "score": 0.9,
+          "evidence": "There is no authorization control in place to verify that the user_id belongs to the authenticated user making the request, which is required for CWE-863.",
+          "required_control": "Authorization check",
+          "control_requirement_evidence": "CWE-863 requires that authorization checks be correctly performed when accessing resources or performing actions. The code does not verify that the requesting user owns the user_id being accessed.",
+          "existing_controls_checked": [
+            "No explicit authorization check in DeviceListView.get_queryset()",
+            "No explicit authorization check in DeviceListView.get_context_data()"
+          ],
+          "deficiency_evidence": "The code directly assigns int(self.kwargs['user_id']) to context without verifying that the authenticated user has permission to access data for that user_id. The TOTPDevice.objects.devices_for_user method is called with unvalidated input, and there's no evidence of authorization enforcement."
+        },
+        "concrete_impact": {
+          "score": 0.65,
+          "evidence": "The mechanism allows potential unauthorized access to devices belonging to other users if the devices_for_user method does not properly validate ownership, which constitutes a concrete security consequence."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the user_id would not be stored in context, potentially removing an unvalidated input path that could lead to incorrect authorization. However, the core issue remains in get_queryset() which still uses self.kwargs['user_id'] directly without authorization verification.",
+      "supporting_evidence": [
+        "The code assigns int(self.kwargs['user_id']) to context['user_id'] without validation",
+        "TOTPDevice.objects.devices_for_user is called with unvalidated user_id from URL",
+        "No explicit authorization check exists before accessing user-specific data"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether TOTPDevice.objects.devices_for_user properly validates that the provided user_id belongs to the authenticated user making the request",
+        "Whether the application enforces authorization checks before allowing access to devices belonging to other users"
+      ],
+      "review_comment": "The code directly assigns unvalidated user input from URL path parameters to context without authorization verification. This allows potential unauthorized access to user devices if the devices_for_user method does not enforce ownership validation. The patch introduces an unvalidated assignment that bypasses proper authorization checks. Ensure that all user_id values are validated against the authenticated user before accessing user-specific data.",
+      "change_type": "A",
+      "raw_score": 0.7799999999999999,
+      "score": 0.7799999999999999
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 71,
+      "statement": "context['user_id'] = int(self.kwargs['user_id'])",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The mechanism involves unvalidated user input leading to unauthorized access, but not traditional path traversal with file system paths. Instead, it's about unauthorized device access based on user_id manipulation."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The user_id from URL kwargs is directly used in get_queryset() and get_context_data(). The int() conversion does not prevent malicious manipulation of the user_id to access other users' devices."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted, the context['user_id'] would not be set, potentially preventing unauthorized device access through manipulated user_id values. The patch directly introduces the unvalidated assignment."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "There is no validation or authorization check on user_id before it's used to fetch devices. The int() conversion does not provide security validation.",
+          "required_control": "Authorization and input validation",
+          "control_requirement_evidence": "CWE-22 requires proper limitation of pathnames to restricted directories, which in this context means ensuring that user_id corresponds to the authenticated user making the request.",
+          "existing_controls_checked": [
+            "TOTPDevice.objects.devices_for_user() method behavior",
+            "No explicit authorization check before device access"
+          ],
+          "deficiency_evidence": "The code does not verify that the requesting user has permission to access devices for the specified user_id. The int() conversion is a data transformation, not a security control."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "A malicious user could manipulate the user_id parameter in the URL to access other users' devices if the devices_for_user method does not properly validate ownership. However, the exact impact depends on downstream validation which is unresolved."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the context['user_id'] would not be set, removing an unvalidated user input that could potentially be used to access unauthorized device resources.",
+      "supporting_evidence": [
+        "The user_id comes from URL kwargs and is directly used in get_queryset()",
+        "No validation or authorization check on user_id before device access",
+        "The int() conversion does not provide security validation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether TOTPDevice.objects.devices_for_user properly validates that the provided user_id belongs to the authenticated user making the request",
+        "Whether the application enforces authorization checks before allowing access to devices belonging to other users"
+      ],
+      "review_comment": "The code accepts unvalidated user_id from URL parameters and stores it in context without authorization verification. This could allow a malicious user to manipulate the user_id parameter to access other users' devices if proper authorization is not enforced downstream. The patch introduces an unvalidated assignment that bypasses normal access controls. Ensure that device access is properly authorized based on the authenticated user.",
+      "change_type": "A",
+      "raw_score": 0.6,
+      "score": 0.6
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,147 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "lib/localvalidator.ts",
+  "changed_line": 104,
+  "statement": "this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"",
+  "change_type": "A",
+  "function_name": "isValidSlpTxid",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+  "security_relevance_score": 0.8,
+  "code_context": "1: import BITBOX from 'bitbox-sdk/lib/bitbox-sdk';\n2: import { SlpValidator, Slp } from './slp';\n3: import { SlpTransactionType, SlpTransactionDetails } from './slpjs';\n4: import * as bitcore from 'bitcore-lib-cash';\n5: import { BitcoreTransaction } from './global';\n6: import BigNumber from 'bignumber.js';\n7: import axios from 'axios';\n8: \n9: export interface Validation { hex: string|null; validity: boolean|null; parents: Parent[], details: SlpTransactionDetails|null, invalidReason: string|null } \n10: export type GetRawTransactionsAsync = (txid: string[]) => Promise<string[]|null>;\n11: \n12: const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))\n13: \n14: interface Parent {\n15:     txid: string;\n16:     versionType: number;\n17:     valid: boolean|null;\n18:     inputQty: BigNumber|null;\n19: }\n20: \n21: export class LocalValidator implements SlpValidator {\n22:     BITBOX: BITBOX;\n23:     cachedRawTransactions: { [txid: string]: string }\n24:     cachedValidations: { [txid: string]: Validation }\n25:     getRawTransactions: GetRawTransactionsAsync;\n26:     slp: Slp;\n27: \n28:     constructor(BITBOX: BITBOX, getRawTransactions: GetRawTransactionsAsync) {\n29:         this.BITBOX = BITBOX;\n30:         this.getRawTransactions = getRawTransactions;\n31:         this.slp = new Slp(BITBOX);\n32:         this.cachedValidations = {};\n33:         this.cachedRawTransactions = {};\n34:     }\n35: \n36:     addValidationFromStore(hex: string, isValid: boolean) {\n37:         let id = (<Buffer>this.BITBOX.Crypto.sha256(this.BITBOX.Crypto.sha256(Buffer.from(hex, 'hex'))).reverse()).toString('hex');\n38:         if(!this.cachedValidations[id])\n39:             this.cachedValidations[id] = { hex: hex, validity: isValid, parents: [], details: null, invalidReason: null }\n40:         if(!this.cachedRawTransactions[id])\n41:             this.cachedRawTransactions[id] = hex;\n42:     }\n43:     \n44:     async waitForParentValidationProcessing(txid: string) {\n45:         // TODO: Add some timeout?\n46:         let cached: Validation = this.cachedValidations[txid];\n47: \n48:         while(true) {\n49:             let slpParentCount = cached.parents.length;\n50:             let count = 0;\n51:             cached.parents.forEach(p => {\n52:                 let parent = this.cachedValidations[p.txid];\n53:                 if(parent) {\n54:                     if(typeof parent.validity === 'boolean')\n55:                         count += 1;\n56:                 }\n57:             });\n58:             if(count === slpParentCount && typeof cached.validity === 'boolean')\n59:                 break\n60:             await sleep(200);\n61:         }\n62:     }\n63: \n64:     async waitForTransactionPreProcessing(txid: string){\n65:         // TODO: Add some timeout?\n66:         while(true) {\n67:             if(this.cachedValidations[txid].hex && this.cachedValidations[txid].details)\n68:                 break\n69:             await sleep(200);\n70:         }\n71:         //await sleep(100); // short wait to make sure parent's properties gets set first.\n72:         return\n73:     }\n74: \n75:     async getRawTransaction(txid: string) {\n76:         if(this.cachedRawTransactions[txid])\n77:             return this.cachedRawTransactions[txid];\n78:         this.cachedRawTransactions[txid] = (await this.getRawTransactions([txid]))[0]\n79:         if(this.cachedRawTransactions[txid])\n80:             return this.cachedRawTransactions[txid];\n81:         return null;\n82:     }\n83: \n84:     async isValidSlpTxid(txid: string) {\n85:         if(txid && !this.cachedValidations[txid]) {\n86:             this.cachedValidations[txid] = { hex: null, validity: null, parents: [], details: null, invalidReason: null }\n87:             this.cachedValidations[txid].hex = await this.getRawTransaction(txid);\n88:         }\n89: \n90:         // Check to see how we should proceed based on the validation-cache state\n91:         if(!this.cachedValidations[txid].hex)\n92:             await this.waitForTransactionPreProcessing(txid);\n93:         if(typeof this.cachedValidations[txid].validity === 'boolean')\n94:             return this.cachedValidations[txid].validity;\n95:         if(this.cachedValidations[txid].details)\n96:             await this.waitForParentValidationProcessing(txid);\n97: \n98:         // Check SLP message validity\n99:         let txn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[txid].hex)\n100:         let slpmsg: SlpTransactionDetails;\n101:         try {\n102:             slpmsg = this.cachedValidations[txid].details = this.slp.parseSlpOutputScript(txn.outputs[0]._scriptBuffer)\n103:         } catch(e) {\n104:             this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"\n105:             return this.cachedValidations[txid].validity = false;\n106:         }\n107: \n108:         // Check DAG validity\n109:         if(slpmsg.transactionType === SlpTransactionType.GENESIS) {\n110:             return this.cachedValidations[txid].validity = true;\n111:         } \n112:         else if (slpmsg.transactionType === SlpTransactionType.MINT) {\n113:             for(let i = 0; i < txn.inputs.length; i++) {\n114:                 let input_txid = txn.inputs[i].prevTxId.toString('hex')\n115:                 let input_txhex = await this.getRawTransaction(input_txid)\n116:                 if (input_txhex) {\n117:                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);\n118:                     try {\n119:                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)\n120:                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)\n121:                             input_slpmsg.tokenIdHex = input_txid;\n122:                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {\n123:                             if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {\n124:                                 if(txn.inputs[i].outputIndex === input_slpmsg.batonVout)\n125:                                     this.cachedValidations[txid].parents.push({ txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType ,valid: null, inputQty: null })\n126:                             }\n127:                         }\n128:                     } catch(_) {}\n129:                 }\n130:             }\n131:             if(this.cachedValidations[txid].parents.length !== 1) {\n132:                 this.cachedValidations[txid].invalidReason = \"MINT transaction must have 1 valid baton parent.\"\n133:                 return this.cachedValidations[txid].validity = false;\n134:             }\n135:         }\n136:         else if(slpmsg.transactionType === SlpTransactionType.SEND) {\n137:             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))\n138:             let tokenInQty = new BigNumber(0);\n139:             for(let i = 0; i < txn.inputs.length; i++) {\n140:                 let input_txid = txn.inputs[i].prevTxId.toString('hex')\n141:                 let input_txhex = await this.getRawTransaction(input_txid)\n142:                 if (input_txhex) {\n143:                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);\n144:                     try {\n145:                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)\n146:                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)\n147:                             input_slpmsg.tokenIdHex = input_txid;\n148:                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {\n149:                             if(input_slpmsg.transactionType === SlpTransactionType.SEND) {\n150:                                 tokenInQty = tokenInQty.plus(input_slpmsg.sendOutputs[txn.inputs[i].outputIndex])\n151:                                 this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.sendOutputs[txn.inputs[i].outputIndex] })\n152:                             }\n153:                             else if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {\n154:                                 if(txn.inputs[i].outputIndex === 1)\n155:                                     tokenInQty = tokenInQty.plus(input_slpmsg.genesisOrMintQuantity)\n156:                                     this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.genesisOrMintQuantity })\n157:                             }\n158:                         }\n159:                     } catch(_) {}\n160:                 }\n161:             }\n162:             \n163:             // Check token inputs are greater than token outputs (includes valid and invalid inputs)\n164:             if(tokenOutQty.isGreaterThan(tokenInQty)) {\n165:                 this.cachedValidations[txid].invalidReason = \"Token outputs are greater than possible token inputs.\"\n166:                 return this.cachedValidations[txid].validity = false;\n167:             }\n168:         }\n169: \n170:         // Set validity validation-cache for parents, and handle MINT condition with no valid input\n171:         for(let i = 0; i < this.cachedValidations[txid].parents.length; i++) {\n172:             let valid = await this.isValidSlpTxid(this.cachedValidations[txid].parents[i].txid)\n173:             this.cachedValidations[txid].parents.find(p => p.txid === this.cachedValidations[txid].parents[i].txid).valid = valid;\n174:             if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.MINT && !valid) {\n175:                 this.cachedValidations[txid].invalidReason = \"MINT transaction with invalid baton parent.\"\n176:                 return this.cachedValidations[txid].validity = false;\n177:             }\n178:         }\n179: \n180:         // Check valid inputs are greater than token outputs\n181:         if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {\n182:             let validInputQty = this.cachedValidations[txid].parents.reduce((t, v) => { return v.valid ? t.plus(v.inputQty) : t }, new BigNumber(0));\n183:             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))\n184:             if(tokenOutQty.isGreaterThan(validInputQty)) {\n185:                 this.cachedValidations[txid].invalidReason = \"Token outputs are greater than valid token inputs.\"\n186:                 return this.cachedValidations[txid].validity = false;\n187:             }\n188:         }\n189: \n190:         // Check versionType is not different from any valid parent\n191:         if(this.cachedValidations[txid].parents.filter(p => p.valid).length > 0) {\n192:             let validVersionType = this.cachedValidations[txid].parents.find(p => p.valid).versionType;\n193:             if(this.cachedValidations[txid].details.versionType !== validVersionType) {\n194:                 this.cachedValidations[txid].invalidReason = \"SLP version/type mismatch from valid parent.\"\n195:                 return this.cachedValidations[txid].validity = false;\n196:             }\n197:         } \n198:         // For case with 0 token SEND with no valid parents, must check GENESIS validity / versionType.\n199:         else if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {\n200:             let slpmsg = this.cachedValidations[txid].details\n201:             let valid = await this.isValidSlpTxid(slpmsg.tokenIdHex);\n202:             if(valid) {\n203:                 let genesisTxn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[slpmsg.tokenIdHex].hex)\n204:                 let genesisMsg = this.slp.parseSlpOutputScript(genesisTxn.outputs[0]._scriptBuffer)\n205:                 if(genesisMsg.versionType !== slpmsg.versionType) {\n206:                     this.cachedValidations[txid].invalidReason = \"SLP version/type mismatch from valid GENESIS.\"\n207:                     return this.cachedValidations[txid].validity = false;\n208:                 }\n209:             } else {\n210:                 this.cachedValidations[txid].invalidReason = \"SEND has 0 outputs, but has invalid token GENESIS.\"\n211:                 console.log(this.cachedValidations[slpmsg.tokenIdHex].invalidReason)\n212:                 return this.cachedValidations[txid].validity = false;\n213:             }\n214:         }\n215: \n216:         return this.cachedValidations[txid].validity = true;\n217:     }\n218: \n219:     async validateSlpTransactions(txids: string[]): Promise<string[]> {\n220:         let res = [];\n221:         for (let i = 0; i < txids.length; i++) {\n222:             res.push((await this.isValidSlpTxid) ? txids[i] : '')\n223:         }\n224:         return res.filter((id: string) => id.length > 0);\n225:     }\n226: }",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-534",
+      "cwe_name": "Information Exposure Through Debug Log Files",
+      "fit_reason": "The code directly injects exception messages (including e.message) into invalidReason without sanitization, which could expose sensitive data in logs.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "fit_reason": "The SLP transaction parsing error handling demonstrates incorrect processing of structured data (OP_RETURN script buffers) leading to potential information leakage.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-125",
+    "CWE-19",
+    "CWE-255",
+    "CWE-311",
+    "CWE-425",
+    "CWE-471",
+    "CWE-534",
+    "CWE-668",
+    "CWE-77",
+    "CWE-863",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 104,
+      "statement": "this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"",
+      "cwe_id": "CWE-534",
+      "cwe_name": "Information Exposure Through Debug Log Files",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "The code does not write to debug log files directly; it sets an invalidReason string that may be used elsewhere, but there is no explicit logging mechanism shown."
+        },
+        "connection": {
+          "score": 0.0,
+          "evidence": "There is no evidence that the invalidReason string is written to a debug log file or any other logging mechanism in the provided code context."
+        },
+        "diff_causality": {
+          "score": 0.0,
+          "evidence": "The line sets an invalidReason but does not involve logging or debug output. Reverting this line would only change the error message, not affect any logging behavior."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "No security control related to logging or information exposure is demonstrated in the code context.",
+          "required_control": "Logging sanitization",
+          "control_requirement_evidence": "CWE-534 requires that sensitive information not be exposed through debug logs, which would require sanitizing exception messages before logging.",
+          "existing_controls_checked": [],
+          "deficiency_evidence": "No logging or sanitization mechanism is present in the code to prevent exposure of e.message."
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "There is no evidence that the invalidReason string is actually logged, nor that it leads to information disclosure through debug logs."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the invalidReason would not be set with the exception message, but since there's no logging mechanism shown in the code, this change would not affect any actual exposure of sensitive data.",
+      "supporting_evidence": [
+        "The statement directly assigns e.message to invalidReason without sanitization",
+        "The code context shows no logging or debug output mechanisms"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether invalidReason is actually logged to a debug file",
+        "Whether the system has any logging mechanism that would expose e.message"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.0,
+      "score": 0.0
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 104,
+      "statement": "this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"",
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The code catches exceptions during SLP OP_RETURN parsing and logs them, but this is a general data processing error handling pattern rather than a specific mechanism like buffer overflow or injection."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The exception e.message from the parseSlpOutputScript call is directly used in constructing invalidReason. This shows a connection between the parsing error and the reported reason, but does not establish attacker control over the input that causes the error."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted to not include the e.message in invalidReason, the error reporting would be less informative but not fundamentally different from a generic error message. The change adds specific error context which could aid debugging or potentially expose internal state if e.message contains sensitive information."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "There is no explicit validation or sanitization of the exception message before including it in invalidReason. The code does not demonstrate a control to prevent information leakage.",
+          "required_control": "Sanitization of error messages",
+          "control_requirement_evidence": "CWE-19 covers data processing errors, and in this context, including raw exception messages can lead to information disclosure if they contain sensitive internal details.",
+          "existing_controls_checked": [
+            "No explicit sanitization or filtering of e.message before inclusion in invalidReason"
+          ],
+          "deficiency_evidence": "The code directly interpolates e.message into the error string without any checks for sensitive content, which could expose internal implementation details."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "While the mechanism is present (including exception messages in logs), it's unclear if the specific exception messages contain sensitive information that would lead to a concrete security consequence without further evidence of what e.message contains."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the error reporting would lose specificity about the parsing failure, but the core vulnerability mechanism of including raw exception data in logs would remain unchanged unless other controls are added.",
+      "supporting_evidence": [
+        "The code catches exceptions during SLP OP_RETURN parsing and includes e.message in invalidReason",
+        "The line directly interpolates exception message into error reporting"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the exception messages (e.message) contain sensitive information that could lead to information disclosure",
+        "Whether attacker control over input can influence the content of e.message"
+      ],
+      "review_comment": "The code includes raw exception messages in error reporting which may expose internal implementation details. While not directly exploitable, this could aid an attacker in understanding system internals. Sanitize or filter exception messages before inclusion in logs to prevent potential information leakage.",
+      "change_type": "A",
+      "raw_score": 0.5,
+      "score": 0.5
+    }
+  ],
+  "stage4_status": "completed"
+}

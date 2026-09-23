@@ -1,0 +1,367 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "bottle.py",
+  "changed_line": 895,
+  "statement": "return FormsDict((c.key, c.value) for c in cookies.values())",
+  "change_type": "A",
+  "function_name": "BaseRequest.cookies",
+  "operation_type": "construction_of_security_sensitive_value",
+  "selection_reason": "HTTP_COOKIE environment variable -> parsing into SimpleCookie -> constructing FormsDict from cookie values without decoding signed cookies",
+  "security_relevance_score": 0.7,
+  "code_context": "746:     def _cast(self, out, request, response, peek=None):\n747:         \"\"\" Try to convert the parameter into something WSGI compatible and set\n748:         correct HTTP headers when possible.\n749:         Support: False, str, unicode, dict, HTTPResponse, HTTPError, file-like,\n750:         iterable of strings and iterable of unicodes\n751:         \"\"\"\n752: \n753:         # Empty output is done here\n754:         if not out:\n755:             response['Content-Length'] = 0\n756:             return []\n757:         # Join lists of byte or unicode strings. Mixed lists are NOT supported\n758:         if isinstance(out, (tuple, list))\\\n759:         and isinstance(out[0], (bytes, unicode)):\n760:             out = out[0][0:0].join(out) # b'abc'[0:0] -> b''\n761:         # Encode unicode strings\n762:         if isinstance(out, unicode):\n763:             out = out.encode(response.charset)\n764:         # Byte Strings are just returned\n765:         if isinstance(out, bytes):\n766:             response['Content-Length'] = len(out)\n767:             return [out]\n768:         # HTTPError or HTTPException (recursive, because they may wrap anything)\n769:         # TODO: Handle these explicitly in handle() or make them iterable.\n770:         if isinstance(out, HTTPError):\n771:             out.apply(response)\n772:             out = self.error_handler.get(out.status, repr)(out)\n773:             if isinstance(out, HTTPResponse):\n774:                 depr('Error handlers must not return :exc:`HTTPResponse`.') #0.9\n775:             return self._cast(out, request, response)\n776:         if isinstance(out, HTTPResponse):\n777:             out.apply(response)\n778:             return self._cast(out.output, request, response)\n779: \n780:         # File-like objects.\n781:         if hasattr(out, 'read'):\n782:             if 'wsgi.file_wrapper' in request.environ:\n783:                 return request.environ['wsgi.file_wrapper'](out)\n784:             elif hasattr(out, 'close') or not hasattr(out, '__iter__'):\n785:                 return WSGIFileWrapper(out)\n786: \n787:         # Handle Iterables. We peek into them to detect their inner type.\n788:         try:\n789:             out = iter(out)\n790:             first = out.next()\n791:             while not first:\n792:                 first = out.next()\n793:         except StopIteration:\n794:             return self._cast('', request, response)\n795:         except HTTPResponse:\n796:             first = _e()\n797:         except (KeyboardInterrupt, SystemExit, MemoryError):\n798:             raise\n799:         except Exception:\n800:             if self.catchall: raise\n801:             first = HTTPError(500, 'Unhandled exception', _e(), format_exc(10))\n802: \n803:         # These are the inner types allowed in iterator or generator objects.\n804:         if isinstance(first, HTTPResponse):\n805:             return self._cast(first, request, response)\n806:         if isinstance(first, bytes):\n807:             return itertools.chain([first], out)\n808:         if isinstance(first, unicode):\n809:             return itertools.imap(lambda x: x.encode(response.charset),\n810:                                   itertools.chain([first], out))\n811:         return self._cast(HTTPError(500, 'Unsupported response type: %s'\\\n812:                                          % type(first)), request, response)\n813: \n814:     def wsgi(self, environ, start_response):\n815:         \"\"\" The bottle WSGI-interface. \"\"\"\n816:         try:\n817:             environ['bottle.app'] = self\n818:             request.bind(environ)\n819:             response.bind()\n820:             out = self._cast(self._handle(environ), request, response)\n821:             # rfc2616 section 4.3\n822:             if response._status_code in (100, 101, 204, 304)\\\n823:             or request.method == 'HEAD':\n824:                 if hasattr(out, 'close'): out.close()\n825:                 out = []\n826:             start_response(response._status_line, list(response.iter_headers()))\n827:             return out\n828:         except (KeyboardInterrupt, SystemExit, MemoryError):\n829:             raise\n830:         except Exception:\n831:             if not self.catchall: raise\n832:             err = '<h1>Critical error while processing request: %s</h1>' \\\n833:                   % environ.get('PATH_INFO', '/')\n834:             if DEBUG:\n835:                 err += '<h2>Error:</h2>\\n<pre>%s</pre>\\n' % repr(_e())\n836:                 err += '<h2>Traceback:</h2>\\n<pre>%s</pre>\\n' % format_exc(10)\n837:             environ['wsgi.errors'].write(err) #TODO: wsgi.error should not get html\n838:             start_response('500 INTERNAL SERVER ERROR', [('Content-Type', 'text/html')])\n839:             return [tob(err)]\n840: \n841:     def __call__(self, environ, start_response):\n842:         ''' Each instance of :class:'Bottle' is a WSGI application. '''\n843:         return self.wsgi(environ, start_response)\n844: \n845: \n846: \n847: \n848: \n849: \n850: ###############################################################################\n851: # HTTP and WSGI Tools ##########################################################\n852: ###############################################################################\n853: \n854: \n855: class BaseRequest(DictMixin):\n856:     \"\"\" A wrapper for WSGI environment dictionaries that adds a lot of\n857:         convenient access methods and properties. Most of them are read-only.\"\"\"\n858: \n859:     #: Maximum size of memory buffer for :attr:`body` in bytes.\n860:     MEMFILE_MAX = 102400\n861: \n862:     def __init__(self, environ):\n863:         \"\"\" Wrap a WSGI environ dictionary. \"\"\"\n864:         #: The wrapped WSGI environ dictionary. This is the only real attribute.\n865:         #: All other attributes actually are read-only properties.\n866:         self.environ = environ\n867:         environ['bottle.request'] = self\n868: \n869:     @property\n870:     def path(self):\n871:         ''' The value of ``PATH_INFO`` with exactly one prefixed slash (to fix\n872:             broken clients and avoid the \"empty path\" edge case). '''\n873:         return '/' + self.environ.get('PATH_INFO','').lstrip('/')\n874: \n875:     @property\n876:     def method(self):\n877:         ''' The ``REQUEST_METHOD`` value as an uppercase string. '''\n878:         return self.environ.get('REQUEST_METHOD', 'GET').upper()\n879: \n880:     @DictProperty('environ', 'bottle.request.headers', read_only=True)\n881:     def headers(self):\n882:         ''' A :class:`WSGIHeaderDict` that provides case-insensitive access to\n883:             HTTP request headers. '''\n884:         return WSGIHeaderDict(self.environ)\n885: \n886:     def get_header(self, name, default=None):\n887:         ''' Return the value of a request header, or a given default value. '''\n888:         return self.headers.get(name, default)\n889: \n890:     @DictProperty('environ', 'bottle.request.cookies', read_only=True)\n891:     def cookies(self):\n892:         \"\"\" Cookies parsed into a :class:`FormsDict`. Signed cookies are NOT\n893:             decoded. Use :meth:`get_cookie` if you expect signed cookies. \"\"\"\n894:         cookies = SimpleCookie(self.environ.get('HTTP_COOKIE',''))\n895:         return FormsDict((c.key, c.value) for c in cookies.values())\n896: \n897:     def get_cookie(self, key, default=None, secret=None):\n898:         \"\"\" Return the content of a cookie. To read a `Signed Cookie`, the\n899:             `secret` must match the one used to create the cookie (see\n900:             :meth:`BaseResponse.set_cookie`). If anything goes wrong (missing\n901:             cookie or wrong signature), return a default value. \"\"\"\n902:         value = self.cookies.get(key)\n903:         if secret and value:\n904:             dec = cookie_decode(value, secret) # (key, value) tuple or None\n905:             return dec[1] if dec and dec[0] == key else default\n906:         return value or default\n907: \n908:     @DictProperty('environ', 'bottle.request.query', read_only=True)\n909:     def query(self):\n910:         ''' The :attr:`query_string` parsed into a :class:`FormsDict`. These\n911:             values are sometimes called \"URL arguments\" or \"GET parameters\", but\n912:             not to be confused with \"URL wildcards\" as they are provided by the\n913:             :class:`Router`. '''\n914:         data = parse_qs(self.query_string, keep_blank_values=True)\n915:         get = self.environ['bottle.get'] = FormsDict()\n916:         for key, values in data.items():\n917:             for value in values:\n918:                 get[key] = value\n919:         return get\n920: \n921:     @DictProperty('environ', 'bottle.request.forms', read_only=True)\n922:     def forms(self):\n923:         \"\"\" Form values parsed from an `url-encoded` or `multipart/form-data`\n924:             encoded POST or PUT request body. The result is retuned as a\n925:             :class:`FormsDict`. All keys and values are strings. File uploads\n926:             are stored separately in :attr:`files`. \"\"\"\n927:         forms = FormsDict()\n928:         for name, item in self.POST.iterallitems():\n929:             if not hasattr(item, 'filename'):\n930:                 forms[name] = item\n931:         return forms\n932: \n933:     @DictProperty('environ', 'bottle.request.params', read_only=True)\n934:     def params(self):\n935:         \"\"\" A :class:`FormsDict` with the combined values of :attr:`query` and\n936:             :attr:`forms`. File uploads are stored in :attr:`files`. \"\"\"\n937:         params = FormsDict()\n938:         for key, value in self.query.iterallitems():\n939:             params[key] = value\n940:         for key, value in self.forms.iterallitems():\n941:             params[key] = value\n942:         return params\n943: \n944:     @DictProperty('environ', 'bottle.request.files', read_only=True)\n945:     def files(self):\n946:         \"\"\" File uploads parsed from an `url-encoded` or `multipart/form-data`\n947:             encoded POST or PUT request body. The values are instances of\n948:             :class:`cgi.FieldStorage`. The most important attributes are:\n949: \n950:             filename\n951:                 The filename, if specified; otherwise None; this is the client\n952:                 side filename, *not* the file name on which it is stored (that's\n953:                 a temporary file you don't deal with)\n954:             file\n955:                 The file(-like) object from which you can read the data.\n956:             value\n957:                 The value as a *string*; for file uploads, this transparently\n958:                 reads the file every time you request the value. Do not do this\n959:                 on big files.\n960:         \"\"\"\n961:         files = FormsDict()\n962:         for name, item in self.POST.iterallitems():\n963:             if hasattr(item, 'filename'):\n964:                 files[name] = item\n965:         return files\n966: \n967:     @DictProperty('environ', 'bottle.request.json', read_only=True)\n968:     def json(self):\n969:         ''' If the ``Content-Type`` header is ``application/json``, this\n970:             property holds the parsed content of the request body. Only requests\n971:             smaller than :attr:`MEMFILE_MAX` are processed to avoid memory\n972:             exhaustion. '''\n973:         if 'application/json' in self.environ.get('CONTENT_TYPE', '') \\\n974:         and 0 < self.content_length < self.MEMFILE_MAX:\n975:             return json_loads(self.body.read(self.MEMFILE_MAX))\n976:         return None\n977: \n978:     @DictProperty('environ', 'bottle.request.body', read_only=True)\n979:     def _body(self):\n980:         maxread = max(0, self.content_length)\n981:         stream = self.environ['wsgi.input']\n982:         body = BytesIO() if maxread < self.MEMFILE_MAX else TemporaryFile(mode='w+b')\n983:         while maxread > 0:\n984:             part = stream.read(min(maxread, self.MEMFILE_MAX))\n985:             if not part: break\n986:             body.write(part)\n987:             maxread -= len(part)\n988:         self.environ['wsgi.input'] = body\n989:         body.seek(0)\n990:         return body\n991: \n992:     @property\n993:     def body(self):\n994:         \"\"\" The HTTP request body as a seek-able file-like object. Depending on\n995:             :attr:`MEMFILE_MAX`, this is either a temporary file or a\n996:             :class:`io.BytesIO` instance. Accessing this property for the first\n997:             time reads and replaces the ``wsgi.input`` environ variable.\n998:             Subsequent accesses just do a `seek(0)` on the file object. \"\"\"\n999:         self._body.seek(0)\n1000:         return self._body\n1001: \n1002:     #: An alias for :attr:`query`.\n1003:     GET = query\n1004: \n1005:     @DictProperty('environ', 'bottle.request.post', read_only=True)\n1006:     def POST(self):\n1007:         \"\"\" The values of :attr:`forms` and :attr:`files` combined into a single\n1008:             :class:`FormsDict`. Values are either strings (form values) or\n1009:             instances of :class:`cgi.FieldStorage` (file uploads).\n1010:         \"\"\"\n1011:         post = FormsDict()\n1012:         safe_env = {'QUERY_STRING':''} # Build a safe environment for cgi\n1013:         for key in ('REQUEST_METHOD', 'CONTENT_TYPE', 'CONTENT_LENGTH'):\n1014:             if key in self.environ: safe_env[key] = self.environ[key]\n1015:         if NCTextIOWrapper:\n1016:             fb = NCTextIOWrapper(self.body, encoding='ISO-8859-1', newline='\\n')\n1017:         else:\n1018:             fb = self.body\n1019:         data = cgi.FieldStorage(fp=fb, environ=safe_env, keep_blank_values=True)\n1020:         for item in data.list or []:\n1021:             post[item.name] = item if item.filename else item.value\n1022:         return post\n1023: \n1024:     @property\n1025:     def COOKIES(self):\n1026:         ''' Alias for :attr:`cookies` (deprecated). '''\n1027:         depr('BaseRequest.COOKIES was renamed to BaseRequest.cookies (lowercase).')\n1028:         return self.cookies\n1029: \n1030:     @property\n1031:     def url(self):\n1032:         \"\"\" The full request URI including hostname and scheme. If your app\n1033:             lives behind a reverse proxy or load balancer and you get confusing\n1034:             results, make sure that the ``X-Forwarded-Host`` header is set\n1035:             correctly. \"\"\"\n1036:         return self.urlparts.geturl()\n1037: \n1038:     @DictProperty('environ', 'bottle.request.urlparts', read_only=True)\n1039:     def urlparts(self):\n1040:         ''' The :attr:`url` string as an :class:`urlparse.SplitResult` tuple.\n1041:             The tuple contains (scheme, host, path, query_string and fragment),\n1042:             but the fragment is always empty because it is not visible to the\n1043:             server. '''\n1044:         env = self.environ",
+  "source_summary": "HTTP_COOKIE environment variable -> SimpleCookie parsing -> FormsDict construction with raw cookie values",
+  "sink_summary": "FormsDict accessible via request.cookies property, used by get_cookie() method and potentially by application code",
+  "guard_summary": "Signed cookies are not automatically decoded in cookies() property; get_cookie() method provides signature verification when secret is provided",
+  "risk_pattern": "Raw cookie values from HTTP_COOKIE header are exposed without validation or sanitization, potentially exposing signed cookie payloads that could be manipulated or contain sensitive data",
+  "used_variable_sources": [
+    "self.environ['HTTP_COOKIE']"
+  ],
+  "called_function_context": [
+    "SimpleCookie",
+    "FormsDict"
+  ],
+  "enclosing_conditions": [],
+  "context_summary": "The cookies property parses HTTP cookies into a FormsDict without decoding signed cookies. Signed cookie handling requires explicit use of get_cookie() with a secret parameter for verification.",
+  "unresolved_facts": [
+    "How application code uses the cookies property vs get_cookie method",
+    "Whether signed cookies contain sensitive data that should not be exposed raw",
+    "If there are any validation or sanitization steps applied to cookie values before use"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "fit_reason": "Cookie values from HTTP_COOKIE header are parsed into FormsDict without validation or sanitization, allowing cookie poisoning attacks",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-347",
+      "cwe_name": "Improper Verification of Cryptographic Signature",
+      "fit_reason": "Signed cookies are exposed in raw form without automatic signature verification; verification requires explicit use of get_cookie() method",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-1004",
+      "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+      "fit_reason": "Cookies are parsed and exposed without consideration for security attributes like HttpOnly",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-93",
+      "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+      "fit_reason": "Cookie values containing CRLF sequences could be used for injection attacks if not properly neutralized",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-113",
+      "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+      "fit_reason": "Cookie values could potentially be used in HTTP header contexts without proper CRLF neutralization",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1004",
+    "CWE-113",
+    "CWE-1275",
+    "CWE-20",
+    "CWE-208",
+    "CWE-287",
+    "CWE-321",
+    "CWE-327",
+    "CWE-347",
+    "CWE-563",
+    "CWE-770",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "bottle.py",
+      "changed_line": 895,
+      "statement": "return FormsDict((c.key, c.value) for c in cookies.values())",
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.3,
+          "evidence": "The candidate line constructs a FormsDict from raw cookie values. CWE-20's defining mechanism is the failure to validate input properties required for safe processing. The evidence shows cookie values are passed through without validation, but does not demonstrate a specific downstream processing that requires validation for safety."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "Externally controlled input from HTTP_COOKIE environment variable is directly connected to the FormsDict construction. The path is: self.environ['HTTP_COOKIE'] → SimpleCookie() → FormsDict((c.key, c.value) for c in cookies.values())."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "The candidate line is the sole mechanism that creates the FormsDict from parsed cookies. If this line were reverted, the cookies property would not return a FormsDict containing the raw cookie values, breaking the exposure path."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "",
+          "required_control": "Validation of cookie names and values before storage in a dictionary accessible to application code.",
+          "control_requirement_evidence": "CWE-20 requires validation when input properties affect safe processing. Cookie values could contain malicious content that affects downstream usage (e.g., injection if used in templates, SQL, or commands).",
+          "existing_controls_checked": [
+            "SimpleCookie parsing handles basic cookie format",
+            "get_cookie() method provides signature verification for signed cookies when secret is supplied",
+            "Documentation warns signed cookies are not decoded in cookies() property"
+          ],
+          "deficiency_evidence": "No validation of cookie names/values for dangerous characters, size limits, or expected formats. The control deficiency is that raw, unvalidated values are exposed. However, evidence does not establish that downstream usage requires specific validation for safety; the deficiency is generic absence rather than demonstrated necessity."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No concrete security consequence is demonstrated. The evidence shows raw cookie values are exposed, but does not show how they are used in a way that leads to code execution, data access, or modification. Impact remains speculative."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the cookies property would not return a FormsDict containing the raw cookie values parsed from HTTP_COOKIE. The property would need alternative implementation to provide cookie access.",
+      "supporting_evidence": [
+        "HTTP_COOKIE environment variable is parsed by SimpleCookie",
+        "Cookie values are passed directly to FormsDict constructor without modification",
+        "Documentation states 'Signed cookies are NOT decoded' indicating raw values are exposed"
+      ],
+      "contradicting_evidence": [
+        "The get_cookie() method provides signature verification for signed cookies when secret is supplied",
+        "Documentation explicitly warns developers about signed cookie handling"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "How application code uses the cookies property vs get_cookie method",
+        "Whether signed cookies contain sensitive data that should not be exposed raw",
+        "If there are any validation or sanitization steps applied to cookie values before use in downstream processing",
+        "Whether cookie values are used in contexts requiring validation (e.g., database queries, command execution, template rendering)"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.52,
+      "score": 0.52
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "bottle.py",
+      "changed_line": 895,
+      "statement": "return FormsDict((c.key, c.value) for c in cookies.values())",
+      "cwe_id": "CWE-347",
+      "cwe_name": "Improper Verification of Cryptographic Signature",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code exposes signed cookie values without automatic signature verification. Verification is optional and requires explicit use of get_cookie() method with a secret parameter."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "HTTP_COOKIE environment variable is parsed into SimpleCookie, then raw cookie values are exposed via cookies() property. Application code can access these values directly without signature verification."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The candidate line constructs the FormsDict from cookie values. If reverted, the cookies property would not expose raw cookie values, forcing all cookie access through get_cookie() which provides signature verification."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "",
+          "required_control": "Mandatory cryptographic signature verification for signed cookies before exposure",
+          "control_requirement_evidence": "CWE-347 requires verification of cryptographic signatures before trusting signed data. Signed cookies contain cryptographic signatures that must be verified.",
+          "existing_controls_checked": [
+            "get_cookie() method provides optional signature verification when secret parameter is provided"
+          ],
+          "deficiency_evidence": "The cookies property bypasses signature verification by exposing raw cookie values, allowing unsigned or tampered cookies to be accessed as if they were valid"
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Potential exposure of signed cookie payloads without verification, but specific security consequences depend on how application code uses the cookies property vs get_cookie method."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the cookies property would not exist, forcing all cookie access through get_cookie() method which provides mandatory signature verification for signed cookies.",
+      "supporting_evidence": [
+        "Documentation states: 'Signed cookies are NOT decoded. Use get_cookie() if you expect signed cookies'",
+        "get_cookie() method provides signature verification with cookie_decode() function when secret is provided",
+        "Raw cookie values from HTTP_COOKIE header are exposed without cryptographic verification"
+      ],
+      "contradicting_evidence": [
+        "The code explicitly documents that signed cookies are not decoded in the cookies property",
+        "get_cookie() method provides proper signature verification as an alternative"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether application code uses cookies property for signed cookies instead of get_cookie()",
+        "What sensitive data might be exposed in signed cookie payloads",
+        "Whether there are validation steps in application code that mitigate this risk"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.42000000000000004,
+      "score": 0.42000000000000004
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "bottle.py",
+      "changed_line": 895,
+      "statement": "return FormsDict((c.key, c.value) for c in cookies.values())",
+      "cwe_id": "CWE-1004",
+      "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-1004 specifically requires that a cookie storing sensitive information lacks the HttpOnly flag. The demonstrated code parses incoming cookies but does not set or check cookie flags at all."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "HTTP_COOKIE environment variable is parsed into SimpleCookie, then cookie values are extracted and placed into FormsDict. This connects external input to the cookie storage mechanism."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The candidate line constructs the FormsDict from cookie values. If reverted, cookie parsing would fail or return empty data, but this doesn't relate to HttpOnly flag setting."
+        },
+        "security_control": {
+          "score": 0.15,
+          "evidence": "",
+          "required_control": "HttpOnly flag setting on cookies containing sensitive information",
+          "control_requirement_evidence": "CWE-1004 requires that cookies storing sensitive data must have HttpOnly flag to prevent client-side script access",
+          "existing_controls_checked": [
+            "This code only parses incoming cookies, does not set response cookies or check flags"
+          ],
+          "deficiency_evidence": "The code demonstrates cookie parsing, not cookie setting. HttpOnly flag is a response header attribute, not applicable to request parsing."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No evidence that this code sets cookies or that sensitive information is stored in cookies without HttpOnly flag. The code only parses incoming request cookies."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the cookies property would not return parsed cookie data, breaking cookie functionality entirely, but this doesn't relate to HttpOnly flag security.",
+      "supporting_evidence": [
+        "Code parses HTTP_COOKIE environment variable into SimpleCookie object",
+        "Cookie values are extracted and placed into FormsDict for application access"
+      ],
+      "contradicting_evidence": [
+        "CWE-1004 requires cookie setting with missing HttpOnly flag, but this code only parses incoming cookies",
+        "No evidence of cookie creation or response header setting in this code",
+        "HttpOnly flag is a server response attribute, not applicable to request parsing"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether this application sets cookies in responses",
+        "If any cookies set by the application contain sensitive information",
+        "Whether HttpOnly flag is properly set on response cookies"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.23000000000000004,
+      "score": 0.23000000000000004
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "bottle.py",
+      "changed_line": 895,
+      "statement": "return FormsDict((c.key, c.value) for c in cookies.values())",
+      "cwe_id": "CWE-93",
+      "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-93 requires CRLF sequences to be used as special elements for injection, but the code simply parses cookies into a dictionary without using CRLF as delimiters or special markers"
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "HTTP_COOKIE environment variable is parsed by SimpleCookie and values are passed to FormsDict construction"
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The candidate line constructs the FormsDict from cookie values, but there is no evidence this creates CRLF injection vulnerability"
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "CRLF sequence neutralization when CRLF is used as a special element",
+          "control_requirement_evidence": "CWE-93 requires neutralization only when CRLF sequences are used as delimiters or special elements in the processing logic",
+          "existing_controls_checked": [
+            "SimpleCookie parsing handles cookie format, FormsDict stores key-value pairs"
+          ],
+          "deficiency_evidence": "No evidence that CRLF sequences are treated as special elements requiring neutralization in this cookie parsing context"
+        },
+        "concrete_impact": {
+          "score": 0.15,
+          "evidence": "No demonstrated path where CRLF sequences in cookie values could cause injection attacks through this code"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, cookie values would still be parsed by SimpleCookie but not exposed via the FormsDict property, but this doesn't relate to CRLF injection mechanisms.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "CWE-93 requires CRLF to be used as a special element/delimiter, but cookie parsing uses standard cookie format delimiters (semicolons, equals signs)",
+        "FormsDict construction simply stores key-value pairs without using CRLF as record separators",
+        "No evidence of CRLF-based injection vectors in the cookie parsing and storage mechanism"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether downstream code uses cookie values in contexts where CRLF sequences could cause injection",
+        "How cookie values are ultimately used by application code"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.22999999999999998,
+      "score": 0.22999999999999998
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "bottle.py",
+      "changed_line": 895,
+      "statement": "return FormsDict((c.key, c.value) for c in cookies.values())",
+      "cwe_id": "CWE-113",
+      "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-113 specifically requires CRLF sequences in HTTP headers that enable request/response splitting. The candidate parses incoming cookies into a FormsDict but does not demonstrate header generation or CRLF injection into HTTP responses."
+        },
+        "connection": {
+          "score": 0.15,
+          "evidence": "HTTP_COOKIE header is parsed into SimpleCookie, then values are extracted. No evidence shows these values being used in HTTP response headers where CRLF sequences could cause splitting."
+        },
+        "diff_causality": {
+          "score": 0.2,
+          "evidence": "The candidate adds cookie parsing functionality. If reverted, cookie parsing would not occur, but this doesn't materially affect HTTP header generation or CRLF handling mechanisms."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "CRLF neutralization in HTTP header generation",
+          "control_requirement_evidence": "CWE-113 requires neutralization when user input is reflected in HTTP headers to prevent injection of CRLF sequences",
+          "existing_controls_checked": [
+            "Cookie parsing only extracts values without header generation"
+          ],
+          "deficiency_evidence": "No HTTP header generation is demonstrated, so CRLF control deficiency cannot be established"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No evidence demonstrates cookie values being reflected in HTTP response headers where CRLF injection could cause request/response splitting attacks."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, cookie parsing would not occur, but HTTP header generation and CRLF handling mechanisms would remain unchanged since no header generation is demonstrated.",
+      "supporting_evidence": [
+        "HTTP_COOKIE header is parsed from environment",
+        "Cookie values are extracted without modification"
+      ],
+      "contradicting_evidence": [
+        "No HTTP response header generation is demonstrated",
+        "CWE-113 requires CRLF injection into HTTP headers, which is not shown"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether cookie values are ever used in HTTP response headers",
+        "If any header generation occurs downstream that could be vulnerable to CRLF injection"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.13,
+      "score": 0.13
+    }
+  ],
+  "stage4_status": "completed"
+}

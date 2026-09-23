@@ -1,0 +1,240 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "glance/api/v2/images.py",
+      "changed_line": 282,
+      "statement": "self.db_api.image_update(req.context, image_id, {'status': status})",
+      "change_type": "A",
+      "function_name": "",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+      "security_relevance_score": 0.7,
+      "code_context": "133:             raise webob.exc.HTTPBadRequest(explanation=unicode(e))\n134:         except exception.InvalidSortKey as e:\n135:             raise webob.exc.HTTPBadRequest(explanation=unicode(e))\n136:         except exception.NotFound as e:\n137:             raise webob.exc.HTTPBadRequest(explanation=unicode(e))\n138:         images = [self._normalize_properties(dict(image)) for image in images]\n139:         result['images'] = [self._append_tags(req.context, image)\n140:                             for image in images]\n141:         return result\n142: \n143:     def _get_image(self, context, image_id):\n144:         try:\n145:             return self.db_api.image_get(context, image_id)\n146:         except (exception.NotFound, exception.Forbidden):\n147:             raise webob.exc.HTTPNotFound()\n148: \n149:     def show(self, req, image_id):\n150:         self._enforce(req, 'get_image')\n151:         image = self._get_image(req.context, image_id)\n152:         image = self._normalize_properties(dict(image))\n153:         return self._append_tags(req.context, image)\n154: \n155:     @utils.mutating\n156:     def update(self, req, image_id, changes):\n157:         self._enforce(req, 'modify_image')\n158:         context = req.context\n159:         try:\n160:             image = self.db_api.image_get(context, image_id)\n161:         except (exception.NotFound, exception.Forbidden):\n162:             msg = (\"Failed to find image %(image_id)s to update\" % locals())\n163:             LOG.info(msg)\n164:             raise webob.exc.HTTPNotFound(explanation=msg)\n165: \n166:         image = self._normalize_properties(dict(image))\n167:         updates = self._extract_updates(req, image, changes)\n168: \n169:         tags = None\n170:         if len(updates) > 0:\n171:             tags = self._extract_tags(updates)\n172:             purge_props = 'properties' in updates\n173:             try:\n174:                 image = self.db_api.image_update(context, image_id, updates,\n175:                                                  purge_props)\n176:             except (exception.NotFound, exception.Forbidden):\n177:                 raise webob.exc.HTTPNotFound()\n178:             image = self._normalize_properties(dict(image))\n179: \n180:         v2.update_image_read_acl(req, self.store_api, self.db_api, image)\n181: \n182:         if tags is not None:\n183:             self.db_api.image_tag_set_all(req.context, image_id, tags)\n184:             image['tags'] = tags\n185:         else:\n186:             self._append_tags(req.context, image)\n187: \n188:         self.notifier.info('image.update', image)\n189:         return image\n190: \n191:     def _extract_updates(self, req, image, changes):\n192:         \"\"\" Determine the updates to pass to the database api.\n193: \n194:         Given the current image, convert a list of changes to be made\n195:         into the corresponding update dictionary that should be passed to\n196:         db_api.image_update.\n197: \n198:         Changes have the following parts\n199:         op    - 'add' a new attribute, 'replace' an existing attribute, or\n200:                 'remove' an existing attribute.\n201:         path  - A list of path parts for determining which attribute the\n202:                 the operation applies to.\n203:         value - For 'add' and 'replace', the new value the attribute should\n204:                 assume.\n205: \n206:         For the current use case, there are two types of valid paths. For base\n207:         attributes (fields stored directly on the Image object) the path\n208:         must take the form ['<attribute name>']. These attributes are always\n209:         present so the only valid operation on them is 'replace'. For image\n210:         properties, the path takes the form ['properties', '<property name>']\n211:         and all operations are valid.\n212: \n213:         Future refactoring should simplify this code by hardening the image\n214:         abstraction such that database details such as how image properties\n215:         are stored do not have any influence here.\n216:         \"\"\"\n217:         updates = {}\n218:         property_updates = image['properties']\n219:         for change in changes:\n220:             path = change['path']\n221:             if len(path) == 1:\n222:                 assert change['op'] == 'replace'\n223:                 key = change['path'][0]\n224:                 if key == 'is_public' and change['value']:\n225:                     self._enforce(req, 'publicize_image')\n226:                 updates[key] = change['value']\n227:             else:\n228:                 assert len(path) == 2\n229:                 assert path[0] == 'properties'\n230:                 update_method_name = '_do_%s_property' % change['op']\n231:                 assert hasattr(self, update_method_name)\n232:                 update_method = getattr(self, update_method_name)\n233:                 update_method(property_updates, change)\n234:                 updates['properties'] = property_updates\n235:         return updates\n236: \n237:     def _do_replace_property(self, updates, change):\n238:         \"\"\" Replace a single image property, ensuring it's present. \"\"\"\n239:         key = change['path'][1]\n240:         if key not in updates:\n241:             msg = _(\"Property %s does not exist.\")\n242:             raise webob.exc.HTTPConflict(msg % key)\n243:         updates[key] = change['value']\n244: \n245:     def _do_add_property(self, updates, change):\n246:         \"\"\" Add a new image property, ensuring it does not already exist. \"\"\"\n247:         key = change['path'][1]\n248:         if key in updates:\n249:             msg = _(\"Property %s already present.\")\n250:             raise webob.exc.HTTPConflict(msg % key)\n251:         updates[key] = change['value']\n252: \n253:     def _do_remove_property(self, updates, change):\n254:         \"\"\" Remove an image property, ensuring it's present. \"\"\"\n255:         key = change['path'][1]\n256:         if key not in updates:\n257:             msg = _(\"Property %s does not exist.\")\n258:             raise webob.exc.HTTPConflict(msg % key)\n259:         del updates[key]\n260: \n261:     @utils.mutating\n262:     def delete(self, req, image_id):\n263:         self._enforce(req, 'delete_image')\n264:         image = self._get_image(req.context, image_id)\n265: \n266:         if image['protected']:\n267:             msg = _(\"Unable to delete as image %(image_id)s is protected\"\n268:                     % locals())\n269:             raise webob.exc.HTTPForbidden(explanation=msg)\n270: \n271:         status = 'deleted'\n272:         if image['location']:\n273:             if CONF.delayed_delete:\n274:                 status = 'pending_delete'\n275:                 self.store_api.schedule_delayed_delete_from_backend(\n276:                                 image['location'], id)\n277:             else:\n278:                 self.store_api.safe_delete_from_backend(image['location'],\n279:                                                         req.context, id)\n280: \n281:         try:\n282:             self.db_api.image_update(req.context, image_id, {'status': status})\n283:             self.db_api.image_destroy(req.context, image_id)\n284:         except (exception.NotFound, exception.Forbidden):\n285:             msg = (\"Failed to find image %(image_id)s to delete\" % locals())\n286:             LOG.info(msg)\n287:             raise webob.exc.HTTPNotFound()\n288:         else:\n289:             self.notifier.info('image.delete', image)\n290: \n291: \n292: class RequestDeserializer(wsgi.JSONRequestDeserializer):\n293: \n294:     _readonly_properties = ['created_at', 'updated_at', 'status', 'checksum',\n295:             'size', 'direct_url', 'self', 'file', 'schema']\n296:     _reserved_properties = ['owner', 'is_public', 'location',\n297:             'deleted', 'deleted_at']\n298:     _base_properties = ['checksum', 'created_at', 'container_format',\n299:             'disk_format', 'id', 'min_disk', 'min_ram', 'name', 'size',\n300:             'status', 'tags', 'updated_at', 'visibility', 'protected']\n301: \n302:     def __init__(self, schema=None):\n303:         super(RequestDeserializer, self).__init__()\n304:         self.schema = schema or get_schema()\n305: \n306:     def _parse_image(self, request):\n307:         body = self._get_request_body(request)\n308:         try:\n309:             self.schema.validate(body)\n310:         except exception.InvalidObject as e:\n311:             raise webob.exc.HTTPBadRequest(explanation=unicode(e))\n312: \n313:         # Ensure all specified properties are allowed\n314:         self._check_readonly(body)\n315:         self._check_reserved(body)\n316: \n317:         # Create a dict of base image properties, with user- and deployer-\n318:         # defined properties contained in a 'properties' dictionary\n319:         image = {'properties': body}\n320:         for key in self._base_properties:\n321:             try:\n322:                 image[key] = image['properties'].pop(key)\n323:             except KeyError:\n324:                 pass\n325: \n326:         if 'visibility' in image:\n327:             image['is_public'] = image.pop('visibility') == 'public'\n328: \n329:         return {'image': image}\n330: \n331:     def _get_request_body(self, request):\n332:         output = super(RequestDeserializer, self).default(request)\n333:         if not 'body' in output:\n334:             msg = _('Body expected in request.')\n335:             raise webob.exc.HTTPBadRequest(explanation=msg)\n336:         return output['body']\n337: \n338:     @classmethod\n339:     def _check_readonly(cls, image):\n340:         for key in cls._readonly_properties:\n341:             if key in image:\n342:                 msg = \"Attribute \\'%s\\' is read-only.\" % key\n343:                 raise webob.exc.HTTPForbidden(explanation=unicode(msg))\n344: \n345:     @classmethod\n346:     def _check_reserved(cls, image):\n347:         for key in cls._reserved_properties:\n348:             if key in image:\n349:                 msg = \"Attribute \\'%s\\' is reserved.\" % key\n350:                 raise webob.exc.HTTPForbidden(explanation=unicode(msg))\n351: \n352:     def create(self, request):\n353:         return self._parse_image(request)\n354: \n355:     def _get_change_operation(self, raw_change):\n356:         op = None\n357:         for key in ['replace', 'add', 'remove']:\n358:             if key in raw_change:\n359:                 if op is not None:\n360:                     msg = _('Operation objects must contain only one member'\n361:                             ' named \"add\", \"remove\", or \"replace\".')\n362:                     raise webob.exc.HTTPBadRequest(explanation=msg)\n363:                 op = key\n364:         if op is None:\n365:             msg = _('Operation objects must contain exactly one member'\n366:                     ' named \"add\", \"remove\", or \"replace\".')\n367:             raise webob.exc.HTTPBadRequest(explanation=msg)\n368:         return op\n369: \n370:     def _get_change_path(self, raw_change, op):\n371:         key = self._decode_json_pointer(raw_change[op])\n372:         if key in self._readonly_properties:\n373:             msg = \"Attribute \\'%s\\' is read-only.\" % key\n374:             raise webob.exc.HTTPForbidden(explanation=unicode(msg))\n375:         if key in self._reserved_properties:\n376:             msg = \"Attribute \\'%s\\' is reserved.\" % key\n377:             raise webob.exc.HTTPForbidden(explanation=unicode(msg))\n378: \n379:         # For image properties, we need to put \"properties\" at the beginning\n380:         if key not in self._base_properties:\n381:             return ['properties', key]\n382:         return [key]\n383: \n384:     def _decode_json_pointer(self, pointer):\n385:         \"\"\" Parse a json pointer.\n386: \n387:         Json Pointers are defined in\n388:         http://tools.ietf.org/html/draft-pbryan-zyp-json-pointer .\n389:         The pointers use '/' for separation between object attributes, such\n390:         that '/A/B' would evaluate to C in {\"A\": {\"B\": \"C\"}}. A '/' character\n391:         in an attribute name is encoded as \"~1\" and a '~' character is encoded\n392:         as \"~0\".\n393:         \"\"\"\n394:         self._validate_json_pointer(pointer)\n395:         return pointer.lstrip('/').replace('~1', '/').replace('~0', '~')\n396: \n397:     def _validate_json_pointer(self, pointer):\n398:         \"\"\" Validate a json pointer.\n399: \n400:         We only accept a limited form of json pointers. Specifically, we do\n401:         not allow multiple levels of indirection, so there can only be one '/'\n402:         in the pointer, located at the start of the string.\n403:         \"\"\"\n404:         if not pointer.startswith('/'):\n405:             msg = _('Pointer `%s` does not start with \"/\".' % pointer)\n406:             raise webob.exc.HTTPBadRequest(explanation=msg)\n407:         if '/' in pointer[1:]:\n408:             msg = _('Pointer `%s` contains more than one \"/\".' % pointer)\n409:             raise webob.exc.HTTPBadRequest(explanation=msg)\n410:         if re.match('~[^01]', pointer):\n411:             msg = _('Pointer `%s` contains \"~\" not part of'\n412:                     ' a recognized escape sequence.' % pointer)\n413:             raise webob.exc.HTTPBadRequest(explanation=msg)\n414: \n415:     def _get_change_value(self, raw_change, op):\n416:         if 'value' not in raw_change:\n417:             msg = _('Operation \"%s\" requires a member named \"value\".')\n418:             raise webob.exc.HTTPBadRequest(explanation=msg % op)\n419:         return raw_change['value']\n420: \n421:     def _validate_change(self, change):\n422:         if change['op'] == 'delete':\n423:             return\n424:         partial_image = {change['path'][-1]: change['value']}\n425:         try:\n426:             self.schema.validate(partial_image)\n427:         except exception.InvalidObject as e:\n428:             raise webob.exc.HTTPBadRequest(explanation=unicode(e))\n429: \n430:     def update(self, request):\n431:         changes = []",
+      "retrieval_query": {
+        "source": "user input via API request",
+        "sensitive_operation": "database update with status field",
+        "missing_control": "lack of validation on status value",
+        "mechanism_keywords": [
+          "status update",
+          "unvalidated input",
+          "database operation"
+        ]
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/csrf-protection-disabled",
+          "cwe_id": "CWE-352",
+          "cwe_name": "Cross-Site Request Forgery (CSRF)",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 14.7902,
+          "raw_bm25_score": 14.7902,
+          "description": "Disabling or weakening CSRF protection may make the application vulnerable to a Cross-Site Request Forgery (CSRF) attack.",
+          "pattern": "Find state-changing operations that lack CSRF protection mechanisms",
+          "remediation": "Implement CSRF tokens for all state-changing operations. Use SameSite cookie attributes and validate the Origin/Referer headers.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-352"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "fallback/cwe-471-modification-of-assumed-immutable-data-maid",
+          "cwe_id": "CWE-471",
+          "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 12.3705,
+          "raw_bm25_score": 12.3705,
+          "description": "Security-critical data assumed immutable can be modified by an attacker.",
+          "pattern": "cwe-471 assumed-immutable immutable-data hidden-field cookie reverse-dns attacker-modified trusted-value mutable security-decision",
+          "remediation": "Do not trust client-modifiable values as immutable security state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-471"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/url-redirection",
+          "cwe_id": "CWE-601",
+          "cwe_name": "URL Redirection to Untrusted Site ('Open Redirect')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 10.5488,
+          "raw_bm25_score": 10.5488,
+          "description": "URL redirection based on unvalidated user input may cause redirection to malicious web sites.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Validate redirect URLs against allowlists. Use relative URLs where possible and avoid user-controlled redirects.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-601"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/reflective-xss",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 10.2063,
+          "raw_bm25_score": 10.2063,
+          "description": "Writing user input directly to a web page allows for a cross-site scripting vulnerability.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output operations. Implement proper escaping for HTML, JavaScript, CSS, and URL contexts.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-116"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/count-untrusted-data-external-api",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 9.2571,
+          "raw_bm25_score": 9.2571,
+          "description": "This reports the external APIs that are used with untrusted data, along with how frequently the API is called, and how many unique sources of untrusted data flow to it.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/timing-attack-against-header-value",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 8.7886,
+          "raw_bm25_score": 8.7886,
+          "description": "Use of a non-constant-time verification routine to check the value of an HTTP header, possibly allowing a timing attack to infer the header's expected value.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208",
+            "experimental"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.4495,
+          "raw_bm25_score": 7.4495,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/samesite-none-cookie",
+          "cwe_id": "CWE-1275",
+          "cwe_name": "Sensitive Cookie with Improper SameSite Attribute",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.4148,
+          "raw_bm25_score": 7.4148,
+          "description": "Cookies with `SameSite` set to `None` can allow for Cross-Site Request Forgery (CSRF) attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1275"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/ineffectual-statement",
+          "cwe_id": "CWE-561",
+          "cwe_name": "Dead Code",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.1581,
+          "raw_bm25_score": 7.1581,
+          "description": "A statement has no effect",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove dead code through static analysis. Use code coverage tools to identify unreachable code. Implement regular code reviews to eliminate unused functionality.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "useless-code",
+            "external/cwe/cwe-561"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/super-not-enclosing-class",
+          "cwe_id": "CWE-687",
+          "cwe_name": "Function Call With Incorrectly Specified Argument Value",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.017,
+          "raw_bm25_score": 7.017,
+          "description": "Calling super with something other than the enclosing class may cause incorrect object initialization.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-687. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-687"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

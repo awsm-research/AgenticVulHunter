@@ -1,0 +1,237 @@
+diff --git a/nova/tests/test_virt.py b/nova/tests/test_virt.py
+index 388f075afb..c4aa828ad0 100644
+--- a/nova/tests/test_virt.py
++++ b/nova/tests/test_virt.py
+@@ -3,32 +3,34 @@
+ # Copyright 2011 Isaku Yamahata
+ # All Rights Reserved.
+ #
+ #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+ #    not use this file except in compliance with the License. You may obtain
+ #    a copy of the License at
+ #
+ #         http://www.apache.org/licenses/LICENSE-2.0
+ #
+ #    Unless required by applicable law or agreed to in writing, software
+ #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++from nova import exception
+ from nova import flags
+ from nova import test
++from nova.virt.disk import api as disk_api
+ from nova.virt import driver
+ 
+ FLAGS = flags.FLAGS
+ 
+ 
+ class TestVirtDriver(test.TestCase):
+     def test_block_device(self):
+         swap = {'device_name': '/dev/sdb',
+                 'swap_size': 1}
+         ephemerals = [{'num': 0,
+                        'virtual_name': 'ephemeral0',
+                        'device_name': '/dev/sdc1',
+                        'size': 1}]
+         block_device_mapping = [{'mount_device': '/dev/sde',
+                                  'device_path': 'fake_device'}]
+@@ -69,15 +71,33 @@ class TestVirtDriver(test.TestCase):
+             ephemerals)
+         self.assertEqual(
+             driver.block_device_info_get_ephemerals(empty_block_device_info),
+             [])
+         self.assertEqual(
+             driver.block_device_info_get_ephemerals(None),
+             [])
+ 
+     def test_swap_is_usable(self):
+         self.assertFalse(driver.swap_is_usable(None))
+         self.assertFalse(driver.swap_is_usable({'device_name': None}))
+         self.assertFalse(driver.swap_is_usable({'device_name': '/dev/sdb',
+                                                 'swap_size': 0}))
+         self.assertTrue(driver.swap_is_usable({'device_name': '/dev/sdb',
+                                                 'swap_size': 1}))
++
++
++class TestVirtDisk(test.TestCase):
++    def test_check_safe_path(self):
++        ret = disk_api._join_and_check_path_within_fs('/foo', 'etc',
++                                                      'something.conf')
++        self.assertEquals(ret, '/foo/etc/something.conf')
++
++    def test_check_unsafe_path(self):
++        self.assertRaises(exception.Invalid,
++                          disk_api._join_and_check_path_within_fs,
++                          '/foo', 'etc/../../../something.conf')
++
++    def test_inject_files_with_bad_path(self):
++        self.assertRaises(exception.Invalid,
++                          disk_api._inject_file_into_fs,
++                          '/tmp', '/etc/../../../../etc/passwd',
++                          'hax')
+diff --git a/nova/virt/disk/api.py b/nova/virt/disk/api.py
+index 42d9d91626..3e66cd2a7b 100644
+--- a/nova/virt/disk/api.py
++++ b/nova/virt/disk/api.py
+@@ -299,113 +299,134 @@ def destroy_container(img):
+ def inject_data_into_fs(fs, key, net, metadata, admin_password, execute):
+     """Injects data into a filesystem already mounted by the caller.
+     Virt connections can call this directly if they mount their fs
+     in a different way to inject_data
+     """
+     if key:
+         _inject_key_into_fs(key, fs, execute=execute)
+     if net:
+         _inject_net_into_fs(net, fs, execute=execute)
+     if metadata:
+         _inject_metadata_into_fs(metadata, fs, execute=execute)
+     if admin_password:
+         _inject_admin_password_into_fs(admin_password, fs, execute=execute)
+ 
+ 
+-def _inject_file_into_fs(fs, path, contents):
+-    absolute_path = os.path.join(fs, path.lstrip('/'))
++def _join_and_check_path_within_fs(fs, *args):
++    '''os.path.join() with safety check for injected file paths.
++
++    Join the supplied path components and make sure that the
++    resulting path we are injecting into is within the
++    mounted guest fs.  Trying to be clever and specifying a
++    path with '..' in it will hit this safeguard.
++    '''
++    absolute_path = os.path.realpath(os.path.join(fs, *args))
++    if not absolute_path.startswith(os.path.realpath(fs) + '/'):
++        raise exception.Invalid(_('injected file path not valid'))
++    return absolute_path
++
++
++def _inject_file_into_fs(fs, path, contents, append=False):
++    absolute_path = _join_and_check_path_within_fs(fs, path.lstrip('/'))
++
+     parent_dir = os.path.dirname(absolute_path)
+     utils.execute('mkdir', '-p', parent_dir, run_as_root=True)
+-    utils.execute('tee', absolute_path, process_input=contents,
+-          run_as_root=True)
++
++    args = []
++    if append:
++        args.append('-a')
++    args.append(absolute_path)
++
++    kwargs = dict(process_input=contents, run_as_root=True)
++
++    utils.execute('tee', *args, **kwargs)
+ 
+ 
+ def _inject_metadata_into_fs(metadata, fs, execute=None):
+-    metadata_path = os.path.join(fs, "meta.js")
+     metadata = dict([(m.key, m.value) for m in metadata])
+-
+-    utils.execute('tee', metadata_path,
+-                  process_input=jsonutils.dumps(metadata), run_as_root=True)
++    _inject_file_into_fs(fs, 'meta.js', jsonutils.dumps(metadata))
+ 
+ 
+ def _inject_key_into_fs(key, fs, execute=None):
+     """Add the given public ssh key to root's authorized_keys.
+ 
+     key is an ssh key string.
+     fs is the path to the base of the filesystem into which to inject the key.
+     """
+-    sshdir = os.path.join(fs, 'root', '.ssh')
++    sshdir = _join_and_check_path_within_fs(fs, 'root', '.ssh')
+     utils.execute('mkdir', '-p', sshdir, run_as_root=True)
+     utils.execute('chown', 'root', sshdir, run_as_root=True)
+     utils.execute('chmod', '700', sshdir, run_as_root=True)
+-    keyfile = os.path.join(sshdir, 'authorized_keys')
+-    key_data = [
++
++    keyfile = os.path.join('root', '.ssh', 'authorized_keys')
++
++    key_data = ''.join([
+         '\n',
+         '# The following ssh key was injected by Nova',
+         '\n',
+         key.strip(),
+         '\n',
+-    ]
+-    utils.execute('tee', '-a', keyfile,
+-                  process_input=''.join(key_data), run_as_root=True)
++    ])
++
++    _inject_file_into_fs(fs, keyfile, key_data, append=True)
+ 
+ 
+ def _inject_net_into_fs(net, fs, execute=None):
+     """Inject /etc/network/interfaces into the filesystem rooted at fs.
+ 
+     net is the contents of /etc/network/interfaces.
+     """
+-    netdir = os.path.join(os.path.join(fs, 'etc'), 'network')
++    netdir = _join_and_check_path_within_fs(fs, 'etc', 'network')
+     utils.execute('mkdir', '-p', netdir, run_as_root=True)
+     utils.execute('chown', 'root:root', netdir, run_as_root=True)
+     utils.execute('chmod', 755, netdir, run_as_root=True)
+-    netfile = os.path.join(netdir, 'interfaces')
+-    utils.execute('tee', netfile, process_input=net, run_as_root=True)
++
++    netfile = os.path.join('etc', 'network', 'interfaces')
++    _inject_file_into_fs(fs, netfile, net)
+ 
+ 
+ def _inject_admin_password_into_fs(admin_passwd, fs, execute=None):
+     """Set the root password to admin_passwd
+ 
+     admin_password is a root password
+     fs is the path to the base of the filesystem into which to inject
+     the key.
+ 
+     This method modifies the instance filesystem directly,
+     and does not require a guest agent running in the instance.
+ 
+     """
+     # The approach used here is to copy the password and shadow
+     # files from the instance filesystem to local files, make any
+     # necessary changes, and then copy them back.
+ 
+     admin_user = 'root'
+ 
+     fd, tmp_passwd = tempfile.mkstemp()
+     os.close(fd)
+     fd, tmp_shadow = tempfile.mkstemp()
+     os.close(fd)
+ 
+-    utils.execute('cp', os.path.join(fs, 'etc', 'passwd'), tmp_passwd,
+-                  run_as_root=True)
+-    utils.execute('cp', os.path.join(fs, 'etc', 'shadow'), tmp_shadow,
+-                  run_as_root=True)
++    passwd_path = _join_and_check_path_within_fs(fs, 'etc', 'passwd')
++    shadow_path = _join_and_check_path_within_fs(fs, 'etc', 'shadow')
++
++    utils.execute('cp', passwd_path, tmp_passwd, run_as_root=True)
++    utils.execute('cp', shadow_path, tmp_shadow, run_as_root=True)
+     _set_passwd(admin_user, admin_passwd, tmp_passwd, tmp_shadow)
+-    utils.execute('cp', tmp_passwd, os.path.join(fs, 'etc', 'passwd'),
+-                  run_as_root=True)
++    utils.execute('cp', tmp_passwd, passwd_path, run_as_root=True)
+     os.unlink(tmp_passwd)
+-    utils.execute('cp', tmp_shadow, os.path.join(fs, 'etc', 'shadow'),
+-                  run_as_root=True)
++    utils.execute('cp', tmp_shadow, shadow_path, run_as_root=True)
+     os.unlink(tmp_shadow)
+ 
+ 
+ def _set_passwd(username, admin_passwd, passwd_file, shadow_file):
+     """set the password for username to admin_passwd
+ 
+     The passwd_file is not modified.  The shadow_file is updated.
+     if the username is not found in both files, an exception is raised.
+ 
+     :param username: the username
+     :param encrypted_passwd: the  encrypted password
+     :param passwd_file: path to the passwd file
+     :param shadow_file: path to the shadow password file
+     :returns: nothing
+     :raises: exception.NovaException(), IOError()

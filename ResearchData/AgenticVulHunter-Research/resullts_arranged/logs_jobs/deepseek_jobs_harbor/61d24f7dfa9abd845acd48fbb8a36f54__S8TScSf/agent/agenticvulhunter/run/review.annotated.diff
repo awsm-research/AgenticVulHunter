@@ -1,0 +1,426 @@
+@@ -1,210 +1,226 @@
+[C,lib/localvalidator.ts,1] import BITBOX from 'bitbox-sdk/lib/bitbox-sdk';
+[C,lib/localvalidator.ts,2] import { SlpValidator, Slp } from './slp';
+[C,lib/localvalidator.ts,3] import { SlpTransactionType, SlpTransactionDetails } from './slpjs';
+[C,lib/localvalidator.ts,4] import * as bitcore from 'bitcore-lib-cash';
+[C,lib/localvalidator.ts,5] import { BitcoreTransaction } from './global';
+[C,lib/localvalidator.ts,6] import BigNumber from 'bignumber.js';
+[C,lib/localvalidator.ts,7] import axios from 'axios';
+[C,lib/localvalidator.ts,8] 
+[D,lib/localvalidator.ts,9] export interface Validation { hex: string|null; validity: boolean|null; parents: Parent[], details: SlpTransactionDetails|null } 
+[A,lib/localvalidator.ts,9] export interface Validation { hex: string|null; validity: boolean|null; parents: Parent[], details: SlpTransactionDetails|null, invalidReason: string|null } 
+[C,lib/localvalidator.ts,10] export type GetRawTransactionsAsync = (txid: string[]) => Promise<string[]|null>;
+[C,lib/localvalidator.ts,11] 
+[C,lib/localvalidator.ts,12] const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+[C,lib/localvalidator.ts,13] 
+[C,lib/localvalidator.ts,14] interface Parent {
+[C,lib/localvalidator.ts,15]     txid: string;
+[A,lib/localvalidator.ts,16]     versionType: number;
+[C,lib/localvalidator.ts,17]     valid: boolean|null;
+[C,lib/localvalidator.ts,18]     inputQty: BigNumber|null;
+[C,lib/localvalidator.ts,19] }
+[C,lib/localvalidator.ts,20] 
+[C,lib/localvalidator.ts,21] export class LocalValidator implements SlpValidator {
+[C,lib/localvalidator.ts,22]     BITBOX: BITBOX;
+[C,lib/localvalidator.ts,23]     cachedRawTransactions: { [txid: string]: string }
+[C,lib/localvalidator.ts,24]     cachedValidations: { [txid: string]: Validation }
+[C,lib/localvalidator.ts,25]     getRawTransactions: GetRawTransactionsAsync;
+[C,lib/localvalidator.ts,26]     slp: Slp;
+[C,lib/localvalidator.ts,27] 
+[C,lib/localvalidator.ts,28]     constructor(BITBOX: BITBOX, getRawTransactions: GetRawTransactionsAsync) {
+[C,lib/localvalidator.ts,29]         this.BITBOX = BITBOX;
+[C,lib/localvalidator.ts,30]         this.getRawTransactions = getRawTransactions;
+[C,lib/localvalidator.ts,31]         this.slp = new Slp(BITBOX);
+[C,lib/localvalidator.ts,32]         this.cachedValidations = {};
+[C,lib/localvalidator.ts,33]         this.cachedRawTransactions = {};
+[C,lib/localvalidator.ts,34]     }
+[C,lib/localvalidator.ts,35] 
+[D,lib/localvalidator.ts,35]     addValidationFromStore(txhex: string, isValid: boolean) {
+[D,lib/localvalidator.ts,36]         let id = (<Buffer>this.BITBOX.Crypto.sha256(this.BITBOX.Crypto.sha256(Buffer.from(txhex, 'hex'))).reverse()).toString('hex');
+[D,lib/localvalidator.ts,37]         this.cachedValidations[id] = { hex: txhex, validity: isValid, parents: [], details: null }
+[A,lib/localvalidator.ts,36]     addValidationFromStore(hex: string, isValid: boolean) {
+[A,lib/localvalidator.ts,37]         let id = (<Buffer>this.BITBOX.Crypto.sha256(this.BITBOX.Crypto.sha256(Buffer.from(hex, 'hex'))).reverse()).toString('hex');
+[A,lib/localvalidator.ts,38]         if(!this.cachedValidations[id])
+[A,lib/localvalidator.ts,39]             this.cachedValidations[id] = { hex: hex, validity: isValid, parents: [], details: null, invalidReason: null }
+[A,lib/localvalidator.ts,40]         if(!this.cachedRawTransactions[id])
+[A,lib/localvalidator.ts,41]             this.cachedRawTransactions[id] = hex;
+[C,lib/localvalidator.ts,42]     }
+[D,lib/localvalidator.ts,39] 
+[D,lib/localvalidator.ts,40]     async waitForParentValidation(txid: string) {
+[A,lib/localvalidator.ts,43]     
+[A,lib/localvalidator.ts,44]     async waitForParentValidationProcessing(txid: string) {
+[A,lib/localvalidator.ts,45]         // TODO: Add some timeout?
+[C,lib/localvalidator.ts,46]         let cached: Validation = this.cachedValidations[txid];
+[C,lib/localvalidator.ts,47] 
+[D,lib/localvalidator.ts,43]         if(cached.parents.length === 0) {
+[D,lib/localvalidator.ts,44]             if(cached.details.transactionType !== SlpTransactionType.GENESIS)
+[D,lib/localvalidator.ts,45]                 throw Error("Invalid parent.") // Cannot have no SLP parents in non-genesis transaction.
+[D,lib/localvalidator.ts,46]             return
+[D,lib/localvalidator.ts,47]         }
+[D,lib/localvalidator.ts,48] 
+[C,lib/localvalidator.ts,48]         while(true) {
+[C,lib/localvalidator.ts,49]             let slpParentCount = cached.parents.length;
+[C,lib/localvalidator.ts,50]             let count = 0;
+[C,lib/localvalidator.ts,51]             cached.parents.forEach(p => {
+[C,lib/localvalidator.ts,52]                 let parent = this.cachedValidations[p.txid];
+[C,lib/localvalidator.ts,53]                 if(parent) {
+[D,lib/localvalidator.ts,55]                     if(parent.validity)
+[A,lib/localvalidator.ts,54]                     if(typeof parent.validity === 'boolean')
+[C,lib/localvalidator.ts,55]                         count += 1;
+[D,lib/localvalidator.ts,57]                     else
+[D,lib/localvalidator.ts,58]                         throw Error("Invalid parent.")
+[C,lib/localvalidator.ts,56]                 }
+[D,lib/localvalidator.ts,60]                 if(count === slpParentCount)
+[D,lib/localvalidator.ts,61]                     return
+[C,lib/localvalidator.ts,57]             });
+[D,lib/localvalidator.ts,63]             await sleep(250);
+[A,lib/localvalidator.ts,58]             if(count === slpParentCount && typeof cached.validity === 'boolean')
+[A,lib/localvalidator.ts,59]                 break
+[A,lib/localvalidator.ts,60]             await sleep(200);
+[C,lib/localvalidator.ts,61]         }
+[C,lib/localvalidator.ts,62]     }
+[C,lib/localvalidator.ts,63] 
+[D,lib/localvalidator.ts,67]     async waitForTransactionDownload(txid: string){
+[A,lib/localvalidator.ts,64]     async waitForTransactionPreProcessing(txid: string){
+[A,lib/localvalidator.ts,65]         // TODO: Add some timeout?
+[C,lib/localvalidator.ts,66]         while(true) {
+[D,lib/localvalidator.ts,69]             if(this.cachedValidations[txid].hex)
+[A,lib/localvalidator.ts,67]             if(this.cachedValidations[txid].hex && this.cachedValidations[txid].details)
+[C,lib/localvalidator.ts,68]                 break
+[D,lib/localvalidator.ts,71]             await sleep(250);
+[A,lib/localvalidator.ts,69]             await sleep(200);
+[C,lib/localvalidator.ts,70]         }
+[D,lib/localvalidator.ts,73]         await sleep(500); // temporary solution to make sure parents property gets set.
+[A,lib/localvalidator.ts,71]         //await sleep(100); // short wait to make sure parent's properties gets set first.
+[C,lib/localvalidator.ts,72]         return
+[C,lib/localvalidator.ts,73]     }
+[C,lib/localvalidator.ts,74] 
+[C,lib/localvalidator.ts,75]     async getRawTransaction(txid: string) {
+[C,lib/localvalidator.ts,76]         if(this.cachedRawTransactions[txid])
+[C,lib/localvalidator.ts,77]             return this.cachedRawTransactions[txid];
+[D,lib/localvalidator.ts,80]         let txhex: string[] = await this.getRawTransactions([txid])
+[D,lib/localvalidator.ts,81]         if(txhex)
+[D,lib/localvalidator.ts,82]             return (txhex)[0];
+[A,lib/localvalidator.ts,78]         this.cachedRawTransactions[txid] = (await this.getRawTransactions([txid]))[0]
+[A,lib/localvalidator.ts,79]         if(this.cachedRawTransactions[txid])
+[A,lib/localvalidator.ts,80]             return this.cachedRawTransactions[txid];
+[C,lib/localvalidator.ts,81]         return null;
+[C,lib/localvalidator.ts,82]     }
+[C,lib/localvalidator.ts,83] 
+[C,lib/localvalidator.ts,84]     async isValidSlpTxid(txid: string) {
+[D,lib/localvalidator.ts,87]         if(!this.cachedValidations[txid]) {
+[D,lib/localvalidator.ts,88]             this.cachedValidations[txid] = { hex: null, validity: null, parents: [], details: null }
+[A,lib/localvalidator.ts,85]         if(txid && !this.cachedValidations[txid]) {
+[A,lib/localvalidator.ts,86]             this.cachedValidations[txid] = { hex: null, validity: null, parents: [], details: null, invalidReason: null }
+[C,lib/localvalidator.ts,87]             this.cachedValidations[txid].hex = await this.getRawTransaction(txid);
+[C,lib/localvalidator.ts,88]         }
+[C,lib/localvalidator.ts,89] 
+[C,lib/localvalidator.ts,90]         // Check to see how we should proceed based on the validation-cache state
+[C,lib/localvalidator.ts,91]         if(!this.cachedValidations[txid].hex)
+[D,lib/localvalidator.ts,94]             await this.waitForTransactionDownload(txid);
+[D,lib/localvalidator.ts,95]         if(this.cachedValidations[txid].validity)
+[A,lib/localvalidator.ts,92]             await this.waitForTransactionPreProcessing(txid);
+[A,lib/localvalidator.ts,93]         if(typeof this.cachedValidations[txid].validity === 'boolean')
+[C,lib/localvalidator.ts,94]             return this.cachedValidations[txid].validity;
+[C,lib/localvalidator.ts,95]         if(this.cachedValidations[txid].details)
+[D,lib/localvalidator.ts,98]             return await this.queueFinalValidation(txid);
+[A,lib/localvalidator.ts,96]             await this.waitForParentValidationProcessing(txid);
+[C,lib/localvalidator.ts,97] 
+[C,lib/localvalidator.ts,98]         // Check SLP message validity
+[C,lib/localvalidator.ts,99]         let txn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[txid].hex)
+[C,lib/localvalidator.ts,100]         let slpmsg: SlpTransactionDetails;
+[C,lib/localvalidator.ts,101]         try {
+[C,lib/localvalidator.ts,102]             slpmsg = this.cachedValidations[txid].details = this.slp.parseSlpOutputScript(txn.outputs[0]._scriptBuffer)
+[C,lib/localvalidator.ts,103]         } catch(e) {
+[A,lib/localvalidator.ts,104]             this.cachedValidations[txid].invalidReason = "SLP OP_RETURN parsing error (" + e.message + ")."
+[C,lib/localvalidator.ts,105]             return this.cachedValidations[txid].validity = false;
+[C,lib/localvalidator.ts,106]         }
+[C,lib/localvalidator.ts,107] 
+[C,lib/localvalidator.ts,108]         // Check DAG validity
+[C,lib/localvalidator.ts,109]         if(slpmsg.transactionType === SlpTransactionType.GENESIS) {
+[C,lib/localvalidator.ts,110]             return this.cachedValidations[txid].validity = true;
+[C,lib/localvalidator.ts,111]         } 
+[C,lib/localvalidator.ts,112]         else if (slpmsg.transactionType === SlpTransactionType.MINT) {
+[C,lib/localvalidator.ts,113]             for(let i = 0; i < txn.inputs.length; i++) {
+[C,lib/localvalidator.ts,114]                 let input_txid = txn.inputs[i].prevTxId.toString('hex')
+[C,lib/localvalidator.ts,115]                 let input_txhex = await this.getRawTransaction(input_txid)
+[C,lib/localvalidator.ts,116]                 if (input_txhex) {
+[C,lib/localvalidator.ts,117]                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);
+[C,lib/localvalidator.ts,118]                     try {
+[C,lib/localvalidator.ts,119]                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)
+[C,lib/localvalidator.ts,120]                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)
+[C,lib/localvalidator.ts,121]                             input_slpmsg.tokenIdHex = input_txid;
+[C,lib/localvalidator.ts,122]                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {
+[C,lib/localvalidator.ts,123]                             if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {
+[C,lib/localvalidator.ts,124]                                 if(txn.inputs[i].outputIndex === input_slpmsg.batonVout)
+[D,lib/localvalidator.ts,126]                                     this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), valid: null, inputQty: null })
+[A,lib/localvalidator.ts,125]                                     this.cachedValidations[txid].parents.push({ txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType ,valid: null, inputQty: null })
+[C,lib/localvalidator.ts,126]                             }
+[C,lib/localvalidator.ts,127]                         }
+[C,lib/localvalidator.ts,128]                     } catch(_) {}
+[C,lib/localvalidator.ts,129]                 }
+[C,lib/localvalidator.ts,130]             }
+[D,lib/localvalidator.ts,132]             if(this.cachedValidations[txid].parents.length !== 1)
+[A,lib/localvalidator.ts,131]             if(this.cachedValidations[txid].parents.length !== 1) {
+[A,lib/localvalidator.ts,132]                 this.cachedValidations[txid].invalidReason = "MINT transaction must have 1 valid baton parent."
+[C,lib/localvalidator.ts,133]                 return this.cachedValidations[txid].validity = false;
+[D,lib/localvalidator.ts,134]         }  
+[A,lib/localvalidator.ts,134]             }
+[A,lib/localvalidator.ts,135]         }
+[C,lib/localvalidator.ts,136]         else if(slpmsg.transactionType === SlpTransactionType.SEND) {
+[C,lib/localvalidator.ts,137]             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))
+[C,lib/localvalidator.ts,138]             let tokenInQty = new BigNumber(0);
+[C,lib/localvalidator.ts,139]             for(let i = 0; i < txn.inputs.length; i++) {
+[C,lib/localvalidator.ts,140]                 let input_txid = txn.inputs[i].prevTxId.toString('hex')
+[C,lib/localvalidator.ts,141]                 let input_txhex = await this.getRawTransaction(input_txid)
+[C,lib/localvalidator.ts,142]                 if (input_txhex) {
+[C,lib/localvalidator.ts,143]                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);
+[C,lib/localvalidator.ts,144]                     try {
+[C,lib/localvalidator.ts,145]                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)
+[C,lib/localvalidator.ts,146]                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)
+[C,lib/localvalidator.ts,147]                             input_slpmsg.tokenIdHex = input_txid;
+[C,lib/localvalidator.ts,148]                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {
+[C,lib/localvalidator.ts,149]                             if(input_slpmsg.transactionType === SlpTransactionType.SEND) {
+[C,lib/localvalidator.ts,150]                                 tokenInQty = tokenInQty.plus(input_slpmsg.sendOutputs[txn.inputs[i].outputIndex])
+[D,lib/localvalidator.ts,150]                                 this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), valid: null, inputQty: input_slpmsg.sendOutputs[txn.inputs[i].outputIndex] })
+[A,lib/localvalidator.ts,151]                                 this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.sendOutputs[txn.inputs[i].outputIndex] })
+[C,lib/localvalidator.ts,152]                             }
+[C,lib/localvalidator.ts,153]                             else if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {
+[C,lib/localvalidator.ts,154]                                 if(txn.inputs[i].outputIndex === 1)
+[C,lib/localvalidator.ts,155]                                     tokenInQty = tokenInQty.plus(input_slpmsg.genesisOrMintQuantity)
+[D,lib/localvalidator.ts,155]                                     this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), valid: null, inputQty: input_slpmsg.genesisOrMintQuantity })
+[A,lib/localvalidator.ts,156]                                     this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.genesisOrMintQuantity })
+[C,lib/localvalidator.ts,157]                             }
+[C,lib/localvalidator.ts,158]                         }
+[C,lib/localvalidator.ts,159]                     } catch(_) {}
+[C,lib/localvalidator.ts,160]                 }
+[C,lib/localvalidator.ts,161]             }
+[C,lib/localvalidator.ts,162]             
+[C,lib/localvalidator.ts,163]             // Check token inputs are greater than token outputs (includes valid and invalid inputs)
+[D,lib/localvalidator.ts,163]             if(tokenOutQty.isGreaterThan(tokenInQty))
+[A,lib/localvalidator.ts,164]             if(tokenOutQty.isGreaterThan(tokenInQty)) {
+[A,lib/localvalidator.ts,165]                 this.cachedValidations[txid].invalidReason = "Token outputs are greater than possible token inputs."
+[C,lib/localvalidator.ts,166]                 return this.cachedValidations[txid].validity = false;
+[A,lib/localvalidator.ts,167]             }
+[C,lib/localvalidator.ts,168]         }
+[C,lib/localvalidator.ts,169] 
+[C,lib/localvalidator.ts,170]         // Set validity validation-cache for parents, and handle MINT condition with no valid input
+[C,lib/localvalidator.ts,171]         for(let i = 0; i < this.cachedValidations[txid].parents.length; i++) {
+[C,lib/localvalidator.ts,172]             let valid = await this.isValidSlpTxid(this.cachedValidations[txid].parents[i].txid)
+[C,lib/localvalidator.ts,173]             this.cachedValidations[txid].parents.find(p => p.txid === this.cachedValidations[txid].parents[i].txid).valid = valid;
+[D,lib/localvalidator.ts,171]             if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.MINT) {
+[D,lib/localvalidator.ts,172]                 if (!valid)
+[D,lib/localvalidator.ts,173]                     return this.cachedValidations[txid].validity = false;
+[A,lib/localvalidator.ts,174]             if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.MINT && !valid) {
+[A,lib/localvalidator.ts,175]                 this.cachedValidations[txid].invalidReason = "MINT transaction with invalid baton parent."
+[A,lib/localvalidator.ts,176]                 return this.cachedValidations[txid].validity = false;
+[C,lib/localvalidator.ts,177]             }
+[C,lib/localvalidator.ts,178]         }
+[C,lib/localvalidator.ts,179] 
+[C,lib/localvalidator.ts,180]         // Check valid inputs are greater than token outputs
+[C,lib/localvalidator.ts,181]         if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {
+[C,lib/localvalidator.ts,182]             let validInputQty = this.cachedValidations[txid].parents.reduce((t, v) => { return v.valid ? t.plus(v.inputQty) : t }, new BigNumber(0));
+[C,lib/localvalidator.ts,183]             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))
+[D,lib/localvalidator.ts,181]             if(tokenOutQty.isGreaterThan(validInputQty))
+[A,lib/localvalidator.ts,184]             if(tokenOutQty.isGreaterThan(validInputQty)) {
+[A,lib/localvalidator.ts,185]                 this.cachedValidations[txid].invalidReason = "Token outputs are greater than valid token inputs."
+[C,lib/localvalidator.ts,186]                 return this.cachedValidations[txid].validity = false;
+[A,lib/localvalidator.ts,187]             }
+[C,lib/localvalidator.ts,188]         }
+[C,lib/localvalidator.ts,189] 
+[D,lib/localvalidator.ts,185]         return this.cachedValidations[txid].validity = true;
+[D,lib/localvalidator.ts,186]     }
+[D,lib/localvalidator.ts,187] 
+[D,lib/localvalidator.ts,188]     private async queueFinalValidation(txid: string) {
+[D,lib/localvalidator.ts,189]         try {
+[D,lib/localvalidator.ts,190]             await this.waitForParentValidation(txid);
+[D,lib/localvalidator.ts,191]         }
+[D,lib/localvalidator.ts,192]         catch (e) {
+[D,lib/localvalidator.ts,193]             if (e.message === "Invalid parent.")
+[A,lib/localvalidator.ts,190]         // Check versionType is not different from any valid parent
+[A,lib/localvalidator.ts,191]         if(this.cachedValidations[txid].parents.filter(p => p.valid).length > 0) {
+[A,lib/localvalidator.ts,192]             let validVersionType = this.cachedValidations[txid].parents.find(p => p.valid).versionType;
+[A,lib/localvalidator.ts,193]             if(this.cachedValidations[txid].details.versionType !== validVersionType) {
+[A,lib/localvalidator.ts,194]                 this.cachedValidations[txid].invalidReason = "SLP version/type mismatch from valid parent."
+[A,lib/localvalidator.ts,195]                 return this.cachedValidations[txid].validity = false;
+[A,lib/localvalidator.ts,196]             }
+[A,lib/localvalidator.ts,197]         } 
+[A,lib/localvalidator.ts,198]         // For case with 0 token SEND with no valid parents, must check GENESIS validity / versionType.
+[A,lib/localvalidator.ts,199]         else if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {
+[A,lib/localvalidator.ts,200]             let slpmsg = this.cachedValidations[txid].details
+[A,lib/localvalidator.ts,201]             let valid = await this.isValidSlpTxid(slpmsg.tokenIdHex);
+[A,lib/localvalidator.ts,202]             if(valid) {
+[A,lib/localvalidator.ts,203]                 let genesisTxn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[slpmsg.tokenIdHex].hex)
+[A,lib/localvalidator.ts,204]                 let genesisMsg = this.slp.parseSlpOutputScript(genesisTxn.outputs[0]._scriptBuffer)
+[A,lib/localvalidator.ts,205]                 if(genesisMsg.versionType !== slpmsg.versionType) {
+[A,lib/localvalidator.ts,206]                     this.cachedValidations[txid].invalidReason = "SLP version/type mismatch from valid GENESIS."
+[A,lib/localvalidator.ts,207]                     return this.cachedValidations[txid].validity = false;
+[A,lib/localvalidator.ts,208]                 }
+[A,lib/localvalidator.ts,209]             } else {
+[A,lib/localvalidator.ts,210]                 this.cachedValidations[txid].invalidReason = "SEND has 0 outputs, but has invalid token GENESIS."
+[A,lib/localvalidator.ts,211]                 console.log(this.cachedValidations[slpmsg.tokenIdHex].invalidReason)
+[C,lib/localvalidator.ts,212]                 return this.cachedValidations[txid].validity = false;
+[D,lib/localvalidator.ts,195]             else {
+[D,lib/localvalidator.ts,196]                 console.log(e);
+[D,lib/localvalidator.ts,197]                 throw Error("Validator error.");
+[C,lib/localvalidator.ts,213]             }
+[C,lib/localvalidator.ts,214]         }
+[D,lib/localvalidator.ts,200]         return this.cachedValidations[txid].validity;
+[A,lib/localvalidator.ts,215] 
+[A,lib/localvalidator.ts,216]         return this.cachedValidations[txid].validity = true;
+[C,lib/localvalidator.ts,217]     }
+[C,lib/localvalidator.ts,218] 
+[C,lib/localvalidator.ts,219]     async validateSlpTransactions(txids: string[]): Promise<string[]> {
+[C,lib/localvalidator.ts,220]         let res = [];
+[C,lib/localvalidator.ts,221]         for (let i = 0; i < txids.length; i++) {
+[C,lib/localvalidator.ts,222]             res.push((await this.isValidSlpTxid) ? txids[i] : '')
+[C,lib/localvalidator.ts,223]         }
+[C,lib/localvalidator.ts,224]         return res.filter((id: string) => id.length > 0);
+[C,lib/localvalidator.ts,225]     }
+[C,lib/localvalidator.ts,226] }
+@@ -1,18 +1,18 @@
+[C,package.json,1] {
+[C,package.json,2]   "name": "slpjs",
+[D,package.json,3]   "version": "0.10.3",
+[A,package.json,3]   "version": "0.11.1",
+[C,package.json,4]   "description": "Simple Ledger Protocol (SLP) JavaScript Library",
+[C,package.json,5]   "main": "index.js",
+[C,package.json,6]   "files": [
+[C,package.json,7]     "lib/",
+[C,package.json,8]     "dist/"
+[C,package.json,9]   ],
+[C,package.json,10]   "scripts": {
+[C,package.json,11]     "test": "tsc && mocha",
+[C,package.json,12]     "postinstall": "mkdirp dist",
+[C,package.json,13]     "build": "tsc && browserify index.js --standalone slpjs > dist/slpjs.js && uglifyjs dist/slpjs.js > dist/slpjs.min.js"
+[C,package.json,14]   },
+[C,package.json,15]   "repository": {
+[C,package.json,16]     "type": "git",
+[C,package.json,17]     "url": "git+https://github.com/simpleledger/slpjs.git"
+[C,package.json,18]   },
+@@ -2,31 +2,31 @@ const assert = require('assert');
+[C,test/bitdbnetwork.js,2] const BigNumber = require('bignumber.js');
+[C,test/bitdbnetwork.js,3] 
+[C,test/bitdbnetwork.js,4] const BitdbNetwork = require('../lib/bitdbnetwork').BitdbNetwork;
+[C,test/bitdbnetwork.js,5] 
+[C,test/bitdbnetwork.js,6] describe('BitdbNetwork', function() {
+[C,test/bitdbnetwork.js,7]     describe('getTokenInformation()', function() {
+[C,test/bitdbnetwork.js,8]         //console.log(JSON.stringify(BitdbNetwork));
+[C,test/bitdbnetwork.js,9]         let net = new BitdbNetwork();
+[C,test/bitdbnetwork.js,10]         it('returns token information for a given valid tokenId', async () => {
+[C,test/bitdbnetwork.js,11]             let tokenId = '667b28d5885717e6d164c832504ae6b0c4db3c92072119ddfc5ff0db2c433456';
+[C,test/bitdbnetwork.js,12]             let tokenInfo = await net.getTokenInformation(tokenId);
+[C,test/bitdbnetwork.js,13]             let expectedTokenInfo = { 
+[C,test/bitdbnetwork.js,14]                 timestamp: '2019-01-19 14:33',
+[C,test/bitdbnetwork.js,15]                 tokenIdHex: '667b28d5885717e6d164c832504ae6b0c4db3c92072119ddfc5ff0db2c433456',
+[C,test/bitdbnetwork.js,16]                 transactionType: 0,
+[D,test/bitdbnetwork.js,17]                 type: 1, 
+[A,test/bitdbnetwork.js,17]                 versionType: 1, 
+[C,test/bitdbnetwork.js,18]                 symbol: 'BCH',
+[C,test/bitdbnetwork.js,19]                 name: 'Bitcoin Cash',
+[C,test/bitdbnetwork.js,20]                 documentUri: '',
+[C,test/bitdbnetwork.js,21]                 documentSha256: new Buffer.from(''),
+[C,test/bitdbnetwork.js,22]                 decimals: 8,
+[C,test/bitdbnetwork.js,23]                 containsBaton: true,
+[C,test/bitdbnetwork.js,24]                 batonVout: 2, 
+[C,test/bitdbnetwork.js,25]                 genesisOrMintQuantity: new BigNumber("21000000")
+[C,test/bitdbnetwork.js,26]             }
+[C,test/bitdbnetwork.js,27]             assert.deepEqual(tokenInfo, expectedTokenInfo);
+[C,test/bitdbnetwork.js,28]         });
+[C,test/bitdbnetwork.js,29]         it('throws when tokeId is not found', async () => {
+[C,test/bitdbnetwork.js,30]             let tokenId = '000028d5885717e6d164c832504ae6b0c4db3c92072119ddfc5ff0db2c433456';
+[C,test/bitdbnetwork.js,31]             let threw = false;
+[C,test/bitdbnetwork.js,32]             try {
+@@ -6,36 +6,43 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
+[C,test/localvalidator.js,6]         function step(result) { result.done ? resolve(result.value) : new P(function (resolve) { resolve(result.value); }).then(fulfilled, rejected); }
+[C,test/localvalidator.js,7]         step((generator = generator.apply(thisArg, _arguments || [])).next());
+[C,test/localvalidator.js,8]     });
+[C,test/localvalidator.js,9] };
+[C,test/localvalidator.js,10] Object.defineProperty(exports, "__esModule", { value: true });
+[C,test/localvalidator.js,11] const bitbox_sdk_1 = require("bitbox-sdk/lib/bitbox-sdk");
+[C,test/localvalidator.js,12] const BITBOX = new bitbox_sdk_1.default();
+[C,test/localvalidator.js,13] const assert = require("assert");
+[C,test/localvalidator.js,14] require("mocha");
+[C,test/localvalidator.js,15] const localvalidator_1 = require("../lib/localvalidator");
+[C,test/localvalidator.js,16] const txUnitTestData = require('slp-unit-test-data/tx_input_tests.json');
+[C,test/localvalidator.js,17] describe('Slp', function () {
+[C,test/localvalidator.js,18]     describe('isValidSlpTxid() -- SLP Transaction Validation Unit Tests', function () {
+[C,test/localvalidator.js,19]         txUnitTestData.forEach(test => {
+[C,test/localvalidator.js,20]             it(test.description, () => __awaiter(this, void 0, void 0, function* () {
+[A,test/localvalidator.js,21]                 // Create method for serving up the unit test transactions 
+[C,test/localvalidator.js,22]                 let getRawUnitTestTransactions = (txids) => __awaiter(this, void 0, void 0, function* () {
+[C,test/localvalidator.js,23]                     let allTxns = test.when.concat(test.should);
+[C,test/localvalidator.js,24]                     let txn = allTxns.find(i => {
+[C,test/localvalidator.js,25]                         let hash = BITBOX.Crypto.sha256(BITBOX.Crypto.sha256(Buffer.from(i.tx, 'hex'))).reverse().toString('hex');
+[C,test/localvalidator.js,26]                         return hash === txids[0];
+[C,test/localvalidator.js,27]                     });
+[C,test/localvalidator.js,28]                     if (txn)
+[C,test/localvalidator.js,29]                         return [txn.tx];
+[C,test/localvalidator.js,30]                     return null;
+[C,test/localvalidator.js,31]                 });
+[D,test/localvalidator.js,31]                 const slpValidator = new localvalidator_1.LocalValidator(BITBOX, getRawUnitTestTransactions);
+[D,test/localvalidator.js,32]                 test.when.forEach(w => slpValidator.addValidationFromStore(w.tx, w.valid));
+[A,test/localvalidator.js,32]                 // Create instance of Local Validator
+[A,test/localvalidator.js,33]                 var slpValidator = new localvalidator_1.LocalValidator(BITBOX, getRawUnitTestTransactions);
+[A,test/localvalidator.js,34]                 // Pre-Load Validator the unit-test inputs
+[A,test/localvalidator.js,35]                 test.when.forEach(w => {
+[A,test/localvalidator.js,36]                     slpValidator.addValidationFromStore(w.tx, w.valid);
+[A,test/localvalidator.js,37]                 });
+[C,test/localvalidator.js,38]                 let txid = BITBOX.Crypto.sha256(BITBOX.Crypto.sha256(Buffer.from(test.should[0].tx, 'hex'))).reverse().toString('hex');
+[C,test/localvalidator.js,39]                 let shouldBeValid = test.should[0].valid;
+[C,test/localvalidator.js,40]                 let isValid = yield slpValidator.isValidSlpTxid(txid);
+[A,test/localvalidator.js,41]                 if (isValid === false)
+[A,test/localvalidator.js,42]                     console.log('invalid reason:', slpValidator.cachedValidations[txid].invalidReason);
+[C,test/localvalidator.js,43]                 assert.equal(isValid, shouldBeValid);
+[C,test/localvalidator.js,44]             }));
+[C,test/localvalidator.js,45]         });
+[C,test/localvalidator.js,46]     });
+[C,test/localvalidator.js,47] });
+[C,test/localvalidator.js,48] //# sourceMappingURL=localvalidator.js.map
+@@ -1,35 +1,43 @@
+[C,test/localvalidator.ts,1] import BITBOXSDK from 'bitbox-sdk/lib/bitbox-sdk';
+[C,test/localvalidator.ts,2] const BITBOX = new BITBOXSDK();
+[C,test/localvalidator.ts,3] import * as assert from 'assert';
+[C,test/localvalidator.ts,4] import "mocha";
+[C,test/localvalidator.ts,5] import { LocalValidator, GetRawTransactionsAsync } from '../lib/localvalidator';
+[C,test/localvalidator.ts,6] import { SlpValidityUnitTest, SlpTestTxn } from './global';
+[C,test/localvalidator.ts,7] const txUnitTestData: SlpValidityUnitTest[] = require('slp-unit-test-data/tx_input_tests.json');
+[C,test/localvalidator.ts,8] 
+[C,test/localvalidator.ts,9] describe('Slp', function() {
+[C,test/localvalidator.ts,10]     describe('isValidSlpTxid() -- SLP Transaction Validation Unit Tests', function() {
+[C,test/localvalidator.ts,11]         txUnitTestData.forEach(test => {
+[C,test/localvalidator.ts,12]             it(test.description, async () => {
+[A,test/localvalidator.ts,13] 
+[A,test/localvalidator.ts,14]                 // Create method for serving up the unit test transactions 
+[C,test/localvalidator.ts,15]                 let getRawUnitTestTransactions: GetRawTransactionsAsync = async (txids: string[]) => {
+[C,test/localvalidator.ts,16]                     let allTxns: SlpTestTxn[] = test.when.concat(test.should);
+[C,test/localvalidator.ts,17]                     let txn = allTxns.find(i => {
+[C,test/localvalidator.ts,18]                         let hash = (<Buffer>BITBOX.Crypto.sha256(BITBOX.Crypto.sha256(Buffer.from(i.tx, 'hex'))).reverse()).toString('hex');
+[C,test/localvalidator.ts,19]                         return hash === txids[0] 
+[C,test/localvalidator.ts,20]                     });
+[C,test/localvalidator.ts,21]                     if(txn)
+[C,test/localvalidator.ts,22]                         return [txn.tx];
+[C,test/localvalidator.ts,23]                     return null
+[C,test/localvalidator.ts,24]                 }
+[C,test/localvalidator.ts,25]     
+[D,test/localvalidator.ts,24]                 const slpValidator = new LocalValidator(BITBOX, getRawUnitTestTransactions);
+[D,test/localvalidator.ts,25]                 test.when.forEach(w=>slpValidator.addValidationFromStore(w.tx, w.valid));
+[A,test/localvalidator.ts,26]                 // Create instance of Local Validator
+[A,test/localvalidator.ts,27]                 var slpValidator = new LocalValidator(BITBOX, getRawUnitTestTransactions);
+[A,test/localvalidator.ts,28] 
+[A,test/localvalidator.ts,29]                 // Pre-Load Validator the unit-test inputs
+[A,test/localvalidator.ts,30]                 test.when.forEach(w => {
+[A,test/localvalidator.ts,31]                     slpValidator.addValidationFromStore(w.tx, w.valid)
+[A,test/localvalidator.ts,32]                 });
+[C,test/localvalidator.ts,33] 
+[C,test/localvalidator.ts,34]                 let txid = (<Buffer>BITBOX.Crypto.sha256(BITBOX.Crypto.sha256(Buffer.from(test.should[0].tx, 'hex'))).reverse()).toString('hex');
+[C,test/localvalidator.ts,35]                 let shouldBeValid = test.should[0].valid;
+[C,test/localvalidator.ts,36]                 let isValid = await slpValidator.isValidSlpTxid(txid);
+[D,test/localvalidator.ts,30] 
+[A,test/localvalidator.ts,37]                 if(isValid === false)
+[A,test/localvalidator.ts,38]                     console.log('invalid reason:', slpValidator.cachedValidations[txid].invalidReason);
+[C,test/localvalidator.ts,39]                 assert.equal(isValid, shouldBeValid);
+[C,test/localvalidator.ts,40]             });
+[C,test/localvalidator.ts,41]         })
+[C,test/localvalidator.ts,42]     });
+[C,test/localvalidator.ts,43] });

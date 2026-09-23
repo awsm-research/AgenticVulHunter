@@ -1,0 +1,261 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 56,
+      "statement": "var v = vm.runInNewContext(m[1], {});",
+      "change_type": "A",
+      "function_name": "ExecutionInterpreter.replace",
+      "operation_type": "security_sensitive_execution",
+      "selection_reason": "observable input from user configuration -> vm.runInNewContext execution -> arbitrary code execution vulnerability",
+      "security_relevance_score": 0.9,
+      "code_context": "1: var vm = require('vm');\n2: var isPlainObject = require('lodash.isplainobject');\n3: \n4: var getValue = function(obj, key) {\n5:   var o = obj;\n6:   var keys = Array.isArray(key) ? key : key.split('.');\n7:   \n8:   for (var x = 0; x < keys.length -1; ++x) {\n9:     var k = keys[x];\n10:     if (!o[k]) return;\n11:     o = o[k];\n12:   }\n13:   \n14:   return o[keys[keys.length - 1]];\n15: };\n16: \n17: var setValue = function(obj, key, value) {\n18:   var o = obj;\n19:   var keys = Array.isArray(key) ? key : key.split('.');\n20:   \n21:   for (var x = 1; x < keys.length; ++x) {\n22:     var currentKey = keys[x];\n23:     var lastKey = keys[x - 1];\n24:     if (typeof(currentKey) === 'number') {\n25:       if (!o[lastKey]) { o[lastKey] = []; }\n26:       o = o[lastKey];\n27:     } else if (typeof(currentKey) === 'string') {\n28:       if (!o[lastKey]) { o[lastKey] = {}; }\n29:       o = o[lastKey];\n30:     } else {\n31:       throw new Error('Oopsy, key arrays should only be strings and numbers:', keys);\n32:     }\n33:   }\n34:   \n35:   o[keys[keys.length - 1]] = value;\n36:   return obj;\n37: };\n38: \n39: \n40: var EnvVarInterpreter = {\n41:   type: '$',\n42:   replace: function(value, context) {\n43:     var m = /\\$\\{([^\\}]+)\\}/.exec(value);\n44:     if (!m) return value;\n45:     return value.replace(m[0], context.env[m[1]]);\n46:   }\n47: };\n48: \n49: var ExecutionInterpreter = {\n50:   type: '#',\n51:   replace: function(value, context) {\n52:     var m = /#\\{([^\\}]+)\\}/.exec(value);\n53:     if (!m) return value;\n54:     \n55:     try {\n56:       var v = vm.runInNewContext(m[1], {});\n57:       if (m[0] === value) return v;\n58:       return value.replace(m[0], v);\n59:     } catch(err) {\n60:       throw new Error('Invalid execution [' + m[1] + ']: ' + err.message);\n61:     }\n62:   }\n63: };\n64: \n65: var ReferenceInterpreter = {\n66:   type: '@',\n67:   replace: function(value, context) {\n68:     var m = /@\\{([^\\}]+)\\}/.exec(value);\n69:     if (!m) return value;\n70:     \n71:     var v = getValue(context.config, m[1]);\n72:     if (m[0] === value) return v;\n73:     return value.replace(m[0], v);\n74:   }\n75: };\n76: \n77: var Interpreters = [ReferenceInterpreter, EnvVarInterpreter, ExecutionInterpreter];\n78: \n79: var ConnieLang = {\n80:   Interpreters: Interpreters,\n81:   InterpretersByType: Interpreters.reduce(function(o, i) {o[i.type] = i; return o;}, {}),\n82:   \n83:   getEntries: function(config) {\n84:     var entries = [];\n85:     \n86:     var iter = function(value, prefix) {\n87:       if (!prefix) prefix = [];\n88:       \n89:       if (Array.isArray(value)) {\n90:         value.forEach(function(arrValue, idx) {\n91:           iter(arrValue, prefix.concat(idx));\n92:         });\n93:       } else if (isPlainObject(value)) {\n94:         Object.keys(value).forEach(function(key) {\n95:           iter(value[key], prefix.concat(key));\n96:         });\n97:       } else {\n98:         entries.push({key: prefix, value: value});\n99:       }\n100:     };\n101:     \n102:     iter(config);\n103:     return entries;\n104:   },\n105:   \n106:   firstInnermostInterpreterFromValue: function(value) {\n107:     var start = -1;\n108:     var interpreterTypes = Object.keys(ConnieLang.InterpretersByType);\n109:     \n110:     for (var idx = 1; idx < value.length; ++idx) {\n111:       if (value[idx] === '{' && interpreterTypes.indexOf(value[idx - 1]) !== -1) {\n112:         start = idx - 1;\n113:       } else if (value[idx] === '}' && start !== -1) {\n114:         return {\n115:           type: value[start],\n116:           match: value.slice(start, idx + 1),\n117:           value: value.slice(start + 2, idx),\n118:           start: start,\n119:           end: idx + 1\n120:         };\n121:       }\n122:     }\n123:     \n124:     return null;\n125:   },\n126:   \n127:   parse: function(configObj, envObj) {\n128:     var context = {\n129:       config: configObj,\n130:       env: envObj || process.env\n131:     };\n132:     \n133:     var entries = ConnieLang.getEntries(context.config);\n134:     \n135:     // iterate until no updates have been made\n136:     var digest = function() {\n137:       var updated = false;\n138:       \n139:       entries.forEach(function(e) {\n140:         var interpreter = ConnieLang.firstInnermostInterpreterFromValue(e.value, context);\n141:         if (!interpreter) return;\n142:         \n143:         var newValue = ConnieLang.InterpretersByType[interpreter.type].replace(e.value, context);\n144:         if (newValue !== e.value) {\n145:           e.value = newValue;\n146:           updated = true;\n147:         }\n148:       });\n149:       \n150:       return updated;\n151:     };\n152:     \n153:     while(digest()) ;\n154:     \n155:     var result = {};\n156:     entries.forEach(function(e) {\n157:       setValue(result, e.key, e.value);\n158:     });\n159:     \n160:     return result;\n161:   }\n162: };\n163: \n164: module.exports = ConnieLang;",
+      "source_summary": "The value passed to vm.runInNewContext comes from user configuration through the ExecutionInterpreter. The regex pattern /#\\{([^\\}]+)\\}/ extracts content between #{ and } which becomes m[1]. This content originates from configObj values that are processed during parsing.",
+      "sink_summary": "The extracted expression m[1] is executed using vm.runInNewContext with an empty context object {}. This represents a direct execution of user-provided JavaScript code in a new context.",
+      "guard_summary": "There are no validation, sanitization, or authorization controls on the content being executed. The code directly passes user input to vm.runInNewContext without any filtering or escaping.",
+      "risk_pattern": "User-controllable JavaScript code is executed in a new VM context, allowing for arbitrary code execution attacks through configuration values.",
+      "used_variable_sources": [
+        "m[1]"
+      ],
+      "called_function_context": [
+        "vm.runInNewContext(m[1], {})"
+      ],
+      "enclosing_conditions": [],
+      "context_summary": "The vulnerability occurs in the ExecutionInterpreter.replace function where user-provided configuration values containing #{...} expressions are parsed and executed. The parsing process uses a regex to extract content between #{ and } which is then passed directly to vm.runInNewContext without any sanitization or validation.",
+      "unresolved_facts": [],
+      "retrieval_query": {
+        "source": "user configuration values containing #{...} expressions",
+        "sensitive_operation": "vm.runInNewContext execution",
+        "missing_control": "no input validation or sanitization",
+        "mechanism_keywords": [
+          "arbitrary code execution",
+          "javascript execution",
+          "vm.runInNewContext"
+        ]
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/regex/unmatchable-dollar",
+          "cwe_id": "CWE-561",
+          "cwe_name": "Dead Code",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 30.4564,
+          "raw_bm25_score": 30.4564,
+          "description": "If a dollar assertion '$' appears in a regular expression before another term that cannot match the empty string, then this assertion can never match, so the entire regular expression cannot match any string.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove dead code through static analysis. Use code coverage tools to identify unreachable code. Implement regular code reviews to eliminate unused functionality.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "regular-expressions",
+            "external/cwe/cwe-561"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 24.6978,
+          "raw_bm25_score": 24.6978,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/remote-property-injection",
+          "cwe_id": "CWE-400",
+          "cwe_name": "Uncontrolled Resource Consumption",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.339,
+          "raw_bm25_score": 20.339,
+          "description": "Allowing writes to arbitrary properties of an object may lead to denial-of-service attacks.",
+          "pattern": "Look for operations that can consume excessive resources without proper limits or controls",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-250",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/stored-xss",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 18.9252,
+          "raw_bm25_score": 18.9252,
+          "description": "Using uncontrolled stored values in HTML allows for a stored cross-site scripting vulnerability.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output operations. Implement proper escaping for HTML, JavaScript, CSS, and URL contexts.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-116"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/comparison-of-identical-expressions",
+          "cwe_id": "CWE-571",
+          "cwe_name": "Expression is Always True",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 18.6515,
+          "raw_bm25_score": 18.6515,
+          "description": "If the same expression occurs on both sides of a comparison operator, the operator is redundant, and probably indicates a mistake.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-571. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "reliability",
+            "correctness",
+            "readability",
+            "convention",
+            "external/cwe/cwe-570"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/regex-injection",
+          "cwe_id": "CWE-730",
+          "cwe_name": "Security Issue (CWE-730)",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.8435,
+          "raw_bm25_score": 17.8435,
+          "description": "User input should not be used in regular expressions without first being escaped, otherwise a malicious user may be able to inject an expression that could require exponential time on certain inputs.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-730",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/useless-regexp-character-escape",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.4137,
+          "raw_bm25_score": 17.4137,
+          "description": "Prepending a backslash to an ordinary character in a string does not have any effect, and may make regular expressions constructed from this string behave unexpectedly.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/prototype-pollution",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.7643,
+          "raw_bm25_score": 15.7643,
+          "description": "Recursively merging a user-controlled object into another object can allow an attacker to modify the built-in Object prototype, and possibly escalate to remote code execution or cross-site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-094",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/function-declaration-conflict",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.6295,
+          "raw_bm25_score": 15.6295,
+          "description": "If two functions with the same name are declared in the same scope, one of the declarations overrides the other without warning. This makes the code hard to read and maintain, and may even lead to platform-dependent behavior.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/insecure-helmet-configuration",
+          "cwe_id": "CWE-693",
+          "cwe_name": "Protection Mechanism Failure",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.4586,
+          "raw_bm25_score": 15.4586,
+          "description": "The Helmet middleware is used to set security-related HTTP headers in Express applications. This query finds instances where the middleware is configured with important security features disabled.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-693",
+            "external/cwe/cwe-1021"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

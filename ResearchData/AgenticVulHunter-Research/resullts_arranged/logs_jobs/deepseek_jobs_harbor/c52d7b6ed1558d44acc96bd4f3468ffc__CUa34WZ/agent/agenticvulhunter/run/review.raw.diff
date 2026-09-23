@@ -1,0 +1,643 @@
+diff --git a/CHANGELOG b/CHANGELOG
+index 5537337..773bd47 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -1,26 +1,32 @@
+ Release 1.5.2 (**tip**)
+ =======================
+ 
+ * pkg_resources scanning for additional Beaker back-ends gracefully handles
+   situations where its not present (GAE). Fixes #36.
+ * Avoid timing attacks on hash comparison.
+ * Provide abstract base for MemoryNamespaceManager that deals with
+   "dictionaries".
+ * Added tests for invalidating cache, and fixed bug with function cache when
+   no args are present.
+ * The SQLAlchemy backends require SQLAlchemy 0.4 or greater (0.6 recommended).
++* Rudimental Python 3 support is now available.   Simply use Python 3 with
++  Distribute and "python setup.py install" to run 2to3 automatically,
++  or manually run 2to3 on "beaker" and "tests" to convert to a 
++  Python 3 version.
++* Added support for PyCrypto module to encrypted session, etc. in addition
++  to the existing pycryptopp support.
+ 
+ Release 1.5.1 (12/17/2009)
+ ==========================
+ 
+ * Fix cache namespacing.
+ 
+ Release 1.5 (11/23/2009)
+ ========================
+ 
+ * Update memcached to default to using pylibmc when available.
+ * Fix bug when cache value doesn't exist causing has_key to throw
+   an exception rather than return False. Fixes #24.
+ * Fix bug where getpid under GAE is used improperly to assume it
+   should be a non-string. Fixes #22.
+ * Add cache_region decorator that works *before* configuration of
+diff --git a/beaker/crypto/__init__.py b/beaker/crypto/__init__.py
+index c9dc502..419c287 100644
+--- a/beaker/crypto/__init__.py
++++ b/beaker/crypto/__init__.py
+@@ -1,35 +1,39 @@
+-from warnings import warn
+ 
+ from beaker.crypto.pbkdf2 import PBKDF2, strxor
+-from beaker.exceptions import InvalidCryptoBackendError
+-
+-_implementations = ('pycrypto', 'jcecrypto')
++from beaker.crypto.util import hmac, sha1, hmac_sha1, md5
++from beaker import util
+ 
+ keyLength = None
+-for impl_name in _implementations:
++
++if util.jython:
+     try:
+-        package = 'beaker.crypto.%s' % impl_name
+-        module = __import__(package, fromlist=('aesEncrypt', 'getKeyLength'))
+-        keyLength = module.getKeyLength()
+-        aesEncrypt = module.aesEncrypt
+-        if keyLength >= 32:
+-            break
+-    except:
++        from beaker.crypto.jcecrypto import getKeyLength, aesEncrypt
++        keyLength = getKeyLength()
++    except ImportError:
++        pass
++else:
++    try:
++        from beaker.crypto.pycrypto import getKeyLength, aesEncrypt, aesDecrypt
++        keyLength = getKeyLength()
++    except ImportError:
+         pass
+ 
+ if not keyLength:
+-    raise InvalidCryptoBackendError
++    has_aes = False
++else:
++    has_aes = True
+ 
+-if keyLength < 32:
++if has_aes and keyLength < 32:
+     warn('Crypto implementation only supports key lengths up to %d bits. '
+          'Generated session cookies may be incompatible with other '
+          'environments' % (keyLength * 8))
+ 
++
+ def generateCryptoKeys(master_key, salt, iterations):
+     # NB: We XOR parts of the keystream into the randomly-generated parts, just
+     # in case os.urandom() isn't as random as it should be.  Note that if
+     # os.urandom() returns truly random data, this will have no effect on the
+     # overall security.
+     keystream = PBKDF2(master_key, salt, iterations=iterations)
+     cipher_key = keystream.read(keyLength)
+     return cipher_key
+diff --git a/beaker/crypto/jcecrypto.py b/beaker/crypto/jcecrypto.py
+index 0ddcd20..4062d51 100644
+--- a/beaker/crypto/jcecrypto.py
++++ b/beaker/crypto/jcecrypto.py
+@@ -10,19 +10,21 @@ which will allow encryption using 256 bit AES keys.
+ """
+ from javax.crypto import Cipher
+ from javax.crypto.spec import SecretKeySpec, IvParameterSpec
+ 
+ import jarray
+ 
+ # Initialization vector filled with zeros
+ _iv = IvParameterSpec(jarray.zeros(16, 'b'))
+ 
+ def aesEncrypt(data, key):
+     cipher = Cipher.getInstance('AES/CTR/NoPadding')
+     skeySpec = SecretKeySpec(key, 'AES')
+     cipher.init(Cipher.ENCRYPT_MODE, skeySpec, _iv)
+     return cipher.doFinal(data).tostring()
+ 
++# magic.
++aesDecrypt = aesEncrypt
+ 
+ def getKeyLength():
+     maxlen = Cipher.getMaxAllowedKeyLength('AES/CTR/NoPadding')
+     return min(maxlen, 256) / 8
+diff --git a/beaker/crypto/pbkdf2.py b/beaker/crypto/pbkdf2.py
+index a96d0c3..7c39bf4 100644
+--- a/beaker/crypto/pbkdf2.py
++++ b/beaker/crypto/pbkdf2.py
+@@ -58,49 +58,33 @@
+ #   function in the previous release) silently truncates all keys to 64
+ #   bytes.  The way it was used in the previous release, this would only be
+ #   problem if the pseudorandom function that returned values larger than
+ #   64 bytes (so SHA1, SHA256 and SHA512 are fine), but I don't like
+ #   anything that silently reduces the security margin from what is
+ #   expected.
+ #
+ ###########################################################################
+ 
+ __version__ = "1.1"
+ 
+ from struct import pack
+ from binascii import b2a_hex
+ from random import randint
+ 
+-from beaker.util import b64encode
++from base64 import b64encode
+ 
+-try:
+-    # Use PyCrypto (if available)
+-    from Crypto.Hash import HMAC, SHA as SHA1
+-
+-except ImportError:
+-    # PyCrypto not available.  Use the Python standard library.
+-    import hmac as HMAC
+-    import sys
+-    # When using the stdlib, we have to make sure the hmac version and sha
+-    # version are compatible
+-    if sys.version_info[0:2] <= (2,4):
+-        # hmac in python2.4 or less require the sha module
+-        import sha as SHA1
+-    else:
+-        # NOTE: We have to use the callable with hashlib (hashlib.sha1),
+-        # otherwise hmac only accepts the sha module object itself
+-        from hashlib import sha1 as SHA1
++from beaker.crypto.util import hmac as HMAC, hmac_sha1 as SHA1
+ 
+ def strxor(a, b):
+     return "".join([chr(ord(x) ^ ord(y)) for (x, y) in zip(a, b)])
+ 
+ class PBKDF2(object):
+     """PBKDF2.py : PKCS#5 v2.0 Password-Based Key Derivation
+     
+     This implementation takes a passphrase and a salt (and optionally an
+     iteration count, a digest module, and a MAC module) and provides a
+     file-like object from which an arbitrarily-sized key can be read.
+ 
+     If the passphrase and/or salt are unicode objects, they are encoded as
+     UTF-8 before they are processed.
+ 
+     The idea behind PBKDF2 is to derive a cryptographic key from a
+diff --git a/beaker/crypto/pycrypto.py b/beaker/crypto/pycrypto.py
+index 5d4c81b..5837b80 100644
+--- a/beaker/crypto/pycrypto.py
++++ b/beaker/crypto/pycrypto.py
+@@ -1,12 +1,33 @@
+ """
+-Encryption module that uses pycryptopp.
++Encryption module that uses pycryptopp or pycrypto
++
+ """
+-from pycryptopp.cipher import aes
+ 
+-def aesEncrypt(data, key):
+-    cipher = aes.AES(key)
+-    return cipher.process(data)
++try:
++    # TODO: why is pycryptopp preferred over Crypto.Cipher ?
++    
++    from pycryptopp.cipher import aes
++
++    def aesEncrypt(data, key):
++        cipher = aes.AES(key)
++        return cipher.process(data)
++    
++    # magic.
++    aesDecrypt = aesEncrypt
++    
++except ImportError:
++    from Crypto.Cipher import AES
++
++    def aesEncrypt(data, key):
++        cipher = AES.new(key)
++        
++        data = data + (" " * (16 - (len(data) % 16)))
++        return cipher.encrypt(data)
++
++    def aesDecrypt(data, key):
++        cipher = AES.new(key)
+ 
++        return cipher.decrypt(data).rstrip()
+ 
+ def getKeyLength():
+     return 32
+diff --git a/beaker/crypto/util.py b/beaker/crypto/util.py
+new file mode 100644
+index 0000000..d97e8ce
+--- /dev/null
++++ b/beaker/crypto/util.py
+@@ -0,0 +1,30 @@
++from warnings import warn
++from beaker import util
++
++
++try:
++    # Use PyCrypto (if available)
++    from Crypto.Hash import HMAC as hmac, SHA as hmac_sha1
++    sha1 = hmac_sha1.new
++    
++except ImportError:
++    
++    # PyCrypto not available.  Use the Python standard library.
++    import hmac
++
++    # When using the stdlib, we have to make sure the hmac version and sha
++    # version are compatible
++    if util.py24:
++        from sha import sha as sha1
++        import sha as hmac_sha1
++    else:
++        # NOTE: We have to use the callable with hashlib (hashlib.sha1),
++        # otherwise hmac only accepts the sha module object itself
++        from hashlib import sha1
++        hmac_sha1 = sha1
++
++
++if util.py24:
++    from md5 import md5
++else:
++    from hashlib import md5
+diff --git a/beaker/docs/sessions.rst b/beaker/docs/sessions.rst
+index 4715da4..9302b82 100644
+--- a/beaker/docs/sessions.rst
++++ b/beaker/docs/sessions.rst
+@@ -202,27 +202,29 @@ need for a shared storage system when different servers handle the same
+ session.
+ 
+ .. _encryption:
+ 
+ Encryption
+ ----------
+ 
+ In the event that the cookie-based sessions should also be encrypted to
+ prevent the user from being able to decode the data (in addition to not
+ being able to tamper with it), Beaker can use 256-bit AES encryption to
+ secure the contents of the cookie.
+ 
+ Depending on the Python implementation used, Beaker may require an additional
+ library to provide AES encryption.
+ 
+-On CPython (the regular Python), the `pycryptopp`_ library is required.
++On CPython (the regular Python), the `pycryptopp`_ library or `PyCrypto`_ library
++ is required.
+ 
+ On Jython, no additional packages are required, but at least on the Sun JRE,
+ the size of the encryption key is by default limited to 128 bits, which causes
+ generated sessions to be incompatible with those generated in CPython, and vice
+ versa. To overcome this limitation, you need to install the unlimited strength
+ juristiction policy files from Sun:
+ 
+ * `Policy files for Java 5 <https://cds.sun.com/is-bin/INTERSHOP.enfinity/WFS/CDS-CDS_Developer-Site/en_US/-/USD/ViewProductDetail-Start?ProductRef=jce_policy-1.5.0-oth-JPR@CDS-CDS_Developer>`_
+ * `Policy files for Java 6 <https://cds.sun.com/is-bin/INTERSHOP.enfinity/WFS/CDS-CDS_Developer-Site/en_US/-/USD/ViewProductDetail-Start?ProductRef=jce_policy-6-oth-JPR@CDS-CDS_Developer>`_
+ 
+ .. _pycryptopp: http://pypi.python.org/pypi/pycryptopp
++.. _PyCrypto: http://pypi.python.org/pypi/pycrypto/2.0.1
+diff --git a/beaker/exceptions.py b/beaker/exceptions.py
+index 85210a1..cc0eed2 100644
+--- a/beaker/exceptions.py
++++ b/beaker/exceptions.py
+@@ -8,20 +8,17 @@ class CreationAbortedError(Exception):
+     """Deprecated."""
+ 
+ 
+ class InvalidCacheBackendError(BeakerException, ImportError):
+     pass
+ 
+ 
+ class MissingCacheParameter(BeakerException):
+     pass
+ 
+ 
+ class LockError(BeakerException):
+     pass
+ 
+ 
+-class InvalidCryptoBackendError(BeakerException, ImportError):
+-
+-    def __init__(self):
+-        Exception.__init__(self,
+-                           'No supported crypto implementation was found')
++class InvalidCryptoBackendError(BeakerException):
++    pass
+diff --git a/beaker/session.py b/beaker/session.py
+index 7a8aa67..79b6aad 100644
+--- a/beaker/session.py
++++ b/beaker/session.py
+@@ -1,54 +1,29 @@
+-import cPickle
+ import Cookie
+-import hmac
+ import os
+ import random
+ import time
+ from datetime import datetime, timedelta
+-try:
+-    from hashlib import md5
+-except ImportError:
+-    from md5 import md5
+-try:
+-    # Use PyCrypto (if available)
+-    from Crypto.Hash import HMAC, SHA as SHA1
+-
+-except ImportError:
+-    # PyCrypto not available.  Use the Python standard library.
+-    import hmac as HMAC
+-    import sys
+-    # When using the stdlib, we have to make sure the hmac version and sha
+-    # version are compatible
+-    if sys.version_info[0:2] <= (2,4):
+-        # hmac in python2.4 or less require the sha module
+-        import sha as SHA1
+-    else:
+-        # NOTE: We have to use the callable with hashlib (hashlib.sha1),
+-        # otherwise hmac only accepts the sha module object itself
+-        from hashlib import sha1 as SHA1
+-
+-# Check for pycryptopp encryption for AES
+-try:
+-    from beaker.crypto import generateCryptoKeys, aesEncrypt
+-    crypto_ok = True
+-except:
+-    crypto_ok = False
++    
++from beaker.crypto import hmac as HMAC, hmac_sha1 as SHA1, md5
++from beaker.util import pickle
+ 
++from beaker import crypto
+ from beaker.cache import clsmap
+ from beaker.exceptions import BeakerException
+-from beaker.util import b64decode, b64encode
++from base64 import b64encode, b64decode
++
+ 
+ __all__ = ['SignedCookie', 'Session']
+ 
+ getpid = hasattr(os, 'getpid') and os.getpid or (lambda : '')
+ 
+ class SignedCookie(Cookie.BaseCookie):
+     """Extends python cookie to give digital signature support"""
+     def __init__(self, secret, input=None):
+         self.secret = secret
+         Cookie.BaseCookie.__init__(self, input)
+     
+     def value_decode(self, val):
+         val = val.strip('"')
+         sig = HMAC.new(self.secret, val[40:], SHA1).hexdigest()
+         
+@@ -361,32 +336,33 @@ class CookieSession(Session):
+         whether session data is still valid.
+     ``encrypt_key``
+         The key to use for the session encryption, if not provided the
+         session will not be encrypted.
+     ``validate_key``
+         The key used to sign the encrypted session
+     ``cookie_domain``
+         Domain to use for the cookie.
+     ``secure``
+         Whether or not the cookie should only be sent over SSL.
+     
+     """
+     def __init__(self, request, key='beaker.session.id', timeout=None,
+                  cookie_expires=True, cookie_domain=None, encrypt_key=None,
+                  validate_key=None, secure=False, **kwargs):
+-        if not crypto_ok and encrypt_key:
+-            raise BeakerException("pycryptopp is not installed, can't use "
++        
++        if not crypto.has_aes and encrypt_key:
++            raise InvalidCryptoBackendError("No AES library is installed, can't generate "
+                                   "encrypted cookie-only Session.")
+         
+         self.request = request
+         self.key = key
+         self.timeout = timeout
+         self.cookie_expires = cookie_expires
+         self.encrypt_key = encrypt_key
+         self.validate_key = validate_key
+         self.request['set_cookie'] = False
+         self.secure = secure
+         self._domain = cookie_domain
+         self._path = '/'
+         
+         try:
+             cookieheader = request['cookie']
+@@ -436,51 +412,51 @@ class CookieSession(Session):
+     domain = property(_get_domain, _set_domain)
+     
+     def _set_path(self, path):
+         self['_path'] = path
+         self._path = path
+     
+     def _get_path(self, domain):
+         return self._path
+     
+     path = property(_get_path, _set_path)
+ 
+     def _encrypt_data(self):
+         """Serialize, encipher, and base64 the session dict"""
+         if self.encrypt_key:
+             nonce = b64encode(os.urandom(40))[:8]
+-            encrypt_key = generateCryptoKeys(self.encrypt_key,
++            encrypt_key = crypto.generateCryptoKeys(self.encrypt_key,
+                                              self.validate_key + nonce, 1)
+-            data = cPickle.dumps(self.copy(), 2)
+-            return nonce + b64encode(aesEncrypt(data, encrypt_key))
++            data = pickle.dumps(self.copy(), 2)
++            return nonce + b64encode(crypto.aesEncrypt(data, encrypt_key))
+         else:
+-            data = cPickle.dumps(self.copy(), 2)
++            data = pickle.dumps(self.copy(), 2)
+             return b64encode(data)
+     
+     def _decrypt_data(self):
+         """Bas64, decipher, then un-serialize the data for the session
+         dict"""
+         if self.encrypt_key:
+             nonce = self.cookie[self.key].value[:8]
+-            encrypt_key = generateCryptoKeys(self.encrypt_key,
++            encrypt_key = crypto.generateCryptoKeys(self.encrypt_key,
+                                              self.validate_key + nonce, 1)
+             payload = b64decode(self.cookie[self.key].value[8:])
+-            data = aesEncrypt(payload, encrypt_key)
+-            return cPickle.loads(data)
++            data = crypto.aesDecrypt(payload, encrypt_key)
++            return pickle.loads(data)
+         else:
+             data = b64decode(self.cookie[self.key].value)
+-            return cPickle.loads(data)
++            return pickle.loads(data)
+     
+     def _make_id(self):
+         return md5(md5(
+             "%f%s%f%s" % (time.time(), id({}), random.random(), getpid())
+             ).hexdigest()
+         ).hexdigest()
+     
+     def save(self, accessed_only=False):
+         """Saves the data for this session to persistent storage"""
+         if accessed_only and self.is_new:
+             return
+         if accessed_only:
+             self.clear()
+             self.update(self.accessed_dict)
+         self._create_cookie()
+diff --git a/beaker/util.py b/beaker/util.py
+index 9818d38..3f4204b 100644
+--- a/beaker/util.py
++++ b/beaker/util.py
+@@ -1,41 +1,42 @@
+ """Beaker utilities"""
++
+ try:
+     import thread as _thread
+     import threading as _threading
+ except ImportError:
+     import dummy_thread as _thread
+     import dummy_threading as _threading
+ 
+ from datetime import datetime, timedelta
+ import os
+ import string
+ import types
+ import weakref
+ import warnings
+ import sys
+ 
+ py3k = getattr(sys, 'py3kwarning', False) or sys.version_info >= (3, 0)
++py24 = sys.version_info <= (2, 4)
++jython = sys.platform.startswith('java')
+ 
+-try:
+-    from hashlib import sha1
+-except ImportError:
+-    # py2.4
+-    from sha import sha as sha1
++if py3k or jython:
++    import pickle
++else:
++    import cPickle as pickle
+ 
+ from beaker.converters import asbool
+-from base64 import b64encode, b64decode
+ from threading import local as _tlocal
+ 
+ 
+ __all__  = ["ThreadLocal", "Registry", "WeakValuedRegistry", "SyncDict",
+             "encoded_path", "verify_directory"]
+ 
+ 
+ def verify_directory(dir):
+     """verifies and creates a directory.  tries to
+     ignore collisions with other threads and processes."""
+ 
+     tries = 0
+     while not os.access(dir, os.F_OK):
+         try:
+             tries += 1
+@@ -130,37 +131,42 @@ class SyncDict(object):
+     def __getitem__(self, key):
+         return self.dict.__getitem__(key)
+     def __setitem__(self, key, value):
+         self.dict.__setitem__(key, value)
+     def __delitem__(self, key):
+         return self.dict.__delitem__(key)
+     def clear(self):
+         self.dict.clear()
+ 
+ 
+ class WeakValuedRegistry(SyncDict):
+     def __init__(self):
+         self.mutex = _threading.RLock()
+         self.dict = weakref.WeakValueDictionary()
+ 
+-            
++sha1 = None            
+ def encoded_path(root, identifiers, extension = ".enc", depth = 3,
+                  digest_filenames=True):
++                 
+     """Generate a unique file-accessible path from the given list of
+     identifiers starting at the given root directory."""
+     ident = "_".join(identifiers)
+-
++    
++    global sha1
++    if sha1 is None:
++        from beaker.crypto import sha1
++        
+     if digest_filenames:
+         if py3k:
+             ident = sha1(ident.encode('utf-8')).hexdigest()
+         else:
+             ident = sha1(ident).hexdigest()
+     
+     ident = os.path.basename(ident)
+ 
+     tokens = []
+     for d in range(1, depth):
+         tokens.append(ident[0:d])
+     
+     dir = os.path.join(root, *tokens)
+     verify_directory(dir)
+     
+diff --git a/tests/test_cookie_domain_only.py b/tests/test_cookie_domain_only.py
+index 03076b5..a46f918 100644
+--- a/tests/test_cookie_domain_only.py
++++ b/tests/test_cookie_domain_only.py
+@@ -1,25 +1,26 @@
+ import re
+ import os
+ 
+ import beaker.session
+ from beaker.middleware import SessionMiddleware
+ from nose import SkipTest
+ from webtest import TestApp
+ 
+-if not beaker.session.crypto_ok:
+-    raise SkipTest("PyCryptopp is not installed, can't test cookie-only "
++from beaker import crypto
++if not crypto.has_aes:
++    raise SkipTest("No AES library is installed, can't test cookie-only "
+                    "Sessions")
+ 
+ def simple_app(environ, start_response):
+     session = environ['beaker.session']
+     if not session.has_key('value'):
+         session['value'] = 0
+     session['value'] += 1
+     domain = environ.get('domain')
+     if domain:
+         session.domain = domain
+     if not environ['PATH_INFO'].startswith('/nosave'):
+         session.save()
+     start_response('200 OK', [('Content-type', 'text/plain')])
+     return ['The current value is: %d and cookie is %s' % (session['value'], session)]
+ 
+diff --git a/tests/test_cookie_only.py b/tests/test_cookie_only.py
+index dfc2588..dcacf86 100644
+--- a/tests/test_cookie_only.py
++++ b/tests/test_cookie_only.py
+@@ -1,25 +1,26 @@
+ import re
+ import os
+ 
+ import beaker.session
+ from beaker.middleware import SessionMiddleware
+ from nose import SkipTest
+ from webtest import TestApp
+ 
+-if not beaker.session.crypto_ok:
+-    raise SkipTest("No usable crypto library found, can't test cookie-only "
++from beaker import crypto
++if not crypto.has_aes:
++    raise SkipTest("No AES library is installed, can't test cookie-only "
+                    "Sessions")
+ 
+ def simple_app(environ, start_response):
+     session = environ['beaker.session']
+     if not session.has_key('value'):
+         session['value'] = 0
+     session['value'] += 1
+     if not environ['PATH_INFO'].startswith('/nosave'):
+         session.save()
+     start_response('200 OK', [('Content-type', 'text/plain')])
+     return ['The current value is: %d and cookie is %s' % (session['value'], session)]
+ 
+ def test_increment():
+     options = {'session.validate_key':'hoobermas', 'session.type':'cookie'}
+     app = TestApp(SessionMiddleware(simple_app, **options))

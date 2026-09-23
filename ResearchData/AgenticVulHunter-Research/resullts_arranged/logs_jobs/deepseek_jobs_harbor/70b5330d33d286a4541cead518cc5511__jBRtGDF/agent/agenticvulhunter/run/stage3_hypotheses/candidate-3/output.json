@@ -1,0 +1,90 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "lib/unpack.js",
+  "changed_line": 208,
+  "statement": "this[SKIPNEWER](entry)",
+  "change_type": "A",
+  "function_name": "[CHECKFS]",
+  "operation_type": "file_extraction_decision",
+  "selection_reason": "decision to skip file extraction -> prevents intended file updates -> potential integrity or availability impact",
+  "security_relevance_score": 0.7,
+  "code_context": "59: \n60:     this.cwd = path.resolve(opt.cwd || process.cwd())\n61:     this.strip = +opt.strip || 0\n62:     this.umask = typeof opt.umask === 'number' ? opt.umask : process.umask()\n63:     // default mode for dirs created as parents\n64:     this.dmode = opt.dmode || (0o0777 & (~this.umask))\n65:     this.fmode = opt.fmode || (0o0666 & (~this.umask))\n66:     this.on('entry', entry => this[ONENTRY](entry))\n67:     if (typeof opt.onwarn === 'function')\n68:       this.on('warn', opt.onwarn)\n69:   }\n70: \n71:   [MAYBECLOSE] () {\n72:     if (this[ENDED] && this[PENDING] === 0)\n73:       this.emit('close')\n74:   }\n75: \n76:   [CHECKPATH] (entry) {\n77:     if (this.strip) {\n78:       const parts = entry.path.split(/\\/|\\\\/)\n79:       if (parts.length < this.strip)\n80:         return false\n81:       entry.path = parts.slice(this.strip).join('/')\n82:     }\n83: \n84:     if (!this.preservePaths) {\n85:       const p = entry.path\n86:       if (p.match(/(^|\\/|\\\\)\\.\\.(\\\\|\\/|$)/)) {\n87:         this.warn('path contains \\'..\\'', p)\n88:         return false\n89:       }\n90:       if (path.isAbsolute(p)) {\n91:         const parsed = path.parse(p)\n92:         this.warn('stripping ' + parsed.root + ' from absolute path', p)\n93:         entry.path = p.substr(parsed.root.length)\n94:       }\n95:     }\n96: \n97:     if (path.isAbsolute(entry.path))\n98:       entry.absolute = entry.path\n99:     else\n100:       entry.absolute = path.resolve(this.cwd, entry.path)\n101: \n102:     return true\n103:   }\n104: \n105:   [ONENTRY] (entry) {\n106:     if (!this[CHECKPATH](entry))\n107:       return entry.resume()\n108: \n109:     assert.equal(typeof entry.absolute, 'string')\n110: \n111:     switch (entry.type) {\n112:       case 'File':\n113:       case 'OldFile':\n114:       case 'ContiguousFile':\n115:       case 'Link':\n116:       case 'SymbolicLink':\n117:       case 'Directory':\n118:       case 'GNUDumpDir':\n119:         return this[CHECKFS](entry)\n120: \n121:       case 'CharacterDevice':\n122:       case 'BlockDevice':\n123:       case 'FIFO':\n124:         return this[UNSUPPORTED](entry)\n125: \n126:       // this should be impossible\n127:       /* istanbul ignore next */\n128:       default:\n129:         return this.emit('error', new Error('unknown type: ' + entry.type))\n130:     }\n131:   }\n132: \n133:   [ONERROR] (er, entry) {\n134:     this.warn(er.message, er)\n135:     this[UNPEND]()\n136:     entry.resume()\n137:   }\n138: \n139:   [MKDIR] (dir, mode, cb) {\n140:     mkdir(dir, {\n141:       preserve: this.preservePaths,\n142:       unlink: this.unlink,\n143:       cache: this.dirCache,\n144:       cwd: this.cwd,\n145:       mode: mode\n146:     }, cb)\n147:   }\n148: \n149:   [FILE] (entry) {\n150:     const mode = entry.mode & 0o7777 || this.fmode\n151:     const stream = fs.createWriteStream(entry.absolute, { mode: mode })\n152:     stream.on('error', er => this[ONERROR](er, entry))\n153:     stream.on('close', _ => {\n154:       if (entry.mtime)\n155:         fs.utimes(entry.absolute, entry.atime || new Date(), entry.mtime, _ => _)\n156:       this[UNPEND]()\n157:     })\n158:     entry.pipe(stream)\n159:   }\n160: \n161:   [DIRECTORY] (entry) {\n162:     const mode = entry.mode & 0o7777 || this.dmode\n163:     this[MKDIR](entry.absolute, mode, er => {\n164:       if (er)\n165:         return this[ONERROR](er, entry)\n166:       if (entry.mtime)\n167:         fs.utimes(entry.absolute, entry.atime || new Date(), entry.mtime, _ => _)\n168:       this[UNPEND]()\n169:       entry.resume()\n170:     })\n171:   }\n172: \n173:   [UNSUPPORTED] (entry) {\n174:     this.warn('unsupported entry type: ' + entry.type, entry)\n175:     entry.resume()\n176:   }\n177: \n178:   [SYMLINK] (entry) {\n179:     this[LINK](entry, entry.linkpath, 'symlink')\n180:   }\n181: \n182:   [HARDLINK] (entry) {\n183:     this[LINK](entry, path.resolve(this.cwd, entry.linkpath), 'link')\n184:   }\n185: \n186:   [PEND] () {\n187:     this[PENDING]++\n188:   }\n189: \n190:   [UNPEND] () {\n191:     this[PENDING]--\n192:     this[MAYBECLOSE]()\n193:   }\n194: \n195:   [SKIPNEWER] (entry) {\n196:     this[UNPEND]()\n197:     entry.resume()\n198:   }\n199: \n200:   // check if a thing is there, and if so, try to clobber it\n201:   [CHECKFS] (entry) {\n202:     this[PEND]()\n203:     this[MKDIR](path.dirname(entry.absolute), this.dmode, er => {\n204:       if (er)\n205:         return this[ONERROR](er, entry)\n206:       fs.lstat(entry.absolute, (er, st) => {\n207:         if (this.newer && st.mtime > entry.mtime)\n208:           this[SKIPNEWER](entry)\n209:         else if (er || (entry.type === 'File' && !this.unlink && st.isFile()))\n210:           this[MAKEFS](null, entry)\n211:         else if (st.isDirectory()) {\n212:           if (entry.type === 'Directory') {\n213:             if (!entry.mode || (st.mode & 0o7777) === entry.mode)\n214:               this[MAKEFS](null, entry)\n215:             else\n216:               fs.chmod(entry.absolute, entry.mode, er => this[MAKEFS](er, entry))\n217:           } else\n218:             fs.rmdir(entry.absolute, er => this[MAKEFS](er, entry))\n219:         } else\n220:           fs.unlink(entry.absolute, er => this[MAKEFS](er, entry))\n221:       })\n222:     })\n223:   }\n224: \n225:   [MAKEFS] (er, entry) {\n226:     if (er)\n227:       return this[ONERROR](er, entry)\n228: \n229:     switch (entry.type) {\n230:       case 'File':\n231:       case 'OldFile':\n232:       case 'ContiguousFile':\n233:         return this[FILE](entry)\n234: \n235:       case 'Link':\n236:         return this[HARDLINK](entry)\n237: \n238:       case 'SymbolicLink':\n239:         return this[SYMLINK](entry)\n240: \n241:       case 'Directory':\n242:       case 'GNUDumpDir':\n243:         return this[DIRECTORY](entry)\n244: \n245:       // should be impossible\n246:       /* istanbul ignore next */\n247:       default:\n248:         return this.emit('error', new Error('unknown type: ' + entry.type))\n249:     }\n250:   }\n251: \n252:   [LINK] (entry, linkpath, link) {\n253:     // XXX: get the type ('file' or 'dir') for windows\n254:     fs[link](linkpath, entry.absolute, er => {\n255:       if (er)\n256:         return this[ONERROR](er, entry)\n257:       this[UNPEND]()\n258:       entry.resume()\n259:     })\n260:   }\n261: }\n262: \n263: class UnpackSync extends Unpack {\n264:   constructor (opt) {\n265:     super(opt)\n266:   }\n267: \n268:   [CHECKFS] (entry) {\n269:     const er = this[MKDIR](path.dirname(entry.absolute), this.dmode)\n270:     if (er)\n271:       return this[ONERROR](er, entry)\n272:     try {\n273:       const st = fs.lstatSync(entry.absolute)\n274:       if (this.newer && st.mtime > entry.mtime)\n275:         return this[SKIPNEWER](entry)\n276:       else if (entry.type === 'File' && !this.unlink && st.isFile())\n277:         return this[MAKEFS](null, entry)\n278:       else {\n279:         try {\n280:           if (st.isDirectory()) {\n281:             if (entry.type === 'Directory') {\n282:               if (entry.mode && (st.mode & 0o7777) !== entry.mode)\n283:                 fs.chmodSync(entry.absolute, entry.mode)\n284:             } else\n285:               fs.rmdirSync(entry.absolute)\n286:           } else\n287:             fs.unlinkSync(entry.absolute)\n288:           return this[MAKEFS](null, entry)\n289:         } catch (er) {\n290:           return this[ONERROR](er, entry)\n291:         }\n292:       }\n293:     } catch (er) {\n294:       return this[MAKEFS](null, entry)\n295:     }\n296:   }\n297: \n298:   [FILE] (entry) {\n299:     const mode = entry.mode & 0o7777 || this.fmode\n300:     try {\n301:       const fd = fs.openSync(entry.absolute, 'w', mode)\n302:       entry.on('data', buf => fs.writeSync(fd, buf, 0, buf.length, null))\n303:       entry.on('end', _ => {\n304:         if (entry.mtime) {\n305:           try {\n306:             fs.futimesSync(fd, entry.atime || new Date(), entry.mtime)\n307:           } catch (er) {}\n308:         }\n309:         try { fs.closeSync(fd) } catch (er) { this[ONERROR](er, entry) }\n310:       })\n311:     } catch (er) { this[ONERROR](er, entry) }\n312:   }\n313: \n314:   [DIRECTORY] (entry) {\n315:     const mode = entry.mode & 0o7777 || this.dmode\n316:     const er = this[MKDIR](entry.absolute, mode)\n317:     if (er)\n318:       return this[ONERROR](er, entry)\n319:     if (entry.mtime) {\n320:       try {\n321:         fs.utimesSync(entry.absolute, entry.atime || new Date(), entry.mtime)\n322:       } catch (er) {}\n323:     }\n324:     entry.resume()\n325:   }\n326: \n327:   [MKDIR] (dir, mode) {\n328:     try {\n329:       return mkdir.sync(dir, {\n330:         preserve: this.preservePaths,\n331:         unlink: this.unlink,\n332:         cache: this.dirCache,\n333:         cwd: this.cwd,\n334:         mode: mode\n335:       })\n336:     } catch (er) {\n337:       return er\n338:     }\n339:   }\n340: \n341:   [LINK] (entry, linkpath, link) {\n342:     try {\n343:       fs[link + 'Sync'](linkpath, entry.absolute)\n344:       entry.resume()\n345:     } catch (er) {\n346:       return this[ONERROR](er, entry)\n347:     }\n348:   }\n349: }\n350: \n351: Unpack.Sync = UnpackSync\n352: module.exports = Unpack",
+  "source_summary": "Entry metadata from archive, file system stat information (st.mtime), and user-controlled 'newer' option",
+  "sink_summary": "File system extraction bypass - skips writing file when existing file is newer than archive entry",
+  "guard_summary": "Conditional check: this.newer && st.mtime > entry.mtime. The 'newer' option must be enabled and existing file must have newer modification time.",
+  "risk_pattern": "Archive extraction skips updating files when existing files are newer, potentially preventing security updates or allowing outdated/insecure files to persist",
+  "used_variable_sources": [
+    "this.newer (user option)",
+    "st.mtime (file system)",
+    "entry.mtime (archive)"
+  ],
+  "called_function_context": [
+    "SKIPNEWER: decrements pending counter and resumes entry stream",
+    "UNPEND: manages pending operation counter",
+    "entry.resume(): continues processing next entry"
+  ],
+  "enclosing_conditions": [
+    "this.newer option enabled",
+    "Existing file modification time > archive entry modification time"
+  ],
+  "context_summary": "Called during file system check when unpacking archive entries. When newer option is set and existing file is newer than archive version, extraction is skipped entirely for that file.",
+  "unresolved_facts": [
+    "Specific security impact depends on archive source and context of use",
+    "Whether skipping newer files is intentional security feature or potential bypass mechanism"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-807",
+      "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+      "fit_reason": "Security decision (skip file extraction) relies on file modification times from untrusted archive and file system, allowing attacker to prevent security updates",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-367",
+      "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+      "fit_reason": "File modification time check followed by extraction decision could be vulnerable to race conditions if file state changes between check and intended operation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-471",
+      "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+      "fit_reason": "File modification times are assumed immutable for security decisions but can be manipulated by attackers to bypass updates",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "fit_reason": "Insufficient validation of file modification time inputs used for security-critical extraction decisions",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "Archive extraction context with potential path validation issues, though mechanism focus is on timestamp-based bypass",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-117",
+    "CWE-193",
+    "CWE-20",
+    "CWE-22",
+    "CWE-367",
+    "CWE-378",
+    "CWE-471",
+    "CWE-494",
+    "CWE-497",
+    "CWE-59",
+    "CWE-758",
+    "CWE-807",
+    "CWE-829",
+    "CWE-863",
+    "CWE-912"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25"
+}

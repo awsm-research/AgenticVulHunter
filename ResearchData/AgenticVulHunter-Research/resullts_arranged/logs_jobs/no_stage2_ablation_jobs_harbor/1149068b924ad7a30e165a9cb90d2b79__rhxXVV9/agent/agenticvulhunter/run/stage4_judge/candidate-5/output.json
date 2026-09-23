@@ -1,0 +1,158 @@
+{
+  "candidate_id": "candidate-5",
+  "filepath": "src/wagtail_2fa/views.py",
+  "changed_line": 127,
+  "statement": "class DeviceDeleteView(OtpRequiredMixin, DeleteView):",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "observable input/state (view class inheritance) -> exact operation (adding OtpRequiredMixin) -> security-sensitive effect (enforces OTP requirement for device deletion view)",
+  "security_relevance_score": 0.75,
+  "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: from wagtail_2fa.mixins import OtpRequiredMixin\n21: \n22: \n23: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n24:     template_name = \"wagtail_2fa/otp_form.html\"\n25:     form_class = forms.TokenForm\n26:     redirect_field_name = REDIRECT_FIELD_NAME\n27: \n28:     @method_decorator(sensitive_post_parameters())\n29:     @method_decorator(never_cache)\n30:     def dispatch(self, *args, **kwargs):\n31:         return super().dispatch(*args, **kwargs)\n32: \n33:     def get_form_kwargs(self):\n34:         kwargs = super().get_form_kwargs()\n35:         kwargs[\"user\"] = self.request.user\n36:         return kwargs\n37: \n38:     def get_context_data(self, *args, **kwargs):\n39:         context = super().get_context_data(*args, **kwargs)\n40:         context[self.redirect_field_name] = self.get_redirect_url()\n41:         return context\n42: \n43:     def form_valid(self, form):\n44:         otp_login(self.request, self.request.user.otp_device)\n45:         return super().form_valid(form)\n46: \n47:     def get_redirect_url(self):\n48:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n49:         redirect_to = self.request.POST.get(\n50:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n51:         )\n52:         url_is_safe = is_safe_url(\n53:             url=redirect_to,\n54:             allowed_hosts=self.get_success_url_allowed_hosts(),\n55:             require_https=self.request.is_secure(),\n56:         )\n57:         return redirect_to if url_is_safe else \"\"\n58: \n59:     def get_success_url(self):\n60:         url = self.get_redirect_url()\n61:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n62: \n63: \n64: class DeviceListView(OtpRequiredMixin, ListView):\n65:     template_name = \"wagtail_2fa/device_list.html\"\n66: \n67:     # require OTP if configured\n68:     if_configured = True\n69: \n70:     def get_queryset(self):\n71:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n72: \n73:     def get_context_data(self, **kwargs):\n74:         context = super().get_context_data(**kwargs)\n75:         context['user_id'] = int(self.kwargs['user_id'])\n76:         return context\n77: \n78: \n79: class DeviceCreateView(OtpRequiredMixin, FormView):\n80:     form_class = forms.DeviceForm\n81:     template_name = \"wagtail_2fa/device_form.html\"\n82: \n83:     # require OTP if configured\n84:     if_configured = True\n85: \n86:     def get_form_kwargs(self):\n87:         kwargs = super().get_form_kwargs()\n88:         kwargs[\"user\"] = self.request.user\n89:         kwargs[\"instance\"] = self.device\n90:         return kwargs\n91: \n92:     def form_valid(self, form):\n93:         form.save()\n94:         utils.delete_unconfirmed_devices(form.user)\n95: \n96:         if not self.request.user.is_verified():\n97:             otp_login(self.request, form.instance)\n98:         return super().form_valid(form)\n99: \n100:     def get_success_url(self):\n101:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n102: \n103:     @cached_property\n104:     def device(self):\n105:         if self.request.method.lower() == \"get\":\n106:             return utils.new_unconfirmed_device(self.request.user)\n107:         else:\n108:             return utils.get_unconfirmed_device(self.request.user)\n109: \n110: \n111: class DeviceUpdateView(OtpRequiredMixin, UpdateView):\n112:     form_class = forms.DeviceForm\n113:     template_name = \"wagtail_2fa/device_form.html\"\n114: \n115:     def get_queryset(self):\n116:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n117: \n118:     def get_form_kwargs(self):\n119:         kwargs = super().get_form_kwargs()\n120:         kwargs[\"user\"] = self.request.user\n121:         return kwargs\n122: \n123:     def get_success_url(self):\n124:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n125: \n126: \n127: class DeviceDeleteView(OtpRequiredMixin, DeleteView):\n128:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n129: \n130:     def get_queryset(self):\n131:         device = TOTPDevice.objects.get(**self.kwargs)\n132:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n133: \n134:     def get_success_url(self):\n135:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n136: \n137: \n138: class DeviceQRCodeView(OtpRequiredMixin, View):\n139:     # require OTP if configured\n140:     if_configured = True\n141: \n142:     def get(self, request):\n143:         device = utils.get_unconfirmed_device(self.request.user)\n144:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n145:         response = HttpResponse(content_type=\"image/svg+xml\")\n146:         img.save(response)\n147: \n148:         return response",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "The DeviceDeleteView inherits from OtpRequiredMixin which enforces OTP but does not validate that the user owns the device being deleted, leading to potential incorrect authorization.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "fit_reason": "The DeviceDeleteView allows direct access to delete any device via URL parameters without proper authorization checks, enabling forced browsing.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1321",
+    "CWE-208",
+    "CWE-264",
+    "CWE-285",
+    "CWE-311",
+    "CWE-352",
+    "CWE-377",
+    "CWE-425",
+    "CWE-471",
+    "CWE-561",
+    "CWE-581",
+    "CWE-628",
+    "CWE-685",
+    "CWE-687",
+    "CWE-730",
+    "CWE-863"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 127,
+      "statement": "class DeviceDeleteView(OtpRequiredMixin, DeleteView):",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The DeviceDeleteView inherits from OtpRequiredMixin, which enforces OTP authentication but does not validate that the user owns the device being deleted. This directly matches the mechanism of incorrect authorization where a check is performed but not correctly applied."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The view accepts device parameters via self.kwargs and retrieves the device using TOTPDevice.objects.get(**self.kwargs). The user's ownership of the device is not validated before deletion, creating a path from user input to unauthorized access."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted to remove OtpRequiredMixin, the view would no longer enforce OTP authentication. However, if the line remains but the authorization check is removed, it would allow unauthorized deletion of devices. The patch adds the OtpRequiredMixin which changes the authorization mechanism from none to OTP-based."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "The required control is proper authorization validation before device deletion. The code does not validate that the user owns the device being deleted, only that they are authenticated with OTP. The existing controls checked include OtpRequiredMixin (which enforces OTP but not ownership) and the device retrieval logic.",
+          "required_control": "Authorization validation to ensure user owns the device",
+          "control_requirement_evidence": "CWE-863 requires correct authorization checks. Without validating that the user owns the device, an attacker can delete any device if they know its ID.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin (enforces OTP but not ownership)",
+            "TOTPDevice.objects.get(**self.kwargs) (retrieves device without validation)"
+          ],
+          "deficiency_evidence": "The view retrieves a device using self.kwargs and does not validate that the requesting user owns that device. The authorization check is bypassed, allowing any authenticated user to delete any device."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "An attacker with knowledge of a device ID can delete it without owning it, leading to unauthorized access control. This allows for potential denial-of-service or privilege escalation if the device is associated with another user."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the DeviceDeleteView would no longer inherit from OtpRequiredMixin, removing OTP enforcement. However, this would not address the core authorization issue where device ownership is not validated before deletion.",
+      "supporting_evidence": [
+        "DeviceDeleteView inherits from OtpRequiredMixin which enforces OTP authentication",
+        "The view retrieves device using TOTPDevice.objects.get(**self.kwargs) without validating user ownership",
+        "The get_queryset method retrieves devices for a specific user but does not validate that the requested device belongs to the current user"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the device deletion actually affects other users' access or just removes their device from their own list",
+        "The exact mechanism by which device ownership is determined in the TOTPDevice model"
+      ],
+      "review_comment": "The DeviceDeleteView enforces OTP authentication but does not validate that the user owns the device being deleted. This allows any authenticated user to delete devices they don't own, violating authorization principles. Add a check to ensure the requesting user owns the device before deletion.",
+      "change_type": "A",
+      "raw_score": 0.7000000000000001,
+      "score": 0.7000000000000001
+    },
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 127,
+      "statement": "class DeviceDeleteView(OtpRequiredMixin, DeleteView):",
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The DeviceDeleteView inherits from OtpRequiredMixin, which enforces OTP requirement, but the view itself does not validate that the user has authorization to delete the specific device being requested. The vulnerability arises because the URL parameters allow direct access to any device's deletion endpoint without checking if the current user owns or is authorized to delete that device."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The DeviceDeleteView accepts device parameters via URL (e.g., device ID) and uses them in get_queryset() to retrieve a device. The connection between the user's input (device ID from URL) and the vulnerable operation (deletion) is demonstrated, but it's not clear if the user can control which device they delete without proper authorization checks."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted to remove OtpRequiredMixin, the view would still be vulnerable to forced browsing because it lacks authorization checks for device ownership. However, if the change was to add proper authorization checks (e.g., ensuring that only the owner of a device can delete it), then the patch would materially address the vulnerability."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The view uses OtpRequiredMixin, which enforces OTP authentication but does not validate authorization to delete a specific device. The required control is proper authorization checking (i.e., ensuring that only the owner of a device can delete it). This control is missing or insufficiently implemented.",
+          "required_control": "Authorization check for device ownership",
+          "control_requirement_evidence": "CWE-425 requires that all restricted URLs, scripts, or files must have appropriate authorization enforcement. The DeviceDeleteView allows deletion of any device via URL parameters without verifying if the user is authorized to delete that specific device.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin (enforces OTP but not ownership)",
+            "get_queryset() method (retrieves device based on URL params)"
+          ],
+          "deficiency_evidence": "The view retrieves a device using URL parameters and allows deletion without verifying if the current user owns that device. The authorization check is missing, which is essential for preventing forced browsing."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "An attacker could potentially delete any device by knowing its ID, assuming they have access to the OTP (which is required). However, without proper authorization checks, an attacker could exploit this to delete devices belonging to other users, leading to unauthorized actions."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, removing OtpRequiredMixin, the view would still be vulnerable to forced browsing because it lacks authorization checks for device ownership. The OTP requirement alone does not prevent an attacker from deleting any device if they know its ID.",
+      "supporting_evidence": [
+        "DeviceDeleteView inherits from OtpRequiredMixin which enforces OTP but not authorization",
+        "get_queryset() method retrieves device based on URL parameters without checking ownership",
+        "The view allows deletion of any device via URL parameters"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the user can control which device they delete without proper authorization checks",
+        "Whether downstream validation prevents unauthorized deletions"
+      ],
+      "review_comment": "The DeviceDeleteView allows direct access to delete any device via URL parameters without verifying if the current user owns that device. The view enforces OTP but lacks authorization checks for device ownership, enabling forced browsing. Add an authorization check in get_queryset() to ensure only the owner of a device can delete it.",
+      "change_type": "A",
+      "raw_score": 0.64,
+      "score": 0.64
+    }
+  ],
+  "stage4_status": "completed"
+}

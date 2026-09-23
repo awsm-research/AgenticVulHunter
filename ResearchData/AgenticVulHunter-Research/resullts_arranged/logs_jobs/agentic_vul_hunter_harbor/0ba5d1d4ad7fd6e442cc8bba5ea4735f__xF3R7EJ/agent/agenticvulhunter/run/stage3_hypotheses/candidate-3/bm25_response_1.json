@@ -1,0 +1,244 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "change_type": "A",
+      "function_name": "MandrillSignatureMixin.validate_request",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+      "security_relevance_score": 0.7,
+      "code_context": "1: import json\n2: from datetime import datetime\n3: \n4: import hashlib\n5: import hmac\n6: from base64 import b64encode\n7: from django.utils.crypto import constant_time_compare\n8: from django.utils.timezone import utc\n9: \n10: from .base import AnymailBaseWebhookView\n11: from ..exceptions import AnymailWebhookValidationFailure, AnymailConfigurationError\n12: from ..signals import tracking, AnymailTrackingEvent, EventType\n13: from ..utils import get_anymail_setting, getfirst, get_request_uri\n14: \n15: \n16: class MandrillSignatureMixin(object):\n17:     \"\"\"Validates Mandrill webhook signature\"\"\"\n18: \n19:     # These can be set from kwargs in View.as_view, or pulled from settings in init:\n20:     webhook_key = None  # required\n21:     webhook_url = None  # optional; defaults to actual url used\n22: \n23:     def __init__(self, **kwargs):\n24:         # noinspection PyUnresolvedReferences\n25:         esp_name = self.esp_name\n26:         # webhook_key is required for POST, but not for HEAD when Mandrill validates webhook url.\n27:         # Defer \"missing setting\" error until we actually try to use it in the POST...\n28:         webhook_key = get_anymail_setting('webhook_key', esp_name=esp_name, default=None,\n29:                                           kwargs=kwargs, allow_bare=True)\n30:         if webhook_key is not None:\n31:             self.webhook_key = webhook_key.encode('ascii')  # hmac.new requires bytes key in python 3\n32:         self.webhook_url = get_anymail_setting('webhook_url', esp_name=esp_name, default=None,\n33:                                                kwargs=kwargs, allow_bare=True)\n34:         # noinspection PyArgumentList\n35:         super(MandrillSignatureMixin, self).__init__(**kwargs)\n36: \n37:     def validate_request(self, request):\n38:         if self.webhook_key is None:\n39:             # issue deferred \"missing setting\" error (re-call get-setting without a default)\n40:             # noinspection PyUnresolvedReferences\n41:             get_anymail_setting('webhook_key', esp_name=self.esp_name, allow_bare=True)\n42: \n43:         try:\n44:             signature = request.META[\"HTTP_X_MANDRILL_SIGNATURE\"]\n45:         except KeyError:\n46:             raise AnymailWebhookValidationFailure(\"X-Mandrill-Signature header missing from webhook POST\")\n47: \n48:         # Mandrill signs the exact URL (including basic auth, if used) plus the sorted POST params:\n49:         url = self.webhook_url or get_request_uri(request)\n50:         params = request.POST.dict()\n51:         signed_data = url\n52:         for key in sorted(params.keys()):\n53:             signed_data += key + params[key]\n54: \n55:         expected_signature = b64encode(hmac.new(key=self.webhook_key, msg=signed_data.encode('utf-8'),\n56:                                                 digestmod=hashlib.sha1).digest())\n57:         if not constant_time_compare(signature, expected_signature):\n58:             raise AnymailWebhookValidationFailure(\n59:                 \"Mandrill webhook called with incorrect signature (for url %r)\" % url)\n60: \n61: \n62: class MandrillBaseWebhookView(MandrillSignatureMixin, AnymailBaseWebhookView):\n63:     \"\"\"Base view class for Mandrill webhooks\"\"\"\n64: \n65:     warn_if_no_basic_auth = False  # because we validate against signature\n66: \n67:     def parse_events(self, request):\n68:         esp_events = json.loads(request.POST['mandrill_events'])\n69:         return [self.esp_to_anymail_event(esp_event) for esp_event in esp_events]\n70: \n71:     def esp_to_anymail_event(self, esp_event):\n72:         raise NotImplementedError()\n73: \n74: \n75: class MandrillTrackingWebhookView(MandrillBaseWebhookView):\n76: \n77:     signal = tracking\n78: \n79:     event_types = {\n80:         # Message events:\n81:         'send': EventType.SENT,\n82:         'deferral': EventType.DEFERRED,\n83:         'hard_bounce': EventType.BOUNCED,\n84:         'soft_bounce': EventType.DEFERRED,\n85:         'open': EventType.OPENED,\n86:         'click': EventType.CLICKED,\n87:         'spam': EventType.COMPLAINED,\n88:         'unsub': EventType.UNSUBSCRIBED,\n89:         'reject': EventType.REJECTED,\n90:         # Sync events (we don't really normalize these well):\n91:         'whitelist': EventType.UNKNOWN,\n92:         'blacklist': EventType.UNKNOWN,\n93:         # Inbound events:\n94:         'inbound': EventType.INBOUND,\n95:     }\n96: \n97:     def esp_to_anymail_event(self, esp_event):\n98:         esp_type = getfirst(esp_event, ['event', 'type'], None)\n99:         event_type = self.event_types.get(esp_type, EventType.UNKNOWN)\n100:         if event_type == EventType.INBOUND:\n101:             raise AnymailConfigurationError(\n102:                 \"You seem to have set Mandrill's *inbound* webhook URL \"\n103:                 \"to Anymail's Mandrill *tracking* webhook URL.\")\n104: \n105:         try:\n106:             timestamp = datetime.fromtimestamp(esp_event['ts'], tz=utc)\n107:         except (KeyError, ValueError):\n108:             timestamp = None\n109: \n110:         try:\n111:             recipient = esp_event['msg']['email']\n112:         except KeyError:\n113:             try:\n114:                 recipient = esp_event['reject']['email']  # sync events\n115:             except KeyError:\n116:                 recipient = None\n117: \n118:         try:\n119:             mta_response = esp_event['msg']['diag']\n120:         except KeyError:\n121:             mta_response = None\n122: \n123:         try:\n124:             description = getfirst(esp_event['reject'], ['detail', 'reason'])\n125:         except KeyError:\n126:             description = None\n127: \n128:         try:\n129:             metadata = esp_event['msg']['metadata']\n130:         except KeyError:\n131:             metadata = None\n132: \n133:         try:\n134:             tags = esp_event['msg']['tags']\n135:         except KeyError:\n136:             tags = None\n137: \n138:         return AnymailTrackingEvent(\n139:             click_url=esp_event.get('url', None),\n140:             description=description,\n141:             esp_event=esp_event,\n142:             event_type=event_type,\n143:             message_id=esp_event.get('_id', None),\n144:             metadata=metadata,\n145:             mta_response=mta_response,\n146:             recipient=recipient,\n147:             reject_reason=None,  # probably map esp_event['msg']['bounce_description'], but insufficient docs\n148:             tags=tags,\n149:             timestamp=timestamp,\n150:             user_agent=esp_event.get('user_agent', None),\n151:         )",
+      "source_summary": "The url variable is sourced from either the instance's webhook_url attribute (which can be set via Django settings) or from get_request_uri(request), which constructs a URL including any basic authentication credentials present in the request.",
+      "sink_summary": "The constructed url is used as part of the signed_data for HMAC signature validation. It is also included in an error message if signature validation fails.",
+      "guard_summary": "The security control is the HMAC signature validation using webhook_key, which ensures that only requests with a valid signature (computed over the url and POST parameters) are accepted. The basic auth credentials in the URL are part of the signed data, so they must match what Mandrill used when signing.",
+      "risk_pattern": "If webhook_url is set to an attacker-controlled value, it could be used to manipulate the HMAC signature validation by changing the URL that gets signed. However, if webhook_url is not explicitly set, get_request_uri(request) is used which includes basic auth credentials from the request, making the signature dependent on those credentials.",
+      "used_variable_sources": [
+        "self.webhook_url",
+        "get_request_uri(request)"
+      ],
+      "called_function_context": [
+        "get_request_uri(request)"
+      ],
+      "enclosing_conditions": [],
+      "context_summary": "The statement determines which URL is used for HMAC signature validation. If self.webhook_url is set (potentially from Django settings), it's used directly; otherwise, get_request_uri(request) constructs the URL including any basic auth credentials present in the request.",
+      "unresolved_facts": [
+        "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+        "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+      ],
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/timing-attack-against-hash",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 51.8571,
+          "raw_bm25_score": 51.8571,
+          "description": "When checking a Hash over a message, a constant-time algorithm should be used. Otherwise, an attacker may be able to forge a valid Hash for an arbitrary message by running a timing attack if they can send to the validation procedure. A successful attack can result in authentication bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/client-exposed-cookie",
+          "cwe_id": "CWE-1004",
+          "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.4461,
+          "raw_bm25_score": 29.4461,
+          "description": "Cookies without the `HttpOnly` attribute set can be accessed by JS scripts, making them more vulnerable to XSS attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Set HttpOnly flag on session cookies to prevent JavaScript access. Also use Secure and SameSite attributes.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1004"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/unicode-dos",
+          "cwe_id": "CWE-770",
+          "cwe_name": "Allocation of Resources Without Limits or Throttling",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.1661,
+          "raw_bm25_score": 28.1661,
+          "description": "A remote user-controlled data can reach a costly Unicode normalization with either form NFKC or NFKD. On Windows OS, with an attack such as the One Million Unicode Characters, this could lead to a denial of service. And, with the use of special Unicode characters, like U+2100 (℀) or U+2105 (℅), the payload size could be tripled.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-770"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.0914,
+          "raw_bm25_score": 27.0914,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/weak-symmetric-encryption",
+          "cwe_id": "CWE-327",
+          "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.5875,
+          "raw_bm25_score": 26.5875,
+          "description": "Finds uses of symmetric cryptography algorithms that are weak, obsolete, or otherwise unaccepted. The key lengths allowed are 128, 192, and 256 bits. These are all the key lengths supported by AES, so any application of AES is considered acceptable.",
+          "pattern": "Identify usage of weak or deprecated cryptographic algorithms and practices",
+          "remediation": "Use modern cryptographic algorithms and proper key management. Avoid deprecated algorithms and implement proper random number generation.",
+          "tags": [
+            "external/cwe/cwe-327"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.1722,
+          "raw_bm25_score": 23.1722,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "fallback/cwe-471-modification-of-assumed-immutable-data-maid",
+          "cwe_id": "CWE-471",
+          "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 22.3134,
+          "raw_bm25_score": 22.3134,
+          "description": "Security-critical data assumed immutable can be modified by an attacker.",
+          "pattern": "cwe-471 assumed-immutable immutable-data hidden-field cookie reverse-dns attacker-modified trusted-value mutable security-decision",
+          "remediation": "Do not trust client-modifiable values as immutable security state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-471"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/regex-injection",
+          "cwe_id": "CWE-730",
+          "cwe_name": "Security Issue (CWE-730)",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.4224,
+          "raw_bm25_score": 21.4224,
+          "description": "User input should not be used in regular expressions without first being escaped, otherwise a malicious user may be able to inject an expression that could require exponential time on certain inputs.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-730",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/samesite-none-cookie",
+          "cwe_id": "CWE-1275",
+          "cwe_name": "Sensitive Cookie with Improper SameSite Attribute",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.7645,
+          "raw_bm25_score": 20.7645,
+          "description": "Cookies with `SameSite` set to `None` can allow for Cross-Site Request Forgery (CSRF) attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1275"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 19.9451,
+          "raw_bm25_score": 19.9451,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

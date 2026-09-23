@@ -1,0 +1,258 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "src/index.js",
+      "changed_line": 135,
+      "statement": "await utils.run(`git diff ${startTag} ${endTag} --binary > ${patchFile}`, { cwd: _tmpDir });",
+      "change_type": "A",
+      "function_name": "createPatchFile",
+      "operation_type": "command_construction",
+      "selection_reason": "observable inputs 'startTag', 'endTag' -> command construction with shell interpolation -> security-sensitive effect of executing arbitrary git diff commands",
+      "security_relevance_score": 0.7,
+      "code_context": "1: 'use strict';\n2: \n3: const path = require('path');\n4: const { promisify } = require('util');\n5: const tmpDir = promisify(require('tmp').dir);\n6: const fs = require('fs-extra');\n7: const uuidv1 = require('uuid/v1');\n8: const debug = require('debug')('git-diff-apply');\n9: const utils = require('./utils');\n10: const getRootDir = require('./get-root-dir');\n11: const getSubDir = require('./get-sub-dir');\n12: const gitInit = require('./git-init');\n13: const getCheckedOutBranchName = require('./get-checked-out-branch-name');\n14: const gitStatus = require('./git-status');\n15: const commit = require('./commit');\n16: const checkOutTag = require('./check-out-tag');\n17: const convertToObj = require('./convert-to-obj');\n18: const resolveConflicts = require('./resolve-conflicts');\n19: const commitAndTag = require('./commit-and-tag');\n20: const gitRemoveAll = require('./git-remove-all');\n21: const createCustomRemote = require('./create-custom-remote');\n22: const mergeDir = require('./merge-dir');\n23: const doesBranchExist = require('./does-branch-exist');\n24: \n25: const { isGitClean } = gitStatus;\n26: \n27: const tempBranchName = uuidv1();\n28: \n29: async function ensureDir(dir) {\n30:   debug('ensureDir', dir);\n31:   await fs.ensureDir(dir);\n32: }\n33: \n34: module.exports = async function gitDiffApply({\n35:   remoteUrl,\n36:   startTag,\n37:   endTag,\n38:   resolveConflicts: _resolveConflicts,\n39:   ignoredFiles = [],\n40:   reset,\n41:   init,\n42:   createCustomDiff,\n43:   startCommand,\n44:   endCommand,\n45:   wasRunAsExecutable\n46: }) {\n47:   let _tmpDir;\n48:   let tmpWorkingDir;\n49: \n50:   let oldBranchName;\n51:   let hasConflicts;\n52:   let returnObject;\n53: \n54:   let isTempBranchCheckedOut;\n55:   let isCodeUntracked;\n56:   let isCodeModified;\n57:   let shouldReturnGitIgnoredFiles;\n58:   let isTempBranchCommitted;\n59: \n60:   let root;\n61:   let cwd;\n62:   let gitIgnoredFiles;\n63: \n64:   let err;\n65: \n66:   async function buildReturnObject() {\n67:     let from;\n68: \n69:     if (reset || init) {\n70:       from = {};\n71:     } else {\n72:       await checkOutTag(_tmpDir, startTag);\n73: \n74:       from = convertToObj(_tmpDir, ignoredFiles);\n75:     }\n76: \n77:     await checkOutTag(_tmpDir, endTag);\n78: \n79:     let to = convertToObj(_tmpDir, ignoredFiles);\n80: \n81:     return {\n82:       from,\n83:       to\n84:     };\n85:   }\n86: \n87:   async function namespaceRepoWithSubDir(subDir) {\n88:     let newTmpDir = await tmpDir();\n89: \n90:     await gitInit({ cwd: newTmpDir });\n91: \n92:     let newTmpSubDir = path.join(newTmpDir, subDir);\n93: \n94:     async function copyToSubDir(tag) {\n95:       await ensureDir(newTmpSubDir);\n96: \n97:       await checkOutTag(_tmpDir, tag);\n98: \n99:       await utils.copy(_tmpDir, newTmpSubDir);\n100: \n101:       await commitAndTag(tag, { cwd: newTmpDir });\n102:     }\n103: \n104:     if (!(reset || init)) {\n105:       await copyToSubDir(startTag);\n106: \n107:       await gitRemoveAll({ cwd: newTmpDir });\n108:     }\n109: \n110:     await copyToSubDir(endTag);\n111: \n112:     _tmpDir = newTmpDir;\n113:     tmpWorkingDir = newTmpSubDir;\n114:   }\n115: \n116:   async function copy() {\n117:     await utils.copy(tmpWorkingDir, cwd);\n118:   }\n119: \n120:   async function resetIgnoredFiles() {\n121:     for (let ignoredFile of ignoredFiles) {\n122:       // An exist check is not good enough.\n123:       // `git checkout` will fail unless it is also tracked.\n124:       let isTracked = await utils.run(`git ls-files ${ignoredFile}`);\n125:       if (isTracked) {\n126:         await utils.run(`git checkout -- ${ignoredFile}`);\n127:       } else {\n128:         await fs.remove(ignoredFile);\n129:       }\n130:     }\n131:   }\n132: \n133:   async function createPatchFile() {\n134:     let patchFile = path.join(await tmpDir(), 'file.patch');\n135:     await utils.run(`git diff ${startTag} ${endTag} --binary > ${patchFile}`, { cwd: _tmpDir });\n136:     if (await fs.readFile(patchFile, 'utf8') !== '') {\n137:       return patchFile;\n138:     }\n139:   }\n140: \n141:   async function applyDiff() {\n142:     let patchFile = await createPatchFile();\n143:     if (patchFile) {\n144:       // --whitespace=fix seems to prevent any unnecessary conflicts with line endings\n145:       // https://stackoverflow.com/questions/6308625/how-to-avoid-git-apply-changing-line-endings#comment54419617_11189296\n146:       await utils.run(`git apply --whitespace=fix ${patchFile}`);\n147:     }\n148:   }\n149: \n150:   async function go() {\n151:     if (reset || init) {\n152:       await checkOutTag(_tmpDir, endTag);\n153: \n154:       isCodeUntracked = true;\n155:       isCodeModified = true;\n156:       if (reset) {\n157:         await utils.gitRemoveAll({ cwd: root });\n158:       }\n159: \n160:       await copy();\n161: \n162:       await utils.run('git reset');\n163: \n164:       await resetIgnoredFiles();\n165: \n166:       return;\n167:     }\n168: \n169:     await checkOutTag(_tmpDir, startTag);\n170: \n171:     oldBranchName = await getCheckedOutBranchName();\n172:     await utils.run(`git checkout --orphan ${tempBranchName}`);\n173:     isTempBranchCheckedOut = true;\n174: \n175:     await utils.gitRemoveAll({ cwd: root });\n176: \n177:     gitIgnoredFiles = await tmpDir();\n178:     await mergeDir(cwd, gitIgnoredFiles);\n179:     shouldReturnGitIgnoredFiles = true;\n180: \n181:     isCodeUntracked = true;\n182:     await copy();\n183: \n184:     isTempBranchCommitted = true;\n185:     await commit();\n186:     isCodeUntracked = false;\n187: \n188:     isCodeUntracked = true;\n189:     isCodeModified = true;\n190:     await applyDiff();\n191: \n192:     await resetIgnoredFiles();\n193: \n194:     let wereAnyChanged = !await isGitClean();\n195: \n196:     if (wereAnyChanged) {\n197:       await commit();\n198:     }\n199:     isCodeUntracked = false;\n200:     isCodeModified = false;\n201: \n202:     let sha;\n203:     if (wereAnyChanged) {\n204:       sha = await utils.run('git rev-parse HEAD');\n205:     }\n206: \n207:     await utils.run(`git checkout ${oldBranchName}`);\n208:     isTempBranchCheckedOut = false;\n209: \n210:     if (wereAnyChanged) {\n211:       try {\n212:         await utils.run(`git cherry-pick --no-commit ${sha.trim()}`);\n213:       } catch (err) {\n214:         hasConflicts = true;\n215:       }\n216:     }\n217:   }\n218: \n219:   try {\n220:     if (startTag === endTag && !(reset || init)) {\n221:       throw 'Tags match, nothing to apply';\n222:     }\n223: \n224:     let isClean;\n225: \n226:     try {\n227:       isClean = await isGitClean();\n228:     } catch (err) {\n229:       throw 'Not a git repository';\n230:     }\n231: \n232:     if (!isClean) {\n233:       throw 'You must start with a clean working directory';\n234:     }\n235: \n236:     if (createCustomDiff) {\n237:       let tmpPath = await createCustomRemote({\n238:         startCommand,\n239:         endCommand,\n240:         startTag,\n241:         endTag,\n242:         reset,\n243:         init\n244:       });\n245: \n246:       remoteUrl = tmpPath;\n247:     }\n248: \n249:     _tmpDir = await tmpDir();\n250:     tmpWorkingDir = _tmpDir;\n251: \n252:     await utils.run(`git clone ${remoteUrl} ${_tmpDir}`);\n253: \n254:     returnObject = await buildReturnObject();\n255: \n256:     root = await getRootDir();\n257:     let subDir = await getSubDir(root);\n258:     if (subDir) {\n259:       debug('subDir', subDir);\n260: \n261:       await namespaceRepoWithSubDir(subDir);\n262:     }\n263: \n264:     cwd = process.cwd();\n265: \n266:     await go();\n267: \n268:     debug('success');\n269:   } catch (_err) {\n270:     err = _err;\n271: \n272:     try {\n273:       if (isCodeUntracked) {\n274:         await utils.run('git clean -f');\n275:       }\n276:       if (isCodeModified) {\n277:         await utils.run('git reset --hard');\n278:       }\n279: \n280:       if (isTempBranchCheckedOut) {\n281:         await utils.run(`git checkout ${oldBranchName}`);\n282:       }\n283:     } catch (err2) {\n284:       throw {",
+      "source_summary": "The variables 'startTag' and 'endTag' are function parameters passed into the gitDiffApply function, which is called with these values from external sources (e.g., test files or other modules). There is no explicit validation or sanitization of these parameters before they are used in command construction.",
+      "sink_summary": "The constructed command is executed via utils.run(), which internally uses child_process.exec() to run shell commands. This allows for shell injection if the inputs contain special shell characters.",
+      "guard_summary": "There are no validation, sanitization, or escaping mechanisms applied to 'startTag' and 'endTag' before they are interpolated into the shell command. The function relies on the caller to provide valid inputs, but there is no explicit security control in place to prevent malicious input.",
+      "risk_pattern": "Shell command injection vulnerability due to direct interpolation of unvalidated user-provided parameters into a shell command without sanitization or escaping.",
+      "used_variable_sources": [
+        "startTag",
+        "endTag"
+      ],
+      "called_function_context": [
+        "utils.run"
+      ],
+      "enclosing_conditions": [],
+      "context_summary": "The candidate line constructs a git diff command using two parameters (startTag and endTag) that are passed into the function. These parameters are not validated or sanitized before being used in shell command construction, creating a potential for shell injection if malicious values are provided.",
+      "unresolved_facts": [
+        "The exact source of startTag and endTag values is not determined within this file - they are passed as function parameters",
+        "Whether the calling code performs any validation or sanitization of startTag and endTag before passing them to gitDiffApply is unknown"
+      ],
+      "retrieval_query": {
+        "mechanism_keywords": [
+          "git command injection",
+          "tag validation",
+          "shell command interpolation"
+        ],
+        "impact": "arbitrary code execution"
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/unnecessary-use-of-cat",
+          "cwe_id": "CWE-78",
+          "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 46.4353,
+          "raw_bm25_score": 46.4353,
+          "description": "Using the  `cat` process to read a file is unnecessarily complex, inefficient, unportable, and can lead to subtle bugs, or even security vulnerabilities.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use safe command execution APIs with parameter arrays. Validate and sanitize command arguments against strict allowlists.",
+          "tags": [
+            "correctness",
+            "security",
+            "maintainability",
+            "external/cwe/cwe-078"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "fallback/cwe-77-improper-neutralization-of-special-elements-used-in-a-command-command-injection",
+          "cwe_id": "CWE-77",
+          "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 44.808,
+          "raw_bm25_score": 44.808,
+          "description": "Externally influenced data changes the syntax or meaning of a command sent to a downstream command interpreter.",
+          "pattern": "cwe-77 command-injection command-construction shell exec spawn process subprocess child_process os.system popen argument-delimiter metacharacter",
+          "remediation": "Keep external data separate from command syntax and use safe argument APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-077"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/indirect-command-line-injection",
+          "cwe_id": "CWE-88",
+          "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 36.4254,
+          "raw_bm25_score": 36.4254,
+          "description": "Forwarding command-line arguments to a child process executed within a shell may indirectly introduce command-line injection vulnerabilities.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-088. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-088"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/eval-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 30.0835,
+          "raw_bm25_score": 30.0835,
+          "description": "The 'eval' function and the 'Function' constructor execute strings as code. This is dangerous and impedes program analysis and understanding. Consequently, these two functions should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/env-key-and-value-injection",
+          "cwe_id": "CWE-99",
+          "cwe_name": "Improper Control of Resource Identifiers ('Resource Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.9118,
+          "raw_bm25_score": 29.9118,
+          "description": "creating arbitrary environment variables from user controlled data is not secure",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-089"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/count-untrusted-data-external-api",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.7423,
+          "raw_bm25_score": 28.7423,
+          "description": "This reports the external APIs that are used with untrusted data, along with how frequently the API is called, and how many unique sources of untrusted data flow to it.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/function-declaration-conflict",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.2857,
+          "raw_bm25_score": 27.2857,
+          "description": "If two functions with the same name are declared in the same scope, one of the declarations overrides the other without warning. This makes the code hard to read and maintain, and may even lead to platform-dependent behavior.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/template-object-injection",
+          "cwe_id": "CWE-94",
+          "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.0629,
+          "raw_bm25_score": 26.0629,
+          "description": "Instantiating a template using a user-controlled object is vulnerable to local file read and potential remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-073",
+            "external/cwe/cwe-094"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/insecure-temporary-file",
+          "cwe_id": "CWE-378",
+          "cwe_name": "Creation of Temporary File With Insecure Permissions",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.9644,
+          "raw_bm25_score": 25.9644,
+          "description": "Creating a temporary file that is accessible by other users can lead to information disclosure and sometimes remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-378. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "external/cwe/cwe-377",
+            "external/cwe/cwe-378",
+            "security"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 25.9013,
+          "raw_bm25_score": 25.9013,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

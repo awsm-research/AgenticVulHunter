@@ -1,0 +1,192 @@
+{
+  "candidate_id": "candidate-11",
+  "filepath": "src/sandstorm/backup.c++",
+  "changed_line": 185,
+  "statement": "KJ_SYSCALL(lstat(path.cStr(), &stats));",
+  "change_type": "A",
+  "function_name": "BackupMain::findFilesToZip",
+  "operation_type": "filesystem_stat_operation",
+  "selection_reason": "user-controlled path -> lstat call -> potential symlink or path traversal",
+  "security_relevance_score": 0.6,
+  "code_context": "36:                            \"metadata struct on stdin. Or, restores the backup in <file>, \"\n37:                            \"unpacking it to <grain>, and writing the metadata to stdout. In \"\n38:                            \"backup mode, <file> can be `-` to write the data to stdout.\")\n39:         .addOption({'r', \"restore\"}, KJ_BIND_METHOD(*this, setRestore),\n40:                    \"Restore a backup, rather than create a backup.\")\n41:         .addOptionWithArg({\"root\"}, KJ_BIND_METHOD(*this, setRoot), \"<root>\",\n42:                    \"Set the \\\"root directory\\\" to map in, which contains the zip/unzip binaries.\")\n43:         .expectArg(\"<file>\", KJ_BIND_METHOD(*this, setFile))\n44:         .expectArg(\"<grain>\", KJ_BIND_METHOD(*this, run))\n45:         .build();\n46:   }\n47: \n48: private:\n49:   kj::ProcessContext& context;\n50:   bool restore = false;\n51:   kj::StringPtr filename;\n52:   kj::StringPtr root = \"\";\n53: \n54:   bool setRestore() {\n55:     restore = true;\n56:     return true;\n57:   }\n58: \n59:   bool setFile(kj::StringPtr arg) {\n60:     filename = arg;\n61:     return true;\n62:   }\n63: \n64:   bool setRoot(kj::StringPtr arg) {\n65:     root = arg;\n66:     return true;\n67:   }\n68: \n69:   void writeSetgroupsIfPresent(const char *contents) {\n70:     KJ_IF_MAYBE(fd, raiiOpenIfExists(\"/proc/self/setgroups\", O_WRONLY | O_CLOEXEC)) {\n71:       kj::FdOutputStream(kj::mv(*fd)).write(contents, strlen(contents));\n72:     }\n73:   }\n74: \n75:   void writeUserNSMap(const char *type, kj::StringPtr contents) {\n76:     kj::FdOutputStream(raiiOpen(kj::str(\"/proc/self/\", type, \"_map\").cStr(), O_WRONLY | O_CLOEXEC))\n77:         .write(contents.begin(), contents.size());\n78:   }\n79: \n80:   bool run(kj::StringPtr grainDir) {\n81:     uid_t uid = getuid();\n82:     gid_t gid = getgid();\n83: \n84:     KJ_SYSCALL(unshare(CLONE_NEWUSER | CLONE_NEWNS));\n85:     writeSetgroupsIfPresent(\"deny\\n\");\n86:     writeUserNSMap(\"uid\", kj::str(\"1000 \", uid, \" 1\\n\"));\n87:     writeUserNSMap(\"gid\", kj::str(\"1000 \", gid, \" 1\\n\"));\n88: \n89:     // Mount root read-only.\n90:     KJ_SYSCALL(mount(kj::str(root, \"/\").cStr(), \"/tmp\", nullptr,\n91:                      MS_BIND | MS_REC | MS_RDONLY, nullptr));\n92: \n93:     if (access(\"/tmp/dev/null\", F_OK) != 0) {\n94:       // Looks like we need to bind in /dev.\n95:       KJ_SYSCALL(mount(\"/dev\", \"/tmp/dev\", nullptr, MS_BIND, nullptr));\n96:     }\n97: \n98:     // Hide sensitive directories.\n99:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/proc\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n100:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/var\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n101:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/etc\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n102: \n103:     // Mount inner tmpfs.\n104:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/tmp\", \"tmpfs\", 0, \"size=8m,nr_inodes=128,mode=777\"));\n105: \n106:     // Bind in the grain's `data` (=`sandbox`).\n107:     if (restore) {\n108:       KJ_SYSCALL(mkdir(kj::str(grainDir, \"/sandbox\").cStr(), 0770));\n109:     }\n110:     KJ_SYSCALL(mkdir(\"/tmp/tmp/data\", 0700));\n111:     KJ_SYSCALL(mount(kj::str(grainDir, \"/sandbox\").cStr(), \"/tmp/tmp/data\", nullptr,\n112:                      MS_BIND | (restore ? 0 : MS_RDONLY), nullptr));\n113: \n114:     // Bind in the grain's `log`. When restoring, we discard the log.\n115:     if (!restore) {\n116:       KJ_SYSCALL(mknod(\"/tmp/tmp/log\", S_IFREG | 0600, 0));\n117:       KJ_SYSCALL(mount(kj::str(grainDir, \"/log\").cStr(), \"/tmp/tmp/log\", nullptr,\n118:                        MS_BIND | MS_RDONLY, nullptr));\n119:     }\n120: \n121:     // Bind in the file.\n122:     if (restore) {\n123:       KJ_SYSCALL(mknod(\"/tmp/tmp/file.zip\", S_IFREG | 0600, 0));\n124:       KJ_SYSCALL(mount(filename.cStr(), \"/tmp/tmp/file.zip\", nullptr, MS_BIND, nullptr));\n125:     } else if (filename != \"-\") {\n126:       // Instead of binding, just open the file and we'll compress to stdout.\n127:       KJ_SYSCALL(dup2(raiiOpen(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC), STDOUT_FILENO));\n128:     }\n129: \n130:     // Use Andy's ridiculous pivot_root trick to place ourselves into the sandbox.\n131:     // See supervisor-main.c++ for more discussion.\n132:     {\n133:       auto oldRootDir = raiiOpen(\"/\", O_RDONLY | O_DIRECTORY | O_CLOEXEC);\n134:       KJ_SYSCALL(syscall(SYS_pivot_root, \"/tmp\", \"/tmp\"));\n135:       KJ_SYSCALL(fchdir(oldRootDir));\n136:       KJ_SYSCALL(umount2(\".\", MNT_DETACH));\n137:       KJ_SYSCALL(chdir(\"/tmp\"));\n138:     }\n139: \n140:     // TODO(someday): Find a zip library that doesn't suck and use it instead of shelling out\n141:     //   to zip/unzip.\n142:     if (restore) {\n143:       Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();\n144: \n145:       // Read metadata file to stdout.\n146:       kj::FdInputStream in(raiiOpen(\"metadata\", O_RDONLY | O_CLOEXEC));\n147:       kj::FdOutputStream out(STDOUT_FILENO);\n148:       pump(in, out);\n149:     } else {\n150:       // Read stdin to metadata file.\n151:       {\n152:         kj::FdInputStream in(STDIN_FILENO);\n153:         kj::FdOutputStream out(raiiOpen(\"metadata\", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC));\n154:         pump(in, out);\n155:       }\n156: \n157:       Subprocess::Options zipOptions({\"zip\", \"-qy@\", \"-\"});\n158:       auto inPipe = Pipe::make();\n159:       zipOptions.stdin = inPipe.readEnd;\n160:       Subprocess zip(kj::mv(zipOptions));\n161:       inPipe.readEnd = nullptr;\n162: \n163:       {\n164:         kj::FdOutputStream out(kj::mv(inPipe.writeEnd));\n165:         for (auto& entry: listDirectory(\".\")) {\n166:           findFilesToZip(entry, out);\n167:         }\n168:       }\n169: \n170:       zip.waitForSuccess();\n171:     }\n172: \n173:     return true;\n174:   }\n175: \n176:   static void pump(kj::InputStream& in, kj::OutputStream& out) {\n177:     byte buffer[4096];\n178:     while (size_t n = in.tryRead(buffer, 1, sizeof(buffer))) {\n179:       out.write(buffer, n);\n180:     }\n181:   }\n182: \n183:   void findFilesToZip(kj::StringPtr path, kj::OutputStream& out) {\n184:     struct stat stats;\n185:     KJ_SYSCALL(lstat(path.cStr(), &stats));\n186:     if (S_ISREG(stats.st_mode) || S_ISLNK(stats.st_mode)) {\n187:       // Regular file or link can be zipped; write to file stream.\n188:       // If the path contains a newline, we cannot correctly pass it to `zip` since `zip` expects\n189:       // one file per line. For security reasons, we must detect and filter out these files.\n190:       // Hopefully this never happens legitimately?\n191:       if (path.findFirst('\\n') == nullptr) {\n192:         kj::ArrayPtr<const byte> pieces[2];\n193:         pieces[0] = path.asBytes();\n194:         pieces[1] = kj::StringPtr(\"\\n\").asBytes();\n195:         out.write(pieces);\n196:       } else {\n197:         KJ_LOG(ERROR, \"tried to backup file containing newlines\", path);\n198:       }\n199:     } else if (S_ISDIR(stats.st_mode)) {\n200:       // Subdirectory; enumerate contents.\n201:       for (auto& entry: listDirectory(path)) {\n202:         findFilesToZip(kj::str(path, '/', entry), out);\n203:       }\n204:     }\n205:   }\n206: };\n207: \n208: kj::Own<AbstractMain> getBackupMain(kj::ProcessContext& context) {\n209:   return kj::heap<BackupMain>(context);\n210: }\n211: \n212: } // namespace sandstorm\n213: ",
+  "source_summary": "Path originates from listDirectory(\".\") after chdir(\"/tmp\") in sandbox environment. Entries are directory names filtered to exclude \".\" and \"..\".",
+  "sink_summary": "lstat() follows symlinks to get file status, used to decide if file should be added to zip archive or if directory should be recursively enumerated.",
+  "guard_summary": "listDirectory filters \".\" and \"..\". Paths containing newlines are filtered. Sandbox uses namespace isolation with pivot_root and read-only mounts. No symlink traversal protection in lstat call.",
+  "risk_pattern": "lstat on directory entries follows symlinks without validation, potentially allowing stat of files outside intended backup scope or inclusion of external files via symlinks.",
+  "used_variable_sources": [
+    "listDirectory(\".\") returns filtered directory entries",
+    "recursive concatenation: kj::str(path, '/', entry)"
+  ],
+  "called_function_context": [
+    "listDirectory() from util.c++",
+    "KJ_SYSCALL macro for error handling"
+  ],
+  "enclosing_conditions": [
+    "if (S_ISREG(stats.st_mode) || S_ISLNK(stats.st_mode))",
+    "else if (S_ISDIR(stats.st_mode))",
+    "if (path.findFirst('\\n') == nullptr)"
+  ],
+  "context_summary": "In backup mode (not restore), enumerates current directory (\"/tmp\" after pivot_root) recursively, calling lstat on each entry to determine file type for zip archive creation.",
+  "unresolved_facts": [
+    "Whether symlinks can exist in mounted directories at /tmp",
+    "Exact directory structure at /tmp during backup execution",
+    "If backup should be from /tmp or from grain data directory /tmp/tmp/data"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "fit_reason": "lstat follows symlinks without validation; directory enumeration includes symlinks that could point outside intended backup scope, leading to unintended file inclusion or information disclosure.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "Recursive concatenation of paths from directory listing may allow traversal via symlinks, bypassing intended root directory restriction; lstat on symlink could stat files outside sandbox.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1236",
+    "CWE-178",
+    "CWE-200",
+    "CWE-22",
+    "CWE-352",
+    "CWE-378",
+    "CWE-483",
+    "CWE-563",
+    "CWE-59",
+    "CWE-676",
+    "CWE-685",
+    "CWE-754",
+    "CWE-758",
+    "CWE-829"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-11",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 185,
+      "statement": "KJ_SYSCALL(lstat(path.cStr(), &stats));",
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "lstat() follows symbolic links to retrieve file status, which is the link-following mechanism. However, CWE-59 specifically addresses improper link resolution before file access, where the link resolution leads to unintended resource access. Here, lstat is used only for type checking, not for subsequent file access operations."
+        },
+        "connection": {
+          "score": 0.5,
+          "evidence": "Path originates from listDirectory(\".\") after chdir(\"/tmp\") in sandbox environment. The path is directly passed to lstat(). If a symlink exists in the enumerated directory, lstat will follow it and return information about the target, not the symlink itself."
+        },
+        "diff_causality": {
+          "score": 0.2,
+          "evidence": "The candidate line is an addition (change_type: 'A'), but the diff context shows this is part of a new function findFilesToZip. Reverting this line would break the backup functionality entirely, not specifically create or remove link-following behavior. The link-following is inherent to lstat() semantics, not materially created by this patch."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "",
+          "required_control": "Proper symlink validation or canonical path resolution before using lstat() on user/environment-supplied paths",
+          "control_requirement_evidence": "CWE-59 requires that link resolution be properly validated to prevent accessing unintended resources. When enumerating directory entries that could contain symlinks, the code should either: 1) Use stat() with O_NOFOLLOW or equivalent, 2) Check S_ISLNK separately and handle symlinks appropriately, or 3) Resolve canonical paths before processing.",
+          "existing_controls_checked": [
+            "listDirectory() filters \".\" and \"..\"",
+            "Sandbox uses namespace isolation with pivot_root and read-only mounts",
+            "Paths containing newlines are filtered"
+          ],
+          "deficiency_evidence": "The code uses lstat() which follows symlinks without any validation of whether symlinks should be followed. No check for S_ISLNK before using lstat results, and no canonical path resolution is performed. However, the sandbox isolation may limit the impact scope."
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "If symlinks exist in the enumerated directory, lstat will follow them and return information about the target. This could lead to: 1) Incorrect file type detection (reporting symlink target type instead of symlink), 2) Potential information disclosure about files outside intended scope, 3) Possible inclusion of external files in backup if the symlink target is a regular file. However, the actual file access for backup occurs through different mechanisms, and the concrete security consequence is not directly demonstrated."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the findFilesToZip function would not be able to determine file types, breaking the backup functionality entirely. The link-following behavior is not created by this specific line but is inherent to the lstat() system call semantics.",
+      "supporting_evidence": [
+        "lstat() follows symbolic links to retrieve information about the target file",
+        "Path originates from listDirectory(\".\") which enumerates directory entries that could include symlinks",
+        "No symlink validation or canonical path resolution is performed before lstat()"
+      ],
+      "contradicting_evidence": [
+        "The code uses lstat() for type checking only, not for subsequent file access operations",
+        "Sandbox isolation with pivot_root and read-only mounts may limit the scope of symlink traversal",
+        "The actual file inclusion in backup uses different mechanisms (writing paths to zip process)"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether symlinks can exist in the mounted directories at /tmp during backup execution",
+        "The exact directory structure and potential symlink targets within the sandbox",
+        "Whether the backup should follow symlinks or treat them as separate entities",
+        "If the zip process itself follows symlinks when archiving files"
+      ],
+      "review_comment": "The lstat() call follows symbolic links without validation, which could lead to incorrect file type detection during backup enumeration. While sandbox isolation limits the impact scope, consider using stat() with O_NOFOLLOW or checking S_ISLNK separately to properly handle symlinks. If symlinks should be backed up as links rather than their targets, use readlink() to get the link target and handle it appropriately in the backup process.",
+      "change_type": "A",
+      "raw_score": 0.33999999999999997,
+      "score": 0.33999999999999997
+    },
+    {
+      "candidate_id": "candidate-11",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 185,
+      "statement": "KJ_SYSCALL(lstat(path.cStr(), &stats));",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "CWE-22 requires improper limitation of pathname to restricted directory. The code uses lstat on paths from directory traversal but lacks symlink validation, potentially allowing access outside intended scope via symlinks."
+        },
+        "connection": {
+          "score": 0.45,
+          "evidence": "Path originates from listDirectory(\".\") after chdir(\"/tmp\") in sandbox. The recursive concatenation (kj::str(path, '/', entry)) builds paths that are passed to lstat. Symlinks could redirect to locations outside the intended backup scope."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The added lstat call enables the file type checking mechanism. Without this line, the backup would not stat files to determine if they're regular files, symlinks, or directories, breaking the recursive backup functionality."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "",
+          "required_control": "symlink validation and canonical path resolution",
+          "control_requirement_evidence": "CWE-22 requires proper path limitation when traversing directories with potential symlinks",
+          "existing_controls_checked": [
+            "sandbox namespace isolation",
+            "listDirectory filters \".\" and \"..\"",
+            "newline character filtering"
+          ],
+          "deficiency_evidence": "No validation that symlinks point within the intended backup directory tree; lstat follows symlinks without checking if target is within allowed scope"
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Potential inclusion of files outside intended backup scope via symlinks, but the actual impact depends on whether symlinks exist and where they point within the sandbox environment."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the backup functionality would fail as it wouldn't be able to determine file types (regular file, symlink, or directory) needed for proper archive creation and recursive directory traversal.",
+      "supporting_evidence": [
+        "Recursive path concatenation: kj::str(path, '/', entry) builds paths from directory entries",
+        "lstat follows symlinks without validation of target location",
+        "Sandbox environment with namespace isolation but potential symlink traversal"
+      ],
+      "contradicting_evidence": [
+        "The code operates in a sandboxed environment after pivot_root to /tmp",
+        "listDirectory filters out \".\" and \"..\" entries",
+        "Paths containing newlines are filtered out"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether symlinks can exist in the mounted directories at /tmp",
+        "If the sandbox isolation prevents symlinks from pointing outside intended scope",
+        "Whether backup should be limited to /tmp/tmp/data or includes entire /tmp"
+      ],
+      "review_comment": "The backup function recursively traverses directories using lstat without validating symlink targets. While operating in a sandboxed environment, symlinks could potentially allow files outside the intended backup scope to be included. Add symlink validation to ensure all accessed files are within the intended backup directory tree by resolving paths canonically and checking they remain under the backup root.",
+      "change_type": "A",
+      "raw_score": 0.35000000000000003,
+      "score": 0.35000000000000003
+    }
+  ],
+  "stage4_status": "completed"
+}

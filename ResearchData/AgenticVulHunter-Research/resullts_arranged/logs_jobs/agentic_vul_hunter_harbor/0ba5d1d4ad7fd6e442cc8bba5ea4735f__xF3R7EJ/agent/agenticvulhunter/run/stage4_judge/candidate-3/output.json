@@ -1,0 +1,348 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "anymail/webhooks/mandrill.py",
+  "changed_line": 49,
+  "statement": "url = self.webhook_url or get_request_uri(request)",
+  "change_type": "A",
+  "function_name": "MandrillSignatureMixin.validate_request",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+  "security_relevance_score": 0.7,
+  "code_context": "1: import json\n2: from datetime import datetime\n3: \n4: import hashlib\n5: import hmac\n6: from base64 import b64encode\n7: from django.utils.crypto import constant_time_compare\n8: from django.utils.timezone import utc\n9: \n10: from .base import AnymailBaseWebhookView\n11: from ..exceptions import AnymailWebhookValidationFailure, AnymailConfigurationError\n12: from ..signals import tracking, AnymailTrackingEvent, EventType\n13: from ..utils import get_anymail_setting, getfirst, get_request_uri\n14: \n15: \n16: class MandrillSignatureMixin(object):\n17:     \"\"\"Validates Mandrill webhook signature\"\"\"\n18: \n19:     # These can be set from kwargs in View.as_view, or pulled from settings in init:\n20:     webhook_key = None  # required\n21:     webhook_url = None  # optional; defaults to actual url used\n22: \n23:     def __init__(self, **kwargs):\n24:         # noinspection PyUnresolvedReferences\n25:         esp_name = self.esp_name\n26:         # webhook_key is required for POST, but not for HEAD when Mandrill validates webhook url.\n27:         # Defer \"missing setting\" error until we actually try to use it in the POST...\n28:         webhook_key = get_anymail_setting('webhook_key', esp_name=esp_name, default=None,\n29:                                           kwargs=kwargs, allow_bare=True)\n30:         if webhook_key is not None:\n31:             self.webhook_key = webhook_key.encode('ascii')  # hmac.new requires bytes key in python 3\n32:         self.webhook_url = get_anymail_setting('webhook_url', esp_name=esp_name, default=None,\n33:                                                kwargs=kwargs, allow_bare=True)\n34:         # noinspection PyArgumentList\n35:         super(MandrillSignatureMixin, self).__init__(**kwargs)\n36: \n37:     def validate_request(self, request):\n38:         if self.webhook_key is None:\n39:             # issue deferred \"missing setting\" error (re-call get-setting without a default)\n40:             # noinspection PyUnresolvedReferences\n41:             get_anymail_setting('webhook_key', esp_name=self.esp_name, allow_bare=True)\n42: \n43:         try:\n44:             signature = request.META[\"HTTP_X_MANDRILL_SIGNATURE\"]\n45:         except KeyError:\n46:             raise AnymailWebhookValidationFailure(\"X-Mandrill-Signature header missing from webhook POST\")\n47: \n48:         # Mandrill signs the exact URL (including basic auth, if used) plus the sorted POST params:\n49:         url = self.webhook_url or get_request_uri(request)\n50:         params = request.POST.dict()\n51:         signed_data = url\n52:         for key in sorted(params.keys()):\n53:             signed_data += key + params[key]\n54: \n55:         expected_signature = b64encode(hmac.new(key=self.webhook_key, msg=signed_data.encode('utf-8'),\n56:                                                 digestmod=hashlib.sha1).digest())\n57:         if not constant_time_compare(signature, expected_signature):\n58:             raise AnymailWebhookValidationFailure(\n59:                 \"Mandrill webhook called with incorrect signature (for url %r)\" % url)\n60: \n61: \n62: class MandrillBaseWebhookView(MandrillSignatureMixin, AnymailBaseWebhookView):\n63:     \"\"\"Base view class for Mandrill webhooks\"\"\"\n64: \n65:     warn_if_no_basic_auth = False  # because we validate against signature\n66: \n67:     def parse_events(self, request):\n68:         esp_events = json.loads(request.POST['mandrill_events'])\n69:         return [self.esp_to_anymail_event(esp_event) for esp_event in esp_events]\n70: \n71:     def esp_to_anymail_event(self, esp_event):\n72:         raise NotImplementedError()\n73: \n74: \n75: class MandrillTrackingWebhookView(MandrillBaseWebhookView):\n76: \n77:     signal = tracking\n78: \n79:     event_types = {\n80:         # Message events:\n81:         'send': EventType.SENT,\n82:         'deferral': EventType.DEFERRED,\n83:         'hard_bounce': EventType.BOUNCED,\n84:         'soft_bounce': EventType.DEFERRED,\n85:         'open': EventType.OPENED,\n86:         'click': EventType.CLICKED,\n87:         'spam': EventType.COMPLAINED,\n88:         'unsub': EventType.UNSUBSCRIBED,\n89:         'reject': EventType.REJECTED,\n90:         # Sync events (we don't really normalize these well):\n91:         'whitelist': EventType.UNKNOWN,\n92:         'blacklist': EventType.UNKNOWN,\n93:         # Inbound events:\n94:         'inbound': EventType.INBOUND,\n95:     }\n96: \n97:     def esp_to_anymail_event(self, esp_event):\n98:         esp_type = getfirst(esp_event, ['event', 'type'], None)\n99:         event_type = self.event_types.get(esp_type, EventType.UNKNOWN)\n100:         if event_type == EventType.INBOUND:\n101:             raise AnymailConfigurationError(\n102:                 \"You seem to have set Mandrill's *inbound* webhook URL \"\n103:                 \"to Anymail's Mandrill *tracking* webhook URL.\")\n104: \n105:         try:\n106:             timestamp = datetime.fromtimestamp(esp_event['ts'], tz=utc)\n107:         except (KeyError, ValueError):\n108:             timestamp = None\n109: \n110:         try:\n111:             recipient = esp_event['msg']['email']\n112:         except KeyError:\n113:             try:\n114:                 recipient = esp_event['reject']['email']  # sync events\n115:             except KeyError:\n116:                 recipient = None\n117: \n118:         try:\n119:             mta_response = esp_event['msg']['diag']\n120:         except KeyError:\n121:             mta_response = None\n122: \n123:         try:\n124:             description = getfirst(esp_event['reject'], ['detail', 'reason'])\n125:         except KeyError:\n126:             description = None\n127: \n128:         try:\n129:             metadata = esp_event['msg']['metadata']\n130:         except KeyError:\n131:             metadata = None\n132: \n133:         try:\n134:             tags = esp_event['msg']['tags']\n135:         except KeyError:\n136:             tags = None\n137: \n138:         return AnymailTrackingEvent(\n139:             click_url=esp_event.get('url', None),\n140:             description=description,\n141:             esp_event=esp_event,\n142:             event_type=event_type,\n143:             message_id=esp_event.get('_id', None),\n144:             metadata=metadata,\n145:             mta_response=mta_response,\n146:             recipient=recipient,\n147:             reject_reason=None,  # probably map esp_event['msg']['bounce_description'], but insufficient docs\n148:             tags=tags,\n149:             timestamp=timestamp,\n150:             user_agent=esp_event.get('user_agent', None),\n151:         )",
+  "source_summary": "The url variable is sourced from either the instance's webhook_url attribute (which can be set via Django settings) or from get_request_uri(request), which constructs a URL including any basic authentication credentials present in the request.",
+  "sink_summary": "The constructed url is used as part of the signed_data for HMAC signature validation. It is also included in an error message if signature validation fails.",
+  "guard_summary": "The security control is the HMAC signature validation using webhook_key, which ensures that only requests with a valid signature (computed over the url and POST parameters) are accepted. The basic auth credentials in the URL are part of the signed data, so they must match what Mandrill used when signing.",
+  "risk_pattern": "If webhook_url is set to an attacker-controlled value, it could be used to manipulate the HMAC signature validation by changing the URL that gets signed. However, if webhook_url is not explicitly set, get_request_uri(request) is used which includes basic auth credentials from the request, making the signature dependent on those credentials.",
+  "used_variable_sources": [
+    "self.webhook_url",
+    "get_request_uri(request)"
+  ],
+  "called_function_context": [
+    "get_request_uri(request)"
+  ],
+  "enclosing_conditions": [],
+  "context_summary": "The statement determines which URL is used for HMAC signature validation. If self.webhook_url is set (potentially from Django settings), it's used directly; otherwise, get_request_uri(request) constructs the URL including any basic auth credentials present in the request.",
+  "unresolved_facts": [
+    "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+    "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Path Traversal",
+      "fit_reason": "The mechanism involves manipulation of URL in HMAC signature validation where webhook_url can be attacker-controlled, potentially leading to path traversal if the URL is used in file operations",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-471",
+      "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+      "fit_reason": "The webhook_url setting is assumed to be immutable but can be modified by an attacker, affecting the HMAC signature validation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-208",
+      "cwe_name": "Observable Timing Discrepancy",
+      "fit_reason": "HMAC signature validation could be vulnerable to timing attacks if not using constant-time comparison, potentially allowing authentication bypass",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-327",
+      "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+      "fit_reason": "The code uses SHA1 for HMAC which is considered weak and risky cryptographic algorithm",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-287",
+      "cwe_name": "Improper Authentication",
+      "fit_reason": "The authentication mechanism relies on webhook_key but if webhook_url is attacker-controlled, it could lead to improper authentication",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1004",
+    "CWE-1275",
+    "CWE-208",
+    "CWE-22",
+    "CWE-287",
+    "CWE-327",
+    "CWE-425",
+    "CWE-471",
+    "CWE-685",
+    "CWE-730",
+    "CWE-770"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "The mechanism demonstrated in the code does not involve file path traversal. The url variable is used for HMAC signature validation, not for file system access or path resolution."
+        },
+        "connection": {
+          "score": 0.0,
+          "evidence": "There is no connection between externally controlled input and a vulnerable file system operation. The url is only used in HMAC computation and error reporting, not for file access."
+        },
+        "diff_causality": {
+          "score": 0.0,
+          "evidence": "Reverting this line would not materially change the vulnerability because the code does not perform path traversal operations. The line simply selects which URL to use for signature validation."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "No security control deficiency is demonstrated for CWE-22. The code does not perform file system operations or path resolution that would be vulnerable to path traversal.",
+          "required_control": "Path validation and sanitization for file paths",
+          "control_requirement_evidence": "CWE-22 requires controls to prevent manipulation of file paths to access restricted directories.",
+          "existing_controls_checked": [
+            "HMAC signature validation",
+            "URL construction from request"
+          ],
+          "deficiency_evidence": "The code does not perform any path traversal operations or file system access that would require path validation."
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "No concrete security consequence is demonstrated for CWE-22. The vulnerability mechanism is not present in the code."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the behavior would remain unchanged because it's simply selecting between two URL sources for signature validation. No path traversal vulnerability would be introduced or removed.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "The url variable is used only for HMAC signature validation and error reporting, not for file system operations",
+        "No file path resolution or manipulation occurs in the code"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether webhook_url can be controlled by an attacker",
+        "The exact security implications of using get_request_uri(request) vs self.webhook_url"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.0,
+      "score": 0.0
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "cwe_id": "CWE-471",
+      "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The code assumes that self.webhook_url is immutable and will not be modified by an attacker, but the setting can be configured via Django settings which may be controlled by an attacker in some deployment scenarios."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The webhook_url setting is used to construct the URL that is signed during HMAC validation. If an attacker controls this value, they can manipulate the signature validation process, though the exact reachability and impact depends on whether the setting is attacker-controlled."
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "If this line were reverted to only use get_request_uri(request), the vulnerability would be mitigated because the URL used for signature validation would always include request-specific information (including basic auth) and not an attacker-controlled setting."
+        },
+        "security_control": {
+          "score": 0.65,
+          "evidence": "The security control is the HMAC signature validation, which depends on a URL that may be attacker-controlled. The required control is to ensure webhook_url is not attacker-modifiable or properly validated before use.",
+          "required_control": "Validation of webhook_url setting",
+          "control_requirement_evidence": "CWE-471 requires that assumed-immutable data not be modifiable by attackers. The webhook_url setting is assumed to be immutable but can be modified by an attacker through Django settings.",
+          "existing_controls_checked": [
+            "HMAC signature validation (depends on URL)",
+            "get_request_uri(request) function (used as fallback)"
+          ],
+          "deficiency_evidence": "The code does not validate or sanitize the webhook_url setting before using it in HMAC signature computation. The setting can be modified by an attacker, violating the assumption of immutability."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "If an attacker controls webhook_url, they could potentially manipulate the URL used for signature validation, but concrete impact depends on whether the setting is actually attacker-controlled and whether this leads to successful signature bypass."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted to only use get_request_uri(request), then the URL used for HMAC signature validation would always be derived from the actual request URI, including any basic auth credentials. This would prevent an attacker from manipulating the signature validation by controlling a setting that could be modified externally.",
+      "supporting_evidence": [
+        "The webhook_url can be set via Django settings which may be controlled by an attacker",
+        "The URL used for HMAC signature validation includes the webhook_url value in its computation",
+        "The code explicitly states that webhook_url is optional and defaults to actual url used"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+        "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+      ],
+      "review_comment": "The webhook_url setting is assumed to be immutable but can be modified by an attacker through Django settings. This allows manipulation of HMAC signature validation since the URL used for signing includes this potentially attacker-controlled value. The fix should validate or sanitize the webhook_url setting before using it in signature computation, ensuring it's not externally modifiable.",
+      "change_type": "A",
+      "raw_score": 0.6299999999999999,
+      "score": 0.6299999999999999
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "cwe_id": "CWE-208",
+      "cwe_name": "Observable Timing Discrepancy",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "The candidate line does not demonstrate a timing discrepancy mechanism. It simply assigns a URL value to be used in HMAC signature validation, without any timing-related operations or comparisons that would lead to observable timing differences."
+        },
+        "connection": {
+          "score": 0.0,
+          "evidence": "There is no demonstrated connection between externally controlled input and a timing-sensitive operation. The url variable is used for signature validation but not in a way that introduces timing discrepancies."
+        },
+        "diff_causality": {
+          "score": 0.0,
+          "evidence": "Reverting this line would not materially change the vulnerability mechanism related to observable timing discrepancies, as the line itself does not introduce timing issues; it only determines which URL is used for signature validation."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "The security control in question (constant-time comparison) is present and correctly implemented with 'constant_time_compare', but this line does not relate to timing discrepancies or the mechanism of CWE-208.",
+          "required_control": "Constant-time comparison for HMAC signature validation",
+          "control_requirement_evidence": "CWE-208 relates to timing discrepancies that can leak information, and constant-time comparison is necessary to prevent such leaks in cryptographic operations like HMAC validation.",
+          "existing_controls_checked": [
+            "constant_time_compare function usage in line 57"
+          ],
+          "deficiency_evidence": "The code correctly uses constant_time_compare for signature verification, but this line does not introduce or relate to timing discrepancies."
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "There is no demonstrated concrete security consequence related to observable timing discrepancies in the mechanism shown by this line. The vulnerability described by CWE-208 is not present in this specific code path."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the logic for determining which URL to use for signature validation would remain unchanged; the behavior of HMAC signature validation would be identical since the line only affects URL selection, not timing or comparison operations.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "The statement 'url = self.webhook_url or get_request_uri(request)' does not involve any timing-sensitive operations or comparisons that could lead to observable timing discrepancies",
+        "The code correctly implements constant_time_compare for HMAC signature validation, which is the primary defense against timing attacks in this context"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+        "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.0,
+      "score": 0.0
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "cwe_id": "CWE-327",
+      "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "The code uses SHA1 in HMAC for signature validation, but the vulnerability mechanism is not about using a broken cryptographic algorithm directly in the vulnerable operation. The issue is with the URL used in signature computation, not the algorithm itself."
+        },
+        "connection": {
+          "score": 0.0,
+          "evidence": "There is no direct connection established between the input (webhook_url or request URI) and a cryptographic algorithm that is broken or risky. The vulnerability lies in how the URL is constructed for signature validation, not in the cryptographic algorithm itself."
+        },
+        "diff_causality": {
+          "score": 0.0,
+          "evidence": "Reverting this line would not materially change the cryptographic algorithm used (SHA1 in HMAC). The core issue of using SHA1 is not introduced or removed by this specific line."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "No relevant security control deficiency is demonstrated for CWE-327. The code uses HMAC-SHA1 which is indeed a weak algorithm, but the vulnerability mechanism does not match the exact CWE definition.",
+          "required_control": "Use of strong cryptographic algorithms",
+          "control_requirement_evidence": "CWE-327 specifically requires avoiding broken or risky cryptographic algorithms, such as SHA1 in HMAC when better alternatives exist.",
+          "existing_controls_checked": [
+            "HMAC-SHA1 usage for signature validation"
+          ],
+          "deficiency_evidence": "The code uses SHA1 which is considered weak and risky, but this line itself does not introduce or remove the use of SHA1; it's about how the URL is constructed for signing."
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "No concrete security consequence is demonstrated that relates to using a broken cryptographic algorithm in this specific context. The impact would be related to signature validation bypass, not direct cryptographic weakness."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the URL used for HMAC signature validation would still be computed using SHA1 in hmac.new(), but the method of constructing that URL would change slightly. However, this does not materially affect the use of SHA1 as a cryptographic algorithm.",
+      "supporting_evidence": [
+        "The code uses SHA1 in HMAC signature validation (line 55)",
+        "HMAC-SHA1 is considered a weak and risky cryptographic algorithm"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+        "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.0,
+      "score": 0.0
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "cwe_id": "CWE-287",
+      "cwe_name": "Improper Authentication",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The mechanism involves authentication via HMAC signature validation, but the vulnerability is not in the core authentication process itself, rather in how the URL used for signing can be manipulated."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The url variable is used in HMAC signature validation and is sourced from either self.webhook_url (potentially attacker-controlled) or get_request_uri(request). If webhook_url is set by an attacker, it can influence the signed data."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted to only use get_request_uri(request), the vulnerability would be mitigated because the URL used for signing would always include basic auth credentials from the request, making it harder for an attacker to manipulate the signature."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "The HMAC validation is present but vulnerable due to potential manipulation of the URL used in signing. The control is weakened because self.webhook_url can be set from external configuration.",
+          "required_control": "Validation of webhook_url setting",
+          "control_requirement_evidence": "CWE-287 requires that authentication claims be properly verified. If webhook_url is attacker-controlled, it undermines the integrity of the signature validation process.",
+          "existing_controls_checked": [
+            "HMAC signature validation",
+            "get_request_uri(request) function"
+          ],
+          "deficiency_evidence": "The code allows self.webhook_url to be set from Django settings without validation, potentially allowing an attacker to control the URL used for signing."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "If webhook_url is attacker-controlled and differs from the actual webhook endpoint, it could allow an attacker to forge signatures for a different URL, potentially bypassing authentication checks."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would always use get_request_uri(request) to construct the URL for signature validation, which includes basic auth credentials from the request. This would prevent an attacker from manipulating the signed URL through a configurable webhook_url setting.",
+      "supporting_evidence": [
+        "The statement uses self.webhook_url or get_request_uri(request) to determine URL for HMAC signing",
+        "webhook_url can be set via Django settings which may be attacker-controlled",
+        "HMAC signature validation depends on the URL used in signed_data"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the webhook_url setting can be controlled by an attacker or if it's always derived from a trusted source",
+        "The exact security implications of using get_request_uri(request) vs self.webhook_url when both are available"
+      ],
+      "review_comment": "The code allows webhook_url to be set from Django settings without validation, potentially allowing an attacker to manipulate the URL used for HMAC signature validation. This creates a potential authentication bypass if the attacker can control the webhook_url setting. The fix is to validate that webhook_url is a trusted endpoint or always use get_request_uri(request) which includes basic auth credentials.",
+      "change_type": "A",
+      "raw_score": 0.6,
+      "score": 0.6
+    }
+  ],
+  "stage4_status": "completed"
+}

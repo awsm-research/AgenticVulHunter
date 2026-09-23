@@ -1,0 +1,184 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "sydent/http/servlets/store_invite_servlet.py",
+    "changed_line": 79,
+    "statement": "substitutions[key] = values[0]",
+    "change_type": "A",
+    "function_name": "render_POST",
+    "operation_type": "request_parameter_processing",
+    "selection_reason": "User-controlled request parameters stored without HTML escaping, potentially enabling injection attacks",
+    "security_relevance_score": 0.9,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: import nacl.signing\n17: import random\n18: import string\n19: from email.header import Header\n20: \n21: from twisted.web.resource import Resource\n22: from unpaddedbase64 import encode_base64\n23: \n24: import json\n25: from sydent.db.invite_tokens import JoinTokenStore\n26: from sydent.db.threepid_associations import GlobalAssociationStore\n27: \n28: from sydent.http.servlets import require_args, send_cors\n29: from sydent.util.emailutils import sendEmail\n30: \n31: \n32: class StoreInviteServlet(Resource):\n33:     def __init__(self, syd):\n34:         self.sydent = syd\n35: \n36:     def render_POST(self, request):\n37:         send_cors(request)\n38:         err = require_args(request, (\"medium\", \"address\", \"room_id\", \"sender\",))\n39:         if err:\n40:             return json.dumps(err)\n41:         medium = request.args[\"medium\"][0]\n42:         address = request.args[\"address\"][0]\n43:         roomId = request.args[\"room_id\"][0]\n44:         sender = request.args[\"sender\"][0]\n45: \n46:         globalAssocStore = GlobalAssociationStore(self.sydent)\n47:         mxid = globalAssocStore.getMxid(medium, address)\n48:         if mxid:\n49:             request.setResponseCode(400)\n50:             return json.dumps({\n51:                 \"errcode\": \"THREEPID_IN_USE\",\n52:                 \"error\": \"Binding already known\",\n53:                 \"mxid\": mxid,\n54:             })\n55: \n56:         if medium != \"email\":\n57:             request.setResponseCode(400)\n58:             return json.dumps({\n59:                 \"errcode\": \"M_UNRECOGNIZED\",\n60:                 \"error\": \"Didn't understand medium '%s'\" % (medium,),\n61:             })\n62: \n63:         token = self._randomString(128)\n64: \n65:         tokenStore = JoinTokenStore(self.sydent)\n66: \n67:         ephemeralPrivateKey = nacl.signing.SigningKey.generate()\n68:         ephemeralPublicKey = ephemeralPrivateKey.verify_key\n69: \n70:         ephemeralPrivateKeyBase64 = encode_base64(ephemeralPrivateKey.encode(), True)\n71:         ephemeralPublicKeyBase64 = encode_base64(ephemeralPublicKey.encode(), True)\n72: \n73:         tokenStore.storeEphemeralPublicKey(ephemeralPublicKeyBase64)\n74:         tokenStore.storeToken(medium, address, roomId, sender, token)\n75: \n76:         substitutions = {}\n77:         for key, values in request.args.items():\n78:             if len(values) == 1 and type(values[0]) == str:\n79:                 substitutions[key] = values[0]\n80:         substitutions[\"token\"] = token\n81: \n82:         required = [\n83:             'sender_display_name',\n84:             'token',\n85:             'room_name',\n86:             'bracketed_room_name',\n87:             'room_avatar_url',\n88:             'sender_display_name',\n89:             'guest_user_id',\n90:             'guest_access_token',\n91:         ]\n92:         for k in required:\n93:             substitutions.setdefault(k, '')\n94: \n95:         substitutions[\"ephemeral_private_key\"] = ephemeralPrivateKeyBase64\n96:         if substitutions[\"room_name\"] != '':\n97:             substitutions[\"bracketed_room_name\"] = \"(%s)\" % substitutions[\"room_name\"]\n98: \n99:         subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')\n100:         substitutions[\"subject_header_value\"] = subject_header.encode()\n101: \n102:         sendEmail(self.sydent, \"email.invite_template\", address, substitutions)\n103: \n104:         pubKey = self.sydent.keyring.ed25519.verify_key\n105:         pubKeyBase64 = encode_base64(pubKey.encode())\n106: \n107:         baseUrl = \"%s/_matrix/identity/api/v1\" % (self.sydent.cfg.get('http', 'client_http_base'),)\n108: \n109:         keysToReturn = []\n110:         keysToReturn.append({\n111:             \"public_key\": pubKeyBase64,\n112:             \"key_validity_url\": baseUrl + \"/pubkey/isvalid\",\n113:         })\n114:         keysToReturn.append({\n115:             \"public_key\": ephemeralPublicKeyBase64,\n116:             \"key_validity_url\": baseUrl + \"/pubkey/ephemeral/isvalid\",\n117:         })\n118: \n119:         resp = {\n120:             \"token\": token,\n121:             \"public_key\": pubKeyBase64,\n122:             \"public_keys\": keysToReturn,\n123:             \"display_name\": self.redact(address),\n124:         }\n125: \n126:         return json.dumps(resp)\n127: \n128:     def redact(self, address):\n129:         return \"@\".join(map(self._redact, address.split(\"@\", 1)))\n130: \n131:     def _redact(self, s):\n132:         if len(s) > 5:\n133:             return s[:3] + \"...\"\n134:         elif len(s) > 1:\n135:             return s[0] + \"...\"\n136:         else:\n137:             return \"...\"\n138: \n139:     def _randomString(self, length):\n140:         return ''.join(random.choice(string.ascii_letters) for _ in xrange(length))",
+    "source_summary": "Request parameters from request.args (user-controlled HTTP request data) are directly copied into substitutions dictionary",
+    "sink_summary": "Substitutions are used in email template formatting via string interpolation (line 56 in emailutils.py) and sent via SMTP",
+    "guard_summary": "Limited filtering: only single-value string parameters are included. HTML escaping is applied in emailutils.py line 53 via cgi.escape for *_forhtml variables",
+    "risk_pattern": "User-controlled request parameters are directly interpolated into email templates without validation, though HTML escaping is applied for specific template variables",
+    "used_variable_sources": [
+      "request.args (HTTP request parameters)"
+    ],
+    "called_function_context": [
+      "sendEmail",
+      "cgi.escape",
+      "urllib.quote"
+    ],
+    "enclosing_conditions": [
+      "if len(values) == 1 and type(values[0]) == str"
+    ],
+    "context_summary": "Request parameters are collected into substitutions dictionary for email invitation template. The email template system applies HTML escaping to variables with _forhtml suffix and URL encoding to variables with _forurl suffix",
+    "unresolved_facts": [
+      "Specific email template content and usage patterns",
+      "Whether all template variables that use raw substitutions are properly escaped",
+      "Configuration of email template file location and content"
+    ]
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "sydent/util/emailutils.py",
+    "changed_line": 53,
+    "statement": "allSubstitutions[k+\"_forhtml\"] = cgi.escape(v.decode('utf8'))",
+    "change_type": "A",
+    "function_name": "sendEmail",
+    "operation_type": "html_escaping",
+    "selection_reason": "Applies HTML escaping to template variables for safe HTML context usage",
+    "security_relevance_score": 0.8,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2014-2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: \n17: import logging\n18: import os\n19: import random\n20: import smtplib\n21: import email.utils\n22: import string\n23: import twisted.python.log\n24: import cgi\n25: import urllib\n26: \n27: import email.utils\n28: \n29: from sydent.util import time_msec\n30: \n31: logger = logging.getLogger(__name__)\n32: \n33: \n34: def sendEmail(sydent, templateName, mailTo, substitutions):\n35:         mailFrom = sydent.cfg.get('email', 'email.from')\n36:         mailTemplateFile = sydent.cfg.get('email', templateName)\n37: \n38:         myHostname = os.uname()[1]\n39:         midRandom = \"\".join([random.choice(string.ascii_letters) for _ in range(16)])\n40:         messageid = \"<%d%s@%s>\" % (time_msec(), midRandom, myHostname)\n41: \n42:         allSubstitutions = {}\n43:         allSubstitutions.update(substitutions)\n44:         allSubstitutions.update({\n45:             'messageid': messageid,\n46:             'date': email.utils.formatdate(localtime=False),\n47:             'to': mailTo,\n48:             'from': mailFrom,\n49:         })\n50: \n51:         for k,v in allSubstitutions.items():\n52:             allSubstitutions[k] = v.decode('utf8')\n53:             allSubstitutions[k+\"_forhtml\"] = cgi.escape(v.decode('utf8'))\n54:             allSubstitutions[k+\"_forurl\"] = urllib.quote(v)\n55: \n56:         mailString = open(mailTemplateFile).read() % allSubstitutions\n57:         rawFrom = email.utils.parseaddr(mailFrom)[1]\n58:         rawTo = email.utils.parseaddr(mailTo)[1]\n59:         if rawFrom == '' or rawTo == '':\n60:             logger.info(\"Couldn't parse from / to address %s / %s\", mailFrom, mailTo)\n61:             raise EmailAddressException()\n62:         mailServer = sydent.cfg.get('email', 'email.smtphost')\n63:         logger.info(\"Sending mail to %s with mail server: %s\" % (mailTo, mailServer,))\n64:         try:\n65:             smtp = smtplib.SMTP(mailServer)\n66:             smtp.sendmail(rawFrom, rawTo, mailString.encode('utf-8'))\n67:             smtp.quit()\n68:         except Exception as origException:\n69:             twisted.python.log.err()\n70:             ese = EmailSendException()\n71:             ese.cause = origException\n72:             raise ese\n73: \n74: \n75: class EmailAddressException(Exception):\n76:     pass\n77: \n78: \n79: class EmailSendException(Exception):\n80:     pass",
+    "source_summary": "substitutions dictionary contains values from HTTP request arguments (store_invite_servlet) or generated tokens/links (emailvalidator). In store_invite_servlet, request.args items are taken directly from user‑controlled query parameters; in emailvalidator, values include token, ipaddress, and a generated link.",
+    "sink_summary": "The escaped values (with '_forhtml' suffix) are used in email templates (e.g., 'email.template', 'email.invite_template') via string substitution (line 56: mailString = open(mailTemplateFile).read() % allSubstitutions). The resulting mailString is sent as an email body via SMTP.",
+    "guard_summary": "HTML escaping is applied to each value via cgi.escape(v.decode('utf8')) before insertion into the template. However, the template itself is not inspected; if the template uses the non‑escaped variable (without '_forhtml') in an HTML context, XSS could still occur. The escaping is applied uniformly to all substitution keys, but the template must reference the '_forhtml' suffixed keys to be safe.",
+    "risk_pattern": "User‑controlled input from HTTP request arguments flows into email templates. HTML escaping is performed on a copy of each variable (with '_forhtml' suffix), but the template must explicitly use the escaped copy. If the template uses the raw variable in an HTML context, cross‑site scripting (XSS) in email could result.",
+    "used_variable_sources": [
+      "request.args (store_invite_servlet)",
+      "generated token",
+      "generated validation link",
+      "ipaddress",
+      "room_name",
+      "sender_display_name",
+      "ephemeral_private_key"
+    ],
+    "called_function_context": [
+      "sendEmail is called from store_invite_servlet and emailvalidator"
+    ],
+    "enclosing_conditions": [
+      "Loop over allSubstitutions.items()",
+      "Preceded by allSubstitutions[k] = v.decode('utf8')"
+    ],
+    "context_summary": "The function sendEmail prepares substitution variables for email templates. For each key‑value pair, it creates three variants: decoded UTF‑8 plain text, HTML‑escaped (cgi.escape), and URL‑quoted. The template file is read and formatted with these substitutions, then emailed.",
+    "unresolved_facts": [
+      "Exact content of email templates (res/email.template, email.invite_template) to confirm whether they use '_forhtml' suffixed variables for HTML contexts",
+      "Whether any template uses raw variables (without suffix) in HTML context, which would bypass the escaping",
+      "Whether cgi.escape is sufficient for all HTML contexts in the templates (e.g., inside attributes)"
+    ]
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "sydent/util/emailutils.py",
+    "changed_line": 54,
+    "statement": "allSubstitutions[k+\"_forurl\"] = urllib.quote(v)",
+    "change_type": "A",
+    "function_name": "sendEmail",
+    "operation_type": "url_encoding",
+    "selection_reason": "Applies URL encoding to template variables for safe URL parameter usage",
+    "security_relevance_score": 0.8,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2014-2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: \n17: import logging\n18: import os\n19: import random\n20: import smtplib\n21: import email.utils\n22: import string\n23: import twisted.python.log\n24: import cgi\n25: import urllib\n26: \n27: import email.utils\n28: \n29: from sydent.util import time_msec\n30: \n31: logger = logging.getLogger(__name__)\n32: \n33: \n34: def sendEmail(sydent, templateName, mailTo, substitutions):\n35:         mailFrom = sydent.cfg.get('email', 'email.from')\n36:         mailTemplateFile = sydent.cfg.get('email', templateName)\n37: \n38:         myHostname = os.uname()[1]\n39:         midRandom = \"\".join([random.choice(string.ascii_letters) for _ in range(16)])\n40:         messageid = \"<%d%s@%s>\" % (time_msec(), midRandom, myHostname)\n41: \n42:         allSubstitutions = {}\n43:         allSubstitutions.update(substitutions)\n44:         allSubstitutions.update({\n45:             'messageid': messageid,\n46:             'date': email.utils.formatdate(localtime=False),\n47:             'to': mailTo,\n48:             'from': mailFrom,\n49:         })\n50: \n51:         for k,v in allSubstitutions.items():\n52:             allSubstitutions[k] = v.decode('utf8')\n53:             allSubstitutions[k+\"_forhtml\"] = cgi.escape(v.decode('utf8'))\n54:             allSubstitutions[k+\"_forurl\"] = urllib.quote(v)\n55: \n56:         mailString = open(mailTemplateFile).read() % allSubstitutions\n57:         rawFrom = email.utils.parseaddr(mailFrom)[1]\n58:         rawTo = email.utils.parseaddr(mailTo)[1]\n59:         if rawFrom == '' or rawTo == '':\n60:             logger.info(\"Couldn't parse from / to address %s / %s\", mailFrom, mailTo)\n61:             raise EmailAddressException()\n62:         mailServer = sydent.cfg.get('email', 'email.smtphost')\n63:         logger.info(\"Sending mail to %s with mail server: %s\" % (mailTo, mailServer,))\n64:         try:\n65:             smtp = smtplib.SMTP(mailServer)\n66:             smtp.sendmail(rawFrom, rawTo, mailString.encode('utf-8'))\n67:             smtp.quit()\n68:         except Exception as origException:\n69:             twisted.python.log.err()\n70:             ese = EmailSendException()\n71:             ese.cause = origException\n72:             raise ese\n73: \n74: \n75: class EmailAddressException(Exception):\n76:     pass\n77: \n78: \n79: class EmailSendException(Exception):\n80:     pass",
+    "source_summary": "substitutions dictionary contains values from HTTP request parameters (store_invite_servlet) or generated tokens/links (emailvalidator). In store_invite_servlet, request.args items are copied directly; values are strings from user-controlled POST parameters (medium, address, room_id, sender, etc.). In emailvalidator, substitutions include ipaddress, link, token; link is constructed with urllib.quote on token and clientSecret.",
+    "sink_summary": "The encoded _forurl values are used in email templates via string substitution (line 56: mailString = open(mailTemplateFile).read() % allSubstitutions). The resulting email body is sent via SMTP. The _forurl suffix suggests usage in URL contexts within email templates (e.g., hyperlinks).",
+    "guard_summary": "No validation or sanitization on request.args values before being placed into substitutions. The URL encoding (urllib.quote) is applied to the raw value v (which is still bytes/string before decode on line 52). However, line 52 decodes v to utf8 for the plain key, but line 54 uses v (original) before decode? Actually v is the same value from allSubstitutions.items() before modification; line 52 modifies allSubstitutions[k] = v.decode('utf8'), but v remains unchanged. So urllib.quote(v) operates on the original v (bytes/string). If v contains unsafe URL characters, quote encodes them. This is a security control for URL safety when the value is interpolated into a URL in the template.",
+    "risk_pattern": "User-controlled request parameters are URL-encoded and inserted into email templates, potentially mitigating URL injection when values are used in hyperlinks. However, the encoding is applied after the value is already in substitutions; there is no prior validation of the value content. The encoding may be insufficient if the template uses the value in a non-URL context where other encoding (e.g., HTML) is needed.",
+    "used_variable_sources": [
+      "request.args (store_invite_servlet)",
+      "generated token",
+      "ipaddress string",
+      "constructed validate link"
+    ],
+    "called_function_context": [
+      "sendEmail called from store_invite_servlet.render_POST",
+      "sendEmail called from emailvalidator.requestToken"
+    ],
+    "enclosing_conditions": [
+      "Loop over allSubstitutions.items()",
+      "Preceded by decode and HTML escape for each key"
+    ],
+    "context_summary": "In sendEmail, for each substitution key, three variants are created: plain utf8 decoded, HTML escaped, and URL quoted. These are used in email template substitution. The URL quoted variant is intended for safe inclusion in URLs within the email.",
+    "unresolved_facts": [
+      "Exact content of email templates (res/email.template and invite template) to confirm usage of _forurl in URL contexts",
+      "Whether any template uses _forurl in a non-URL context where URL encoding is inappropriate",
+      "Whether v is always a string/bytes safe for urllib.quote (e.g., no Unicode issues)"
+    ]
+  },
+  {
+    "candidate_id": "candidate-4",
+    "filepath": "sydent/http/servlets/store_invite_servlet.py",
+    "changed_line": 99,
+    "statement": "subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')",
+    "change_type": "A",
+    "function_name": "render_POST",
+    "operation_type": "email_header_encoding",
+    "selection_reason": "Encodes email subject header with proper MIME encoding for safe header injection prevention",
+    "security_relevance_score": 0.7,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: import nacl.signing\n17: import random\n18: import string\n19: from email.header import Header\n20: \n21: from twisted.web.resource import Resource\n22: from unpaddedbase64 import encode_base64\n23: \n24: import json\n25: from sydent.db.invite_tokens import JoinTokenStore\n26: from sydent.db.threepid_associations import GlobalAssociationStore\n27: \n28: from sydent.http.servlets import require_args, send_cors\n29: from sydent.util.emailutils import sendEmail\n30: \n31: \n32: class StoreInviteServlet(Resource):\n33:     def __init__(self, syd):\n34:         self.sydent = syd\n35: \n36:     def render_POST(self, request):\n37:         send_cors(request)\n38:         err = require_args(request, (\"medium\", \"address\", \"room_id\", \"sender\",))\n39:         if err:\n40:             return json.dumps(err)\n41:         medium = request.args[\"medium\"][0]\n42:         address = request.args[\"address\"][0]\n43:         roomId = request.args[\"room_id\"][0]\n44:         sender = request.args[\"sender\"][0]\n45: \n46:         globalAssocStore = GlobalAssociationStore(self.sydent)\n47:         mxid = globalAssocStore.getMxid(medium, address)\n48:         if mxid:\n49:             request.setResponseCode(400)\n50:             return json.dumps({\n51:                 \"errcode\": \"THREEPID_IN_USE\",\n52:                 \"error\": \"Binding already known\",\n53:                 \"mxid\": mxid,\n54:             })\n55: \n56:         if medium != \"email\":\n57:             request.setResponseCode(400)\n58:             return json.dumps({\n59:                 \"errcode\": \"M_UNRECOGNIZED\",\n60:                 \"error\": \"Didn't understand medium '%s'\" % (medium,),\n61:             })\n62: \n63:         token = self._randomString(128)\n64: \n65:         tokenStore = JoinTokenStore(self.sydent)\n66: \n67:         ephemeralPrivateKey = nacl.signing.SigningKey.generate()\n68:         ephemeralPublicKey = ephemeralPrivateKey.verify_key\n69: \n70:         ephemeralPrivateKeyBase64 = encode_base64(ephemeralPrivateKey.encode(), True)\n71:         ephemeralPublicKeyBase64 = encode_base64(ephemeralPublicKey.encode(), True)\n72: \n73:         tokenStore.storeEphemeralPublicKey(ephemeralPublicKeyBase64)\n74:         tokenStore.storeToken(medium, address, roomId, sender, token)\n75: \n76:         substitutions = {}\n77:         for key, values in request.args.items():\n78:             if len(values) == 1 and type(values[0]) == str:\n79:                 substitutions[key] = values[0]\n80:         substitutions[\"token\"] = token\n81: \n82:         required = [\n83:             'sender_display_name',\n84:             'token',\n85:             'room_name',\n86:             'bracketed_room_name',\n87:             'room_avatar_url',\n88:             'sender_display_name',\n89:             'guest_user_id',\n90:             'guest_access_token',\n91:         ]\n92:         for k in required:\n93:             substitutions.setdefault(k, '')\n94: \n95:         substitutions[\"ephemeral_private_key\"] = ephemeralPrivateKeyBase64\n96:         if substitutions[\"room_name\"] != '':\n97:             substitutions[\"bracketed_room_name\"] = \"(%s)\" % substitutions[\"room_name\"]\n98: \n99:         subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')\n100:         substitutions[\"subject_header_value\"] = subject_header.encode()\n101: \n102:         sendEmail(self.sydent, \"email.invite_template\", address, substitutions)\n103: \n104:         pubKey = self.sydent.keyring.ed25519.verify_key\n105:         pubKeyBase64 = encode_base64(pubKey.encode())\n106: \n107:         baseUrl = \"%s/_matrix/identity/api/v1\" % (self.sydent.cfg.get('http', 'client_http_base'),)\n108: \n109:         keysToReturn = []\n110:         keysToReturn.append({\n111:             \"public_key\": pubKeyBase64,\n112:             \"key_validity_url\": baseUrl + \"/pubkey/isvalid\",\n113:         })\n114:         keysToReturn.append({\n115:             \"public_key\": ephemeralPublicKeyBase64,\n116:             \"key_validity_url\": baseUrl + \"/pubkey/ephemeral/isvalid\",\n117:         })\n118: \n119:         resp = {\n120:             \"token\": token,\n121:             \"public_key\": pubKeyBase64,\n122:             \"public_keys\": keysToReturn,\n123:             \"display_name\": self.redact(address),\n124:         }\n125: \n126:         return json.dumps(resp)\n127: \n128:     def redact(self, address):\n129:         return \"@\".join(map(self._redact, address.split(\"@\", 1)))\n130: \n131:     def _redact(self, s):\n132:         if len(s) > 5:\n133:             return s[:3] + \"...\"\n134:         elif len(s) > 1:\n135:             return s[0] + \"...\"\n136:         else:\n137:             return \"...\"\n138: \n139:     def _randomString(self, length):\n140:         return ''.join(random.choice(string.ascii_letters) for _ in xrange(length))",
+    "source_summary": "Request arguments (medium, address, room_id, sender) and additional substitution values including user-provided sender_display_name, room_name, etc. are processed into substitutions dictionary",
+    "sink_summary": "Email Subject header via template substitution in res/invite_template_vector.eml, ultimately sent via SMTP",
+    "guard_summary": "Header class from email.header provides MIME encoding for safe header injection prevention; template uses %(subject_header_value)s placeholder",
+    "risk_pattern": "User-controlled values from HTTP request arguments are substituted into email subject template, then properly MIME-encoded for header safety",
+    "used_variable_sources": [
+      "request.args (user input)",
+      "configuration template 'email.invite.subject'"
+    ],
+    "called_function_context": [
+      "Header.encode()",
+      "sendEmail()",
+      "self.sydent.cfg.get()"
+    ],
+    "enclosing_conditions": [
+      "medium == 'email'",
+      "required substitution keys present"
+    ],
+    "context_summary": "Email invitation system where user-provided values are substituted into email subject and body templates, with proper header encoding to prevent injection",
+    "unresolved_facts": [
+      "Exact content of email.invite.subject configuration template",
+      "Full validation of user input values before substitution"
+    ]
+  },
+  {
+    "candidate_id": "candidate-5",
+    "filepath": "sydent/util/emailutils.py",
+    "changed_line": 66,
+    "statement": "smtp.sendmail(rawFrom, rawTo, mailString.encode('utf-8'))",
+    "change_type": "A",
+    "function_name": "sendEmail",
+    "operation_type": "email_sending",
+    "selection_reason": "Encodes email content to UTF-8 for proper character handling and encoding safety",
+    "security_relevance_score": 0.6,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2014-2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: \n17: import logging\n18: import os\n19: import random\n20: import smtplib\n21: import email.utils\n22: import string\n23: import twisted.python.log\n24: import cgi\n25: import urllib\n26: \n27: import email.utils\n28: \n29: from sydent.util import time_msec\n30: \n31: logger = logging.getLogger(__name__)\n32: \n33: \n34: def sendEmail(sydent, templateName, mailTo, substitutions):\n35:         mailFrom = sydent.cfg.get('email', 'email.from')\n36:         mailTemplateFile = sydent.cfg.get('email', templateName)\n37: \n38:         myHostname = os.uname()[1]\n39:         midRandom = \"\".join([random.choice(string.ascii_letters) for _ in range(16)])\n40:         messageid = \"<%d%s@%s>\" % (time_msec(), midRandom, myHostname)\n41: \n42:         allSubstitutions = {}\n43:         allSubstitutions.update(substitutions)\n44:         allSubstitutions.update({\n45:             'messageid': messageid,\n46:             'date': email.utils.formatdate(localtime=False),\n47:             'to': mailTo,\n48:             'from': mailFrom,\n49:         })\n50: \n51:         for k,v in allSubstitutions.items():\n52:             allSubstitutions[k] = v.decode('utf8')\n53:             allSubstitutions[k+\"_forhtml\"] = cgi.escape(v.decode('utf8'))\n54:             allSubstitutions[k+\"_forurl\"] = urllib.quote(v)\n55: \n56:         mailString = open(mailTemplateFile).read() % allSubstitutions\n57:         rawFrom = email.utils.parseaddr(mailFrom)[1]\n58:         rawTo = email.utils.parseaddr(mailTo)[1]\n59:         if rawFrom == '' or rawTo == '':\n60:             logger.info(\"Couldn't parse from / to address %s / %s\", mailFrom, mailTo)\n61:             raise EmailAddressException()\n62:         mailServer = sydent.cfg.get('email', 'email.smtphost')\n63:         logger.info(\"Sending mail to %s with mail server: %s\" % (mailTo, mailServer,))\n64:         try:\n65:             smtp = smtplib.SMTP(mailServer)\n66:             smtp.sendmail(rawFrom, rawTo, mailString.encode('utf-8'))\n67:             smtp.quit()\n68:         except Exception as origException:\n69:             twisted.python.log.err()\n70:             ese = EmailSendException()\n71:             ese.cause = origException\n72:             raise ese\n73: \n74: \n75: class EmailAddressException(Exception):\n76:     pass\n77: \n78: \n79: class EmailSendException(Exception):\n80:     pass",
+    "source_summary": "Email content comes from template files (email.template, email.invite_template) with substitutions from user input (email addresses, tokens, room names, sender info) and system-generated values (message IDs, timestamps). Email addresses and substitution data come from HTTP requests and validation sessions.",
+    "sink_summary": "SMTP server via smtplib.sendmail() with UTF-8 encoded email content",
+    "guard_summary": "Email address parsing validation (lines 57-61), template file reading, and UTF-8 encoding. No content sanitization or injection protection for email headers/body.",
+    "risk_pattern": "User-controlled and system-generated data flows into email templates via string formatting, then gets sent via SMTP with UTF-8 encoding but without proper email header/content sanitization against injection attacks.",
+    "used_variable_sources": [
+      "sydent.cfg.get('email', 'email.from')",
+      "sydent.cfg.get('email', templateName)",
+      "substitutions parameter (user-controlled data)",
+      "mailTo parameter (user email address)",
+      "system-generated messageid and date"
+    ],
+    "called_function_context": [
+      "email.utils.parseaddr()",
+      "smtplib.SMTP()",
+      "smtplib.sendmail()",
+      "open().read()",
+      "string formatting with % operator"
+    ],
+    "enclosing_conditions": [
+      "if rawFrom == '' or rawTo == '': (address validation)",
+      "try-except block for SMTP errors"
+    ],
+    "context_summary": "Function sends email using templates with substitutions. The changed line adds UTF-8 encoding to ensure proper character handling when sending email content through SMTP.",
+    "unresolved_facts": [
+      "Exact content and structure of email template files",
+      "Whether template files contain proper escaping for email headers/body",
+      "Specific SMTP server configuration and security controls",
+      "Whether user input undergoes additional validation before reaching substitutions"
+    ]
+  }
+]

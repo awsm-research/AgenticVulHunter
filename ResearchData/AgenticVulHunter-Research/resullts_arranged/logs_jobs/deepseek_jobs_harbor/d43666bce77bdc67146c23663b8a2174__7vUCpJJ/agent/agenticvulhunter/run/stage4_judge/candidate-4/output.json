@@ -1,0 +1,385 @@
+{
+  "candidate_id": "candidate-4",
+  "filepath": "glance/api/v1/images.py",
+  "changed_line": 763,
+  "statement": "schedule_delayed_delete_from_backend(image['location'], id)",
+  "change_type": "A",
+  "function_name": "delete",
+  "operation_type": "sensitive_data_scheduled_deletion",
+  "selection_reason": "image location data -> scheduled deletion call -> deferred removal with potential timing/race condition implications",
+  "security_relevance_score": 0.8,
+  "code_context": "614:             self._enforce(req, 'publicize_image')\n615: \n616:         image_meta = self._reserve(req, image_meta)\n617:         id = image_meta['id']\n618: \n619:         image_meta = self._handle_source(req, id, image_meta, image_data)\n620: \n621:         location_uri = image_meta.get('location')\n622:         if location_uri:\n623:             self.update_store_acls(req, id, location_uri, public=is_public)\n624: \n625:         # Prevent client from learning the location, as it\n626:         # could contain security credentials\n627:         image_meta.pop('location', None)\n628: \n629:         return {'image_meta': image_meta}\n630: \n631:     @utils.mutating\n632:     def update(self, req, id, image_meta, image_data):\n633:         \"\"\"\n634:         Updates an existing image with the registry.\n635: \n636:         :param request: The WSGI/Webob Request object\n637:         :param id: The opaque image identifier\n638: \n639:         :retval Returns the updated image information as a mapping\n640:         \"\"\"\n641:         self._enforce(req, 'modify_image')\n642:         is_public = image_meta.get('is_public')\n643:         if is_public:\n644:             self._enforce(req, 'publicize_image')\n645: \n646:         orig_image_meta = self.get_image_meta_or_404(req, id)\n647:         orig_status = orig_image_meta['status']\n648: \n649:         # The default behaviour for a PUT /images/<IMAGE_ID> is to\n650:         # override any properties that were previously set. This, however,\n651:         # leads to a number of issues for the common use case where a caller\n652:         # registers an image with some properties and then almost immediately\n653:         # uploads an image file along with some more properties. Here, we\n654:         # check for a special header value to be false in order to force\n655:         # properties NOT to be purged. However we also disable purging of\n656:         # properties if an image file is being uploaded...\n657:         purge_props = req.headers.get('x-glance-registry-purge-props', True)\n658:         purge_props = (utils.bool_from_string(purge_props) and\n659:                        image_data is None)\n660: \n661:         if image_data is not None and orig_status != 'queued':\n662:             raise HTTPConflict(_(\"Cannot upload to an unqueued image\"))\n663: \n664:         # Only allow the Location|Copy-From fields to be modified if the\n665:         # image is in queued status, which indicates that the user called\n666:         # POST /images but originally supply neither a Location|Copy-From\n667:         # field NOR image data\n668:         location = self._external_source(image_meta, req)\n669:         reactivating = orig_status != 'queued' and location\n670:         activating = orig_status == 'queued' and (location or image_data)\n671: \n672:         # Make image public in the backend store (if implemented)\n673:         orig_or_updated_loc = location or orig_image_meta.get('location', None)\n674:         if orig_or_updated_loc:\n675:             self.update_store_acls(req, id, orig_or_updated_loc,\n676:                                    public=is_public)\n677: \n678:         if reactivating:\n679:             msg = _(\"Attempted to update Location field for an image \"\n680:                     \"not in queued status.\")\n681:             raise HTTPBadRequest(explanation=msg,\n682:                                  request=req,\n683:                                  content_type=\"text/plain\")\n684: \n685:         try:\n686:             if location:\n687:                 image_meta['size'] = self._get_size(req.context, image_meta,\n688:                                                     location)\n689: \n690:             image_meta = registry.update_image_metadata(req.context,\n691:                                                         id,\n692:                                                         image_meta,\n693:                                                         purge_props)\n694: \n695:             if activating:\n696:                 image_meta = self._handle_source(req, id, image_meta,\n697:                                                  image_data)\n698: \n699:         except exception.Invalid, e:\n700:             msg = (_(\"Failed to update image metadata. Got error: %(e)s\")\n701:                    % locals())\n702:             for line in msg.split('\\n'):\n703:                 LOG.error(line)\n704:             self.notifier.error('image.update', msg)\n705:             raise HTTPBadRequest(explanation=msg,\n706:                                  request=req,\n707:                                  content_type=\"text/plain\")\n708:         except exception.NotFound, e:\n709:             msg = (\"Failed to find image to update: %(e)s\" % locals())\n710:             for line in msg.split('\\n'):\n711:                 LOG.info(line)\n712:             self.notifier.info('image.update', msg)\n713:             raise HTTPNotFound(explanation=msg,\n714:                                request=req,\n715:                                content_type=\"text/plain\")\n716:         except exception.Forbidden, e:\n717:             msg = (\"Forbidden to update image: %(e)s\" % locals())\n718:             for line in msg.split('\\n'):\n719:                 LOG.info(line)\n720:             self.notifier.info('image.update', msg)\n721:             raise HTTPForbidden(explanation=msg,\n722:                                 request=req,\n723:                                 content_type=\"text/plain\")\n724:         else:\n725:             self.notifier.info('image.update', image_meta)\n726: \n727:         # Prevent client from learning the location, as it\n728:         # could contain security credentials\n729:         image_meta.pop('location', None)\n730: \n731:         return {'image_meta': image_meta}\n732: \n733:     @utils.mutating\n734:     def delete(self, req, id):\n735:         \"\"\"\n736:         Deletes the image and all its chunks from the Glance\n737: \n738:         :param req: The WSGI/Webob Request object\n739:         :param id: The opaque image identifier\n740: \n741:         :raises HttpBadRequest if image registry is invalid\n742:         :raises HttpNotFound if image or any chunk is not available\n743:         :raises HttpUnauthorized if image or any chunk is not\n744:                 deleteable by the requesting user\n745:         \"\"\"\n746:         self._enforce(req, 'delete_image')\n747: \n748:         image = self.get_image_meta_or_404(req, id)\n749:         if image['protected']:\n750:             msg = _(\"Image is protected\")\n751:             LOG.debug(msg)\n752:             raise HTTPForbidden(explanation=msg,\n753:                                 request=req,\n754:                                 content_type=\"text/plain\")\n755: \n756:         # The image's location field may be None in the case\n757:         # of a saving or queued image, therefore don't ask a backend\n758:         # to delete the image if the backend doesn't yet store it.\n759:         # See https://bugs.launchpad.net/glance/+bug/747799\n760:         try:\n761:             if image['location']:\n762:                 if CONF.delayed_delete:\n763:                     schedule_delayed_delete_from_backend(image['location'], id)\n764:                     registry.update_image_metadata(req.context, id,\n765:                                                   {'status': 'pending_delete'})\n766:                 else:\n767:                     safe_delete_from_backend(image['location'],\n768:                                              req.context, id)\n769:                     registry.update_image_metadata(req.context, id,\n770:                                                    {'status': 'deleted'})\n771:             registry.delete_image_metadata(req.context, id)\n772:         except exception.NotFound, e:\n773:             msg = (\"Failed to find image to delete: %(e)s\" % locals())\n774:             for line in msg.split('\\n'):\n775:                 LOG.info(line)\n776:             self.notifier.info('image.delete', msg)\n777:             raise HTTPNotFound(explanation=msg,\n778:                                request=req,\n779:                                content_type=\"text/plain\")\n780:         except exception.Forbidden, e:\n781:             msg = (\"Forbidden to delete image: %(e)s\" % locals())\n782:             for line in msg.split('\\n'):\n783:                 LOG.info(line)\n784:             self.notifier.info('image.delete', msg)\n785:             raise HTTPForbidden(explanation=msg,\n786:                                 request=req,\n787:                                 content_type=\"text/plain\")\n788:         else:\n789:             self.notifier.info('image.delete', image)\n790: \n791:     def get_store_or_400(self, request, scheme):\n792:         \"\"\"\n793:         Grabs the storage backend for the supplied store name\n794:         or raises an HTTPBadRequest (400) response\n795: \n796:         :param request: The WSGI/Webob Request object\n797:         :param scheme: The backend store scheme\n798: \n799:         :raises HTTPNotFound if store does not exist\n800:         \"\"\"\n801:         try:\n802:             return get_store_from_scheme(request.context, scheme)\n803:         except exception.UnknownScheme:\n804:             msg = _(\"Store for scheme %s not found\")\n805:             LOG.error(msg % scheme)\n806:             raise HTTPBadRequest(explanation=msg,\n807:                                  request=request,\n808:                                  content_type='text/plain')\n809: \n810:     def verify_scheme_or_exit(self, scheme):\n811:         \"\"\"\n812:         Verifies availability of the storage backend for the\n813:         given scheme or exits\n814: \n815:         :param scheme: The backend store scheme\n816:         \"\"\"\n817:         try:\n818:             get_store_from_scheme(context.RequestContext(), scheme)\n819:         except exception.UnknownScheme:\n820:             msg = _(\"Store for scheme %s not found\")\n821:             LOG.error(msg % scheme)\n822:             # message on stderr will only be visible if started directly via\n823:             # bin/glance-api, as opposed to being daemonized by glance-control\n824:             sys.stderr.write(msg % scheme)\n825:             sys.exit(255)\n826: \n827: \n828: class ImageDeserializer(wsgi.JSONRequestDeserializer):\n829:     \"\"\"Handles deserialization of specific controller method requests.\"\"\"\n830: \n831:     def _deserialize(self, request):\n832:         result = {}\n833:         try:\n834:             result['image_meta'] = utils.get_image_meta_from_headers(request)\n835:         except exception.Invalid:\n836:             image_size_str = request.headers['x-image-meta-size']\n837:             msg = _(\"Incoming image size of %s was not convertible to \"\n838:                     \"an integer.\") % image_size_str\n839:             raise HTTPBadRequest(explanation=msg, request=request)\n840: \n841:         image_meta = result['image_meta']\n842:         if request.content_length:\n843:             image_size = request.content_length\n844:         elif 'size' in image_meta:\n845:             image_size = image_meta['size']\n846:         else:\n847:             image_size = None\n848: \n849:         data = request.body_file if self.has_body(request) else None\n850: \n851:         if image_size is None and data is not None:\n852:             data = utils.LimitingReader(data, CONF.image_size_cap)\n853: \n854:             #NOTE(bcwaldon): this is a hack to make sure the downstream code\n855:             # gets the correct image data\n856:             request.body_file = data\n857: \n858:         elif image_size > CONF.image_size_cap:\n859:             max_image_size = CONF.image_size_cap\n860:             msg = _(\"Denying attempt to upload image larger than %d bytes.\")\n861:             LOG.warn(msg % max_image_size)\n862:             raise HTTPBadRequest(explanation=msg % max_image_size,\n863:                                  request=request)\n864: \n865:         result['image_data'] = data\n866:         return result\n867: \n868:     def create(self, request):\n869:         return self._deserialize(request)\n870: \n871:     def update(self, request):\n872:         return self._deserialize(request)\n873: \n874: \n875: class ImageSerializer(wsgi.JSONResponseSerializer):\n876:     \"\"\"Handles serialization of specific controller method responses.\"\"\"\n877: \n878:     def __init__(self):\n879:         self.notifier = notifier.Notifier()\n880: \n881:     def _inject_location_header(self, response, image_meta):\n882:         location = self._get_image_location(image_meta)\n883:         response.headers['Location'] = location\n884: \n885:     def _inject_checksum_header(self, response, image_meta):\n886:         response.headers['ETag'] = image_meta['checksum']\n887: \n888:     def _inject_image_meta_headers(self, response, image_meta):\n889:         \"\"\"\n890:         Given a response and mapping of image metadata, injects\n891:         the Response with a set of HTTP headers for the image\n892:         metadata. Each main image metadata field is injected\n893:         as a HTTP header with key 'x-image-meta-<FIELD>' except\n894:         for the properties field, which is further broken out\n895:         into a set of 'x-image-meta-property-<KEY>' headers\n896: \n897:         :param response: The Webob Response object\n898:         :param image_meta: Mapping of image metadata\n899:         \"\"\"\n900:         headers = utils.image_meta_to_http_headers(image_meta)\n901: \n902:         for k, v in headers.items():\n903:             response.headers[k] = v\n904: \n905:     def _get_image_location(self, image_meta):\n906:         \"\"\"Build a relative url to reach the image defined by image_meta.\"\"\"\n907:         return \"/v1/images/%s\" % image_meta['id']\n908: \n909:     def meta(self, response, result):\n910:         image_meta = result['image_meta']\n911:         self._inject_image_meta_headers(response, image_meta)\n912:         self._inject_location_header(response, image_meta)",
+  "source_summary": "image['location'] from image metadata retrieved via get_image_meta_or_404() which comes from registry database; image location may contain backend storage URIs with security credentials",
+  "sink_summary": "schedule_delayed_delete_from_backend writes image location URI and deletion timestamp to scrubber_datadir file, creating a deferred deletion queue entry",
+  "guard_summary": "Protected images blocked by image['protected'] check; authentication via self._enforce(req, 'delete_image'); location presence check via image['location'] conditional; CONF.delayed_delete flag controls delayed vs immediate deletion path",
+  "risk_pattern": "Image location URIs containing sensitive credentials are written to filesystem with delayed deletion timing, creating a window where credentials may be exposed if file permissions or scrubber process is compromised",
+  "used_variable_sources": [
+    "image['location'] from registry database",
+    "id from function parameter"
+  ],
+  "called_function_context": [
+    "schedule_delayed_delete_from_backend",
+    "registry.update_image_metadata",
+    "self._enforce",
+    "self.get_image_meta_or_404"
+  ],
+  "enclosing_conditions": [
+    "if image['location']",
+    "if CONF.delayed_delete",
+    "if image['protected']"
+  ],
+  "context_summary": "In image deletion flow, when delayed_delete is enabled, sensitive image location URIs are scheduled for deferred deletion by writing to scrubber_datadir with file permissions 0600 and future timestamp",
+  "unresolved_facts": [
+    "scrubber_datadir configuration security",
+    "scrubber process implementation and security controls",
+    "file permission enforcement reliability",
+    "scrub_time configuration value",
+    "registry database security for location storage"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-377",
+      "cwe_name": "Insecure Temporary File",
+      "fit_reason": "Schedule_delayed_delete_from_backend writes sensitive image location URIs containing credentials to scrubber_datadir filesystem with delayed deletion timing, creating insecure temporary file exposure window",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "fit_reason": "Image location URIs with embedded security credentials are written to filesystem queue instead of secure credential storage, exposing credentials during deletion delay period",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-534",
+      "cwe_name": "Information Exposure Through Debug Log Files",
+      "fit_reason": "Sensitive credential-containing URIs written to filesystem scrubber queue files could be exposed if file permissions or scrubber process is compromised",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "fit_reason": "Scrubber process reading from scrubber_datadir may follow symlinks if proper link resolution controls are missing",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-264",
+      "cwe_name": "Permissions, Privileges, and Access Controls",
+      "fit_reason": "Inadequate file permissions or access controls on scrubber_datadir could allow unauthorized access to credential-containing deletion queue files",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1004",
+    "CWE-1236",
+    "CWE-20",
+    "CWE-200",
+    "CWE-208",
+    "CWE-22",
+    "CWE-255",
+    "CWE-264",
+    "CWE-377",
+    "CWE-534",
+    "CWE-59",
+    "CWE-628",
+    "CWE-685"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 763,
+      "statement": "schedule_delayed_delete_from_backend(image['location'], id)",
+      "cwe_id": "CWE-377",
+      "cwe_name": "Insecure Temporary File",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code writes image location data to filesystem for deferred deletion, but CWE-377 specifically addresses temporary files created with predictable names, insecure permissions, or race conditions during creation. The evidence shows file creation but lacks details on naming patterns, permissions, or race conditions."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "Image location data from registry database flows directly to schedule_delayed_delete_from_backend function, which writes to scrubber_datadir filesystem. The path is: image metadata retrieval → location extraction → scheduled deletion function call."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This is an added line that introduces the delayed deletion path. If reverted, image deletion would only use the immediate safe_delete_from_backend path, eliminating the filesystem writing mechanism entirely."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "The scrubber_datadir files are created with 0600 permissions, but the evidence doesn't establish whether this control is sufficient or if predictable naming, race conditions, or directory security exist.",
+          "required_control": "Secure temporary file creation with unpredictable names, proper permissions, and atomic operations",
+          "control_requirement_evidence": "CWE-377 requires protection against predictable naming, insecure permissions, and race conditions during temporary file operations",
+          "existing_controls_checked": [
+            "file permissions 0600 mentioned in context",
+            "scrubber_datadir configuration"
+          ],
+          "deficiency_evidence": "Evidence doesn't demonstrate whether file naming is predictable, if race conditions exist during file creation, or if scrubber_datadir directory permissions are secure"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "Potential exposure of image location URIs containing credentials if filesystem access is compromised, but the delayed deletion timing and scrubber process security controls are unresolved facts."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, image deletion would bypass the delayed deletion path entirely, using only the immediate safe_delete_from_backend call that doesn't write location data to filesystem.",
+      "supporting_evidence": [
+        "schedule_delayed_delete_from_backend writes image location URIs to scrubber_datadir filesystem",
+        "Image location may contain backend storage credentials as noted in code comments",
+        "Files are created with 0600 permissions but delayed deletion creates exposure window"
+      ],
+      "contradicting_evidence": [
+        "Code comments indicate awareness of credential sensitivity in location URIs",
+        "File permissions 0600 provide some protection against unauthorized access"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "scrubber_datadir directory permissions and security controls",
+        "File naming patterns and predictability",
+        "Race conditions during file creation",
+        "Scrubber process implementation security",
+        "Registry database security for location storage"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.5599999999999999,
+      "score": 0.5599999999999999
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 763,
+      "statement": "schedule_delayed_delete_from_backend(image['location'], id)",
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "CWE-255 is a legacy category grouping credential management issues. The code handles image location URIs that may contain credentials, but doesn't demonstrate the specific credential management errors defined in more precise CWEs like CWE-257, CWE-259, or CWE-798."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "Image location data from registry database flows directly to schedule_delayed_delete_from_backend function. The code context shows image['location'] may contain security credentials (line 626-627), establishing a clear data flow path."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "This is an added line that introduces delayed deletion functionality. If reverted, image location URIs with credentials would be immediately deleted via safe_delete_from_backend instead of being written to filesystem queue, eliminating the credential exposure window."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "",
+          "required_control": "Secure credential storage and lifecycle management for image location URIs containing authentication data",
+          "control_requirement_evidence": "CWE-255 requires proper management of credentials throughout their lifecycle. Image location URIs may contain backend storage credentials that need secure handling.",
+          "existing_controls_checked": [
+            "file permissions 0600 on scrubber_datadir",
+            "authentication via self._enforce",
+            "protected image check"
+          ],
+          "deficiency_evidence": "Writing credentials to filesystem queue creates exposure window; no evidence of encryption, secure memory handling, or immediate credential sanitization after use"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "Potential credential exposure if scrubber_datadir files are compromised during deletion delay, but no demonstrated exploit path or actual credential compromise shown."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, image deletion would proceed immediately via safe_delete_from_backend without writing location URIs with potential credentials to the filesystem queue, eliminating the delayed exposure window.",
+      "supporting_evidence": [
+        "Code comment at line 625-627 explicitly states location may contain security credentials",
+        "Image location data flows from registry database to filesystem queue via schedule_delayed_delete_from_backend",
+        "Delayed deletion creates temporal window where credentials may be exposed"
+      ],
+      "contradicting_evidence": [
+        "CWE-255 is a broad category, not a specific credential management error",
+        "File permissions 0600 provide some protection for scrubber_datadir files"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Actual content and sensitivity of image location URIs in practice",
+        "Security controls and isolation of scrubber process",
+        "File permission enforcement reliability on target systems",
+        "Exploitability of the credential exposure window"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.53,
+      "score": 0.53
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 763,
+      "statement": "schedule_delayed_delete_from_backend(image['location'], id)",
+      "cwe_id": "CWE-534",
+      "cwe_name": "Information Exposure Through Debug Log Files",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-534 is deprecated and specifically concerns debug log files. The candidate writes to a scrubber queue file for deferred deletion, which is a functional queue, not a debug log. The mechanism is operational data persistence, not debugging."
+        },
+        "connection": {
+          "score": 0.9,
+          "evidence": "The image['location'] URI, which may contain security credentials, is directly passed as an argument to schedule_delayed_delete_from_backend. The function writes this location to a file in scrubber_datadir. The path from sensitive state (database-stored location) to sink (filesystem write) is concrete and demonstrated in the code."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "The candidate line is added within the CONF.delayed_delete conditional branch. If reverted, the delayed deletion path would not execute, and the sensitive location would not be written to the scrubber queue file. The patch materially creates the exposure mechanism when the flag is enabled."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "",
+          "required_control": "Access control and encryption for sensitive data at rest, or avoidance of writing sensitive data to filesystem.",
+          "control_requirement_evidence": "CWE-534 requires that sensitive information not be written to debug log files. A related control is to protect sensitive data written to any file. The demonstrated mechanism writes a potentially credential-containing URI to a filesystem queue.",
+          "existing_controls_checked": [
+            "File permissions are set to 0600 (owner read/write) per schedule_delayed_delete_from_backend implementation assumption.",
+            "The scrubber_datadir is a configured directory.",
+            "Authentication (self._enforce) and authorization (protected check) precede the write."
+          ],
+          "deficiency_evidence": "The deficiency is not strongly established. The file is not a debug log, and the operational necessity of the queue is acknowledged. The control of file permissions (0600) is a standard protection, but its effectiveness depends on filesystem security and scrubber process integrity, which are unresolved. No evidence shows the control is missing, weak, or bypassed; it is a design choice with inherent risk."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "A concrete impact of credential disclosure is plausible if the scrubber queue file is read by an unauthorized actor due to misconfigured permissions, scrubber process compromise, or filesystem vulnerability. However, the evidence does not demonstrate that such compromise occurs or that the credentials are actually exposed. The impact remains speculative."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, when CONF.delayed_delete is True, the sensitive image location URI would not be written to the scrubber queue file. Deletion would either not occur (if location is required) or would follow the immediate deletion path (safe_delete_from_backend) which does not persist the location to disk.",
+      "supporting_evidence": [
+        "Image location URIs may contain security credentials (source code comment line 625-627).",
+        "schedule_delayed_delete_from_backend writes the location and a future timestamp to a file in scrubber_datadir.",
+        "The write occurs only when CONF.delayed_delete is True and image['location'] is not None."
+      ],
+      "contradicting_evidence": [
+        "CWE-534 is deprecated and specifically targets debug log files. The scrubber queue is an operational deferred deletion queue, not a debug log.",
+        "File permissions are set to 0600 (owner read/write only) per typical implementation, providing a base level of access control."
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Exact implementation of schedule_delayed_delete_from_backend (file permissions, path construction).",
+        "Security of scrubber_datadir configuration and filesystem.",
+        "Integrity and isolation of the scrubber process.",
+        "Whether the location URI actually contains credentials in practice.",
+        "Exploitability of the persisted file (e.g., race conditions, symlink attacks)."
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.5,
+      "score": 0.5
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 763,
+      "statement": "schedule_delayed_delete_from_backend(image['location'], id)",
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "No evidence of link resolution or file access in the candidate code. The code schedules deletion by writing to a queue file, but doesn't demonstrate file access that could follow symlinks."
+        },
+        "connection": {
+          "score": 0.15,
+          "evidence": "Image location data flows to schedule_delayed_delete_from_backend, but no connection to file access operations that could involve link following is demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.2,
+          "evidence": "The added line creates a new delayed deletion path, but doesn't materially create link resolution vulnerability since the scrubber process implementation is not shown."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "Proper link resolution controls during file access",
+          "control_requirement_evidence": "CWE-59 requires controls to prevent following unintended symlinks when accessing files",
+          "existing_controls_checked": [
+            "scrubber_datadir file permissions (0600 mentioned in context)",
+            "delayed deletion queue mechanism"
+          ],
+          "deficiency_evidence": "No evidence of link resolution controls is present in the demonstrated code path; the scrubber process implementation is unknown"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No concrete impact from link following is demonstrated since file access operations are not shown in the candidate code."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, delayed deletion scheduling would not occur, but immediate deletion would still proceed via the else branch, with no change to link resolution behavior.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "The candidate code writes to a deletion queue but doesn't perform file access operations that could follow symlinks",
+        "Link resolution vulnerability would require demonstration of file access in scrubber process, which is not shown"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "scrubber process implementation and file access patterns",
+        "scrubber_datadir security controls and link resolution behavior",
+        "Whether scrubber process accesses files in a way that could follow symlinks"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.13,
+      "score": 0.13
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 763,
+      "statement": "schedule_delayed_delete_from_backend(image['location'], id)",
+      "cwe_id": "CWE-264",
+      "cwe_name": "Permissions, Privileges, and Access Controls",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.25,
+          "evidence": "CWE-264 is a legacy category for access control weaknesses. The demonstrated behavior involves writing sensitive location URIs to filesystem for deferred deletion, which could involve file permission issues, but this is not the defining mechanism of CWE-264 itself."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "Image location data from registry database is connected to schedule_delayed_delete_from_backend call. The location may contain credentials, and this data is written to scrubber_datadir files. However, attacker control over this path or unauthorized access to these files is not demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this candidate line were reverted, delayed deletion would not be scheduled when CONF.delayed_delete is enabled. The patch materially creates the deferred deletion path that writes location URIs to filesystem."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "The code shows file permissions 0600 are set on scrubber_datadir files, but downstream scrubber process security and configuration are unknown.",
+          "required_control": "Access controls preventing unauthorized read access to files containing credential URIs",
+          "control_requirement_evidence": "For credential exposure via filesystem, required control is proper file permissions and process isolation to prevent unauthorized reads.",
+          "existing_controls_checked": [
+            "File permissions 0600 set on scrubber_datadir files"
+          ],
+          "deficiency_evidence": "No evidence demonstrates these permissions are insufficient or bypassable. The control appears present but its effectiveness against local attackers or compromised processes is unsupported."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No concrete security consequence is demonstrated. Potential credential exposure is speculative, dependent on file permission bypass, scrubber process compromise, or configuration issues not shown in evidence."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, when CONF.delayed_delete is enabled, image location URIs would not be written to scrubber_datadir files for deferred deletion. Instead, immediate deletion via safe_delete_from_backend would occur.",
+      "supporting_evidence": [
+        "Image location URIs may contain security credentials (line 626-627 comment)",
+        "schedule_delayed_delete_from_backend writes location and timestamp to scrubber_datadir",
+        "File permissions 0600 are set on scrubber_datadir files"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether scrubber_datadir file permissions 0600 are sufficient against local attackers",
+        "Whether scrubber process has proper isolation and security controls",
+        "Whether attacker can read scrubber_datadir files",
+        "Whether location URIs actually contain credentials in deployment"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.39,
+      "score": 0.39
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,396 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "shell/server/backup.js",
+  "changed_line": 83,
+  "statement": "var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;",
+  "change_type": "A",
+  "function_name": "restoreGrain",
+  "operation_type": "backend_restore_operation",
+  "selection_reason": "user-controlled token ID -> executes backend restore operation -> unpacks potentially malicious backup content",
+  "security_relevance_score": 0.9,
+  "code_context": "1: // Sandstorm - Personal Cloud Sandbox\n2: // Copyright (c) 2014 Sandstorm Development Group, Inc. and contributors\n3: // All rights reserved.\n4: //\n5: // Licensed under the Apache License, Version 2.0 (the \"License\");\n6: // you may not use this file except in compliance with the License.\n7: // You may obtain a copy of the License at\n8: //\n9: //   http://www.apache.org/licenses/LICENSE-2.0\n10: //\n11: // Unless required by applicable law or agreed to in writing, software\n12: // distributed under the License is distributed on an \"AS IS\" BASIS,\n13: // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: // See the License for the specific language governing permissions and\n15: // limitations under the License.\n16: \n17: var ChildProcess = Npm.require(\"child_process\");\n18: var Future = Npm.require(\"fibers/future\");\n19: var Promise = Npm.require(\"es6-promise\").Promise;\n20: var Capnp = Npm.require(\"capnp\");\n21: \n22: var GrainInfo = Capnp.importSystem(\"sandstorm/grain.capnp\").GrainInfo;\n23: \n24: var TOKEN_CLEANUP_MINUTES = 15;\n25: var TOKEN_CLEANUP_TIMER = TOKEN_CLEANUP_MINUTES * 60 * 1000;\n26: \n27: function cleanupToken(tokenId) {\n28:   check(tokenId, String);\n29:   waitPromise(sandstormBackend.deleteBackup(tokenId));\n30:   FileTokens.remove({_id: tokenId});\n31: }\n32: \n33: Meteor.startup(function () {\n34:   // Cleanup tokens every TOKEN_CLEANUP_MINUTES\n35:   Meteor.setInterval(function () {\n36:     var queryDate = new Date(Date.now() - TOKEN_CLEANUP_TIMER);\n37: \n38:     FileTokens.find({timestamp: {$lt: queryDate}}).forEach(function (token) {\n39:       cleanupToken(token._id);\n40:     });\n41:   }, TOKEN_CLEANUP_TIMER);\n42: });\n43: \n44: Meteor.methods({\n45:   backupGrain: function (grainId) {\n46:     check(grainId, String);\n47:     var grain = Grains.findOne(grainId);\n48:     if (!grain || !this.userId || grain.userId !== this.userId) {\n49:       throw new Meteor.Error(403, \"Unauthorized\", \"User is not the owner of this grain\");\n50:     }\n51: \n52:     this.unblock();\n53: \n54:     var token = {\n55:       _id: Random.id(),\n56:       timestamp: new Date(),\n57:       name: grain.title\n58:     };\n59: \n60:     // TODO(soon): does the grain need to be offline?\n61: \n62:     var grainInfo = _.pick(grain, \"appId\", \"appVersion\", \"title\");\n63: \n64:     FileTokens.insert(token);\n65:     waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));\n66: \n67:     return token._id;\n68:   },\n69: \n70:   restoreGrain: function (tokenId) {\n71:     check(tokenId, String);\n72:     var token = FileTokens.findOne(tokenId);\n73:     if (!token || !isSignedUpOrDemo()) {\n74:       throw new Meteor.Error(403, \"Unauthorized\",\n75:           \"Token was not found, or user cannot create grains\");\n76:     }\n77: \n78:     this.unblock();\n79: \n80:     var grainId = Random.id(22);\n81: \n82:     try {\n83:       var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;\n84:       if (!grainInfo.appId) {\n85:           throw new Meteor.Error(500, \"Metadata object for uploaded grain has no AppId\");\n86:       }\n87: \n88:       var action = UserActions.findOne({appId: grainInfo.appId, userId: this.userId});\n89:       if (!action) {\n90:         throw new Meteor.Error(500,\n91:                                \"App id for uploaded grain not installed\",\n92:                                \"App Id: \" + grainInfo.appId);\n93:       }\n94:       if (action.appVersion < grainInfo.appVersion) {\n95:         throw new Meteor.Error(500,\n96:                                \"App version for uploaded grain is newer than any \" +\n97:                                \"installed version. You need to upgrade your app first\",\n98:                                \"New version: \" + grainInfo.appVersion +\n99:                                \", Old version: \" + action.appVersion);\n100:       }\n101: \n102:       Grains.insert({\n103:         _id: grainId,\n104:         packageId: action.packageId,\n105:         appId: action.appId,\n106:         appVersion: action.appVersion,\n107:         userId: this.userId,\n108:         title: grainInfo.title,\n109:         private: true\n110:       });\n111:     } finally {\n112:       cleanupToken(tokenId);\n113:     }\n114: \n115:     return grainId;\n116:   },\n117: });\n118: \n119: Router.map(function () {\n120:   this.route(\"downloadBackup\", {\n121:     where: \"server\",\n122:     path: \"/downloadBackup/:tokenId\",\n123:     action: function () {\n124:       var token = FileTokens.findOne(this.params.tokenId);\n125:       var response = this.response;\n126:       if (!token) {\n127:         response.writeHead(404, {\"Content-Type\": \"text/plain\"});\n128:         return response.end(\"File does not exist\");\n129:       }\n130: \n131:       var started = false;\n132:       var filename = (token.name.replace(/[\"\\n]/g, \"\") || \"backup\") + \".zip\";\n133:       var sawEnd = false;\n134: \n135:       var stream = {\n136:         expectSize: function (size) {\n137:           if (!started) {\n138:             started = true;\n139:             response.writeHead(200, {\n140:               \"Content-Length\": size,\n141:               \"Content-Type\": \"application/zip\",\n142:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n143:             });\n144:           }\n145:         },\n146:         write: function (data) {\n147:           if (!started) {\n148:             started = true;\n149:             response.writeHead(200, {\n150:               \"Content-Type\": \"application/zip\",\n151:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n152:             });\n153:           }\n154:           response.write(data);\n155:         },\n156:         done: function (data) {\n157:           if (!started) {\n158:             started = true;\n159:             response.writeHead(200, {\n160:               \"Content-Length\": 0,\n161:               \"Content-Type\": \"application/zip\",\n162:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n163:             });\n164:           }\n165:           sawEnd = true;\n166:           response.end();\n167:         }\n168:       };\n169: \n170:       waitPromise(sandstormBackend.downloadBackup(this.params.tokenId, stream));\n171: \n172:       if (!sawEnd) {\n173:         console.error(\"backend failed to call done() when downloading backup\");\n174:         if (!started) {\n175:           throw new Meteor.Error(500, \"backend failed to produce data\");\n176:         }\n177:         response.end();\n178:       }\n179: \n180:       cleanupToken(this.params.tokenId);\n181:     }\n182:   });\n183: \n184:   this.route(\"uploadBackup\", {\n185:     where: \"server\",\n186:     path: \"/uploadBackup\",\n187:     action: function () {\n188:       if (this.request.method === \"POST\") {\n189:         var request = this.request;\n190:         try {\n191:           var token = {\n192:             _id: Random.id(),\n193:             timestamp: new Date()\n194:           };\n195:           var stream = sandstormBackend.uploadBackup(token._id).stream;\n196: \n197:           FileTokens.insert(token);\n198: \n199:           waitPromise(new Promise(function (resolve, reject) {\n200:             request.on(\"data\", function (data) {\n201:               stream.write(data);\n202:             });\n203:             request.on(\"end\", function () {\n204:               resolve(stream.done());\n205:             });\n206:             request.on(\"error\", function (err) {\n207:               stream.close();\n208:             });\n209:           }));\n210: \n211:           this.response.writeHead(200, {\n212:             \"Content-Length\": token._id.length,\n213:             \"Content-Type\": \"text/plain\"\n214:           });\n215:           this.response.write(token._id);\n216:           this.response.end();\n217:         } catch(error) {\n218:           console.error(error.stack);\n219:           this.response.writeHead(500, {\n220:             \"Content-Type\": \"text/plain\"\n221:           });\n222:           this.response.write(error.stack);\n223:           this.response.end();\n224:         }\n225:       } else {\n226:         this.response.writeHead(405, {\n227:           \"Content-Type\": \"text/plain\"\n228:         });\n229:         this.response.write(\"You can only POST here.\");\n230:         this.response.end();\n231:       }\n232:     }",
+  "source_summary": "tokenId from user input via Meteor method parameter, userId from authenticated session, grainId randomly generated",
+  "sink_summary": "sandstormBackend.restoreGrain() - backend operation that restores grain from backup data",
+  "guard_summary": "Token validation (FileTokens.findOne), user authentication (this.userId), signed-up/demo check (isSignedUpOrDemo()), app installation verification, version compatibility check",
+  "risk_pattern": "User-controlled token ID triggers backend restore operation that unpacks and processes backup content with limited validation of the backup data itself",
+  "used_variable_sources": [
+    "tokenId (method parameter)",
+    "this.userId (session)",
+    "grainId (randomly generated)"
+  ],
+  "called_function_context": [
+    "sandstormBackend.restoreGrain() - backend restore operation",
+    "FileTokens.findOne() - token validation",
+    "isSignedUpOrDemo() - user capability check"
+  ],
+  "enclosing_conditions": [
+    "if (!token || !isSignedUpOrDemo()) - token and user authorization check"
+  ],
+  "context_summary": "Restores grain from backup token after validating token existence and user permissions, then performs app installation and version checks",
+  "unresolved_facts": [
+    "Exact implementation and security controls in sandstormBackend.restoreGrain()",
+    "Backup data validation and sanitization in backend",
+    "Potential security implications of processing untrusted backup content"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "Backup restoration involves extracting archive files; malicious backup could contain path traversal payloads to write files outside intended directory",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-502",
+      "cwe_name": "Deserialization of Untrusted Data",
+      "fit_reason": "Backup restoration likely involves deserializing grain metadata and content; malicious backup could contain dangerous serialized objects",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-94",
+      "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+      "fit_reason": "Backup processing may involve template instantiation or code generation from untrusted backup content",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "Backup metadata (appId, appVersion) could be forged to bypass app installation and version checks",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "fit_reason": "Archive extraction may follow symlinks in malicious backup files to access unintended resources",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-193",
+    "CWE-200",
+    "CWE-22",
+    "CWE-254",
+    "CWE-264",
+    "CWE-352",
+    "CWE-378",
+    "CWE-502",
+    "CWE-561",
+    "CWE-563",
+    "CWE-59",
+    "CWE-643",
+    "CWE-676",
+    "CWE-754",
+    "CWE-79",
+    "CWE-829",
+    "CWE-863",
+    "CWE-94"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 83,
+      "statement": "var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "No pathname construction or directory restriction mechanism is demonstrated. The code calls a backend restore operation but doesn't show path manipulation."
+        },
+        "connection": {
+          "score": 0.25,
+          "evidence": "User-controlled tokenId connects to backend restore operation, but no path traversal payload path is established."
+        },
+        "diff_causality": {
+          "score": 0.1,
+          "evidence": "The added line enables backup restoration but doesn't materially create path traversal vulnerability without backend implementation details."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "Path validation and canonicalization for backup extraction",
+          "control_requirement_evidence": "CWE-22 requires controls to prevent path traversal during file operations",
+          "existing_controls_checked": [
+            "token validation (FileTokens.findOne)",
+            "user authentication (this.userId)",
+            "app installation verification"
+          ],
+          "deficiency_evidence": "No evidence of path validation controls in the demonstrated code; backend implementation unknown"
+        },
+        "concrete_impact": {
+          "score": 0.15,
+          "evidence": "No concrete path traversal impact demonstrated; backend processing details are unknown"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, backup restoration functionality would be disabled, but no path traversal mechanism would be removed since none is demonstrated in this code.",
+      "supporting_evidence": [
+        "User-controlled tokenId passed to backend restore operation"
+      ],
+      "contradicting_evidence": [
+        "No pathname construction or file system operations visible in the code",
+        "Backend implementation details are abstracted away"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Backend implementation of sandstormBackend.restoreGrain()",
+        "Whether backup extraction involves file path operations",
+        "Path validation controls in backend"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.16999999999999998,
+      "score": 0.16999999999999998
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 83,
+      "statement": "var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;",
+      "cwe_id": "CWE-502",
+      "cwe_name": "Deserialization of Untrusted Data",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code calls a backend restore operation that likely processes backup data, but the exact deserialization mechanism is not demonstrated in the visible code. The CWE requires actual deserialization of untrusted data, which may occur in the backend but is not shown."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "User-controlled tokenId is passed directly to sandstormBackend.restoreGrain(). The tokenId comes from the Meteor method parameter and is validated only for existence, not content. This connects external input to a backend operation that processes backup data."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This is an added line that introduces the restoreGrain functionality. If reverted, the entire grain restoration capability would be removed, eliminating the attack surface for processing potentially malicious backup data."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "",
+          "required_control": "validation/sanitization of serialized backup data before deserialization",
+          "control_requirement_evidence": "CWE-502 requires validation of serialized data to prevent malicious object instantiation or code execution during deserialization",
+          "existing_controls_checked": [
+            "token existence validation",
+            "user authentication",
+            "app installation check",
+            "version compatibility check"
+          ],
+          "deficiency_evidence": "No evidence of backup data validation or safe deserialization practices. The controls present validate metadata but not the backup content itself, which is processed by the backend."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "The potential impact is speculative - malicious backup data could lead to code execution or object injection, but this depends on the backend implementation which is not visible. The demonstrated path shows data flow but not actual exploitation."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the restoreGrain functionality would be completely removed, eliminating the ability to process potentially malicious backup data through the backend restore operation.",
+      "supporting_evidence": [
+        "User-controlled tokenId parameter flows directly to backend restore operation",
+        "Backup restoration inherently involves processing serialized data structures",
+        "Limited validation of backup content is visible in the frontend code"
+      ],
+      "contradicting_evidence": [
+        "The actual deserialization mechanism occurs in the backend, which is not visible in this code",
+        "The code shows metadata validation (appId, appVersion) but not backup content validation"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Implementation details of sandstormBackend.restoreGrain() and its deserialization safety",
+        "Whether backup data undergoes validation/sanitization before processing",
+        "Specific deserialization mechanisms used in the backend"
+      ],
+      "review_comment": "The restoreGrain operation processes user-supplied backup tokens without visible validation of the backup content itself. While metadata is checked, the actual backup data flows to the backend where deserialization may occur. Implement backup content validation at the backend level, including schema validation, size limits, and safe deserialization practices to prevent malicious object injection.",
+      "change_type": "A",
+      "raw_score": 0.5399999999999999,
+      "score": 0.5399999999999999
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 83,
+      "statement": "var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;",
+      "cwe_id": "CWE-94",
+      "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "The code calls a backend restore operation with user-controlled tokenId, but there is no evidence of code generation, template instantiation, or dynamic code construction from the input. The operation appears to be a data restoration function rather than code generation."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "tokenId is user-controlled input from the Meteor method parameter, which flows directly to sandstormBackend.restoreGrain(). The connection is direct and established through the function call."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If this line were reverted, the restoreGrain backend operation would not be called, preventing any potential vulnerability in the backup restoration process. The line is essential to the restoration functionality."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "",
+          "required_control": "Input validation and sanitization for code generation operations",
+          "control_requirement_evidence": "CWE-94 requires controls to prevent untrusted input from modifying generated code syntax or behavior",
+          "existing_controls_checked": [
+            "Token validation (FileTokens.findOne)",
+            "User authentication (this.userId)",
+            "User capability check (isSignedUpOrDemo())"
+          ],
+          "deficiency_evidence": "No evidence of code generation controls is present because no code generation is demonstrated. The controls present are for authentication/authorization, not for preventing code injection in generation operations."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No concrete impact is demonstrated since there is no evidence of code generation or execution from the backup content. The operation appears to restore data/metadata rather than generate executable code."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the grain restoration from backup would not occur, preventing any potential security issues in the backup processing pipeline.",
+      "supporting_evidence": [
+        "User-controlled tokenId flows to backend restore operation",
+        "Backup restoration involves processing external data"
+      ],
+      "contradicting_evidence": [
+        "No evidence of code generation, template instantiation, or dynamic code construction",
+        "The operation appears to be data restoration rather than code generation",
+        "The retrieved grainInfo is used for metadata validation, not code execution"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Exact implementation and security controls in sandstormBackend.restoreGrain()",
+        "Whether backup processing involves any code generation or template instantiation",
+        "How the backend processes and validates backup content"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.44000000000000006,
+      "score": 0.44000000000000006
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 83,
+      "statement": "var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.3,
+          "evidence": "The code performs authorization checks (token validation, user authentication, app installation checks), but there's no demonstrated flaw in those checks. CWE-863 requires an incorrect authorization check, not just the presence of authorization logic."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "User-controlled tokenId connects to backend restore operation. The token is validated via FileTokens.findOne() and user is authenticated via this.userId. However, the connection between forged backup metadata and bypassing downstream checks is speculative."
+        },
+        "diff_causality": {
+          "score": 0.2,
+          "evidence": "The candidate line calls restoreGrain but doesn't materially change authorization logic. Reverting this line would prevent the restore operation entirely, not fix an authorization flaw. The authorization checks (lines 72-76, 84-100) exist independently."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "",
+          "required_control": "Correct authorization check for backup restoration",
+          "control_requirement_evidence": "CWE-863 requires that authorization checks be performed correctly when accessing resources. For backup restoration, this includes validating the user's right to restore from this token and ensuring the restored content is authorized.",
+          "existing_controls_checked": [
+            "Token validation via FileTokens.findOne()",
+            "User authentication via this.userId",
+            "User capability check via isSignedUpOrDemo()",
+            "App installation check via UserActions.findOne()",
+            "App version compatibility check"
+          ],
+          "deficiency_evidence": "No demonstrated deficiency in the existing controls. The hypothesis about forged backup metadata bypassing checks is unsupported by evidence. The code validates token existence, user authentication, app installation, and version compatibility before inserting the grain."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No concrete security consequence demonstrated. The speculative impact (bypassing app installation/version checks via forged metadata) depends on unsupported assumptions about backup data validation in sandstormBackend.restoreGrain()."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the restoreGrain method would fail to call the backend restore operation, preventing any grain restoration. The authorization checks would still exist but would be irrelevant since no restoration would occur.",
+      "supporting_evidence": [
+        "Token validation at line 72: var token = FileTokens.findOne(tokenId);",
+        "User authentication via this.userId passed to restoreGrain",
+        "User capability check at line 73: if (!token || !isSignedUpOrDemo())",
+        "App installation check at lines 88-93",
+        "App version compatibility check at lines 94-100"
+      ],
+      "contradicting_evidence": [
+        "Multiple authorization checks exist and appear correctly implemented",
+        "The restore operation only proceeds after token validation, user authentication, and capability checks",
+        "App installation and version checks occur after restore but before grain insertion"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether backup metadata (appId, appVersion) can be forged by an attacker",
+        "Whether sandstormBackend.restoreGrain() validates backup data integrity",
+        "Whether forged metadata could bypass the downstream app installation/version checks",
+        "Whether the backend properly isolates or validates the restored content"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.26999999999999996,
+      "score": 0.26999999999999996
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 83,
+      "statement": "var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;",
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "No evidence of file path resolution or symlink handling in the demonstrated code. The operation is a high-level backend restore call without visible file system operations."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "User-controlled tokenId connects to backend restore operation, but the path from input to potential symlink resolution is speculative."
+        },
+        "diff_causality": {
+          "score": 0.3,
+          "evidence": "The added line enables backup restoration, but doesn't specifically introduce symlink-related functionality."
+        },
+        "security_control": {
+          "score": 0.15,
+          "evidence": "",
+          "required_control": "Proper symlink resolution and path validation during archive extraction",
+          "control_requirement_evidence": "CWE-59 requires controls to prevent following malicious symlinks during file operations",
+          "existing_controls_checked": [
+            "Backend restore operation implementation is unknown",
+            "No visible path validation in frontend code"
+          ],
+          "deficiency_evidence": "No evidence of symlink validation controls in the demonstrated code, but the backend implementation is unknown"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "Impact is speculative - depends on backend implementation details not visible in this code"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the restoreGrain method would be incomplete and unable to restore grains from backups.",
+      "supporting_evidence": [
+        "User-controlled tokenId flows to backend restore operation",
+        "Backup operations inherently involve file system access"
+      ],
+      "contradicting_evidence": [
+        "No file path operations visible in the code",
+        "No symlink-related functionality demonstrated",
+        "Backend implementation details are unknown"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Implementation of sandstormBackend.restoreGrain()",
+        "Backup file validation and extraction logic",
+        "Symlink handling in the backend",
+        "File system security controls in the restore process"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.23000000000000004,
+      "score": 0.23000000000000004
+    }
+  ],
+  "stage4_status": "completed"
+}

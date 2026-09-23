@@ -1,0 +1,141 @@
+diff --git a/accounts/forms.py b/accounts/forms.py
+index 49f0bb70407c..c643ce57d876 100644
+--- a/accounts/forms.py
++++ b/accounts/forms.py
+@@ -357,3 +357,14 @@ class PasswordChangeForm(forms.Form):
+         widget=forms.PasswordInput(render_value=False),
+         label=_("Current password"),
+     )
++
++
++class ResetForm(EmailForm):
++    def clean_email(self):
++        users = User.objects.filter(email__iexact=self.cleaned_data['email'])
++
++        if not users.exists():
++            raise forms.ValidationError(
++                _('User with this email address was not found.')
++            )
++        return users[0]
+diff --git a/accounts/pipeline.py b/accounts/pipeline.py
+index d74db89395f6..13787996355a 100644
+--- a/accounts/pipeline.py
++++ b/accounts/pipeline.py
+@@ -43,6 +43,11 @@ def require_email(strategy, details, user=None, is_new=False,
+             if email and user.email != email:
+                 return {'is_new': True}
+ 
++            # Password reset form
++            if strategy.session_get('password_reset'):
++                strategy.session_pop('password_reset')
++                return {'is_new': True}
++
+         return
+ 
+     elif is_new and not details.get('email'):
+diff --git a/accounts/urls.py b/accounts/urls.py
+index 551a67efb218..1c98474ac257 100644
+--- a/accounts/urls.py
++++ b/accounts/urls.py
+@@ -60,6 +60,7 @@
+         name='email-sent'
+     ),
+     url(r'^password/', 'accounts.views.password', name='password'),
++    url(r'^reset/', 'accounts.views.reset_password', name='password_reset'),
+     url(r'^logout/', 'accounts.views.weblate_logout', name='logout'),
+     url(r'^profile/', 'accounts.views.user_profile', name='profile'),
+     url(r'^login/$', 'accounts.views.weblate_login', name='login'),
+diff --git a/accounts/views.py b/accounts/views.py
+index 6f4da6272150..33a27a19a3f4 100644
+--- a/accounts/views.py
++++ b/accounts/views.py
+@@ -32,7 +32,7 @@
+ from urllib import urlencode
+ 
+ from accounts.forms import (
+-    RegistrationForm, PasswordForm, PasswordChangeForm, EmailForm
++    RegistrationForm, PasswordForm, PasswordChangeForm, EmailForm, ResetForm
+ )
+ from social.backends.utils import load_backends
+ from social.apps.django_app.utils import BACKENDS
+@@ -386,3 +386,30 @@ def password(request):
+             }
+         )
+     )
++
++
++def reset_password(request):
++    '''
++    Password reset handling.
++    '''
++    if request.method == 'POST':
++        form = ResetForm(request.POST)
++        if form.is_valid():
++            user = form.cleaned_data['email']
++            user.set_unusable_password()
++            user.save()
++            request.session['password_reset'] = True
++            return complete(request, 'email')
++    else:
++        form = ResetForm()
++
++    return render_to_response(
++        'accounts/reset.html',
++        RequestContext(
++            request,
++            {
++                'title': _('Password reset'),
++                'form': form,
++            }
++        )
++    )
+diff --git a/weblate/html/accounts/login.html b/weblate/html/accounts/login.html
+index 5e0d06612cb9..32f47118dfd7 100644
+--- a/weblate/html/accounts/login.html
++++ b/weblate/html/accounts/login.html
+@@ -41,7 +41,7 @@ <h2>{% trans "Password log in" %}</h2>
+ {% endif %}
+ 
+ <p>
+-{% url 'auth_password_reset' as reset_url %}
++{% url 'password_reset' as reset_url %}
+ {% blocktrans %}Forgot your password? You can <a href="{{ reset_url }}">reset it</a>.{% endblocktrans %}
+ </p>
+ 
+diff --git a/weblate/html/accounts/reset.html b/weblate/html/accounts/reset.html
+new file mode 100644
+index 000000000000..30953f0c43db
+--- /dev/null
++++ b/weblate/html/accounts/reset.html
+@@ -0,0 +1,31 @@
++{% extends "base.html" %}
++{% load url from future %}
++{% load i18n %}
++
++{% block content %}
++
++<h2>{% trans "Password reset" %}</h2>
++
++<p>{% trans "Forgotten your password? Enter your e-mail address below, and we'll e-mail instructions for setting a new one." %}</p>
++
++{% if form.errors %}
++<div class="ui-widget">
++    <div style="padding: 0pt 0.7em;" class="ui-state-error ui-corner-all"> 
++        <p><span style="float: left; margin-right: 0.3em;" class="ui-icon ui-icon-alert"></span>
++        {% trans "Please fix errors in registration form." %}
++        </p>
++    </div>
++</div>
++{% endif %}
++
++<form action="{% url 'password_reset' %}" method="post" accept-charset="utf-8">
++{% csrf_token %}
++<table>
++{{ form.as_table }}
++</table>
++<p>
++</p>
++<p><input type="submit" value="{% trans 'Reset my password' %}" class="button" /></p>
++</form>
++
++{% endblock %}

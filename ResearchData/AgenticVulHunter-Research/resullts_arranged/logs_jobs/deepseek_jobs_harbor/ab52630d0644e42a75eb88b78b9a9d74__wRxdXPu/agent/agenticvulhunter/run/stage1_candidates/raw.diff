@@ -1,0 +1,106 @@
+diff --git a/Tests/images/fli_overrun.bin b/Tests/images/fli_overrun.bin
+new file mode 100644
+index 00000000000..e1e8c590179
+Binary files /dev/null and b/Tests/images/fli_overrun.bin differ
+diff --git a/Tests/images/pcx_overrun.bin b/Tests/images/pcx_overrun.bin
+new file mode 100644
+index 00000000000..ea46d2c1194
+Binary files /dev/null and b/Tests/images/pcx_overrun.bin differ
+diff --git a/Tests/images/sgi_overrun.bin b/Tests/images/sgi_overrun.bin
+new file mode 100644
+index 00000000000..9a45d065ab8
+Binary files /dev/null and b/Tests/images/sgi_overrun.bin differ
+diff --git a/Tests/test_image.py b/Tests/test_image.py
+index 493b4735acd..47196a1394a 100644
+--- a/Tests/test_image.py
++++ b/Tests/test_image.py
+@@ -589,6 +589,15 @@ def act(fp):
+ 
+             self.assertFalse(fp.closed)
+ 
++    def test_overrun(self):
++        for file in ["fli_overrun.bin", "sgi_overrun.bin", "pcx_overrun.bin"]:
++            im = Image.open(os.path.join("Tests/images", file))
++            try:
++                im.load()
++                self.assertFail()
++            except IOError as e:
++                self.assertEqual(str(e), "buffer overrun when reading image file")
++
+ 
+ class MockEncoder(object):
+     pass
+diff --git a/src/libImaging/FliDecode.c b/src/libImaging/FliDecode.c
+index e21259900e5..5f4485f890c 100644
+--- a/src/libImaging/FliDecode.c
++++ b/src/libImaging/FliDecode.c
+@@ -30,7 +30,7 @@ ImagingFliDecode(Imaging im, ImagingCodecState state, UINT8* buf, Py_ssize_t byt
+ {
+     UINT8* ptr;
+     int framesize;
+-    int c, chunks;
++    int c, chunks, advance;
+     int l, lines;
+     int i, j, x = 0, y, ymax;
+ 
+@@ -59,10 +59,16 @@ ImagingFliDecode(Imaging im, ImagingCodecState state, UINT8* buf, Py_ssize_t byt
+ 
+     chunks = I16(ptr+6);
+     ptr += 16;
++    bytes -= 16;
+ 
+     /* Process subchunks */
+     for (c = 0; c < chunks; c++) {
+-	UINT8 *data = ptr + 6;
++	UINT8* data;
++	if (bytes < 10) {
++	    state->errcode = IMAGING_CODEC_OVERRUN;
++	    return -1;
++	}
++	data = ptr + 6;
+ 	switch (I16(ptr+4)) {
+ 	case 4: case 11:
+ 	    /* FLI COLOR chunk */
+@@ -198,7 +204,9 @@ ImagingFliDecode(Imaging im, ImagingCodecState state, UINT8* buf, Py_ssize_t byt
+ 	    state->errcode = IMAGING_CODEC_UNKNOWN;
+ 	    return -1;
+ 	}
+-	ptr += I32(ptr);
++	advance = I32(ptr);
++	ptr += advance;
++	bytes -= advance;
+     }
+ 
+     return -1; /* end of frame */
+diff --git a/src/libImaging/PcxDecode.c b/src/libImaging/PcxDecode.c
+index 4a5931bee73..67dcc1e0858 100644
+--- a/src/libImaging/PcxDecode.c
++++ b/src/libImaging/PcxDecode.c
+@@ -22,6 +22,11 @@ ImagingPcxDecode(Imaging im, ImagingCodecState state, UINT8* buf, Py_ssize_t byt
+     UINT8 n;
+     UINT8* ptr;
+ 
++    if (strcmp(im->mode, "1") == 0 && state->xsize > state->bytes * 8) {
++        state->errcode = IMAGING_CODEC_OVERRUN;
++        return -1;
++    }
++
+     ptr = buf;
+ 
+     for (;;) {
+diff --git a/src/libImaging/SgiRleDecode.c b/src/libImaging/SgiRleDecode.c
+index d8341f3e55f..8a81ba8e6c0 100644
+--- a/src/libImaging/SgiRleDecode.c
++++ b/src/libImaging/SgiRleDecode.c
+@@ -157,6 +157,11 @@ ImagingSgiRleDecode(Imaging im, ImagingCodecState state,
+             c->rlelength = c->lengthtab[c->rowno + c->channo * im->ysize];
+             c->rleoffset -= SGI_HEADER_SIZE;
+ 
++            if (c->rleoffset + c->rlelength > c->bufsize) {
++                state->errcode = IMAGING_CODEC_OVERRUN;
++                return -1;
++            }
++
+             /* row decompression */
+             if (c->bpc ==1) {
+                 if(expandrow(&state->buffer[c->channo], &ptr[c->rleoffset], c->rlelength, im->bands))

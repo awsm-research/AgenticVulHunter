@@ -1,0 +1,438 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "anymail/utils.py",
+    "changed_line": 358,
+    "statement": "return base64.b64decode(authdata).decode('utf-8')",
+    "change_type": "A",
+    "function_name": "get_request_basic_auth",
+    "operation_type": "credential_extraction",
+    "selection_reason": "HTTP_AUTHORIZATION header -> base64 decode -> plaintext credentials extraction",
+    "security_relevance_score": 0.9,
+    "code_context": "209:     if value is None:\n210:         return None\n211:     # _splitparam(value)[0].lower() :\n212:     return str(value).partition(';')[0].strip().lower()\n213: \n214: \n215: def get_anymail_setting(name, default=UNSET, esp_name=None, kwargs=None, allow_bare=False):\n216:     \"\"\"Returns an Anymail option from kwargs or Django settings.\n217: \n218:     Returns first of:\n219:     - kwargs[name] -- e.g., kwargs['api_key'] -- and name key will be popped from kwargs\n220:     - settings.ANYMAIL['<ESP_NAME>_<NAME>'] -- e.g., settings.ANYMAIL['MAILGUN_API_KEY']\n221:     - settings.ANYMAIL_<ESP_NAME>_<NAME> -- e.g., settings.ANYMAIL_MAILGUN_API_KEY\n222:     - settings.<ESP_NAME>_<NAME> (only if allow_bare) -- e.g., settings.MAILGUN_API_KEY\n223:     - default if provided; else raises AnymailConfigurationError\n224: \n225:     If allow_bare, allows settings.<ESP_NAME>_<NAME> without the ANYMAIL_ prefix:\n226:     ANYMAIL = { \"MAILGUN_API_KEY\": \"xyz\", ... }\n227:     ANYMAIL_MAILGUN_API_KEY = \"xyz\"\n228:     MAILGUN_API_KEY = \"xyz\"\n229:     \"\"\"\n230: \n231:     try:\n232:         value = kwargs.pop(name)\n233:         if name in ['username', 'password']:\n234:             # Work around a problem in django.core.mail.send_mail, which calls\n235:             # get_connection(... username=None, password=None) by default.\n236:             # We need to ignore those None defaults (else settings like\n237:             # 'SENDGRID_USERNAME' get unintentionally overridden from kwargs).\n238:             if value is not None:\n239:                 return value\n240:         else:\n241:             return value\n242:     except (AttributeError, KeyError):\n243:         pass\n244: \n245:     if esp_name is not None:\n246:         setting = \"{}_{}\".format(esp_name.upper(), name.upper())\n247:     else:\n248:         setting = name.upper()\n249:     anymail_setting = \"ANYMAIL_%s\" % setting\n250: \n251:     try:\n252:         return settings.ANYMAIL[setting]\n253:     except (AttributeError, KeyError):\n254:         try:\n255:             return getattr(settings, anymail_setting)\n256:         except AttributeError:\n257:             if allow_bare:\n258:                 try:\n259:                     return getattr(settings, setting)\n260:                 except AttributeError:\n261:                     pass\n262:             if default is UNSET:\n263:                 message = \"You must set %s or ANYMAIL = {'%s': ...}\" % (anymail_setting, setting)\n264:                 if allow_bare:\n265:                     message += \" or %s\" % setting\n266:                 message += \" in your Django settings\"\n267:                 raise AnymailConfigurationError(message)\n268:             else:\n269:                 return default\n270: \n271: \n272: def collect_all_methods(cls, method_name):\n273:     \"\"\"Return list of all `method_name` methods for cls and its superclass chain.\n274: \n275:     List is in MRO order, with no duplicates. Methods are unbound.\n276: \n277:     (This is used to simplify mixins and subclasses that contribute to a method set,\n278:     without requiring superclass chaining, and without requiring cooperating\n279:     superclasses.)\n280:     \"\"\"\n281:     methods = []\n282:     for ancestor in cls.__mro__:\n283:         try:\n284:             validator = getattr(ancestor, method_name)\n285:         except AttributeError:\n286:             pass\n287:         else:\n288:             if validator not in methods:\n289:                 methods.append(validator)\n290:     return methods\n291: \n292: \n293: EPOCH = datetime(1970, 1, 1, tzinfo=utc)\n294: \n295: \n296: def timestamp(dt):\n297:     \"\"\"Return the unix timestamp (seconds past the epoch) for datetime dt\"\"\"\n298:     # This is the equivalent of Python 3.3's datetime.timestamp\n299:     try:\n300:         return dt.timestamp()\n301:     except AttributeError:\n302:         if dt.tzinfo is None:\n303:             return mktime(dt.timetuple())\n304:         else:\n305:             return (dt - EPOCH).total_seconds()\n306: \n307: \n308: def rfc2822date(dt):\n309:     \"\"\"Turn a datetime into a date string as specified in RFC 2822.\"\"\"\n310:     # This is almost the equivalent of Python 3.3's email.utils.format_datetime,\n311:     # but treats naive datetimes as local rather than \"UTC with no information ...\"\n312:     timeval = timestamp(dt)\n313:     return formatdate(timeval, usegmt=True)\n314: \n315: \n316: def is_lazy(obj):\n317:     \"\"\"Return True if obj is a Django lazy object.\"\"\"\n318:     # See django.utils.functional.lazy. (This appears to be preferred\n319:     # to checking for `not isinstance(obj, six.text_type)`.)\n320:     return isinstance(obj, Promise)\n321: \n322: \n323: def force_non_lazy(obj):\n324:     \"\"\"If obj is a Django lazy object, return it coerced to text; otherwise return it unchanged.\n325: \n326:     (Similar to django.utils.encoding.force_text, but doesn't alter non-text objects.)\n327:     \"\"\"\n328:     if is_lazy(obj):\n329:         return six.text_type(obj)\n330: \n331:     return obj\n332: \n333: \n334: def force_non_lazy_list(obj):\n335:     \"\"\"Return a (shallow) copy of sequence obj, with all values forced non-lazy.\"\"\"\n336:     try:\n337:         return [force_non_lazy(item) for item in obj]\n338:     except (AttributeError, TypeError):\n339:         return force_non_lazy(obj)\n340: \n341: \n342: def force_non_lazy_dict(obj):\n343:     \"\"\"Return a (deep) copy of dict obj, with all values forced non-lazy.\"\"\"\n344:     try:\n345:         return {key: force_non_lazy_dict(value) for key, value in obj.items()}\n346:     except (AttributeError, TypeError):\n347:         return force_non_lazy(obj)\n348: \n349: \n350: def get_request_basic_auth(request):\n351:     \"\"\"Returns HTTP basic auth string sent with request, or None.\n352: \n353:     If request includes basic auth, result is string 'username:password'.\n354:     \"\"\"\n355:     try:\n356:         authtype, authdata = request.META['HTTP_AUTHORIZATION'].split()\n357:         if authtype.lower() == \"basic\":\n358:             return base64.b64decode(authdata).decode('utf-8')\n359:     except (IndexError, KeyError, TypeError, ValueError):\n360:         pass\n361:     return None\n362: \n363: \n364: def get_request_uri(request):\n365:     \"\"\"Returns the \"exact\" url used to call request.\n366: \n367:     Like :func:`django.http.request.HTTPRequest.build_absolute_uri`,\n368:     but also inlines HTTP basic auth, if present.\n369:     \"\"\"\n370:     url = request.build_absolute_uri()\n371:     basic_auth = get_request_basic_auth(request)\n372:     if basic_auth is not None:\n373:         # must reassemble url with auth\n374:         parts = urlsplit(url)\n375:         url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,\n376:                           parts.path, parts.query, parts.fragment))\n377:     return url",
+    "source_summary": "HTTP_AUTHORIZATION header from request.META, specifically the authdata portion after 'Basic ' prefix",
+    "sink_summary": "Returned as plaintext 'username:password' string to callers; used in URL construction (get_request_uri) and webhook authentication validation (AnymailBasicAuthMixin)",
+    "guard_summary": "Basic auth type check (authtype.lower() == 'basic'); exception handling for malformed input; webhook validation compares against configured credentials",
+    "risk_pattern": "Base64-decoded HTTP Basic Auth credentials returned as plaintext without additional validation, potentially exposing credentials in URLs or logs",
+    "used_variable_sources": [
+      "request.META['HTTP_AUTHORIZATION']"
+    ],
+    "called_function_context": [
+      "base64.b64decode",
+      "str.decode"
+    ],
+    "enclosing_conditions": [
+      "authtype.lower() == 'basic'",
+      "try-except block for error handling"
+    ],
+    "context_summary": "Extracts and decodes HTTP Basic Auth credentials for URL reconstruction and webhook authentication validation",
+    "unresolved_facts": [
+      "Whether URL construction with credentials could expose them in logs or external systems",
+      "Whether webhook validation properly handles timing attacks on credential comparison"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-255",
+        "cwe_name": "Credentials Management Errors",
+        "fit_reason": "HTTP Basic Auth credentials extracted from header, base64 decoded, returned as plaintext for URL construction and authentication validation without proper safeguards",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-534",
+        "cwe_name": "Information Exposure Through Debug Log Files",
+        "fit_reason": "Credentials returned as plaintext could be exposed in URLs that may be logged or transmitted to external systems",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "Basic Auth credentials extracted and potentially exposed through URL construction and logging",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-208",
+        "cwe_name": "Observable Timing Discrepancy",
+        "fit_reason": "Webhook validation using extracted credentials may be vulnerable to timing attacks during comparison",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-19",
+        "cwe_name": "Data Processing Errors",
+        "fit_reason": "Base64 decoding of untrusted HTTP Authorization header data without sufficient input validation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-113",
+      "CWE-19",
+      "CWE-200",
+      "CWE-208",
+      "CWE-255",
+      "CWE-285",
+      "CWE-390",
+      "CWE-396",
+      "CWE-497",
+      "CWE-502",
+      "CWE-534",
+      "CWE-584",
+      "CWE-601",
+      "CWE-685",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "anymail/utils.py",
+    "changed_line": 375,
+    "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+    "change_type": "A",
+    "function_name": "get_request_uri",
+    "operation_type": "security_sensitive_construction",
+    "selection_reason": "basic auth credentials -> embed into URL -> potential credential exposure in logs/signatures",
+    "security_relevance_score": 0.8,
+    "code_context": "226:     ANYMAIL = { \"MAILGUN_API_KEY\": \"xyz\", ... }\n227:     ANYMAIL_MAILGUN_API_KEY = \"xyz\"\n228:     MAILGUN_API_KEY = \"xyz\"\n229:     \"\"\"\n230: \n231:     try:\n232:         value = kwargs.pop(name)\n233:         if name in ['username', 'password']:\n234:             # Work around a problem in django.core.mail.send_mail, which calls\n235:             # get_connection(... username=None, password=None) by default.\n236:             # We need to ignore those None defaults (else settings like\n237:             # 'SENDGRID_USERNAME' get unintentionally overridden from kwargs).\n238:             if value is not None:\n239:                 return value\n240:         else:\n241:             return value\n242:     except (AttributeError, KeyError):\n243:         pass\n244: \n245:     if esp_name is not None:\n246:         setting = \"{}_{}\".format(esp_name.upper(), name.upper())\n247:     else:\n248:         setting = name.upper()\n249:     anymail_setting = \"ANYMAIL_%s\" % setting\n250: \n251:     try:\n252:         return settings.ANYMAIL[setting]\n253:     except (AttributeError, KeyError):\n254:         try:\n255:             return getattr(settings, anymail_setting)\n256:         except AttributeError:\n257:             if allow_bare:\n258:                 try:\n259:                     return getattr(settings, setting)\n260:                 except AttributeError:\n261:                     pass\n262:             if default is UNSET:\n263:                 message = \"You must set %s or ANYMAIL = {'%s': ...}\" % (anymail_setting, setting)\n264:                 if allow_bare:\n265:                     message += \" or %s\" % setting\n266:                 message += \" in your Django settings\"\n267:                 raise AnymailConfigurationError(message)\n268:             else:\n269:                 return default\n270: \n271: \n272: def collect_all_methods(cls, method_name):\n273:     \"\"\"Return list of all `method_name` methods for cls and its superclass chain.\n274: \n275:     List is in MRO order, with no duplicates. Methods are unbound.\n276: \n277:     (This is used to simplify mixins and subclasses that contribute to a method set,\n278:     without requiring superclass chaining, and without requiring cooperating\n279:     superclasses.)\n280:     \"\"\"\n281:     methods = []\n282:     for ancestor in cls.__mro__:\n283:         try:\n284:             validator = getattr(ancestor, method_name)\n285:         except AttributeError:\n286:             pass\n287:         else:\n288:             if validator not in methods:\n289:                 methods.append(validator)\n290:     return methods\n291: \n292: \n293: EPOCH = datetime(1970, 1, 1, tzinfo=utc)\n294: \n295: \n296: def timestamp(dt):\n297:     \"\"\"Return the unix timestamp (seconds past the epoch) for datetime dt\"\"\"\n298:     # This is the equivalent of Python 3.3's datetime.timestamp\n299:     try:\n300:         return dt.timestamp()\n301:     except AttributeError:\n302:         if dt.tzinfo is None:\n303:             return mktime(dt.timetuple())\n304:         else:\n305:             return (dt - EPOCH).total_seconds()\n306: \n307: \n308: def rfc2822date(dt):\n309:     \"\"\"Turn a datetime into a date string as specified in RFC 2822.\"\"\"\n310:     # This is almost the equivalent of Python 3.3's email.utils.format_datetime,\n311:     # but treats naive datetimes as local rather than \"UTC with no information ...\"\n312:     timeval = timestamp(dt)\n313:     return formatdate(timeval, usegmt=True)\n314: \n315: \n316: def is_lazy(obj):\n317:     \"\"\"Return True if obj is a Django lazy object.\"\"\"\n318:     # See django.utils.functional.lazy. (This appears to be preferred\n319:     # to checking for `not isinstance(obj, six.text_type)`.)\n320:     return isinstance(obj, Promise)\n321: \n322: \n323: def force_non_lazy(obj):\n324:     \"\"\"If obj is a Django lazy object, return it coerced to text; otherwise return it unchanged.\n325: \n326:     (Similar to django.utils.encoding.force_text, but doesn't alter non-text objects.)\n327:     \"\"\"\n328:     if is_lazy(obj):\n329:         return six.text_type(obj)\n330: \n331:     return obj\n332: \n333: \n334: def force_non_lazy_list(obj):\n335:     \"\"\"Return a (shallow) copy of sequence obj, with all values forced non-lazy.\"\"\"\n336:     try:\n337:         return [force_non_lazy(item) for item in obj]\n338:     except (AttributeError, TypeError):\n339:         return force_non_lazy(obj)\n340: \n341: \n342: def force_non_lazy_dict(obj):\n343:     \"\"\"Return a (deep) copy of dict obj, with all values forced non-lazy.\"\"\"\n344:     try:\n345:         return {key: force_non_lazy_dict(value) for key, value in obj.items()}\n346:     except (AttributeError, TypeError):\n347:         return force_non_lazy(obj)\n348: \n349: \n350: def get_request_basic_auth(request):\n351:     \"\"\"Returns HTTP basic auth string sent with request, or None.\n352: \n353:     If request includes basic auth, result is string 'username:password'.\n354:     \"\"\"\n355:     try:\n356:         authtype, authdata = request.META['HTTP_AUTHORIZATION'].split()\n357:         if authtype.lower() == \"basic\":\n358:             return base64.b64decode(authdata).decode('utf-8')\n359:     except (IndexError, KeyError, TypeError, ValueError):\n360:         pass\n361:     return None\n362: \n363: \n364: def get_request_uri(request):\n365:     \"\"\"Returns the \"exact\" url used to call request.\n366: \n367:     Like :func:`django.http.request.HTTPRequest.build_absolute_uri`,\n368:     but also inlines HTTP basic auth, if present.\n369:     \"\"\"\n370:     url = request.build_absolute_uri()\n371:     basic_auth = get_request_basic_auth(request)\n372:     if basic_auth is not None:\n373:         # must reassemble url with auth\n374:         parts = urlsplit(url)\n375:         url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,\n376:                           parts.path, parts.query, parts.fragment))\n377:     return url",
+    "source_summary": "basic_auth comes from HTTP Authorization header via get_request_basic_auth, which decodes base64 credentials. This is user-provided authentication data.",
+    "sink_summary": "The constructed URL with embedded credentials is used in Mandrill webhook signature validation (signed_data) and included in error messages when signature validation fails, potentially exposing credentials in logs.",
+    "guard_summary": "No sanitization or filtering of credentials before embedding. The URL construction is intentional to include exact request details for signature verification.",
+    "risk_pattern": "HTTP Basic Auth credentials are extracted from request headers and embedded into URL strings used for cryptographic signing and error reporting, potentially exposing credentials in application logs or error responses.",
+    "used_variable_sources": [
+      "request.META['HTTP_AUTHORIZATION']"
+    ],
+    "called_function_context": [
+      "get_request_basic_auth",
+      "request.build_absolute_uri",
+      "urlsplit",
+      "urlunsplit"
+    ],
+    "enclosing_conditions": [
+      "if basic_auth is not None"
+    ],
+    "context_summary": "Function constructs complete request URI including basic auth for webhook signature verification. When signature validation fails, the URL with embedded credentials is included in error messages.",
+    "unresolved_facts": [
+      "Whether error messages with embedded credentials are logged to external systems",
+      "Whether there are other callers of get_request_uri beyond Mandrill webhooks"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "HTTP Basic Auth credentials embedded in URL and potentially exposed in error messages/logs leads to credential exposure",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-497",
+        "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+        "fit_reason": "Credentials included in error messages when signature validation fails, exposing sensitive authentication data",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-255",
+        "cwe_name": "Credentials Management Errors",
+        "fit_reason": "Insecure handling of credentials by embedding them in URLs for signature verification without proper protection",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-534",
+        "cwe_name": "Information Exposure Through Debug Log Files",
+        "fit_reason": "Credentials could be exposed through debug logs if error messages with embedded URLs are logged",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-117",
+        "cwe_name": "Improper Output Neutralization for Logs",
+        "fit_reason": "User-controlled credentials embedded in URLs without neutralization before inclusion in log entries",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-113",
+      "CWE-117",
+      "CWE-1236",
+      "CWE-20",
+      "CWE-200",
+      "CWE-208",
+      "CWE-22",
+      "CWE-255",
+      "CWE-321",
+      "CWE-347",
+      "CWE-497",
+      "CWE-534",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "anymail/webhooks/mandrill.py",
+    "changed_line": 49,
+    "statement": "url = self.webhook_url or get_request_uri(request)",
+    "change_type": "A",
+    "function_name": "validate_request",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "request -> get_request_uri (includes basic auth) -> used in signature verification",
+    "security_relevance_score": 0.7,
+    "code_context": "1: import json\n2: from datetime import datetime\n3: \n4: import hashlib\n5: import hmac\n6: from base64 import b64encode\n7: from django.utils.crypto import constant_time_compare\n8: from django.utils.timezone import utc\n9: \n10: from .base import AnymailBaseWebhookView\n11: from ..exceptions import AnymailWebhookValidationFailure, AnymailConfigurationError\n12: from ..signals import tracking, AnymailTrackingEvent, EventType\n13: from ..utils import get_anymail_setting, getfirst, get_request_uri\n14: \n15: \n16: class MandrillSignatureMixin(object):\n17:     \"\"\"Validates Mandrill webhook signature\"\"\"\n18: \n19:     # These can be set from kwargs in View.as_view, or pulled from settings in init:\n20:     webhook_key = None  # required\n21:     webhook_url = None  # optional; defaults to actual url used\n22: \n23:     def __init__(self, **kwargs):\n24:         # noinspection PyUnresolvedReferences\n25:         esp_name = self.esp_name\n26:         # webhook_key is required for POST, but not for HEAD when Mandrill validates webhook url.\n27:         # Defer \"missing setting\" error until we actually try to use it in the POST...\n28:         webhook_key = get_anymail_setting('webhook_key', esp_name=esp_name, default=None,\n29:                                           kwargs=kwargs, allow_bare=True)\n30:         if webhook_key is not None:\n31:             self.webhook_key = webhook_key.encode('ascii')  # hmac.new requires bytes key in python 3\n32:         self.webhook_url = get_anymail_setting('webhook_url', esp_name=esp_name, default=None,\n33:                                                kwargs=kwargs, allow_bare=True)\n34:         # noinspection PyArgumentList\n35:         super(MandrillSignatureMixin, self).__init__(**kwargs)\n36: \n37:     def validate_request(self, request):\n38:         if self.webhook_key is None:\n39:             # issue deferred \"missing setting\" error (re-call get-setting without a default)\n40:             # noinspection PyUnresolvedReferences\n41:             get_anymail_setting('webhook_key', esp_name=self.esp_name, allow_bare=True)\n42: \n43:         try:\n44:             signature = request.META[\"HTTP_X_MANDRILL_SIGNATURE\"]\n45:         except KeyError:\n46:             raise AnymailWebhookValidationFailure(\"X-Mandrill-Signature header missing from webhook POST\")\n47: \n48:         # Mandrill signs the exact URL (including basic auth, if used) plus the sorted POST params:\n49:         url = self.webhook_url or get_request_uri(request)\n50:         params = request.POST.dict()\n51:         signed_data = url\n52:         for key in sorted(params.keys()):\n53:             signed_data += key + params[key]\n54: \n55:         expected_signature = b64encode(hmac.new(key=self.webhook_key, msg=signed_data.encode('utf-8'),\n56:                                                 digestmod=hashlib.sha1).digest())\n57:         if not constant_time_compare(signature, expected_signature):\n58:             raise AnymailWebhookValidationFailure(\n59:                 \"Mandrill webhook called with incorrect signature (for url %r)\" % url)\n60: \n61: \n62: class MandrillBaseWebhookView(MandrillSignatureMixin, AnymailBaseWebhookView):\n63:     \"\"\"Base view class for Mandrill webhooks\"\"\"\n64: \n65:     warn_if_no_basic_auth = False  # because we validate against signature\n66: \n67:     def parse_events(self, request):\n68:         esp_events = json.loads(request.POST['mandrill_events'])\n69:         return [self.esp_to_anymail_event(esp_event) for esp_event in esp_events]\n70: \n71:     def esp_to_anymail_event(self, esp_event):\n72:         raise NotImplementedError()\n73: \n74: \n75: class MandrillTrackingWebhookView(MandrillBaseWebhookView):\n76: \n77:     signal = tracking\n78: \n79:     event_types = {\n80:         # Message events:\n81:         'send': EventType.SENT,\n82:         'deferral': EventType.DEFERRED,\n83:         'hard_bounce': EventType.BOUNCED,\n84:         'soft_bounce': EventType.DEFERRED,\n85:         'open': EventType.OPENED,\n86:         'click': EventType.CLICKED,\n87:         'spam': EventType.COMPLAINED,\n88:         'unsub': EventType.UNSUBSCRIBED,\n89:         'reject': EventType.REJECTED,\n90:         # Sync events (we don't really normalize these well):\n91:         'whitelist': EventType.UNKNOWN,\n92:         'blacklist': EventType.UNKNOWN,\n93:         # Inbound events:\n94:         'inbound': EventType.INBOUND,\n95:     }\n96: \n97:     def esp_to_anymail_event(self, esp_event):\n98:         esp_type = getfirst(esp_event, ['event', 'type'], None)\n99:         event_type = self.event_types.get(esp_type, EventType.UNKNOWN)\n100:         if event_type == EventType.INBOUND:\n101:             raise AnymailConfigurationError(\n102:                 \"You seem to have set Mandrill's *inbound* webhook URL \"\n103:                 \"to Anymail's Mandrill *tracking* webhook URL.\")\n104: \n105:         try:\n106:             timestamp = datetime.fromtimestamp(esp_event['ts'], tz=utc)\n107:         except (KeyError, ValueError):\n108:             timestamp = None\n109: \n110:         try:\n111:             recipient = esp_event['msg']['email']\n112:         except KeyError:\n113:             try:\n114:                 recipient = esp_event['reject']['email']  # sync events\n115:             except KeyError:\n116:                 recipient = None\n117: \n118:         try:\n119:             mta_response = esp_event['msg']['diag']\n120:         except KeyError:\n121:             mta_response = None\n122: \n123:         try:\n124:             description = getfirst(esp_event['reject'], ['detail', 'reason'])\n125:         except KeyError:\n126:             description = None\n127: \n128:         try:\n129:             metadata = esp_event['msg']['metadata']\n130:         except KeyError:\n131:             metadata = None\n132: \n133:         try:\n134:             tags = esp_event['msg']['tags']\n135:         except KeyError:\n136:             tags = None\n137: \n138:         return AnymailTrackingEvent(\n139:             click_url=esp_event.get('url', None),\n140:             description=description,\n141:             esp_event=esp_event,\n142:             event_type=event_type,\n143:             message_id=esp_event.get('_id', None),\n144:             metadata=metadata,\n145:             mta_response=mta_response,\n146:             recipient=recipient,\n147:             reject_reason=None,  # probably map esp_event['msg']['bounce_description'], but insufficient docs\n148:             tags=tags,\n149:             timestamp=timestamp,\n150:             user_agent=esp_event.get('user_agent', None),\n151:         )",
+    "source_summary": "URL source is either configured webhook_url setting or dynamically constructed from request using get_request_uri(), which includes HTTP basic auth credentials if present",
+    "sink_summary": "URL is used as part of signed_data for HMAC-SHA1 signature verification against X-Mandrill-Signature header",
+    "guard_summary": "Signature verification using constant_time_compare protects against timing attacks; webhook_key required for POST requests",
+    "risk_pattern": "Basic auth credentials included in signature calculation may expose credentials if signature verification fails and error message leaks URL",
+    "used_variable_sources": [
+      "self.webhook_url (configured setting)",
+      "request (HTTP request object)",
+      "get_request_uri() (constructs URL with basic auth)"
+    ],
+    "called_function_context": [
+      "get_request_uri",
+      "get_request_basic_auth",
+      "request.build_absolute_uri",
+      "base64.b64decode",
+      "urlsplit",
+      "urlunsplit"
+    ],
+    "enclosing_conditions": [
+      "if self.webhook_key is None: (deferred error)",
+      "try/except for HTTP_X_MANDRILL_SIGNATURE header"
+    ],
+    "context_summary": "Line 49 constructs URL for Mandrill webhook signature verification. When webhook_url is not configured, get_request_uri() builds URL including basic auth credentials from HTTP_AUTHORIZATION header, which becomes part of HMAC-signed data.",
+    "unresolved_facts": [
+      "Whether error messages containing URL with basic auth are logged or exposed to attackers",
+      "Whether basic auth credentials in error messages could be exploited in practice"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-497",
+        "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+        "fit_reason": "Error message includes URL with basic auth credentials in signature verification failure, potentially exposing authentication credentials",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "Basic auth credentials from URL construction are included in error messages, leading to information disclosure",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-208",
+        "cwe_name": "Observable Timing Discrepancy",
+        "fit_reason": "Signature verification uses constant_time_compare but initial retrieval focused on timing attacks",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-347",
+        "cwe_name": "Improper Verification of Cryptographic Signature",
+        "fit_reason": "Signature verification mechanism includes potentially sensitive data (basic auth) in signed payload",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1236",
+      "CWE-1275",
+      "CWE-20",
+      "CWE-200",
+      "CWE-208",
+      "CWE-22",
+      "CWE-347",
+      "CWE-425",
+      "CWE-497",
+      "CWE-502",
+      "CWE-697",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-4",
+    "filepath": "anymail/webhooks/base.py",
+    "changed_line": 44,
+    "statement": "basic_auth = get_request_basic_auth(request)",
+    "change_type": "A",
+    "function_name": "validate_request",
+    "operation_type": "authentication_validation",
+    "selection_reason": "request -> get_request_basic_auth -> authentication decision",
+    "security_relevance_score": 0.6,
+    "code_context": "1: import re\n2: import warnings\n3: \n4: import six\n5: from django.http import HttpResponse\n6: from django.utils.decorators import method_decorator\n7: from django.views.decorators.csrf import csrf_exempt\n8: from django.views.generic import View\n9: \n10: from ..exceptions import AnymailInsecureWebhookWarning, AnymailWebhookValidationFailure\n11: from ..utils import get_anymail_setting, collect_all_methods, get_request_basic_auth\n12: \n13: \n14: class AnymailBasicAuthMixin(object):\n15:     \"\"\"Implements webhook basic auth as mixin to AnymailBaseWebhookView.\"\"\"\n16: \n17:     # Whether to warn if basic auth is not configured.\n18:     # For most ESPs, basic auth is the only webhook security,\n19:     # so the default is True. Subclasses can set False if\n20:     # they enforce other security (like signed webhooks).\n21:     warn_if_no_basic_auth = True\n22: \n23:     # List of allowable HTTP basic-auth 'user:pass' strings.\n24:     basic_auth = None  # (Declaring class attr allows override by kwargs in View.as_view.)\n25: \n26:     def __init__(self, **kwargs):\n27:         self.basic_auth = get_anymail_setting('webhook_authorization', default=[],\n28:                                               kwargs=kwargs)  # no esp_name -- auth is shared between ESPs\n29:         # Allow a single string:\n30:         if isinstance(self.basic_auth, six.string_types):\n31:             self.basic_auth = [self.basic_auth]\n32:         if self.warn_if_no_basic_auth and len(self.basic_auth) < 1:\n33:             warnings.warn(\n34:                 \"Your Anymail webhooks are insecure and open to anyone on the web. \"\n35:                 \"You should set WEBHOOK_AUTHORIZATION in your ANYMAIL settings. \"\n36:                 \"See 'Securing webhooks' in the Anymail docs.\",\n37:                 AnymailInsecureWebhookWarning)\n38:         # noinspection PyArgumentList\n39:         super(AnymailBasicAuthMixin, self).__init__(**kwargs)\n40: \n41:     def validate_request(self, request):\n42:         \"\"\"If configured for webhook basic auth, validate request has correct auth.\"\"\"\n43:         if self.basic_auth:\n44:             basic_auth = get_request_basic_auth(request)\n45:             if basic_auth is None or basic_auth not in self.basic_auth:\n46:                 # noinspection PyUnresolvedReferences\n47:                 raise AnymailWebhookValidationFailure(\n48:                     \"Missing or invalid basic auth in Anymail %s webhook\" % self.esp_name)\n49: \n50: \n51: # Mixin note: Django's View.__init__ doesn't cooperate with chaining,\n52: # so all mixins that need __init__ must appear before View in MRO.\n53: class AnymailBaseWebhookView(AnymailBasicAuthMixin, View):\n54:     \"\"\"Base view for processing ESP event webhooks\n55: \n56:     ESP-specific implementations should subclass\n57:     and implement parse_events. They may also\n58:     want to implement validate_request\n59:     if additional security is available.\n60:     \"\"\"\n61: \n62:     def __init__(self, **kwargs):\n63:         super(AnymailBaseWebhookView, self).__init__(**kwargs)\n64:         self.validators = collect_all_methods(self.__class__, 'validate_request')\n65: \n66:     # Subclass implementation:\n67: \n68:     # Where to send events: either ..signals.inbound or ..signals.tracking\n69:     signal = None\n70: \n71:     def validate_request(self, request):\n72:         \"\"\"Check validity of webhook post, or raise AnymailWebhookValidationFailure.\n73: \n74:         AnymailBaseWebhookView includes basic auth validation.\n75:         Subclasses can implement (or provide via mixins) if the ESP supports\n76:         additional validation (such as signature checking).\n77: \n78:         *All* definitions of this method in the class chain (including mixins)\n79:         will be called. There is no need to chain to the superclass.\n80:         (See self.run_validators and collect_all_methods.)\n81:         \"\"\"\n82:         # if request.POST['signature'] != expected_signature:\n83:         #     raise AnymailWebhookValidationFailure(\"...message...\")\n84:         # (else just do nothing)\n85:         pass\n86: \n87:     def parse_events(self, request):\n88:         \"\"\"Return a list of normalized AnymailWebhookEvent extracted from ESP post data.\n89: \n90:         Subclasses must implement.\n91:         \"\"\"\n92:         raise NotImplementedError()\n93: \n94:     # HTTP handlers (subclasses shouldn't need to override):\n95: \n96:     http_method_names = [\"post\", \"head\", \"options\"]\n97: \n98:     @method_decorator(csrf_exempt)\n99:     def dispatch(self, request, *args, **kwargs):\n100:         return super(AnymailBaseWebhookView, self).dispatch(request, *args, **kwargs)\n101: \n102:     def head(self, request, *args, **kwargs):\n103:         # Some ESPs verify the webhook with a HEAD request at configuration time\n104:         return HttpResponse()\n105: \n106:     def post(self, request, *args, **kwargs):\n107:         # Normal Django exception handling will do the right thing:\n108:         # - AnymailWebhookValidationFailure will turn into an HTTP 400 response\n109:         #   (via Django SuspiciousOperation handling)\n110:         # - Any other errors (e.g., in signal dispatch) will turn into HTTP 500\n111:         #   responses (via normal Django error handling). ESPs generally\n112:         #   treat that as \"try again later\".\n113:         self.run_validators(request)\n114:         events = self.parse_events(request)\n115:         esp_name = self.esp_name\n116:         for event in events:\n117:             self.signal.send(sender=self.__class__, event=event, esp_name=esp_name)\n118:         return HttpResponse()\n119: \n120:     # Request validation (subclasses shouldn't need to override):\n121: \n122:     def run_validators(self, request):\n123:         for validator in self.validators:\n124:             validator(self, request)\n125: \n126:     @property\n127:     def esp_name(self):\n128:         \"\"\"\n129:         Read-only name of the ESP for this webhook view.\n130: \n131:         (E.g., MailgunTrackingWebhookView will return \"Mailgun\")\n132:         \"\"\"\n133:         return re.sub(r'(Tracking|Inbox)WebhookView$', \"\", self.__class__.__name__)",
+    "source_summary": "HTTP Authorization header from incoming webhook request, extracted via request.META['HTTP_AUTHORIZATION']",
+    "sink_summary": "Authentication decision that raises AnymailWebhookValidationFailure if credentials are missing or invalid, preventing webhook processing",
+    "guard_summary": "Basic auth validation against configured credentials list; fails closed (raises exception) if auth fails or is missing when required",
+    "risk_pattern": "Webhook authentication bypass if basic auth is not properly configured or if validation logic has flaws",
+    "used_variable_sources": [
+      "request.META['HTTP_AUTHORIZATION']",
+      "self.basic_auth (configured credentials)"
+    ],
+    "called_function_context": [
+      "get_request_basic_auth",
+      "base64.b64decode",
+      "AnymailWebhookValidationFailure"
+    ],
+    "enclosing_conditions": [
+      "if self.basic_auth:",
+      "if basic_auth is None or basic_auth not in self.basic_auth:"
+    ],
+    "context_summary": "Basic auth validation runs as part of webhook request validation chain before processing events; protects against unauthorized webhook access",
+    "unresolved_facts": [
+      "Specific ESP implementations may add additional security controls beyond basic auth",
+      "Default credential configuration practices and strength requirements are unknown"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "Basic auth validation exists but may incorrectly evaluate access; matches authentication decision mechanism",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-208",
+        "cwe_name": "Observable Timing Discrepancy",
+        "fit_reason": "String comparison in basic auth validation may be vulnerable to timing attacks to infer credentials",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-285",
+        "cwe_name": "Improper Authorization",
+        "fit_reason": "General authorization flaw category covering authentication validation weaknesses",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-255",
+        "cwe_name": "Credentials Management Errors",
+        "fit_reason": "Basic auth credential validation and management may have flaws",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-284",
+        "cwe_name": "Improper Access Control",
+        "fit_reason": "Webhook access control via basic auth may be improperly enforced",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-113",
+      "CWE-179",
+      "CWE-19",
+      "CWE-20",
+      "CWE-208",
+      "CWE-255",
+      "CWE-284",
+      "CWE-285",
+      "CWE-287",
+      "CWE-425",
+      "CWE-497",
+      "CWE-502",
+      "CWE-523",
+      "CWE-772",
+      "CWE-863",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-5",
+    "filepath": "tests/test_mandrill_webhooks.py",
+    "changed_line": 37,
+    "statement": "full_url = test_client_path.replace(\"://\", \"://\" + auth + \"@\")",
+    "change_type": "A",
+    "function_name": "mandrill_args",
+    "operation_type": "URL construction with embedded credentials",
+    "selection_reason": "auth credentials -> embed into URL -> test signature construction",
+    "security_relevance_score": 0.4,
+    "code_context": "1: import json\n2: from datetime import datetime\n3: # noinspection PyUnresolvedReferences\n4: from six.moves.urllib.parse import urljoin\n5: \n6: import hashlib\n7: import hmac\n8: from base64 import b64encode\n9: from django.core.exceptions import ImproperlyConfigured\n10: from django.test import override_settings\n11: from django.utils.timezone import utc\n12: from mock import ANY\n13: \n14: from anymail.signals import AnymailTrackingEvent\n15: from anymail.webhooks.mandrill import MandrillTrackingWebhookView\n16: \n17: from .webhook_cases import WebhookTestCase, WebhookBasicAuthTestsMixin\n18: \n19: TEST_WEBHOOK_KEY = 'TEST_WEBHOOK_KEY'\n20: \n21: \n22: def mandrill_args(events=None,\n23:                   host=\"http://testserver/\",  # Django test-client default\n24:                   path='/anymail/mandrill/tracking/',  # Anymail urlconf default\n25:                   auth=\"username:password\",  # WebhookTestCase default\n26:                   key=TEST_WEBHOOK_KEY):\n27:     \"\"\"Returns TestClient.post kwargs for Mandrill webhook call with events\n28: \n29:     Computes correct signature.\n30:     \"\"\"\n31:     if events is None:\n32:         events = []\n33:     test_client_path = urljoin(host, path)  # https://testserver/anymail/mandrill/tracking/\n34:     if auth:\n35:         # we can get away with this simplification in these controlled tests,\n36:         # but don't ever construct urls like this in production code -- it's not safe!\n37:         full_url = test_client_path.replace(\"://\", \"://\" + auth + \"@\")\n38:     else:\n39:         full_url = test_client_path\n40:     mandrill_events = json.dumps(events)\n41:     signed_data = full_url + 'mandrill_events' + mandrill_events\n42:     signature = b64encode(hmac.new(key=key.encode('ascii'),\n43:                                    msg=signed_data.encode('utf-8'),\n44:                                    digestmod=hashlib.sha1).digest())\n45:     return {\n46:         'path': test_client_path,\n47:         'data': {'mandrill_events': mandrill_events},\n48:         'HTTP_X_MANDRILL_SIGNATURE': signature,\n49:     }\n50: \n51: \n52: class MandrillWebhookSettingsTestCase(WebhookTestCase):\n53:     def test_requires_webhook_key(self):\n54:         with self.assertRaisesRegex(ImproperlyConfigured, r'MANDRILL_WEBHOOK_KEY'):\n55:             self.client.post('/anymail/mandrill/tracking/',\n56:                              data={'mandrill_events': '[]'})\n57: \n58:     def test_head_does_not_require_webhook_key(self):\n59:         # Mandrill issues an unsigned HEAD request to verify the wehbook url.\n60:         # Only *after* that succeeds will Mandrill will tell you the webhook key.\n61:         # So make sure that HEAD request will go through without any key set:\n62:         response = self.client.head('/anymail/mandrill/tracking/')\n63:         self.assertEqual(response.status_code, 200)\n64: \n65: \n66: @override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)\n67: class MandrillWebhookSecurityTestCase(WebhookTestCase, WebhookBasicAuthTestsMixin):\n68:     should_warn_if_no_auth = False  # because we check webhook signature\n69: \n70:     def call_webhook(self):\n71:         kwargs = mandrill_args([{'event': 'send'}])\n72:         return self.client.post(**kwargs)\n73: \n74:     # Additional tests are in WebhookBasicAuthTestsMixin\n75: \n76:     def test_verifies_correct_signature(self):\n77:         kwargs = mandrill_args([{'event': 'send'}])\n78:         response = self.client.post(**kwargs)\n79:         self.assertEqual(response.status_code, 200)\n80: \n81:     def test_verifies_missing_signature(self):\n82:         response = self.client.post('/anymail/mandrill/tracking/',\n83:                                     data={'mandrill_events': '[{\"event\":\"send\"}]'})\n84:         self.assertEqual(response.status_code, 400)\n85: \n86:     def test_verifies_bad_signature(self):\n87:         kwargs = mandrill_args([{'event': 'send'}], key=\"wrong API key\")\n88:         response = self.client.post(**kwargs)\n89:         self.assertEqual(response.status_code, 400)\n90: \n91:     @override_settings(ANYMAIL={})  # clear WEBHOOK_AUTHORIZATION from WebhookTestCase\n92:     def test_no_basic_auth(self):\n93:         # Signature validation should work properly if you're not using basic auth\n94:         self.clear_basic_auth()\n95:         kwargs = mandrill_args([{'event': 'send'}], auth=\"\")\n96:         response = self.client.post(**kwargs)\n97:         self.assertEqual(response.status_code, 200)\n98: \n99:     @override_settings(ANYMAIL={\n100:         \"MANDRILL_WEBHOOK_URL\": \"https://abcde:12345@example.com/anymail/mandrill/tracking/\",\n101:         \"WEBHOOK_AUTHORIZATION\": \"abcde:12345\",\n102:     })\n103:     def test_webhook_url_setting(self):\n104:         # If Django can't build_absolute_uri correctly (e.g., because your proxy\n105:         # frontend isn't setting the proxy headers correctly), you must set\n106:         # MANDRILL_WEBHOOK_URL to the actual public url where Mandrill calls the webhook.\n107:         self.set_basic_auth(\"abcde\", \"12345\")\n108:         kwargs = mandrill_args([{'event': 'send'}], host=\"https://example.com/\", auth=\"abcde:12345\")\n109:         response = self.client.post(SERVER_NAME=\"127.0.0.1\", **kwargs)\n110:         self.assertEqual(response.status_code, 200)\n111: \n112:     # override WebhookBasicAuthTestsMixin version of this test\n113:     @override_settings(ANYMAIL={'WEBHOOK_AUTHORIZATION': ['cred1:pass1', 'cred2:pass2']})\n114:     def test_supports_credential_rotation(self):\n115:         \"\"\"You can supply a list of basic auth credentials, and any is allowed\"\"\"\n116:         self.set_basic_auth('cred1', 'pass1')\n117:         response = self.client.post(**mandrill_args(auth=\"cred1:pass1\"))\n118:         self.assertEqual(response.status_code, 200)\n119: \n120:         self.set_basic_auth('cred2', 'pass2')\n121:         response = self.client.post(**mandrill_args(auth=\"cred2:pass2\"))\n122:         self.assertEqual(response.status_code, 200)\n123: \n124:         self.set_basic_auth('baduser', 'wrongpassword')\n125:         response = self.client.post(**mandrill_args(auth=\"baduser:wrongpassword\"))\n126:         self.assertEqual(response.status_code, 400)\n127: \n128: \n129: @override_settings(ANYMAIL_MANDRILL_WEBHOOK_KEY=TEST_WEBHOOK_KEY)\n130: class MandrillTrackingTestCase(WebhookTestCase):\n131: \n132:     def test_head_request(self):\n133:         # Mandrill verifies webhooks at config time with a HEAD request\n134:         response = self.client.head('/anymail/mandrill/tracking/')\n135:         self.assertEqual(response.status_code, 200)\n136: \n137:     def test_post_request_invalid_json(self):\n138:         kwargs = mandrill_args()\n139:         kwargs['data'] = {'mandrill_events': \"GARBAGE DATA\"}\n140:         response = self.client.post(**kwargs)\n141:         self.assertEqual(response.status_code, 400)\n142: \n143:     def test_send_event(self):\n144:         raw_events = [{\n145:             \"event\": \"send\",\n146:             \"msg\": {\n147:                 \"ts\": 1461095211,  # time send called\n148:                 \"subject\": \"Webhook Test\",\n149:                 \"email\": \"recipient@example.com\",\n150:                 \"sender\": \"sender@example.com\",\n151:                 \"tags\": [\"tag1\", \"tag2\"],\n152:                 \"metadata\": {\"custom1\": \"value1\", \"custom2\": \"value2\"},\n153:                 \"_id\": \"abcdef012345789abcdef012345789\"\n154:             },\n155:             \"_id\": \"abcdef012345789abcdef012345789\",\n156:             \"ts\": 1461095246  # time of event\n157:         }]\n158:         response = self.client.post(**mandrill_args(events=raw_events))\n159:         self.assertEqual(response.status_code, 200)\n160:         kwargs = self.assert_handler_called_once_with(self.tracking_handler, sender=MandrillTrackingWebhookView,\n161:                                                       event=ANY, esp_name='Mandrill')\n162:         event = kwargs['event']\n163:         self.assertIsInstance(event, AnymailTrackingEvent)\n164:         self.assertEqual(event.event_type, \"sent\")\n165:         self.assertEqual(event.timestamp, datetime(2016, 4, 19, 19, 47, 26, tzinfo=utc))\n166:         self.assertEqual(event.esp_event, raw_events[0])\n167:         self.assertEqual(event.message_id, \"abcdef012345789abcdef012345789\")\n168:         self.assertEqual(event.recipient, \"recipient@example.com\")\n169:         self.assertEqual(event.tags, [\"tag1\", \"tag2\"])\n170:         self.assertEqual(event.metadata, {\"custom1\": \"value1\", \"custom2\": \"value2\"})\n171: \n172:     def test_hard_bounce_event(self):\n173:         raw_events = [{\n174:             \"event\": \"hard_bounce\",\n175:             \"msg\": {\n176:                 \"ts\": 1461095211,  # time send called\n177:                 \"subject\": \"Webhook Test\",\n178:                 \"email\": \"bounce@example.com\",\n179:                 \"sender\": \"sender@example.com\",\n180:                 \"bounce_description\": \"bad_mailbox\",\n181:                 \"bgtools_code\": 10,\n182:                 \"diag\": \"smtp;550 5.1.1 The email account that you tried to reach does not exist.\",\n183:                 \"_id\": \"abcdef012345789abcdef012345789\"\n184:             },\n185:             \"_id\": \"abcdef012345789abcdef012345789\",\n186:             \"ts\": 1461095246  # time of event",
+    "source_summary": "auth parameter (default 'username:password') is passed to function; test_client_path is constructed from host and path parameters using urljoin",
+    "sink_summary": "full_url is used in HMAC signature computation for Mandrill webhook verification; signature is included in HTTP_X_MANDRILL_SIGNATURE header",
+    "guard_summary": "Comment explicitly warns 'don't ever construct urls like this in production code -- it's not safe!'; Production code uses proper URL parsing with urlsplit/urlunsplit in get_request_uri",
+    "risk_pattern": "Test code constructs URLs by string replacement to embed credentials for signature verification, mimicking production behavior but with unsafe string manipulation",
+    "used_variable_sources": [
+      "auth function parameter (default 'username:password')",
+      "test_client_path from urljoin(host, path)",
+      "host parameter (default 'http://testserver/')",
+      "path parameter (default '/anymail/mandrill/tracking/')"
+    ],
+    "called_function_context": [
+      "urljoin from six.moves.urllib.parse",
+      "json.dumps for events serialization",
+      "hmac.new with SHA1 for signature generation",
+      "b64encode for signature encoding"
+    ],
+    "enclosing_conditions": [
+      "if auth: condition (line 34)",
+      "else branch provides fallback without auth (line 39)"
+    ],
+    "context_summary": "Test helper function constructs webhook call parameters including signature; mimics production signature verification which includes basic auth in URL for HMAC computation",
+    "unresolved_facts": [],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-255",
+        "cwe_name": "Credentials Management Errors",
+        "fit_reason": "String replacement of credentials into URL for HMAC signature computation represents insecure credential handling in security-sensitive context",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-93",
+        "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+        "fit_reason": "String replacement in URL construction could allow injection of CRLF sequences affecting signature computation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-113",
+        "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+        "fit_reason": "URL manipulation through string replacement could lead to header splitting vulnerabilities in signature context",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-347",
+        "cwe_name": "Improper Verification of Cryptographic Signature",
+        "fit_reason": "Unsafe URL construction method could lead to signature verification bypass through URL manipulation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-697",
+        "cwe_name": "Incorrect Comparison",
+        "fit_reason": "String replacement URL construction may produce non-canonical URLs leading to incorrect signature comparisons",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-113",
+      "CWE-208",
+      "CWE-22",
+      "CWE-255",
+      "CWE-340",
+      "CWE-347",
+      "CWE-390",
+      "CWE-628",
+      "CWE-643",
+      "CWE-670",
+      "CWE-685",
+      "CWE-697",
+      "CWE-74",
+      "CWE-78",
+      "CWE-90",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  }
+]

@@ -1,0 +1,154 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "lib/connie-lang.js",
+  "changed_line": 56,
+  "statement": "var v = vm.runInNewContext(m[1], {});",
+  "change_type": "A",
+  "function_name": "ExecutionInterpreter.replace",
+  "operation_type": "security_sensitive_execution",
+  "selection_reason": "observable input from user configuration -> vm.runInNewContext execution -> arbitrary code execution vulnerability",
+  "security_relevance_score": 0.9,
+  "code_context": "1: var vm = require('vm');\n2: var isPlainObject = require('lodash.isplainobject');\n3: \n4: var getValue = function(obj, key) {\n5:   var o = obj;\n6:   var keys = Array.isArray(key) ? key : key.split('.');\n7:   \n8:   for (var x = 0; x < keys.length -1; ++x) {\n9:     var k = keys[x];\n10:     if (!o[k]) return;\n11:     o = o[k];\n12:   }\n13:   \n14:   return o[keys[keys.length - 1]];\n15: };\n16: \n17: var setValue = function(obj, key, value) {\n18:   var o = obj;\n19:   var keys = Array.isArray(key) ? key : key.split('.');\n20:   \n21:   for (var x = 1; x < keys.length; ++x) {\n22:     var currentKey = keys[x];\n23:     var lastKey = keys[x - 1];\n24:     if (typeof(currentKey) === 'number') {\n25:       if (!o[lastKey]) { o[lastKey] = []; }\n26:       o = o[lastKey];\n27:     } else if (typeof(currentKey) === 'string') {\n28:       if (!o[lastKey]) { o[lastKey] = {}; }\n29:       o = o[lastKey];\n30:     } else {\n31:       throw new Error('Oopsy, key arrays should only be strings and numbers:', keys);\n32:     }\n33:   }\n34:   \n35:   o[keys[keys.length - 1]] = value;\n36:   return obj;\n37: };\n38: \n39: \n40: var EnvVarInterpreter = {\n41:   type: '$',\n42:   replace: function(value, context) {\n43:     var m = /\\$\\{([^\\}]+)\\}/.exec(value);\n44:     if (!m) return value;\n45:     return value.replace(m[0], context.env[m[1]]);\n46:   }\n47: };\n48: \n49: var ExecutionInterpreter = {\n50:   type: '#',\n51:   replace: function(value, context) {\n52:     var m = /#\\{([^\\}]+)\\}/.exec(value);\n53:     if (!m) return value;\n54:     \n55:     try {\n56:       var v = vm.runInNewContext(m[1], {});\n57:       if (m[0] === value) return v;\n58:       return value.replace(m[0], v);\n59:     } catch(err) {\n60:       throw new Error('Invalid execution [' + m[1] + ']: ' + err.message);\n61:     }\n62:   }\n63: };\n64: \n65: var ReferenceInterpreter = {\n66:   type: '@',\n67:   replace: function(value, context) {\n68:     var m = /@\\{([^\\}]+)\\}/.exec(value);\n69:     if (!m) return value;\n70:     \n71:     var v = getValue(context.config, m[1]);\n72:     if (m[0] === value) return v;\n73:     return value.replace(m[0], v);\n74:   }\n75: };\n76: \n77: var Interpreters = [ReferenceInterpreter, EnvVarInterpreter, ExecutionInterpreter];\n78: \n79: var ConnieLang = {\n80:   Interpreters: Interpreters,\n81:   InterpretersByType: Interpreters.reduce(function(o, i) {o[i.type] = i; return o;}, {}),\n82:   \n83:   getEntries: function(config) {\n84:     var entries = [];\n85:     \n86:     var iter = function(value, prefix) {\n87:       if (!prefix) prefix = [];\n88:       \n89:       if (Array.isArray(value)) {\n90:         value.forEach(function(arrValue, idx) {\n91:           iter(arrValue, prefix.concat(idx));\n92:         });\n93:       } else if (isPlainObject(value)) {\n94:         Object.keys(value).forEach(function(key) {\n95:           iter(value[key], prefix.concat(key));\n96:         });\n97:       } else {\n98:         entries.push({key: prefix, value: value});\n99:       }\n100:     };\n101:     \n102:     iter(config);\n103:     return entries;\n104:   },\n105:   \n106:   firstInnermostInterpreterFromValue: function(value) {\n107:     var start = -1;\n108:     var interpreterTypes = Object.keys(ConnieLang.InterpretersByType);\n109:     \n110:     for (var idx = 1; idx < value.length; ++idx) {\n111:       if (value[idx] === '{' && interpreterTypes.indexOf(value[idx - 1]) !== -1) {\n112:         start = idx - 1;\n113:       } else if (value[idx] === '}' && start !== -1) {\n114:         return {\n115:           type: value[start],\n116:           match: value.slice(start, idx + 1),\n117:           value: value.slice(start + 2, idx),\n118:           start: start,\n119:           end: idx + 1\n120:         };\n121:       }\n122:     }\n123:     \n124:     return null;\n125:   },\n126:   \n127:   parse: function(configObj, envObj) {\n128:     var context = {\n129:       config: configObj,\n130:       env: envObj || process.env\n131:     };\n132:     \n133:     var entries = ConnieLang.getEntries(context.config);\n134:     \n135:     // iterate until no updates have been made\n136:     var digest = function() {\n137:       var updated = false;\n138:       \n139:       entries.forEach(function(e) {\n140:         var interpreter = ConnieLang.firstInnermostInterpreterFromValue(e.value, context);\n141:         if (!interpreter) return;\n142:         \n143:         var newValue = ConnieLang.InterpretersByType[interpreter.type].replace(e.value, context);\n144:         if (newValue !== e.value) {\n145:           e.value = newValue;\n146:           updated = true;\n147:         }\n148:       });\n149:       \n150:       return updated;\n151:     };\n152:     \n153:     while(digest()) ;\n154:     \n155:     var result = {};\n156:     entries.forEach(function(e) {\n157:       setValue(result, e.key, e.value);\n158:     });\n159:     \n160:     return result;\n161:   }\n162: };\n163: \n164: module.exports = ConnieLang;",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-94",
+      "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+      "fit_reason": "The use of vm.runInNewContext with unsanitized user input from configuration directly matches the CWE-94 mechanism of interpreting unsanitized user input as code, allowing arbitrary code execution.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-830",
+      "cwe_name": "Inclusion of Web Functionality from an Untrusted Source",
+      "fit_reason": "The vulnerability involves including functionality (code execution) from untrusted user configuration input, which can lead to arbitrary code execution.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-116",
+    "CWE-200",
+    "CWE-260",
+    "CWE-494",
+    "CWE-502",
+    "CWE-561",
+    "CWE-563",
+    "CWE-79",
+    "CWE-829",
+    "CWE-830",
+    "CWE-862",
+    "CWE-94",
+    "CWE-942",
+    "CWE-99"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 56,
+      "statement": "var v = vm.runInNewContext(m[1], {});",
+      "cwe_id": "CWE-94",
+      "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The code uses vm.runInNewContext() with user-provided input (m[1]) directly from configuration, which is the exact mechanism described in CWE-94 for code injection vulnerabilities."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "User input flows from configuration through m[1] to vm.runInNewContext(), establishing a clear path from externally-controlled input to code execution. The input is not sanitized or validated before being passed to the VM."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If line 56 were reverted (removing vm.runInNewContext call), the code would no longer execute arbitrary user-provided JavaScript, eliminating the vulnerability. The patch directly addresses the root cause of CWE-94."
+        },
+        "security_control": {
+          "score": 0.9,
+          "evidence": "There is no input validation or sanitization of m[1] before passing it to vm.runInNewContext(). The code lacks any security controls that would prevent malicious code execution.",
+          "required_control": "Input validation and sanitization",
+          "control_requirement_evidence": "CWE-94 requires that externally-influenced input used to generate code must be neutralized or validated to prevent modification of the intended code segment.",
+          "existing_controls_checked": [
+            "No input validation or sanitization present",
+            "No escaping/encoding of user input",
+            "No allowlists or parameterization"
+          ],
+          "deficiency_evidence": "The code directly passes user-provided configuration values to vm.runInNewContext() without any checks, making it vulnerable to arbitrary code execution."
+        },
+        "concrete_impact": {
+          "score": 0.85,
+          "evidence": "The vulnerability allows for arbitrary code execution since vm.runInNewContext() can execute any JavaScript code provided in the input string m[1]. This directly leads to the impact described in CWE-94."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would no longer execute user-provided JavaScript expressions through vm.runInNewContext(), eliminating the arbitrary code execution vulnerability that allows attackers to run malicious code on the system.",
+      "supporting_evidence": [
+        "The code uses vm.runInNewContext() with unsanitized user input from configuration",
+        "User input flows directly from config to vm.runInNewContext() without validation",
+        "The vulnerable function ExecutionInterpreter.replace processes user-provided expressions"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [],
+      "review_comment": "User-provided configuration values are directly executed as JavaScript code via vm.runInNewContext(), creating a code injection vulnerability. The patch removes this dangerous execution path by eliminating the direct use of vm.runInNewContext() with unsanitized input. Remove the vm.runInNewContext() call and implement proper input validation before any code execution occurs.",
+      "change_type": "A",
+      "raw_score": 0.89,
+      "score": 0.89
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/connie-lang.js",
+      "changed_line": 56,
+      "statement": "var v = vm.runInNewContext(m[1], {});",
+      "cwe_id": "CWE-830",
+      "cwe_name": "Inclusion of Web Functionality from an Untrusted Source",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "The mechanism demonstrated in the code involves arbitrary code execution via vm.runInNewContext, which is not aligned with CWE-830's focus on inclusion of web functionality from untrusted sources. The vulnerability is more accurately described as a code injection or arbitrary code execution issue."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "User configuration input flows into the ExecutionInterpreter.replace function, which then uses vm.runInNewContext with the user-provided expression (m[1]). This demonstrates a clear connection between untrusted input and code execution."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If line 56 were reverted to not use vm.runInNewContext, the arbitrary code execution vulnerability would be eliminated. The patch directly addresses the mechanism by removing the dangerous code execution capability."
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "There is no validation or sanitization of user-provided expressions before passing them to vm.runInNewContext. The code directly executes arbitrary JavaScript without any controls to prevent malicious input.",
+          "required_control": "Input validation and sanitization",
+          "control_requirement_evidence": "CWE-830 requires preventing inclusion of untrusted web functionality, which in this context means validating user inputs before execution.",
+          "existing_controls_checked": [
+            "No input validation or sanitization present",
+            "No sandboxing or restriction of vm.runInNewContext capabilities"
+          ],
+          "deficiency_evidence": "The code directly passes user-provided expressions to vm.runInNewContext without any checks, allowing full code execution capabilities."
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "The concrete impact is arbitrary code execution, which can lead to complete system compromise. An attacker can execute any JavaScript code within the application's context, potentially accessing sensitive data or performing malicious actions."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the vm.runInNewContext call would be removed, eliminating the arbitrary code execution vulnerability entirely.",
+      "supporting_evidence": [
+        "User configuration input flows into ExecutionInterpreter.replace function",
+        "vm.runInNewContext is called with user-provided expression m[1]",
+        "The code directly executes arbitrary JavaScript without validation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "The exact scope of what constitutes 'web functionality' in this context is not fully defined",
+        "Whether the vulnerability is limited to specific types of expressions or all expressions"
+      ],
+      "review_comment": "User configuration input flows directly into vm.runInNewContext without validation, enabling arbitrary code execution. The patch removes this dangerous capability. Add input validation and sanitization before executing user-provided JavaScript expressions.",
+      "change_type": "A",
+      "raw_score": 0.5800000000000001,
+      "score": 0.5800000000000001
+    }
+  ],
+  "stage4_status": "completed"
+}

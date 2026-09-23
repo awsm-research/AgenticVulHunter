@@ -1,0 +1,214 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "lib/localvalidator.ts",
+  "changed_line": 168,
+  "statement": "this.cachedValidations[txid].parents.filter(p => p.txid === parentTxids[i]).map(p => p.valid = valid);",
+  "change_type": "A",
+  "function_name": "",
+  "operation_type": "data_assignment",
+  "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+  "security_relevance_score": 0.6,
+  "code_context": "19: \n20: export class LocalValidator implements SlpValidator {\n21:     BITBOX: BITBOX;\n22:     cachedRawTransactions: { [txid: string]: string }\n23:     cachedValidations: { [txid: string]: Validation }\n24:     getRawTransactions: GetRawTransactionsAsync;\n25:     slp: Slp;\n26: \n27:     constructor(BITBOX: BITBOX, getRawTransactions: GetRawTransactionsAsync) {\n28:         if(!BITBOX)\n29:             throw Error(\"Must provide BITBOX instance to class constructor.\")\n30:         if(!getRawTransactions)\n31:             throw Error(\"Must provide method getRawTransactions to class constructor.\")\n32:         this.BITBOX = BITBOX;\n33:         this.getRawTransactions = getRawTransactions;\n34:         this.slp = new Slp(BITBOX);\n35:         this.cachedValidations = {};\n36:         this.cachedRawTransactions = {};\n37:     }\n38: \n39:     addValidationFromStore(hex: string, isValid: boolean) {\n40:         let id = (<Buffer>this.BITBOX.Crypto.sha256(this.BITBOX.Crypto.sha256(Buffer.from(hex, 'hex'))).reverse()).toString('hex');\n41:         if(!this.cachedValidations[id])\n42:             this.cachedValidations[id] = { hex: hex, validity: isValid, parents: [], details: null, invalidReason: null }\n43:         if(!this.cachedRawTransactions[id])\n44:             this.cachedRawTransactions[id] = hex;\n45:     }\n46:     \n47:     async waitForCurrentValidationProcessing(txid: string) {\n48:         // TODO: Add some timeout?\n49:         let cached: Validation = this.cachedValidations[txid];\n50: \n51:         while(true) {\n52:             if(typeof cached.validity === 'boolean')\n53:                 break\n54:             await sleep(10);\n55:         }\n56:     }\n57: \n58:     async waitForTransactionPreProcessing(txid: string){\n59:         // TODO: Add some timeout?\n60:         while(true) {\n61:             if(this.cachedValidations[txid].hex && (this.cachedValidations[txid].details || typeof this.cachedValidations.validity === 'boolean'))\n62:                 break\n63:             await sleep(10);\n64:         }\n65:         //await sleep(100); // short wait to make sure parent's properties gets set first.\n66:         return\n67:     }\n68: \n69:     async getRawTransaction(txid: string) {\n70:         if(this.cachedRawTransactions[txid])\n71:             return this.cachedRawTransactions[txid];\n72:         this.cachedRawTransactions[txid] = (await this.getRawTransactions([txid]))[0]\n73:         if(this.cachedRawTransactions[txid])\n74:             return this.cachedRawTransactions[txid];\n75:         return null;\n76:     }\n77: \n78:     async isValidSlpTxid(txid: string) {\n79:         if(txid && !this.cachedValidations[txid]) {\n80:             this.cachedValidations[txid] = { hex: null, validity: null, parents: [], details: null, invalidReason: null }\n81:             this.cachedValidations[txid].hex = await this.getRawTransaction(txid);\n82:         }\n83: \n84:         // Check to see how we should proceed based on the validation-cache state\n85:         if(!this.cachedValidations[txid].hex)\n86:             await this.waitForTransactionPreProcessing(txid);\n87:         if(typeof this.cachedValidations[txid].validity === 'boolean')\n88:             return this.cachedValidations[txid].validity;\n89:         if(this.cachedValidations[txid].details)\n90:             await this.waitForCurrentValidationProcessing(txid);\n91: \n92:         // Check SLP message validity\n93:         let txn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[txid].hex)\n94:         let slpmsg: SlpTransactionDetails;\n95:         try {\n96:             slpmsg = this.cachedValidations[txid].details = this.slp.parseSlpOutputScript(txn.outputs[0]._scriptBuffer)\n97:         } catch(e) {\n98:             this.cachedValidations[txid].invalidReason = \"SLP OP_RETURN parsing error (\" + e.message + \").\"\n99:             return this.cachedValidations[txid].validity = false;\n100:         }\n101: \n102:         // Check DAG validity\n103:         if(slpmsg.transactionType === SlpTransactionType.GENESIS) {\n104:             return this.cachedValidations[txid].validity = true;\n105:         } \n106:         else if (slpmsg.transactionType === SlpTransactionType.MINT) {\n107:             for(let i = 0; i < txn.inputs.length; i++) {\n108:                 let input_txid = txn.inputs[i].prevTxId.toString('hex')\n109:                 let input_txhex = await this.getRawTransaction(input_txid)\n110:                 if (input_txhex) {\n111:                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);\n112:                     try {\n113:                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)\n114:                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)\n115:                             input_slpmsg.tokenIdHex = input_txid;\n116:                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {\n117:                             if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {\n118:                                 if(txn.inputs[i].outputIndex === input_slpmsg.batonVout)\n119:                                     this.cachedValidations[txid].parents.push({ txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType ,valid: null, inputQty: null })\n120:                             }\n121:                         }\n122:                     } catch(_) {}\n123:                 }\n124:             }\n125:             if(this.cachedValidations[txid].parents.length !== 1) {\n126:                 this.cachedValidations[txid].invalidReason = \"MINT transaction must have 1 valid baton parent.\"\n127:                 return this.cachedValidations[txid].validity = false;\n128:             }\n129:         }\n130:         else if(slpmsg.transactionType === SlpTransactionType.SEND) {\n131:             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))\n132:             let tokenInQty = new BigNumber(0);\n133:             for(let i = 0; i < txn.inputs.length; i++) {\n134:                 let input_txid = txn.inputs[i].prevTxId.toString('hex')\n135:                 let input_txhex = await this.getRawTransaction(input_txid)\n136:                 if (input_txhex) {\n137:                     let input_tx: BitcoreTransaction = new bitcore.Transaction(input_txhex);\n138:                     try {\n139:                         let input_slpmsg = this.slp.parseSlpOutputScript(input_tx.outputs[0]._scriptBuffer)\n140:                         if(input_slpmsg.transactionType === SlpTransactionType.GENESIS)\n141:                             input_slpmsg.tokenIdHex = input_txid;\n142:                         if(input_slpmsg.tokenIdHex === slpmsg.tokenIdHex) {\n143:                             if(input_slpmsg.transactionType === SlpTransactionType.SEND) {\n144:                                 tokenInQty = tokenInQty.plus(input_slpmsg.sendOutputs[txn.inputs[i].outputIndex])\n145:                                 this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.sendOutputs[txn.inputs[i].outputIndex] })\n146:                             }\n147:                             else if(input_slpmsg.transactionType === SlpTransactionType.GENESIS || input_slpmsg.transactionType === SlpTransactionType.MINT) {\n148:                                 if(txn.inputs[i].outputIndex === 1)\n149:                                     tokenInQty = tokenInQty.plus(input_slpmsg.genesisOrMintQuantity)\n150:                                     this.cachedValidations[txid].parents.push({txid: txn.inputs[i].prevTxId.toString('hex'), versionType: input_slpmsg.versionType, valid: null, inputQty: input_slpmsg.genesisOrMintQuantity })\n151:                             }\n152:                         }\n153:                     } catch(_) {}\n154:                 }\n155:             }\n156:             \n157:             // Check token inputs are greater than token outputs (includes valid and invalid inputs)\n158:             if(tokenOutQty.isGreaterThan(tokenInQty)) {\n159:                 this.cachedValidations[txid].invalidReason = \"Token outputs are greater than possible token inputs.\"\n160:                 return this.cachedValidations[txid].validity = false;\n161:             }\n162:         }\n163: \n164:         // Set validity validation-cache for parents, and handle MINT condition with no valid input\n165:         let parentTxids = [...new Set(this.cachedValidations[txid].parents.map(p => p.txid))];\n166:         for(let i = 0; i < parentTxids.length; i++) {\n167:             let valid = await this.isValidSlpTxid(parentTxids[i])\n168:             this.cachedValidations[txid].parents.filter(p => p.txid === parentTxids[i]).map(p => p.valid = valid);\n169:             if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.MINT && !valid) {\n170:                 this.cachedValidations[txid].invalidReason = \"MINT transaction with invalid baton parent.\"\n171:                 return this.cachedValidations[txid].validity = false;\n172:             }\n173:         }\n174: \n175:         // Check valid inputs are greater than token outputs\n176:         if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {\n177:             let validInputQty = this.cachedValidations[txid].parents.reduce((t, v) => { return v.valid ? t.plus(v.inputQty) : t }, new BigNumber(0));\n178:             let tokenOutQty = slpmsg.sendOutputs.reduce((t,v)=>{ return t.plus(v) }, new BigNumber(0))\n179:             if(tokenOutQty.isGreaterThan(validInputQty)) {\n180:                 this.cachedValidations[txid].invalidReason = \"Token outputs are greater than valid token inputs.\"\n181:                 return this.cachedValidations[txid].validity = false;\n182:             }\n183:         }\n184: \n185:         // Check versionType is not different from any valid parent\n186:         if(this.cachedValidations[txid].parents.filter(p => p.valid).length > 0) {\n187:             let validVersionType = this.cachedValidations[txid].parents.find(p => p.valid).versionType;\n188:             if(this.cachedValidations[txid].details.versionType !== validVersionType) {\n189:                 this.cachedValidations[txid].invalidReason = \"SLP version/type mismatch from valid parent.\"\n190:                 return this.cachedValidations[txid].validity = false;\n191:             }\n192:         } \n193:         // For case with 0 token SEND with no valid parents, must check GENESIS validity / versionType.\n194:         else if(this.cachedValidations[txid].details.transactionType === SlpTransactionType.SEND) {\n195:             let slpmsg = this.cachedValidations[txid].details\n196:             let valid = await this.isValidSlpTxid(slpmsg.tokenIdHex);\n197:             if(valid) {\n198:                 let genesisTxn: BitcoreTransaction = new bitcore.Transaction(this.cachedValidations[slpmsg.tokenIdHex].hex)\n199:                 let genesisMsg = this.slp.parseSlpOutputScript(genesisTxn.outputs[0]._scriptBuffer)\n200:                 if(genesisMsg.versionType !== slpmsg.versionType) {\n201:                     this.cachedValidations[txid].invalidReason = \"SLP version/type mismatch from valid GENESIS.\"\n202:                     return this.cachedValidations[txid].validity = false;\n203:                 }\n204:             } else {\n205:                 this.cachedValidations[txid].invalidReason = \"SEND has 0 outputs, but has invalid token GENESIS.\"\n206:                 return this.cachedValidations[txid].validity = false;\n207:             }\n208:         }\n209: \n210:         return this.cachedValidations[txid].validity = true;\n211:     }\n212: \n213:     async validateSlpTransactions(txids: string[]): Promise<string[]> {\n214:         let res = [];\n215:         for (let i = 0; i < txids.length; i++) {\n216:             res.push((await this.isValidSlpTxid) ? txids[i] : '')\n217:         }\n218:         return res.filter((id: string) => id.length > 0);\n219:     }\n220: }",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "fit_reason": "The mechanism involves processing of transaction IDs and validation status assignment where incorrect handling of structured data could lead to invalid validation results",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "The recursive validation process assigns validation status based on parent transactions, which could be manipulated if txid values are not properly validated, leading to incorrect authorization decisions",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-125",
+      "cwe_name": "Out-of-bounds Read",
+      "fit_reason": "The code uses array operations on parent transactions that could result in out-of-bounds access if the txid lookup fails or returns unexpected results",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-125",
+    "CWE-1321",
+    "CWE-19",
+    "CWE-255",
+    "CWE-311",
+    "CWE-471",
+    "CWE-534",
+    "CWE-59",
+    "CWE-668",
+    "CWE-697",
+    "CWE-77",
+    "CWE-863"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 168,
+      "statement": "this.cachedValidations[txid].parents.filter(p => p.txid === parentTxids[i]).map(p => p.valid = valid);",
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The statement shows data processing where validation status is assigned to parent transactions, but the mechanism does not directly match CWE-19's specific definition of data processing errors which typically involve incorrect handling of input or output data manipulation."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The statement connects externally controlled transaction IDs (parentTxids[i]) to the assignment of validation status (p.valid = valid). The parentTxids are derived from transaction inputs and can be manipulated by an attacker, creating a potential path for incorrect validation results."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted, the assignment of validation status to parent transactions would not occur, potentially breaking the DAG validation logic and preventing incorrect propagation of validation statuses from parents to children."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "The code lacks explicit validation or sanitization of parent transaction IDs before using them in assignment operations. The required control is input validation/sanitization of externally controlled data used in security-sensitive operations.",
+          "required_control": "Input validation/sanitization",
+          "control_requirement_evidence": "CWE-19 requires safe handling of input throughout processing, and this line processes externally controlled transaction IDs without validation.",
+          "existing_controls_checked": [
+            "No explicit validation of parentTxids before assignment",
+            "No sanitization of transaction IDs in the data flow"
+          ],
+          "deficiency_evidence": "The code directly assigns validation status based on potentially untrusted parent transaction IDs without checking their validity or origin, creating a potential for incorrect data processing."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "There is potential for incorrect validation results when assigning parent validation status, but the concrete impact depends on whether the parent transaction IDs are attacker-controlled and how this affects downstream validation logic."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the assignment of validation status to parent transactions would not occur. This would prevent incorrect propagation of validation results from parents to children in the DAG, potentially breaking the validation chain but also preventing potential manipulation of validation status through controlled parent transaction IDs.",
+      "supporting_evidence": [
+        "The statement directly assigns validation status based on externally controlled transaction IDs",
+        "Parent transaction IDs are derived from transaction inputs and can be manipulated by attackers",
+        "The code processes transaction data in a DAG structure where parent validation affects child validation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the parent transaction IDs are fully attacker-controlled",
+        "The exact impact of incorrect validation status assignment on downstream processing"
+      ],
+      "review_comment": "The code assigns validation status to parent transactions based on externally controlled transaction IDs without input validation. This creates a potential data processing error where malicious inputs could manipulate validation results. The fix should validate parent transaction IDs before using them in assignment operations.",
+      "change_type": "A",
+      "raw_score": 0.6,
+      "score": 0.6
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 168,
+      "statement": "this.cachedValidations[txid].parents.filter(p => p.txid === parentTxids[i]).map(p => p.valid = valid);",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The code performs authorization checks by validating parent transactions, but the mechanism is not fully aligned with CWE-863's definition of incorrect authorization. The vulnerability lies in how validation status is assigned to parents without proper input validation or access control."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The txid values used to identify parent transactions are passed from external sources (transaction inputs) and are used directly in the authorization decision process. The connection path is: external txid input -> parent lookup via txid -> validation status assignment."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted, the assignment of validation status to parent transactions would not occur, preventing incorrect authorization decisions based on potentially malicious parent transaction data."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "The code lacks proper input validation for txid values before using them in authorization decisions. The required control is validation of external inputs to ensure they are legitimate and not manipulated.",
+          "required_control": "Input validation of txid values",
+          "control_requirement_evidence": "CWE-863 requires correct authorization checks, which depend on validating that the actor attempting access has proper credentials or permissions. In this case, the txid values must be validated to prevent unauthorized manipulation of parent transaction status.",
+          "existing_controls_checked": [
+            "No explicit validation of txid inputs before use in authorization decisions",
+            "The code relies on recursive validation without checking if parent txids are valid"
+          ],
+          "deficiency_evidence": "The code directly assigns validation status based on external txid values without verifying their legitimacy or preventing manipulation, creating a path for incorrect authorization decisions."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "The impact is that an attacker could potentially manipulate the validation status of parent transactions by providing malicious txid values, leading to incorrect authorization decisions in downstream processing. However, the exact exploitation path and consequences are not fully demonstrated."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would not assign validation status to parent transactions based on recursive validation results. This would prevent incorrect authorization decisions that could arise from manipulating parent transaction data, but would also break the intended DAG validation logic for SLP transactions.",
+      "supporting_evidence": [
+        "The code recursively validates parent transactions and assigns their validity status",
+        "External txid values are used directly in authorization decisions without validation",
+        "The mechanism involves assigning validation status based on potentially manipulated inputs"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the specific manipulation of txid values would actually lead to incorrect authorization decisions",
+        "The exact impact of bypassing this validation on downstream security",
+        "Whether there are additional controls that might prevent exploitation"
+      ],
+      "review_comment": "The code assigns validation status to parent transactions based on external txid inputs without validating these inputs, creating a potential path for incorrect authorization decisions. An attacker could manipulate parent transaction data to influence validation outcomes. Implement input validation of txid values before using them in authorization decisions.",
+      "change_type": "A",
+      "raw_score": 0.6,
+      "score": 0.6
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/localvalidator.ts",
+      "changed_line": 168,
+      "statement": "this.cachedValidations[txid].parents.filter(p => p.txid === parentTxids[i]).map(p => p.valid = valid);",
+      "cwe_id": "CWE-125",
+      "cwe_name": "Out-of-bounds Read",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "The candidate code does not demonstrate out-of-bounds read behavior. It performs array filtering and mapping operations, but there is no evidence of reading past buffer boundaries or accessing invalid memory locations."
+        },
+        "connection": {
+          "score": 0.0,
+          "evidence": "There is no demonstrated connection between externally controlled input and the vulnerable operation. The code operates on cached validation data and parent transaction IDs that are derived internally, not from external input."
+        },
+        "diff_causality": {
+          "score": 0.0,
+          "evidence": "Reverting this line would not materially change the behavior since it's a data assignment operation within an existing loop. The code does not exhibit out-of-bounds read behavior that would be affected by this specific line."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "No relevant security control is missing or weakened in the context of CWE-125. The code does not perform any memory access operations that could lead to out-of-bounds reads.",
+          "required_control": "none established",
+          "control_requirement_evidence": "CWE-125 requires memory safety controls, but this code does not involve direct memory access or buffer manipulation.",
+          "existing_controls_checked": [],
+          "deficiency_evidence": "No deficiency in memory safety controls is demonstrated because the code does not perform operations that could lead to out-of-bounds reads."
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "There is no concrete security consequence demonstrated. The operation does not result in any memory access violation or data corruption that would constitute an out-of-bounds read."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, there would be no change to the overall validation logic since it's a simple assignment within a loop. The code would still iterate through parent transactions and assign validity values without any memory safety issues.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "The statement performs array filtering and mapping operations but does not involve direct memory access or buffer manipulation that could lead to out-of-bounds reads",
+        "The code operates on cached data structures with known bounds, not raw memory buffers",
+        "No evidence of buffer overflows or memory corruption in the validation process"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "The candidate code does not demonstrate out-of-bounds read behavior as required by CWE-125",
+        "No external input is connected to the vulnerable operation",
+        "No memory access violations are present in the demonstrated code"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.0,
+      "score": 0.0
+    }
+  ],
+  "stage4_status": "completed"
+}

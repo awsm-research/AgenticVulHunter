@@ -1,0 +1,211 @@
+diff --git a/lib/cookie.js b/lib/cookie.js
+index a07f315..c8cca0a 100644
+--- a/lib/cookie.js
++++ b/lib/cookie.js
+@@ -38,30 +38,33 @@ var TOKEN = /[\x21\x23-\x26\x2A\x2B\x2D\x2E\x30-\x39\x41-\x5A\x5E-\x7A\x7C\x7E]/
+ // From RFC6265 S4.1.1
+ // note that it excludes \x3B ";"
+ var COOKIE_OCTET  = /[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]/;
+ var COOKIE_OCTETS = /^[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]+$/;
+ 
+ // The name/key cannot be empty but the value can (S5.2):
+ var COOKIE_PAIR_STRICT = new RegExp('^('+TOKEN.source+'+)=("?)('+COOKIE_OCTET.source+'*)\\2');
+ var COOKIE_PAIR = /^([^=\s]+)\s*=\s*("?)\s*(.*)\s*\2/;
+ 
+ // RFC6265 S4.1.1 defines extension-av as 'any CHAR except CTLs or ";"'
+ // Note ';' is \x3B
+ var NON_CTL_SEMICOLON = /[\x20-\x3A\x3C-\x7E]+/;
+ var EXTENSION_AV = NON_CTL_SEMICOLON;
+ var PATH_VALUE = NON_CTL_SEMICOLON;
+ 
++// Used for checking whether or not there is a trailing semi-colon
++var TRAILING_SEMICOLON = /;+$/;
++
+ /* RFC6265 S5.1.1.5:
+  * [fail if] the day-of-month-value is less than 1 or greater than 31
+  */
+ var DAY_OF_MONTH = /^(0?[1-9]|[12][0-9]|3[01])$/;
+ 
+ /* RFC6265 S5.1.1.5:
+  * [fail if]
+  * *  the hour-value is greater than 23,
+  * *  the minute-value is greater than 59, or
+  * *  the second-value is greater than 59.
+  */
+ var TIME = /(0?[0-9]|1[0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])/;
+ var STRICT_TIME = /^(0?[0-9]|1[0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])$/;
+ 
+ var MONTH = /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/i;
+@@ -287,34 +290,35 @@ function pathMatch(reqPath,cookiePath) {
+ 
+     // " o  The cookie-path is a prefix of the request-path, and the first
+     // character of the request-path that is not included in the cookie- path
+     // is a %x2F ("/") character."
+     if (reqPath.substr(cookiePath.length,1) === "/")
+       return true;
+   }
+ 
+   return false;
+ }
+ 
+ function parse(str, strict) {
+   str = str.trim();
+   
+   // S4.1.1 Trailing semi-colons are not part of the specification.
+-  // If we are not in strict mode we remove the trailing semi-colon.
+-  if (str.charAt(str.length - 1) === ';') {
++  // If we are not in strict mode we remove the trailing semi-colons.
++  var semiColonCheck = TRAILING_SEMICOLON.exec(str);
++  if (semiColonCheck) {
+     if (strict) return;
+-    str = str.slice(0, str.length-1); 
++    str = str.slice(0, semiColonCheck.index);
+   }
+ 
+   // We use a regex to parse the "name-value-pair" part of S5.2
+   var firstSemi = str.indexOf(';'); // S5.2 step 1
+   var pairRx = strict ? COOKIE_PAIR_STRICT : COOKIE_PAIR;
+   var result = pairRx.exec(firstSemi === -1 ? str : str.substr(0,firstSemi));
+ 
+   // Rx satisfies the "the name string is empty" and "lacks a %x3D ("=")"
+   // constraints as well as trimming any whitespace.
+   if (!result) return;
+ 
+   var c = new Cookie();
+   c.key = result[1]; // the regexp should trim() already
+   c.value = result[3]; // [2] is quotes or empty-string
+ 
+diff --git a/test.js b/test.js
+index ff716d4..1fe0a18 100644
+--- a/test.js
++++ b/test.js
+@@ -384,36 +384,47 @@ vows.describe('Cookie Jar').addBatch({
+       "strict": function() { assert.ok(!Cookie.parse("a=b; path=", true)) },
+       "non-strict": function() {
+         var c = Cookie.parse("a=b; path=");
+         assert.ok(c);
+         assert.equal(c.path, null);
+       },
+     },
+     "no-slash path": {
+       "strict": function() { assert.ok(!Cookie.parse("a=b; path=xyzzy", true)) },
+       "non-strict": function() {
+         var c = Cookie.parse("a=b; path=xyzzy");
+         assert.ok(c);
+         assert.equal(c.path, null);
+       },
+     },
+-    "trailing comma after path": {
+-      "strict": function () { assert.ok(!Cookie.parse("a=b; path=/;", true)); },
+-      "non-strict": function () { 
+-        var c = Cookie.parse("a=b; path=/;");
+-        assert.ok(c);
+-        assert.equal(c.path, '/');
++    "trailing semi-colons after path": {
++      topic: function () {
++        return [
++          "a=b; path=/;",
++          "c=d;;;;"
++        ];
++      },
++      "strict": function (t) { 
++        assert.ok(!Cookie.parse(t[0], true)); 
++        assert.ok(!Cookie.parse(t[1], true));
++      },
++      "non-strict": function (t) { 
++        var c1 = Cookie.parse(t[0]);
++        var c2 = Cookie.parse(t[1]);
++        assert.ok(c1);
++        assert.ok(c2);
++        assert.equal(c1.path, '/');
+       }
+     },
+     "secure-with-value": {
+       "strict": function() { assert.ok(!Cookie.parse("a=b; Secure=xyzzy", true)) },
+       "non-strict": function() {
+         var c = Cookie.parse("a=b; Secure=xyzzy");
+         assert.ok(c);
+         assert.equal(c.secure, true);
+       },
+     },
+     "httponly-with-value": {
+       "strict": function() { assert.ok(!Cookie.parse("a=b; HttpOnly=xyzzy", true)) },
+       "non-strict": function() {
+         var c = Cookie.parse("a=b; HttpOnly=xyzzy");
+         assert.ok(c);
+@@ -1089,44 +1100,66 @@ vows.describe('Cookie Jar').addBatch({
+         var cb = this.callback;
+         setTimeout(function() {
+           t.cj.getCookies('http://www.example.com', {http:true, expire:false}, function(err,cookies) {
+             t.cookies = cookies;
+             cb(err,t);
+           });
+         },2000);
+       },
+       "got the cookie": function(t) {
+         assert.lengthOf(t.cookies, 1);
+         assert.equal(t.cookies[0].key, 'near');
+       },
+     }
+   }
+ }).addBatch({
+-  "trailing comma in path set into cj": {
++  "trailing semi-colon set into cj": {
+     topic: function () {
+       var cb = this.callback;
+       var cj = new CookieJar();
+-      cj.setCookie('broken_path=testme; path=/;','http://www.example.com',at(-1), function(err,cookie) {
+-        cb(err, {cj:cj, cookie:cookie});
++      var ex = 'http://www.example.com';
++      tasks = []
++      tasks.push(function(next) {
++        cj.setCookie('broken_path=testme; path=/;',ex,at(-1),next);
+       });
++      tasks.push(function(next) {
++        cj.setCookie('b=2; Path=/;;;;',ex,at(-1),next);
++      });
++      async.parallel(tasks, function (err, cookies) {
++        cb(null, {
++          cj: cj,
++          cookies: cookies
++        });
++      });
++    },
++    "check number of cookies": function (t) {
++      assert.lengthOf(t.cookies, 2, "didn't set");
++    },
++    "check *broken_path* was set properly": function (t) {
++      assert.equal(t.cookies[0].key, "broken_path");
++      assert.equal(t.cookies[0].value, "testme");
++      assert.equal(t.cookies[0].path, "/");
+     },
+-    "set the cookie": function (t) {
+-      assert.ok(t.cookie, "didn't set");
+-      assert.equal(t.cookie.key, "broken_path");
+-      assert.equal(t.cookie.value, 'testme');
++    "check *b* was set properly": function (t) {
++      assert.equal(t.cookies[1].key, "b");
++      assert.equal(t.cookies[1].value, "2");
++      assert.equal(t.cookies[1].path, "/");
+     },
+     "retrieve the cookie": {
+       topic: function (t) {
+         var cb = this.callback;
+         t.cj.getCookies('http://www.example.com', {}, function (err, cookies) {
+           t.cookies = cookies;
+           cb(err, t);
+         });
+       },
+-      "got the cookie": function(t) {
+-        assert.lengthOf(t.cookies, 1);
++      "get the cookie": function(t) {
++        assert.lengthOf(t.cookies, 2);
+         assert.equal(t.cookies[0].key, 'broken_path');
+         assert.equal(t.cookies[0].value, 'testme');
++        assert.equal(t.cookies[1].key, "b");
++        assert.equal(t.cookies[1].value, "2");
++        assert.equal(t.cookies[1].path, "/");
+       },    
+     },
+   }
+ }).export(module);

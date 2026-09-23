@@ -1,0 +1,273 @@
+diff --git a/example/settings.py b/example/settings.py
+index 9f8a577..c516411 100644
+--- a/example/settings.py
++++ b/example/settings.py
+@@ -14,41 +14,43 @@ DATABASES = {
+ }
+ 
+ STATIC_URL = '/static/'
+ 
+ SECRET_KEY = 'DO NOT USE THIS KEY!'
+ 
+ MIDDLEWARE_CLASSES = (
+     'example.middleware.SetRemoteAddrFromForwardedFor',
+     'user_sessions.middleware.SessionMiddleware',
+     'django.middleware.common.CommonMiddleware',
+     'django.middleware.csrf.CsrfViewMiddleware',
+     'django.middleware.locale.LocaleMiddleware',
+     'django.contrib.auth.middleware.AuthenticationMiddleware',
+     'django.contrib.messages.middleware.MessageMiddleware',
+     'django.middleware.clickjacking.XFrameOptionsMiddleware',
++    'debug_toolbar.middleware.DebugToolbarMiddleware',
+ )
+ 
+ ROOT_URLCONF = 'example.urls'
+ 
+ TEMPLATE_DIRS = (
+     os.path.join(PROJECT_PATH, 'templates'),
+ )
+ 
+ INSTALLED_APPS = (
+     'django.contrib.admin',
+     'django.contrib.auth',
+     'django.contrib.contenttypes',
+     # 'django.contrib.sessions',
+     'django.contrib.messages',
+     'django.contrib.staticfiles',
+     'user_sessions',
++    'debug_toolbar',
+ )
+ 
+ 
+ # Custom configuration
+ 
+ SESSION_ENGINE = 'user_sessions.backends.db'
+ 
+ GEOIP_PATH = os.path.join(PROJECT_PATH, 'GeoLiteCity.dat')
+ 
+ LOGIN_URL = '/admin/'
+diff --git a/requirements_dev.txt b/requirements_dev.txt
+index 65d4c50..0c78ac0 100644
+--- a/requirements_dev.txt
++++ b/requirements_dev.txt
+@@ -1,23 +1,27 @@
+ # The app itself
+ 
+ -e .
+ 
+ # Runtime dependencies
+ 
+ Django
+ 
++# Example app
++
++django-debug-toolbar
++
+ # Testing
+ 
+ coverage
+ flake8
+ tox
+ 
+ # Transifex
+ 
+ transifex-client
+ 
+ # Documentation
+ 
+ Sphinx
+ sphinx_rtd_theme
+ 
+diff --git a/tests/tests.py b/tests/tests.py
+index 5f90e91..cf8ed22 100644
+--- a/tests/tests.py
++++ b/tests/tests.py
+@@ -67,44 +67,51 @@ class MiddlewareTest(TestCase):
+         self.assertRedirects(response, '/admin/')
+         session = Session.objects.get(
+             pk=self.client.cookies[settings.SESSION_COOKIE_NAME].value
+         )
+         self.assertEqual(user, session.user)
+ 
+     def test_long_ua(self):
+         self.client.get('/modify_session/',
+                         HTTP_USER_AGENT=''.join('a' for _ in range(400)))
+ 
+ 
+ class ViewsTest(TestCase):
+     client_class = Client
+ 
+     def setUp(self):
+-        User.objects.create_user('bouke', '', 'secret')
++        self.user = User.objects.create_user('bouke', '', 'secret')
+         assert self.client.login(username='bouke', password='secret')
+ 
+     def test_list(self):
+         response = self.client.get(reverse('user_sessions:session_list'))
+         self.assertContains(response, 'Active Sessions')
+         self.assertContains(response, 'End Session', 2)
+ 
+     def test_delete(self):
+         session_key = self.client.cookies[settings.SESSION_COOKIE_NAME].value
+         response = self.client.post(reverse('user_sessions:session_delete',
+                                             args=[session_key]))
+         self.assertRedirects(response, reverse('user_sessions:session_list'))
+ 
++    def test_delete_other(self):
++        self.user.session_set.create(ip='127.0.0.1', expire_date=datetime.now() + timedelta(days=1))
++        self.assertEqual(self.user.session_set.count(), 2)
++        response = self.client.post(reverse('user_sessions:session_delete_other'))
++        self.assertRedirects(response, reverse('user_sessions:session_list'))
++        self.assertEqual(self.user.session_set.count(), 1)
++
+ 
+ class AdminTest(TestCase):
+     client_class = Client
+ 
+     def setUp(self):
+         User.objects.create_superuser('bouke', '', 'secret')
+         assert self.client.login(username='bouke', password='secret')
+ 
+         expired = SessionStore('Python/2.5', '20.13.1.1')
+         expired.set_expiry(-365 * 86400)
+         expired.save()
+         unexpired = SessionStore('Python/2.7', '1.1.1.1')
+         unexpired.save()
+ 
+         self.admin_url = reverse('admin:user_sessions_session_changelist')
+diff --git a/user_sessions/templates/user_sessions/session_list.html b/user_sessions/templates/user_sessions/session_list.html
+index 7c0dce0..bcf13f0 100644
+--- a/user_sessions/templates/user_sessions/session_list.html
++++ b/user_sessions/templates/user_sessions/session_list.html
+@@ -15,22 +15,35 @@
+     </thead>
+     {% for object in object_list %}
+       <tr {% if object.session_key == session_key %}class="active"{% endif %}>
+         <td>{{ object.ip|location }} <small>({{ object.ip }})</small></td>
+         <td>{{ object.user_agent|device }}</td>
+         <td>
+           {% if object.session_key == session_key %}
+             {% blocktrans with time=object.last_activity|timesince %}{{ time }} ago (this session){% endblocktrans %}
+           {% else %}
+             {% blocktrans with time=object.last_activity|timesince %}{{ time }} ago{% endblocktrans %}
+           {% endif %}
+         </td>
+         <td>
+           <form method="post" action="{% url 'user_sessions:session_delete' object.pk %}">
+             {% csrf_token %}
+-            <button type="submit" class="btn btn-xs btn-danger">{% trans "End Session" %}</button>
++            {% if object.session_key == session_key %}
++              <button type="submit" class="btn btn-xs btn-link">{% trans "End Session" %}</button>
++            {% else %}
++              <button type="submit" class="btn btn-xs btn-warning">{% trans "End Session" %}</button>
++            {% endif %}
+           </form>
+         </td>
+       </tr>
+     {% endfor %}
+   </table>
++
++  {% if object_list.count > 1 %}
++    <form method="post" action="{% url 'user_sessions:session_delete_other' %}">
++      {% csrf_token %}
++      <p>{% blocktrans %}You can also end all other sessions but the current.
++        This will log you out on all other devices.{% endblocktrans %}</p>
++      <button type="submit" class="btn btn-default btn-warning">{% trans "End All Other Sessions" %}</button>
++    </form>
++  {% endif %}
+ {% endblock %}
+diff --git a/user_sessions/urls.py b/user_sessions/urls.py
+index 7e5034f..c125a3b 100644
+--- a/user_sessions/urls.py
++++ b/user_sessions/urls.py
+@@ -1,19 +1,25 @@
+ from django.conf.urls import patterns, url
++from user_sessions.views import SessionDeleteOtherView
+ 
+ from .views import SessionListView, SessionDeleteView
+ 
+ 
+ urlpatterns = patterns(
+     '',
+ 
+     url(
+         regex=r'^account/sessions/$',
+         view=SessionListView.as_view(),
+         name='session_list',
+     ),
++    url(
++        regex=r'^account/sessions/other/delete/$',
++        view=SessionDeleteOtherView.as_view(),
++        name='session_delete_other',
++    ),
+     url(
+         regex=r'^account/sessions/(?P<pk>\w+)/delete/$',
+         view=SessionDeleteView.as_view(),
+         name='session_delete',
+     ),
+ )
+diff --git a/user_sessions/views.py b/user_sessions/views.py
+index ef63c85..38c309a 100644
+--- a/user_sessions/views.py
++++ b/user_sessions/views.py
+@@ -1,20 +1,21 @@
+ from django.contrib.auth.decorators import login_required
+ from django.core.urlresolvers import reverse_lazy
+ from django.utils.decorators import method_decorator
+ from django.utils.timezone import now
+-from django.views.generic import ListView, DeleteView
++from django.views.generic import ListView, DeleteView, View
++from django.views.generic.edit import DeletionMixin
+ 
+ 
+ class SessionMixin(object):
+     def get_queryset(self):
+         return self.request.user.session_set\
+             .filter(expire_date__gt=now()).order_by('-last_activity')
+ 
+ 
+ class LoginRequiredMixin(object):
+     @method_decorator(login_required)
+     def dispatch(self, request, *args, **kwargs):
+         return super(LoginRequiredMixin, self).dispatch(request, *args,
+                                                         **kwargs)
+ 
+ 
+@@ -23,20 +24,36 @@ class SessionListView(LoginRequiredMixin, SessionMixin, ListView):
+     View for listing a user's own sessions.
+ 
+     This view shows list of a user's currently active sessions. You can
+     override the template by providing your own template at
+     `user_sessions/session_list.html`.
+     """
+     def get_context_data(self, **kwargs):
+         kwargs['session_key'] = self.request.session.session_key
+         return super(SessionListView, self).get_context_data(**kwargs)
+ 
+ 
+ class SessionDeleteView(LoginRequiredMixin, SessionMixin, DeleteView):
+     """
+     View for deleting a user's own session.
+ 
+-    This view allows a user to delete an active session. For example locking
++    This view allows a user to delete an active session. For example log
+     out a session from a computer at the local library or a friend's place.
+     """
+     def get_success_url(self):
+         return str(reverse_lazy('user_sessions:session_list'))
++
++
++class SessionDeleteOtherView(LoginRequiredMixin, SessionMixin, DeletionMixin, View):
++    """
++    View for deleting all user's sessions but the current.
++
++    This view allows a user to delete all other active session. For example
++    log out all sessions from a computer at the local library or a friend's
++    place.
++    """
++    def get_object(self):
++        return super(SessionDeleteOtherView, self).get_queryset().\
++            exclude(session_key=self.request.session.session_key)
++
++    def get_success_url(self):
++        return str(reverse_lazy('user_sessions:session_list'))

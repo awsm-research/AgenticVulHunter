@@ -1,0 +1,263 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-9",
+      "filepath": "pcsd/pcs.rb",
+      "changed_line": 414,
+      "statement": "if watchdog and not watchdog.strip.empty?",
+      "change_type": "A",
+      "function_name": "add_node",
+      "operation_type": "input_validation",
+      "selection_reason": "watchdog parameter from caller -> conditionally appended to command -> may allow injection if not properly sanitized",
+      "security_relevance_score": 0.5,
+      "code_context": "265: end\n266: \n267: def send_cluster_request_with_token(auth_user, cluster_name, request, post=false, data={}, remote=true, raw_data=nil)\n268:   $logger.info(\"SCRWT: \" + request)\n269:   nodes = get_cluster_nodes(cluster_name)\n270:   return send_nodes_request_with_token(\n271:     auth_user, nodes, request, post, data, remote, raw_data\n272:   )\n273: end\n274: \n275: def send_nodes_request_with_token(auth_user, nodes, request, post=false, data={}, remote=true, raw_data=nil)\n276:   out = \"\"\n277:   code = 0\n278:   $logger.info(\"SNRWT: \" + request)\n279: \n280:   # If we're removing nodes, we don't send this to one of the nodes we're\n281:   # removing, unless we're removing all nodes\n282:   if request == \"/remove_nodes\"\n283:     new_nodes = nodes.dup\n284:     data.each {|k,v|\n285:       if new_nodes.include? v\n286:         new_nodes.delete v\n287:       end\n288:     }\n289:     if new_nodes.length > 0\n290:       nodes = new_nodes\n291:     end\n292:   end\n293: \n294:   for node in nodes\n295:     $logger.info \"SNRWT Node: #{node} Request: #{request}\"\n296:     code, out = send_request_with_token(\n297:       auth_user, node, request, post, data, remote, raw_data\n298:     )\n299:     # try next node if:\n300:     # - current node does not support the request (old version of pcsd?) (404)\n301:     # - an exception or other error occurred (5xx)\n302:     # - we don't have a token for the node (401, notoken)\n303:     # - we didn't get a response form the node (e.g. an exception occurred)\n304:     # - pacemaker is not running on the node\n305:     # do not try next node if\n306:     # - node returned 400 - it means the request cannot be processed because of\n307:     #   invalid arguments or another known issue, no node would be able to\n308:     #   process the request (e.g. removing a non-existing resource)\n309:     # - node returned 403 - permission denied, no node should allow to process\n310:     #   the request\n311:     log = \"SNRWT Node #{node} Request #{request}\"\n312:     if (404 == code) or (code >= 500 and code <= 599)\n313:       $logger.info(\"#{log}: HTTP code #{code}\")\n314:       next\n315:     end\n316:     if (401 == code) or ('{\"notoken\":true}' == out)\n317:       $logger.info(\"#{log}: Bad or missing token\")\n318:       next\n319:     end\n320:     if '{\"pacemaker_not_running\":true}' == out\n321:       $logger.info(\"#{log}: Pacemaker not running\")\n322:       next\n323:     end\n324:     if '{\"noresponse\":true}' == out\n325:       $logger.info(\"#{log}: No response\")\n326:       next\n327:     end\n328:     $logger.info(\"#{log}: HTTP code #{code}\")\n329:     break\n330:   end\n331:   return code, out\n332: end\n333: \n334: def send_request_with_token(auth_user, node, request, post=false, data={}, remote=true, raw_data=nil, timeout=30, additional_tokens={})\n335:   token = additional_tokens[node] || get_node_token(node)\n336:   $logger.info \"SRWT Node: #{node} Request: #{request}\"\n337:   if not token\n338:     $logger.error \"Unable to connect to node #{node}, no token available\"\n339:     return 400,'{\"notoken\":true}'\n340:   end\n341:   cookies_data = {\n342:     'token' => token,\n343:   }\n344:   return send_request(\n345:     auth_user, node, request, post, data, remote, raw_data, timeout, cookies_data\n346:   )\n347: end\n348: \n349: def send_request(auth_user, node, request, post=false, data={}, remote=true, raw_data=nil, timeout=30, cookies_data=nil)\n350:   cookies_data = {} if not cookies_data\n351:   begin\n352:     request = \"/#{request}\" if not request.start_with?(\"/\")\n353: \n354:     # fix ipv6 address for URI.parse\n355:     node6 = node\n356:     if (node.include?(\":\") and ! node.start_with?(\"[\"))\n357:       node6 = \"[#{node}]\"\n358:     end\n359: \n360:     if remote\n361:       uri = URI.parse(\"https://#{node6}:2224/remote\" + request)\n362:     else\n363:       uri = URI.parse(\"https://#{node6}:2224\" + request)\n364:     end\n365: \n366:     if post\n367:       req = Net::HTTP::Post.new(uri.path)\n368:       raw_data ? req.body = raw_data : req.set_form_data(data)\n369:     else\n370:       req = Net::HTTP::Get.new(uri.path)\n371:       req.set_form_data(data)\n372:     end\n373: \n374:     cookies_to_send = []\n375:     cookies_data_default = {}\n376:     # Let's be safe about characters in cookie variables and do base64.\n377:     # We cannot do it for CIB_user however to be backward compatible\n378:     # so we at least remove disallowed characters.\n379:     cookies_data_default['CIB_user'] = PCSAuth.cookieUserSafe(\n380:       auth_user[:username].to_s\n381:     )\n382:     cookies_data_default['CIB_user_groups'] = PCSAuth.cookieUserEncode(\n383:       (auth_user[:usergroups] || []).join(' ')\n384:     )\n385: \n386:     cookies_data_default.update(cookies_data)\n387:     cookies_data_default.each { |name, value|\n388:       cookies_to_send << CGI::Cookie.new('name' => name, 'value' => value).to_s\n389:     }\n390:     req.add_field('Cookie', cookies_to_send.join(';'))\n391: \n392:     # uri.host returns \"[addr]\" for ipv6 addresses, which is wrong\n393:     # uri.hostname returns \"addr\" for ipv6 addresses, which is correct, but it\n394:     #   is not available in older ruby versions\n395:     # There is a bug in Net::HTTP.new in some versions of ruby which prevents\n396:     # ipv6 addresses being used here at all.\n397:     myhttp = Net::HTTP.new(node, uri.port)\n398:     myhttp.use_ssl = true\n399:     myhttp.verify_mode = OpenSSL::SSL::VERIFY_NONE\n400:     res = myhttp.start do |http|\n401:       http.read_timeout = timeout\n402:       http.request(req)\n403:     end\n404:     return res.code.to_i, res.body\n405:   rescue Exception => e\n406:     $logger.info \"No response from: #{node} request: #{request}, exception: #{e}\"\n407:     return 400,'{\"noresponse\":true}'\n408:   end\n409: end\n410: \n411: def add_node(auth_user, new_nodename, all=false, auto_start=true, watchdog=nil)\n412:   if all\n413:     command = [PCS, \"cluster\", \"node\", \"add\", new_nodename]\n414:     if watchdog and not watchdog.strip.empty?\n415:       command << \"--watchdog=#{watchdog.strip}\"\n416:     end\n417:     if auto_start\n418:       command << '--start'\n419:       command << '--enable'\n420:     end\n421:     out, stderror, retval = run_cmd(auth_user, *command)\n422:   else\n423:     out, stderror, retval = run_cmd(\n424:       auth_user, PCS, \"cluster\", \"localnode\", \"add\", new_nodename\n425:     )\n426:   end\n427:   $logger.info(\"Adding #{new_nodename} to pcs_settings.conf\")\n428:   corosync_nodes = get_corosync_nodes()\n429:   pcs_config = PCSConfig.new(Cfgsync::PcsdSettings.from_file().text())\n430:   pcs_config.update_cluster($cluster_name, corosync_nodes)\n431:   sync_config = Cfgsync::PcsdSettings.from_text(pcs_config.text())\n432:   # on version conflict just go on, config will be corrected eventually\n433:   # by displaying the cluster in the web UI\n434:   Cfgsync::save_sync_new_version(\n435:     sync_config, corosync_nodes, $cluster_name, true\n436:   )\n437:   return retval, out.join(\"\\n\") + stderror.join(\"\\n\")\n438: end\n439: \n440: def remove_node(auth_user, new_nodename, all=false)\n441:   if all\n442:     # we check for a quorum loss warning in remote_remove_nodes\n443:     out, stderror, retval = run_cmd(\n444:       auth_user, PCS, \"cluster\", \"node\", \"remove\", new_nodename, \"--force\"\n445:     )\n446:   else\n447:     out, stderror, retval = run_cmd(\n448:       auth_user, PCS, \"cluster\", \"localnode\", \"remove\", new_nodename\n449:     )\n450:   end\n451:   $logger.info(\"Removing #{new_nodename} from pcs_settings.conf\")\n452:   corosync_nodes = get_corosync_nodes()\n453:   pcs_config = PCSConfig.new(Cfgsync::PcsdSettings.from_file().text())\n454:   pcs_config.update_cluster($cluster_name, corosync_nodes)\n455:   sync_config = Cfgsync::PcsdSettings.from_text(pcs_config.text())\n456:   # on version conflict just go on, config will be corrected eventually\n457:   # by displaying the cluster in the web UI\n458:   Cfgsync::save_sync_new_version(\n459:     sync_config, corosync_nodes, $cluster_name, true\n460:   )\n461:   return retval, out + stderror\n462: end\n463: \n464: def get_current_node_name()\n465:   stdout, stderror, retval = run_cmd(\n466:     PCSAuth.getSuperuserAuth(), CRM_NODE, \"-n\"\n467:   )\n468:   if retval == 0 and stdout.length > 0\n469:     return stdout[0].chomp()\n470:   end\n471:   return \"\"\n472: end\n473: \n474: def get_local_node_id()\n475:   if ISRHEL6\n476:     out, errout, retval = run_cmd(\n477:       PCSAuth.getSuperuserAuth(), COROSYNC_CMAPCTL, \"cluster.cman\"\n478:     )\n479:     if retval != 0\n480:       return \"\"\n481:     end\n482:     match = /cluster\\.nodename=(.*)/.match(out.join(\"\\n\"))\n483:     if not match\n484:       return \"\"\n485:     end\n486:     local_node_name = match[1]\n487:     out, errout, retval = run_cmd(\n488:       PCSAuth.getSuperuserAuth(),\n489:       CMAN_TOOL, \"nodes\", \"-F\", \"id\", \"-n\", local_node_name\n490:     )\n491:     if retval != 0\n492:       return \"\"\n493:     end\n494:     return out[0].strip()\n495:   end\n496:   out, errout, retval = run_cmd(\n497:     PCSAuth.getSuperuserAuth(),\n498:     COROSYNC_CMAPCTL, \"-g\", \"runtime.votequorum.this_node_id\"\n499:   )\n500:   if retval != 0\n501:     return \"\"\n502:   else\n503:     return out[0].split(/ = /)[1].strip()\n504:   end\n505: end\n506: \n507: def get_corosync_conf()\n508:   return Cfgsync::cluster_cfg_class.from_file().text()\n509: end\n510: \n511: def get_corosync_nodes()\n512:   stdout, stderror, retval = run_cmd(\n513:     PCSAuth.getSuperuserAuth(), PCS, \"status\", \"nodes\", \"corosync\"\n514:   )\n515:   if retval != 0\n516:     return []\n517:   end\n518: \n519:   stdout.each {|x| x.strip!}\n520:   corosync_online = stdout[1].sub(/^.*Online:/,\"\").strip\n521:   corosync_offline = stdout[2].sub(/^.*Offline:/,\"\").strip\n522:   corosync_nodes = (corosync_online.split(/ /)) + (corosync_offline.split(/ /))\n523: \n524:   return corosync_nodes\n525: end\n526: \n527: def get_nodes()\n528:   nodes = get_nodes_status()\n529:   return [\n530:     (nodes[\"corosync_online\"] + nodes[\"pacemaker_online\"]).uniq,\n531:     (nodes[\"corosync_offline\"] + nodes[\"pacemaker_offline\"] + nodes[\"pacemaker_standby\"]).uniq\n532:   ]\n533: end\n534: \n535: def get_nodes_status()\n536:   corosync_online = []\n537:   corosync_offline = []\n538:   pacemaker_online = []\n539:   pacemaker_offline = []\n540:   pacemaker_standby = []\n541:   in_pacemaker = false\n542:   stdout, stderr, retval = run_cmd(\n543:     PCSAuth.getSuperuserAuth(), PCS, \"status\", \"nodes\", \"both\"\n544:   )\n545:   stdout.each {|l|\n546:     l = l.chomp\n547:     if l.start_with?(\"Pacemaker Nodes:\")\n548:       in_pacemaker = true\n549:     end\n550:     if l.start_with?(\"Pacemaker Remote Nodes:\")\n551:       break\n552:     end\n553:     if l.end_with?(\":\")\n554:       next\n555:     end\n556: \n557:     title,nodes = l.split(/: /,2)\n558:     if nodes == nil\n559:       next\n560:     end\n561: \n562:     if title == \" Online\"\n563:       in_pacemaker ? pacemaker_online.concat(nodes.split(/ /)) : corosync_online.concat(nodes.split(/ /))",
+      "source_summary": "watchdog parameter comes from HTTP request params[:watchdog] via remote_add_node function",
+      "sink_summary": "watchdog value is interpolated into shell command as --watchdog=#{watchdog.strip} and executed via run_cmd",
+      "guard_summary": "Basic validation: checks if watchdog exists and is not empty/whitespace-only. No sanitization against command injection.",
+      "risk_pattern": "User-controlled watchdog parameter is directly interpolated into shell command without proper sanitization, allowing potential command injection",
+      "used_variable_sources": [
+        "params[:watchdog]"
+      ],
+      "called_function_context": [
+        "run_cmd(auth_user, *command)"
+      ],
+      "enclosing_conditions": [
+        "if all",
+        "if watchdog and not watchdog.strip.empty?"
+      ],
+      "context_summary": "The watchdog parameter is conditionally appended to a cluster node add command. When 'all' is true, the command includes user-provided watchdog value directly in the argument string.",
+      "unresolved_facts": [
+        "Exact implementation of run_cmd function to confirm shell execution method",
+        "Whether PCS command properly handles special characters in watchdog parameter"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "User-controlled watchdog parameter from HTTP request is directly interpolated into shell command argument without proper sanitization, allowing command injection",
+        "source": "HTTP request parameter params[:watchdog]",
+        "sensitive_operation": "shell command execution via run_cmd",
+        "missing_control": "proper neutralization of special shell characters",
+        "impact": "arbitrary command execution",
+        "mechanism_keywords": [
+          "command injection",
+          "shell command",
+          "parameter interpolation",
+          "special characters"
+        ]
+      },
+      "language": "ruby",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-77-improper-neutralization-of-special-elements-used-in-a-command-command-injection",
+          "cwe_id": "CWE-77",
+          "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 23.8024,
+          "raw_bm25_score": 23.8024,
+          "description": "Externally influenced data changes the syntax or meaning of a command sent to a downstream command interpreter.",
+          "pattern": "cwe-77 command-injection command-construction shell exec spawn process subprocess child_process os.system popen argument-delimiter metacharacter",
+          "remediation": "Keep external data separate from command syntax and use safe argument APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-077"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 15.6922,
+          "raw_bm25_score": 15.6922,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 10.8225,
+          "raw_bm25_score": 10.8225,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "fallback/cwe-697-incorrect-comparison",
+          "cwe_id": "CWE-697",
+          "cwe_name": "Incorrect Comparison",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 8.1575,
+          "raw_bm25_score": 8.1575,
+          "description": "A security-relevant comparison checks the wrong, incomplete, or non-canonical value.",
+          "pattern": "cwe-697 incorrect-comparison equality compare comparator mismatch canonicalization hostname url signature token partial-comparison substring",
+          "remediation": "Compare canonical complete values with the intended security predicate.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-697"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "fallback/cwe-284-improper-access-control",
+          "cwe_id": "CWE-284",
+          "cwe_name": "Improper Access Control",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 6.1776,
+          "raw_bm25_score": 6.1776,
+          "description": "An access-control policy is missing or incorrectly enforced for a protected resource.",
+          "pattern": "cwe-284 access-control authorization permission acl role owner ownership privilege protected-resource protected-endpoint allow deny",
+          "remediation": "Require explicit server-side authorization before protected operations.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-284"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "fallback/cwe-311-missing-encryption-of-sensitive-data",
+          "cwe_id": "CWE-311",
+          "cwe_name": "Missing Encryption of Sensitive Data",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.5305,
+          "raw_bm25_score": 5.5305,
+          "description": "Sensitive data is stored or transmitted without required encryption.",
+          "pattern": "cwe-311 missing-encryption cleartext plaintext sensitive-data unencrypted storage transmission tls data-at-rest data-in-transit",
+          "remediation": "Encrypt sensitive data in transit and at rest.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-311"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "fallback/cwe-668-exposure-of-resource-to-wrong-sphere",
+          "cwe_id": "CWE-668",
+          "cwe_name": "Exposure of Resource to Wrong Sphere",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.3495,
+          "raw_bm25_score": 5.3495,
+          "description": "A protected resource crosses its intended trust or control boundary and becomes accessible to an unintended actor.",
+          "pattern": "cwe-668 wrong-sphere control-sphere trust-boundary resource-exposure unintended-actor private-resource public-exposure insecure-permission cross-boundary",
+          "remediation": "Keep protected resources inside their intended trust boundary.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-668"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "fallback/cwe-255-credentials-management-errors",
+          "cwe_id": "CWE-255",
+          "cwe_name": "Credentials Management Errors",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 4.8703,
+          "raw_bm25_score": 4.8703,
+          "description": "Legacy category for insecure credential creation, storage, validation, or handling.",
+          "pattern": "cwe-255 credential-management password token secret credential storage rotation validation authentication-secret",
+          "remediation": "Protect credentials throughout storage, validation, transport, and rotation.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-255"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "fallback/cwe-125-out-of-bounds-read",
+          "cwe_id": "CWE-125",
+          "cwe_name": "Out-of-bounds Read",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 4.8245,
+          "raw_bm25_score": 4.8245,
+          "description": "A read accesses memory before or beyond the valid buffer range.",
+          "pattern": "cwe-125 out-of-bounds-read buffer-read memory-read index offset length parser decode malformed-input boundary",
+          "remediation": "Check read offsets, indexes, and lengths before buffer access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-125"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-534-information-exposure-through-debug-log-files",
+          "cwe_id": "CWE-534",
+          "cwe_name": "Information Exposure Through Debug Log Files",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 4.5889,
+          "raw_bm25_score": 4.5889,
+          "description": "Sensitive information is written to debug or diagnostic log files.",
+          "pattern": "cwe-534 debug-log diagnostic-log verbose-log sensitive-log password token credential secret exception stacktrace logging",
+          "remediation": "Redact secrets and disable sensitive diagnostic logging.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-534"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

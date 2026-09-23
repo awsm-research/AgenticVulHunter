@@ -1,0 +1,1132 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "canto_curses/guibase.py",
+    "changed_line": 145,
+    "statement": "os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])",
+    "change_type": "A",
+    "function_name": "_fork",
+    "operation_type": "shell_command_execution",
+    "selection_reason": "path (containing user-controlled href via %u substitution) -> execv with /bin/sh -c -> arbitrary command execution if href is maliciously crafted",
+    "security_relevance_score": 0.95,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: #Canto-curses - ncurses RSS reader\n3: #   Copyright (C) 2010 Jack Miller <jack@codezen.org>\n4: #\n5: #   This program is free software; you can redistribute it and/or modify\n6: #   it under the terms of the GNU General Public License version 2 as \n7: #   published by the Free Software Foundation.\n8: \n9: from canto_next.hooks import call_hook, on_hook\n10: from canto_next.encoding import encoder, decoder\n11: from canto_next.plugins import Plugin\n12: \n13: from command import CommandHandler, command_format\n14: \n15: import logging\n16: \n17: log = logging.getLogger(\"COMMON\")\n18: \n19: import subprocess\n20: import tempfile\n21: import urllib2\n22: import shlex\n23: import sys\n24: import os\n25: \n26: class BasePlugin(Plugin):\n27:     pass\n28: \n29: class GuiBase(CommandHandler):\n30:     def __init__(self):\n31:         CommandHandler.__init__(self)\n32: \n33:         self.plugin_class = BasePlugin\n34:         self.update_plugin_lookups()\n35: \n36:         self.editor = None\n37: \n38:     def input(self, prompt):\n39:         return self.callbacks[\"input\"](prompt)\n40: \n41:     def int(self, args):\n42:         t, r = self._int(args, None, None, lambda : self.input(\"int: \"))\n43:         if t:\n44:             return (True, t, r)\n45:         return (False, None, None)\n46: \n47:     @command_format([])\n48:     def cmd_destroy(self, **kwargs):\n49:         self.callbacks[\"die\"](self)\n50: \n51:     def die(self):\n52:         pass\n53: \n54:     def _cfg_set_prompt(self, option, prompt):\n55:         t = self.callbacks[\"get_opt\"](option)\n56:         self.callbacks[\"set_opt\"](option, True)\n57: \n58:         # It's assumed that if we're wrapping a prompt in this\n59:         # change, that we want to update the pad.\n60: \n61:         if not t:\n62:             self.redraw()\n63: \n64:         r = self.input(prompt)\n65: \n66:         self.callbacks[\"set_opt\"](option, t)\n67:         return r\n68: \n69:     def _tag_cfg_set_prompt(self, tag, option, prompt):\n70:         t = self.callbacks[\"get_tag_opt\"](tag, option)\n71:         self.callbacks[\"set_tag_opt\"](tag, option, True)\n72: \n73:         # Same as above, if we're wrapping a prompt, we want\n74:         # to update the screen.\n75: \n76:         if not t:\n77:             self.redraw()\n78: \n79:         r = self.input(prompt)\n80: \n81:         self.callbacks[\"set_tag_opt\"](tag, option, t)\n82:         return r\n83: \n84:     def _fork(self, path, href, text, fetch=False):\n85: \n86:         # Prepare temporary files, if fetch.\n87: \n88:         if fetch:\n89:             # Get a path (sans query strings, etc.) for the URL\n90:             tmppath = urllib2.urlparse.urlparse(href).path\n91: \n92:             # Return just the basename of the path (no directories)\n93:             fname = os.path.basename(tmppath)\n94: \n95:             # Grab a temporary directory. This allows us to create a file with\n96:             # an unperturbed filename so scripts can freely use regex /\n97:             # extension matching in addition to mimetype detection.\n98: \n99:             tmpdir = tempfile.mkdtemp(prefix=\"canto-\")\n100:             tmpnam = tmpdir + '/' + fname\n101: \n102:             on_hook(\"exit\", lambda : (os.unlink(tmpnam)))\n103:             on_hook(\"exit\", lambda : (os.rmdir(tmpdir)))\n104: \n105:         pid = os.fork()\n106: \n107:         # Parents can now bail.\n108:         if pid:\n109:             return pid\n110: \n111:         if fetch:\n112:             tmp = open(tmpnam, 'w+b')\n113: \n114:             # Grab the HTTP info / prepare to read.\n115:             response = urllib2.urlopen(href)\n116: \n117:             # Grab in kilobyte chunks to avoid wasting memory on something\n118:             # that's going to be immediately written to disk.\n119: \n120:             while True:\n121:                 r = response.read(1024)\n122:                 if not r:\n123:                     break\n124:                 tmp.write(r)\n125: \n126:             response.close()\n127:             tmp.close()\n128: \n129:             href = tmpnam\n130: \n131:         # A lot of programs don't appreciate\n132:         # having their fds closed, so instead\n133:         # we dup them to /dev/null.\n134: \n135:         fd = os.open(\"/dev/null\", os.O_RDWR)\n136:         os.dup2(fd, sys.stderr.fileno())\n137: \n138:         if not text:\n139:             os.setpgid(os.getpid(), os.getpid())\n140:             os.dup2(fd, sys.stdout.fileno())\n141: \n142:         path = path.replace(\"%u\", href)\n143:         path = encoder(path)\n144: \n145:         os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])\n146: \n147:         # Just in case.\n148:         sys.exit(0)\n149: \n150:     def _edit(self, text):\n151:         if not self.editor:\n152:             self.editor = os.getenv(\"EDITOR\")\n153:         if not self.editor:\n154:             self.editor = self.input(\"editor: \")\n155: \n156:         # No editor, or cancelled dialog, no change.\n157:         if not self.editor:\n158:             return text\n159: \n160:         self.callbacks[\"pause_interface\"]()\n161: \n162:         # Setup tempfile to edit.\n163:         fd, path = tempfile.mkstemp(text=True)\n164: \n165:         f = os.fdopen(fd, \"w\")\n166:         f.write(encoder(text))\n167:         f.close()\n168: \n169:         # Invoke editor\n170:         logging.info(\"Invoking editor on %s\" % path)\n171:         pid = self._fork(self.editor + \" %u\", path, True)\n172:         pid, status = os.waitpid(pid, 0)\n173: \n174:         if status == 0:\n175:             f = open(path, \"r\")\n176:             r = f.read()\n177:             f.close()\n178:         else:\n179:             self.callbacks[\"set_var\"](\"error_msg\",\n180:                     \"Editor failed! Status = %d\" % (status,))\n181:             r = text\n182: \n183:         # Cleanup temp file.\n184:         os.unlink(path)\n185: \n186:         self.callbacks[\"unpause_interface\"]()\n187: \n188:         return r\n189: \n190:     # Pass-thru for arbitrary, unquoted strings without prompting.\n191: \n192:     def string_or_not(self, args):\n193:         return (True, args, None)\n194: \n195:     # Pass-thru for arbitrary, unquoted strings.\n196:     def string(self, args, prompt):\n197:         if not args:\n198:             args = prompt()\n199:         return (True, args, None)\n200: \n201:     # Parse a string in shell fashion, returning components.\n202: \n203:     def split_string(self, args, prompt):\n204:         if not args:\n205:             args = prompt()\n206: \n207:         r = [ decoder(s) for s in shlex.split(encoder(args)) ]\n208:         return (True, r, None)\n209: \n210:     def one_opt(self, args):\n211:         t, r = self._first_term(args,\n212:                 lambda : self.input(\"opt: \"))\n213: \n214:         try:\n215:             self.callbacks[\"get_opt\"](t)\n216:         except:\n217:             log.error(\"Unknown option: %s\" % t)\n218:             return (False, None, None)\n219:         return (True, t, None)\n220: \n221:     @command_format([(\"opt\", \"one_opt\")])\n222:     def cmd_edit(self, **kwargs):\n223:         t = self.callbacks[\"get_opt\"](kwargs[\"opt\"])\n224:         r = self._edit(t)\n225:         log.info(\"Edited %s to %s\" % (kwargs[\"opt\"], r))\n226:         self.callbacks[\"set_opt\"](kwargs[\"opt\"], r)\n227: \n228:     def _remote_argv(self, argv):\n229:         loc_args = self.callbacks[\"get_var\"](\"location\")\n230:         argv = [argv[0]] + loc_args + argv[1:]\n231: \n232:         log.debug(\"Calling remote: %s\" % argv)\n233: \n234:         out = decoder(subprocess.check_output(argv))\n235: \n236:         log.debug(\"Output:\")\n237:         log.debug(out)\n238: \n239:         # Strip anything that could be misconstrued as style\n240:         # from remote output.\n241: \n242:         out = out.replace(\"%\",\"\\\\%\")\n243: \n244:         log.info(out)\n245: \n246:     def _remote(self, args):\n247:         args = \"canto-remote \" + args\n248:         args = encoder(args)\n249: \n250:         # Add location args, so the remote is connecting\n251:         # to the correct daemon.\n252: \n253:         self._remote_argv(shlex.split(args))\n254: \n255:     def remote_args(self, args):\n256:         return self.string(args, \"remote: \")\n257: \n258:     @command_format([(\"remote_args\",\"remote_args\")])\n259:     def cmd_remote(self, **kwargs):\n260:         self._remote(kwargs[\"remote_args\"])\n261: \n262:     def _goto(self, urls, fetch=False):\n263:         browser = self.callbacks[\"get_conf\"]()[\"browser\"]\n264: \n265:         if not browser[\"path\"]:\n266:             log.error(\"No browser defined! Cannot goto.\")\n267:             return\n268: \n269:         if browser[\"text\"]:\n270:             self.callbacks[\"pause_interface\"]()\n271: \n272:         for url in urls:\n273:             pid = self._fork(browser[\"path\"], url, browser[\"text\"], fetch)\n274:             if browser[\"text\"]:\n275:                 os.waitpid(pid, 0)\n276: \n277:         if browser[\"text\"]:\n278:             self.callbacks[\"unpause_interface\"]()\n279: \n280:     # Like goto, except download the file to /tmp before executing browser.\n281: \n282:     def _fetch(self, urls):\n283:         self._goto(urls, True)\n284: \n285:     def named_key(self, args):\n286:         return self.input_key(args, lambda : self.callbacks[\"input\"](\"key: \"))",
+    "source_summary": "path parameter comes from either: (1) self.editor + \" %u\" in _edit (editor from environment or user input), or (2) browser[\"path\"] from configuration (default 'firefox %u') in _goto/_fetch",
+    "sink_summary": "Direct shell execution via /bin/sh -c with path variable containing %u substitution replaced by href (URL or temp file path)",
+    "guard_summary": "No validation or sanitization of path before shell execution. %u substitution occurs without escaping, allowing arbitrary command injection if href contains shell metacharacters",
+    "risk_pattern": "Unsanitized user-controlled data (href) substituted into shell command template via %u placeholder, then executed through /bin/sh -c without validation",
+    "used_variable_sources": [
+      "path (function parameter)",
+      "href (function parameter)",
+      "self.editor (environment/user input)",
+      "browser[\"path\"] (configuration)"
+    ],
+    "called_function_context": [
+      "os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])"
+    ],
+    "enclosing_conditions": [
+      "if not text: (line 138) controls stdout redirection but not execution path"
+    ],
+    "context_summary": "In child process after fork, path has %u replaced with href, then executed via shell -c without validation",
+    "unresolved_facts": [
+      "How browser[\"path\"] configuration is set/modified by users",
+      "Whether editor input is validated",
+      "Whether href URLs are validated before substitution"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-77",
+        "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+        "fit_reason": "User-controlled href substituted via %u template into shell command executed via /bin/sh -c without validation or escaping",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-78",
+        "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+        "fit_reason": "OS command injection through shell execution with unsanitized user input in command template",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-88",
+        "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+        "fit_reason": "Argument injection via shell command template where user input can modify command arguments",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-22",
+      "CWE-601",
+      "CWE-643",
+      "CWE-74",
+      "CWE-77",
+      "CWE-770",
+      "CWE-78",
+      "CWE-88",
+      "CWE-943",
+      "CWE-95"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 145,
+        "statement": "os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])",
+        "cwe_id": "CWE-77",
+        "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code constructs a shell command using /bin/sh -c with user-controlled input (path containing %u substitution of href), which is the exact mechanism of CWE-77"
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "path parameter flows from browser configuration or editor input, href parameter contains user-controlled URLs, and both are concatenated into shell command via %u substitution at line 142"
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "This line is newly added (change_type: A) and directly introduces the vulnerable shell execution mechanism that did not exist before"
+          },
+          "security_control": {
+            "score": 0.8,
+            "evidence": "No validation or sanitization of path before shell execution. %u substitution occurs without escaping, allowing arbitrary command injection",
+            "required_control": "Input validation and proper shell argument escaping",
+            "control_requirement_evidence": "CWE-77 requires neutralization of shell metacharacters when constructing shell commands from user input",
+            "existing_controls_checked": [
+              "No input validation observed before substitution",
+              "No shell escaping of href parameter",
+              "Direct execution via /bin/sh -c without parameterization"
+            ],
+            "deficiency_evidence": "User-controlled href is directly substituted into shell command template without validation or escaping"
+          },
+          "concrete_impact": {
+            "score": 0.7,
+            "evidence": "Arbitrary command execution is demonstrated through the shell -c mechanism with user-controlled input"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the shell command execution vulnerability would not exist as the code would lack the mechanism to execute arbitrary shell commands with user input.",
+        "supporting_evidence": [
+          "Line 142: path.replace(\"%u\", href) directly substitutes user-controlled href into command template",
+          "Line 145: os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) executes the constructed command via shell",
+          "path parameter sources include browser configuration and editor input from environment/user"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Specific validation mechanisms for browser configuration input",
+          "Exact user control boundaries for href parameter"
+        ],
+        "review_comment": "The added code constructs shell commands using user-controlled input via %u substitution without validation or escaping. User-provided URLs and configuration values are directly incorporated into shell commands executed via /bin/sh -c, enabling command injection. Replace the shell execution with parameterized subprocess calls that properly escape arguments and avoid shell interpretation.",
+        "change_type": "A",
+        "raw_score": 0.8,
+        "score": 0.8
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 145,
+        "statement": "os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])",
+        "cwe_id": "CWE-88",
+        "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.15,
+            "evidence": "CWE-88 specifically addresses argument delimiters in commands passed to other components, but this code uses shell execution where the entire command string is interpreted by the shell, making it command injection rather than argument injection"
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "path parameter containing %u substitution is directly connected to shell execution. href (user-controlled URL) is substituted into path template at line 142, then passed to /bin/sh -c"
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "This is an added line (change_type: A) that introduces shell command execution. Reverting would remove the vulnerable execution path entirely"
+          },
+          "security_control": {
+            "score": 0.1,
+            "evidence": "",
+            "required_control": "Proper shell argument escaping or avoidance of shell execution",
+            "control_requirement_evidence": "Shell execution requires proper escaping of metacharacters when interpolating user input",
+            "existing_controls_checked": [
+              "No validation or sanitization of path before shell execution observed"
+            ],
+            "deficiency_evidence": "No escaping or validation of user input before shell execution, but this is command injection not argument delimiter injection"
+          },
+          "concrete_impact": {
+            "score": 0.7,
+            "evidence": "Direct shell execution with user-controlled input can lead to arbitrary command execution if href contains shell metacharacters"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the shell command execution would not occur, preventing any potential command injection vulnerability.",
+        "supporting_evidence": [
+          "Line 142: path.replace(\"%u\", href) substitutes user-controlled href into command template",
+          "Line 145: os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) executes the interpolated string via shell"
+        ],
+        "contradicting_evidence": [
+          "CWE-88 specifically addresses argument delimiters when passing commands to other components, but this code executes the command directly via shell interpreter",
+          "The vulnerability pattern matches command injection (CWE-78) more closely than argument injection"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Extent of attacker control over browser[\"path\"] configuration",
+          "Validation of editor input from environment/user",
+          "Whether href URLs are validated before substitution"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.52,
+        "score": 0.52
+      }
+    ],
+    "stage4_status": "degraded",
+    "stage4_errors": [
+      {
+        "candidate_id": "candidate-1",
+        "cwe_id": "CWE-78",
+        "error_type": "RuntimeError",
+        "error": "Stage 4 API judge failed validation after 2 attempts: supported review_comment must describe demonstrated impact, not an impact conditional on unknown downstream behavior",
+        "recovery": "assessment_skipped_with_no_finding"
+      }
+    ]
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "canto_curses/guibase.py",
+    "changed_line": 142,
+    "statement": "path = path.replace(\"%u\", href)",
+    "change_type": "A",
+    "function_name": "_fork",
+    "operation_type": "string_substitution",
+    "selection_reason": "href (user-controlled) -> replace into path string -> constructs shell command with unsanitized input",
+    "security_relevance_score": 0.8,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: #Canto-curses - ncurses RSS reader\n3: #   Copyright (C) 2010 Jack Miller <jack@codezen.org>\n4: #\n5: #   This program is free software; you can redistribute it and/or modify\n6: #   it under the terms of the GNU General Public License version 2 as \n7: #   published by the Free Software Foundation.\n8: \n9: from canto_next.hooks import call_hook, on_hook\n10: from canto_next.encoding import encoder, decoder\n11: from canto_next.plugins import Plugin\n12: \n13: from command import CommandHandler, command_format\n14: \n15: import logging\n16: \n17: log = logging.getLogger(\"COMMON\")\n18: \n19: import subprocess\n20: import tempfile\n21: import urllib2\n22: import shlex\n23: import sys\n24: import os\n25: \n26: class BasePlugin(Plugin):\n27:     pass\n28: \n29: class GuiBase(CommandHandler):\n30:     def __init__(self):\n31:         CommandHandler.__init__(self)\n32: \n33:         self.plugin_class = BasePlugin\n34:         self.update_plugin_lookups()\n35: \n36:         self.editor = None\n37: \n38:     def input(self, prompt):\n39:         return self.callbacks[\"input\"](prompt)\n40: \n41:     def int(self, args):\n42:         t, r = self._int(args, None, None, lambda : self.input(\"int: \"))\n43:         if t:\n44:             return (True, t, r)\n45:         return (False, None, None)\n46: \n47:     @command_format([])\n48:     def cmd_destroy(self, **kwargs):\n49:         self.callbacks[\"die\"](self)\n50: \n51:     def die(self):\n52:         pass\n53: \n54:     def _cfg_set_prompt(self, option, prompt):\n55:         t = self.callbacks[\"get_opt\"](option)\n56:         self.callbacks[\"set_opt\"](option, True)\n57: \n58:         # It's assumed that if we're wrapping a prompt in this\n59:         # change, that we want to update the pad.\n60: \n61:         if not t:\n62:             self.redraw()\n63: \n64:         r = self.input(prompt)\n65: \n66:         self.callbacks[\"set_opt\"](option, t)\n67:         return r\n68: \n69:     def _tag_cfg_set_prompt(self, tag, option, prompt):\n70:         t = self.callbacks[\"get_tag_opt\"](tag, option)\n71:         self.callbacks[\"set_tag_opt\"](tag, option, True)\n72: \n73:         # Same as above, if we're wrapping a prompt, we want\n74:         # to update the screen.\n75: \n76:         if not t:\n77:             self.redraw()\n78: \n79:         r = self.input(prompt)\n80: \n81:         self.callbacks[\"set_tag_opt\"](tag, option, t)\n82:         return r\n83: \n84:     def _fork(self, path, href, text, fetch=False):\n85: \n86:         # Prepare temporary files, if fetch.\n87: \n88:         if fetch:\n89:             # Get a path (sans query strings, etc.) for the URL\n90:             tmppath = urllib2.urlparse.urlparse(href).path\n91: \n92:             # Return just the basename of the path (no directories)\n93:             fname = os.path.basename(tmppath)\n94: \n95:             # Grab a temporary directory. This allows us to create a file with\n96:             # an unperturbed filename so scripts can freely use regex /\n97:             # extension matching in addition to mimetype detection.\n98: \n99:             tmpdir = tempfile.mkdtemp(prefix=\"canto-\")\n100:             tmpnam = tmpdir + '/' + fname\n101: \n102:             on_hook(\"exit\", lambda : (os.unlink(tmpnam)))\n103:             on_hook(\"exit\", lambda : (os.rmdir(tmpdir)))\n104: \n105:         pid = os.fork()\n106: \n107:         # Parents can now bail.\n108:         if pid:\n109:             return pid\n110: \n111:         if fetch:\n112:             tmp = open(tmpnam, 'w+b')\n113: \n114:             # Grab the HTTP info / prepare to read.\n115:             response = urllib2.urlopen(href)\n116: \n117:             # Grab in kilobyte chunks to avoid wasting memory on something\n118:             # that's going to be immediately written to disk.\n119: \n120:             while True:\n121:                 r = response.read(1024)\n122:                 if not r:\n123:                     break\n124:                 tmp.write(r)\n125: \n126:             response.close()\n127:             tmp.close()\n128: \n129:             href = tmpnam\n130: \n131:         # A lot of programs don't appreciate\n132:         # having their fds closed, so instead\n133:         # we dup them to /dev/null.\n134: \n135:         fd = os.open(\"/dev/null\", os.O_RDWR)\n136:         os.dup2(fd, sys.stderr.fileno())\n137: \n138:         if not text:\n139:             os.setpgid(os.getpid(), os.getpid())\n140:             os.dup2(fd, sys.stdout.fileno())\n141: \n142:         path = path.replace(\"%u\", href)\n143:         path = encoder(path)\n144: \n145:         os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])\n146: \n147:         # Just in case.\n148:         sys.exit(0)\n149: \n150:     def _edit(self, text):\n151:         if not self.editor:\n152:             self.editor = os.getenv(\"EDITOR\")\n153:         if not self.editor:\n154:             self.editor = self.input(\"editor: \")\n155: \n156:         # No editor, or cancelled dialog, no change.\n157:         if not self.editor:\n158:             return text\n159: \n160:         self.callbacks[\"pause_interface\"]()\n161: \n162:         # Setup tempfile to edit.\n163:         fd, path = tempfile.mkstemp(text=True)\n164: \n165:         f = os.fdopen(fd, \"w\")\n166:         f.write(encoder(text))\n167:         f.close()\n168: \n169:         # Invoke editor\n170:         logging.info(\"Invoking editor on %s\" % path)\n171:         pid = self._fork(self.editor + \" %u\", path, True)\n172:         pid, status = os.waitpid(pid, 0)\n173: \n174:         if status == 0:\n175:             f = open(path, \"r\")\n176:             r = f.read()\n177:             f.close()\n178:         else:\n179:             self.callbacks[\"set_var\"](\"error_msg\",\n180:                     \"Editor failed! Status = %d\" % (status,))\n181:             r = text\n182: \n183:         # Cleanup temp file.\n184:         os.unlink(path)\n185: \n186:         self.callbacks[\"unpause_interface\"]()\n187: \n188:         return r\n189: \n190:     # Pass-thru for arbitrary, unquoted strings without prompting.\n191: \n192:     def string_or_not(self, args):\n193:         return (True, args, None)\n194: \n195:     # Pass-thru for arbitrary, unquoted strings.\n196:     def string(self, args, prompt):\n197:         if not args:\n198:             args = prompt()\n199:         return (True, args, None)\n200: \n201:     # Parse a string in shell fashion, returning components.\n202: \n203:     def split_string(self, args, prompt):\n204:         if not args:\n205:             args = prompt()\n206: \n207:         r = [ decoder(s) for s in shlex.split(encoder(args)) ]\n208:         return (True, r, None)\n209: \n210:     def one_opt(self, args):\n211:         t, r = self._first_term(args,\n212:                 lambda : self.input(\"opt: \"))\n213: \n214:         try:\n215:             self.callbacks[\"get_opt\"](t)\n216:         except:\n217:             log.error(\"Unknown option: %s\" % t)\n218:             return (False, None, None)\n219:         return (True, t, None)\n220: \n221:     @command_format([(\"opt\", \"one_opt\")])\n222:     def cmd_edit(self, **kwargs):\n223:         t = self.callbacks[\"get_opt\"](kwargs[\"opt\"])\n224:         r = self._edit(t)\n225:         log.info(\"Edited %s to %s\" % (kwargs[\"opt\"], r))\n226:         self.callbacks[\"set_opt\"](kwargs[\"opt\"], r)\n227: \n228:     def _remote_argv(self, argv):\n229:         loc_args = self.callbacks[\"get_var\"](\"location\")\n230:         argv = [argv[0]] + loc_args + argv[1:]\n231: \n232:         log.debug(\"Calling remote: %s\" % argv)\n233: \n234:         out = decoder(subprocess.check_output(argv))\n235: \n236:         log.debug(\"Output:\")\n237:         log.debug(out)\n238: \n239:         # Strip anything that could be misconstrued as style\n240:         # from remote output.\n241: \n242:         out = out.replace(\"%\",\"\\\\%\")\n243: \n244:         log.info(out)\n245: \n246:     def _remote(self, args):\n247:         args = \"canto-remote \" + args\n248:         args = encoder(args)\n249: \n250:         # Add location args, so the remote is connecting\n251:         # to the correct daemon.\n252: \n253:         self._remote_argv(shlex.split(args))\n254: \n255:     def remote_args(self, args):\n256:         return self.string(args, \"remote: \")\n257: \n258:     @command_format([(\"remote_args\",\"remote_args\")])\n259:     def cmd_remote(self, **kwargs):\n260:         self._remote(kwargs[\"remote_args\"])\n261: \n262:     def _goto(self, urls, fetch=False):\n263:         browser = self.callbacks[\"get_conf\"]()[\"browser\"]\n264: \n265:         if not browser[\"path\"]:\n266:             log.error(\"No browser defined! Cannot goto.\")\n267:             return\n268: \n269:         if browser[\"text\"]:\n270:             self.callbacks[\"pause_interface\"]()\n271: \n272:         for url in urls:\n273:             pid = self._fork(browser[\"path\"], url, browser[\"text\"], fetch)\n274:             if browser[\"text\"]:\n275:                 os.waitpid(pid, 0)\n276: \n277:         if browser[\"text\"]:\n278:             self.callbacks[\"unpause_interface\"]()\n279: \n280:     # Like goto, except download the file to /tmp before executing browser.\n281: \n282:     def _fetch(self, urls):\n283:         self._goto(urls, True)\n284: \n285:     def named_key(self, args):\n286:         return self.input_key(args, lambda : self.callbacks[\"input\"](\"key: \"))",
+    "source_summary": "href comes from: 1) URL parameter in _goto/_fetch (user-controlled), 2) temporary file path in _edit (controlled via editor), 3) browser configuration path (config-controlled). path template comes from: 1) editor + \" %u\" in _edit, 2) browser[\"path\"] from configuration in _goto/_fetch.",
+    "sink_summary": "os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) - executes substituted path string as shell command",
+    "guard_summary": "No sanitization of href before substitution. encoder() function applied after substitution but before execv, but its purpose is unclear (likely encoding, not security). No shell escaping or parameterization used.",
+    "risk_pattern": "User-controlled href value directly substituted into shell command template via string replacement, then executed without sanitization",
+    "used_variable_sources": [
+      "href (user URL input or temp file path)",
+      "path (editor command template or browser command template)"
+    ],
+    "called_function_context": [
+      "os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])"
+    ],
+    "enclosing_conditions": [
+      "if fetch: branch may modify href to temporary file path"
+    ],
+    "context_summary": "The _fork function substitutes href into a path template containing %u placeholder, then executes the resulting string as a shell command. Used for opening URLs in browsers and editing files with external editors.",
+    "unresolved_facts": [
+      "Purpose and security effect of encoder() function",
+      "How browser configuration is validated/sanitized",
+      "Whether href URLs are validated before use"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-78",
+        "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+        "fit_reason": "User-controlled href directly substituted into shell command template via string replacement, then executed without sanitization of shell metacharacters",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-77",
+        "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+        "fit_reason": "Externally influenced href data changes the syntax/meaning of command sent to shell interpreter via os.execv",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-88",
+        "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+        "fit_reason": "href substitution into command template may allow injection of argument delimiters when used in browser/editor commands with multiple arguments",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-74",
+        "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+        "fit_reason": "Template injection pattern: user input inserted into command template that is then passed to shell interpreter",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-22",
+      "CWE-377",
+      "CWE-628",
+      "CWE-685",
+      "CWE-687",
+      "CWE-74",
+      "CWE-77",
+      "CWE-770",
+      "CWE-772",
+      "CWE-78",
+      "CWE-88",
+      "CWE-89",
+      "CWE-93",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 142,
+        "statement": "path = path.replace(\"%u\", href)",
+        "cwe_id": "CWE-78",
+        "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code demonstrates direct string substitution of user-controlled href into a command template, then execution via shell without neutralization of shell metacharacters"
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "href flows from user-controlled URLs or editor input through string substitution directly to os.execv shell command execution"
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "This line is the primary mechanism that substitutes user input into the command template, creating the injection vulnerability"
+          },
+          "security_control": {
+            "score": 0.7,
+            "evidence": "No sanitization or shell escaping is applied to href before substitution",
+            "required_control": "shell argument escaping or parameterization",
+            "control_requirement_evidence": "CWE-78 requires neutralization of shell metacharacters when constructing shell commands from external input",
+            "existing_controls_checked": [
+              "encoder() function applied after substitution but purpose unclear",
+              "no shell escaping or parameterization observed"
+            ],
+            "deficiency_evidence": "href is directly substituted without any escaping, allowing shell metacharacters to modify command execution"
+          },
+          "concrete_impact": {
+            "score": 0.65,
+            "evidence": "Arbitrary command execution is demonstrated through shell command injection mechanism"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the substitution of user-controlled href into the shell command would not occur, preventing the command injection vulnerability.",
+        "supporting_evidence": [
+          "href is user-controlled from URLs or editor input",
+          "path template contains %u placeholder for substitution",
+          "os.execv executes the substituted string via shell with -c flag",
+          "No escaping or sanitization applied to href before substitution"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Exact security purpose of encoder() function",
+          "Whether browser configuration validation prevents malicious templates"
+        ],
+        "review_comment": "User-controlled href is directly substituted into a shell command template without escaping, allowing command injection. The patch introduces unsafe string substitution that enables shell metacharacters in href to modify command execution. Use shell escaping or parameterized execution to safely pass href as an argument rather than embedding it in the command string.",
+        "change_type": "A",
+        "raw_score": 0.77,
+        "score": 0.77
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 142,
+        "statement": "path = path.replace(\"%u\", href)",
+        "cwe_id": "CWE-77",
+        "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code constructs a shell command by substituting user-controlled href into a path template containing %u placeholder, then executes via os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]). This directly matches CWE-77's mechanism of command construction with external input."
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "href comes from user-supplied URLs in _goto/_fetch or temporary file paths in _edit. The path template comes from editor configuration or browser configuration. Both flow directly to the shell command execution at line 145."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "This line is the critical substitution that inserts external input into the command template. Without this line, href would not be incorporated into the executed command, preventing the injection vector."
+          },
+          "security_control": {
+            "score": 0.7,
+            "evidence": "Required control: proper neutralization of special shell characters in external input before command construction. Control requirement evidence: shell command execution requires escaping/quoting of metacharacters to prevent injection. Existing controls checked: encoder() function applied after substitution but purpose unclear, no shell escaping or parameterization observed. Deficiency evidence: direct string substitution without shell escaping or parameterization allows injection of command separators.",
+            "required_control": "shell escaping or parameterization of external input",
+            "control_requirement_evidence": "Shell command execution with external input requires proper escaping to prevent injection of metacharacters like ;, &, |, $, etc.",
+            "existing_controls_checked": [
+              "encoder() function applied after substitution but purpose unclear from evidence"
+            ],
+            "deficiency_evidence": "Direct string substitution without shell escaping or parameterization allows injection of command separators and metacharacters"
+          },
+          "concrete_impact": {
+            "score": 0.65,
+            "evidence": "Arbitrary command execution is possible if attacker controls href value and can inject shell metacharacters. The evidence shows direct path to shell execution but doesn't demonstrate specific exploit scenarios."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the href value would not be substituted into the path template, preventing any command injection through this vector. The shell command would execute with the literal %u placeholder.",
+        "supporting_evidence": [
+          "Line 142: path = path.replace(\"%u\", href) - direct substitution of external input",
+          "Line 145: os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) - shell command execution",
+          "Source summary: href comes from user URLs or temporary file paths",
+          "Function calls _fork from _goto (user URLs) and _edit (editor operations)"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Purpose and security effect of encoder() function on line 143",
+          "Whether browser/editor configuration paths are validated before use",
+          "Specific validation of href URLs before substitution"
+        ],
+        "review_comment": "The code substitutes user-controlled href values directly into shell command templates without proper escaping, creating a command injection vulnerability. When href contains shell metacharacters, they will be interpreted by the shell interpreter. Use shell escaping or parameterization (e.g., shlex.quote()) on href before substitution to neutralize special characters.",
+        "change_type": "A",
+        "raw_score": 0.77,
+        "score": 0.77
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 142,
+        "statement": "path = path.replace(\"%u\", href)",
+        "cwe_id": "CWE-88",
+        "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.45,
+            "evidence": "The code substitutes user-controlled href into a command template containing %u placeholder, then executes via shell. This could allow injection of argument delimiters if the template contains multiple arguments separated by spaces."
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "href flows from user-controlled URLs or temporary file paths directly into the path string via string replacement, then to os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) execution."
+          },
+          "diff_causality": {
+            "score": 0.85,
+            "evidence": "This line is the primary mechanism that substitutes user input into the command template. Reverting would prevent the injection vector by removing the substitution operation."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "",
+            "required_control": "Proper argument delimitation through parameterization or shell escaping",
+            "control_requirement_evidence": "CWE-88 requires proper delimitation when constructing commands with user input to prevent argument injection",
+            "existing_controls_checked": [
+              "encoder() function applied after substitution but purpose unclear",
+              "No shell escaping or parameterization observed"
+            ],
+            "deficiency_evidence": "Direct string substitution without proper argument separation or escaping allows injection of command-line arguments if template contains multiple parameters"
+          },
+          "concrete_impact": {
+            "score": 0.5,
+            "evidence": "Argument injection could allow arbitrary command execution if the command template contains multiple arguments and href contains argument delimiters, but the exact template structure is not demonstrated."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the %u placeholder would remain in the path string, preventing command execution with the intended href value and eliminating the injection vector.",
+        "supporting_evidence": [
+          "href is user-controlled from URLs or temporary file paths",
+          "path template contains %u placeholder for substitution",
+          "Resulting string executed via shell command with os.execv",
+          "No sanitization or escaping of href before substitution"
+        ],
+        "contradicting_evidence": [
+          "The exact command template structure is not demonstrated - it may be a single argument command",
+          "encoder() function applied after substitution may provide some protection (purpose unclear)"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "Structure of browser[\"path\"] and editor command templates - whether they contain multiple arguments",
+          "Purpose and security effect of encoder() function",
+          "Whether href values are validated before reaching _fork function"
+        ],
+        "review_comment": "The code substitutes user-controlled href directly into a command template using string replacement, then executes the result via shell. This creates an argument injection vulnerability if the template contains multiple arguments. Use parameterization with subprocess.Popen or proper shell escaping to separate the href value as a distinct argument rather than embedding it via string substitution.",
+        "change_type": "A",
+        "raw_score": 0.59,
+        "score": 0.59
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 142,
+        "statement": "path = path.replace(\"%u\", href)",
+        "cwe_id": "CWE-74",
+        "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code demonstrates command injection: user-controlled href is directly substituted into a command template containing %u placeholder, then executed via shell interpreter without neutralization of special shell characters"
+          },
+          "connection": {
+            "score": 0.9,
+            "evidence": "href flows from user input (URLs) or editor configuration through string substitution directly to os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) - clear path from external input to shell execution"
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If this line were reverted, the %u placeholder would remain unsubstituted, preventing the injection vulnerability. The substitution is the material change that enables the injection"
+          },
+          "security_control": {
+            "score": 0.75,
+            "evidence": "Required control: proper neutralization of special shell characters in user input before shell command construction. Deficiency: href is directly substituted without escaping, quoting, or parameterization. Existing controls checked: encoder() function applied after substitution but purpose unclear, no shell escaping observed",
+            "required_control": "shell command parameterization or proper escaping of user input",
+            "control_requirement_evidence": "CWE-74 requires neutralization when constructing commands for downstream interpreters; shell commands require escaping of metacharacters to prevent injection",
+            "existing_controls_checked": [
+              "encoder() function applied to path after substitution but before execv - purpose unclear from evidence"
+            ],
+            "deficiency_evidence": "href is directly substituted into command template without shell escaping, allowing injection of shell metacharacters"
+          },
+          "concrete_impact": {
+            "score": 0.7,
+            "evidence": "Arbitrary command execution is demonstrated through the shell execution path. The consequence depends on attacker-controlled href content but the mechanism supports full command injection"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the %u placeholder would remain in the path string, preventing substitution of user input and thus eliminating the injection vulnerability.",
+        "supporting_evidence": [
+          "href is user-controlled input from URLs or editor configuration",
+          "path template contains %u placeholder for substitution",
+          "resulting command executed via os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])",
+          "No shell escaping or parameterization applied to href before substitution"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Exact security purpose and effectiveness of encoder() function",
+          "Whether browser configuration validation prevents malicious templates",
+          "Specific validation applied to href URLs before use"
+        ],
+        "review_comment": "User-controlled href is directly substituted into a shell command template without proper escaping, enabling command injection. The substitution replaces %u with href content that may contain shell metacharacters, then executes the resulting command via /bin/sh. Use shell escaping or parameterization (e.g., shlex.quote()) on href before substitution to neutralize special characters.",
+        "change_type": "A",
+        "raw_score": 0.8,
+        "score": 0.8
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "canto_curses/guibase.py",
+    "changed_line": 115,
+    "statement": "response = urllib2.urlopen(href)",
+    "change_type": "A",
+    "function_name": "_fork",
+    "operation_type": "network_fetch",
+    "selection_reason": "href (user-controlled URL) -> urllib2.urlopen -> fetches arbitrary external resource, potential SSRF or malicious content download",
+    "security_relevance_score": 0.7,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: #Canto-curses - ncurses RSS reader\n3: #   Copyright (C) 2010 Jack Miller <jack@codezen.org>\n4: #\n5: #   This program is free software; you can redistribute it and/or modify\n6: #   it under the terms of the GNU General Public License version 2 as \n7: #   published by the Free Software Foundation.\n8: \n9: from canto_next.hooks import call_hook, on_hook\n10: from canto_next.encoding import encoder, decoder\n11: from canto_next.plugins import Plugin\n12: \n13: from command import CommandHandler, command_format\n14: \n15: import logging\n16: \n17: log = logging.getLogger(\"COMMON\")\n18: \n19: import subprocess\n20: import tempfile\n21: import urllib2\n22: import shlex\n23: import sys\n24: import os\n25: \n26: class BasePlugin(Plugin):\n27:     pass\n28: \n29: class GuiBase(CommandHandler):\n30:     def __init__(self):\n31:         CommandHandler.__init__(self)\n32: \n33:         self.plugin_class = BasePlugin\n34:         self.update_plugin_lookups()\n35: \n36:         self.editor = None\n37: \n38:     def input(self, prompt):\n39:         return self.callbacks[\"input\"](prompt)\n40: \n41:     def int(self, args):\n42:         t, r = self._int(args, None, None, lambda : self.input(\"int: \"))\n43:         if t:\n44:             return (True, t, r)\n45:         return (False, None, None)\n46: \n47:     @command_format([])\n48:     def cmd_destroy(self, **kwargs):\n49:         self.callbacks[\"die\"](self)\n50: \n51:     def die(self):\n52:         pass\n53: \n54:     def _cfg_set_prompt(self, option, prompt):\n55:         t = self.callbacks[\"get_opt\"](option)\n56:         self.callbacks[\"set_opt\"](option, True)\n57: \n58:         # It's assumed that if we're wrapping a prompt in this\n59:         # change, that we want to update the pad.\n60: \n61:         if not t:\n62:             self.redraw()\n63: \n64:         r = self.input(prompt)\n65: \n66:         self.callbacks[\"set_opt\"](option, t)\n67:         return r\n68: \n69:     def _tag_cfg_set_prompt(self, tag, option, prompt):\n70:         t = self.callbacks[\"get_tag_opt\"](tag, option)\n71:         self.callbacks[\"set_tag_opt\"](tag, option, True)\n72: \n73:         # Same as above, if we're wrapping a prompt, we want\n74:         # to update the screen.\n75: \n76:         if not t:\n77:             self.redraw()\n78: \n79:         r = self.input(prompt)\n80: \n81:         self.callbacks[\"set_tag_opt\"](tag, option, t)\n82:         return r\n83: \n84:     def _fork(self, path, href, text, fetch=False):\n85: \n86:         # Prepare temporary files, if fetch.\n87: \n88:         if fetch:\n89:             # Get a path (sans query strings, etc.) for the URL\n90:             tmppath = urllib2.urlparse.urlparse(href).path\n91: \n92:             # Return just the basename of the path (no directories)\n93:             fname = os.path.basename(tmppath)\n94: \n95:             # Grab a temporary directory. This allows us to create a file with\n96:             # an unperturbed filename so scripts can freely use regex /\n97:             # extension matching in addition to mimetype detection.\n98: \n99:             tmpdir = tempfile.mkdtemp(prefix=\"canto-\")\n100:             tmpnam = tmpdir + '/' + fname\n101: \n102:             on_hook(\"exit\", lambda : (os.unlink(tmpnam)))\n103:             on_hook(\"exit\", lambda : (os.rmdir(tmpdir)))\n104: \n105:         pid = os.fork()\n106: \n107:         # Parents can now bail.\n108:         if pid:\n109:             return pid\n110: \n111:         if fetch:\n112:             tmp = open(tmpnam, 'w+b')\n113: \n114:             # Grab the HTTP info / prepare to read.\n115:             response = urllib2.urlopen(href)\n116: \n117:             # Grab in kilobyte chunks to avoid wasting memory on something\n118:             # that's going to be immediately written to disk.\n119: \n120:             while True:\n121:                 r = response.read(1024)\n122:                 if not r:\n123:                     break\n124:                 tmp.write(r)\n125: \n126:             response.close()\n127:             tmp.close()\n128: \n129:             href = tmpnam\n130: \n131:         # A lot of programs don't appreciate\n132:         # having their fds closed, so instead\n133:         # we dup them to /dev/null.\n134: \n135:         fd = os.open(\"/dev/null\", os.O_RDWR)\n136:         os.dup2(fd, sys.stderr.fileno())\n137: \n138:         if not text:\n139:             os.setpgid(os.getpid(), os.getpid())\n140:             os.dup2(fd, sys.stdout.fileno())\n141: \n142:         path = path.replace(\"%u\", href)\n143:         path = encoder(path)\n144: \n145:         os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])\n146: \n147:         # Just in case.\n148:         sys.exit(0)\n149: \n150:     def _edit(self, text):\n151:         if not self.editor:\n152:             self.editor = os.getenv(\"EDITOR\")\n153:         if not self.editor:\n154:             self.editor = self.input(\"editor: \")\n155: \n156:         # No editor, or cancelled dialog, no change.\n157:         if not self.editor:\n158:             return text\n159: \n160:         self.callbacks[\"pause_interface\"]()\n161: \n162:         # Setup tempfile to edit.\n163:         fd, path = tempfile.mkstemp(text=True)\n164: \n165:         f = os.fdopen(fd, \"w\")\n166:         f.write(encoder(text))\n167:         f.close()\n168: \n169:         # Invoke editor\n170:         logging.info(\"Invoking editor on %s\" % path)\n171:         pid = self._fork(self.editor + \" %u\", path, True)\n172:         pid, status = os.waitpid(pid, 0)\n173: \n174:         if status == 0:\n175:             f = open(path, \"r\")\n176:             r = f.read()\n177:             f.close()\n178:         else:\n179:             self.callbacks[\"set_var\"](\"error_msg\",\n180:                     \"Editor failed! Status = %d\" % (status,))\n181:             r = text\n182: \n183:         # Cleanup temp file.\n184:         os.unlink(path)\n185: \n186:         self.callbacks[\"unpause_interface\"]()\n187: \n188:         return r\n189: \n190:     # Pass-thru for arbitrary, unquoted strings without prompting.\n191: \n192:     def string_or_not(self, args):\n193:         return (True, args, None)\n194: \n195:     # Pass-thru for arbitrary, unquoted strings.\n196:     def string(self, args, prompt):\n197:         if not args:\n198:             args = prompt()\n199:         return (True, args, None)\n200: \n201:     # Parse a string in shell fashion, returning components.\n202: \n203:     def split_string(self, args, prompt):\n204:         if not args:\n205:             args = prompt()\n206: \n207:         r = [ decoder(s) for s in shlex.split(encoder(args)) ]\n208:         return (True, r, None)\n209: \n210:     def one_opt(self, args):\n211:         t, r = self._first_term(args,\n212:                 lambda : self.input(\"opt: \"))\n213: \n214:         try:\n215:             self.callbacks[\"get_opt\"](t)\n216:         except:\n217:             log.error(\"Unknown option: %s\" % t)\n218:             return (False, None, None)\n219:         return (True, t, None)\n220: \n221:     @command_format([(\"opt\", \"one_opt\")])\n222:     def cmd_edit(self, **kwargs):\n223:         t = self.callbacks[\"get_opt\"](kwargs[\"opt\"])\n224:         r = self._edit(t)\n225:         log.info(\"Edited %s to %s\" % (kwargs[\"opt\"], r))\n226:         self.callbacks[\"set_opt\"](kwargs[\"opt\"], r)\n227: \n228:     def _remote_argv(self, argv):\n229:         loc_args = self.callbacks[\"get_var\"](\"location\")\n230:         argv = [argv[0]] + loc_args + argv[1:]\n231: \n232:         log.debug(\"Calling remote: %s\" % argv)\n233: \n234:         out = decoder(subprocess.check_output(argv))\n235: \n236:         log.debug(\"Output:\")\n237:         log.debug(out)\n238: \n239:         # Strip anything that could be misconstrued as style\n240:         # from remote output.\n241: \n242:         out = out.replace(\"%\",\"\\\\%\")\n243: \n244:         log.info(out)\n245: \n246:     def _remote(self, args):\n247:         args = \"canto-remote \" + args\n248:         args = encoder(args)\n249: \n250:         # Add location args, so the remote is connecting\n251:         # to the correct daemon.\n252: \n253:         self._remote_argv(shlex.split(args))\n254: \n255:     def remote_args(self, args):\n256:         return self.string(args, \"remote: \")\n257: \n258:     @command_format([(\"remote_args\",\"remote_args\")])\n259:     def cmd_remote(self, **kwargs):\n260:         self._remote(kwargs[\"remote_args\"])\n261: \n262:     def _goto(self, urls, fetch=False):\n263:         browser = self.callbacks[\"get_conf\"]()[\"browser\"]\n264: ",
+    "source_summary": "href parameter comes from RSS item links via _goto() calls from cmd_goto commands. URLs originate from RSS feed content controlled by external sources.",
+    "sink_summary": "URL is fetched via urllib2.urlopen() and content written to temporary file, then executed via shell command substitution in browser path with %u placeholder.",
+    "guard_summary": "No URL validation, sanitization, or SSRF protection. fetch parameter controls whether download occurs, but no restrictions on URL schemes or destinations.",
+    "risk_pattern": "External RSS content URLs are fetched without validation and passed to shell command execution via browser configuration.",
+    "used_variable_sources": [
+      "href parameter from RSS item links",
+      "browser configuration path from user settings"
+    ],
+    "called_function_context": [
+      "urllib2.urlopen",
+      "os.execv",
+      "tempfile.mkdtemp",
+      "os.fork"
+    ],
+    "enclosing_conditions": [
+      "if fetch: (line 88, 111)"
+    ],
+    "context_summary": "In _fork method, when fetch=True, downloads URL content to temp file, then substitutes %u in browser command with either original URL or temp file path, executing via shell.",
+    "unresolved_facts": [
+      "Exact browser command configuration format",
+      "Whether browser configuration allows arbitrary command injection",
+      "Specific URL validation in RSS parsing layer"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-918",
+        "cwe_name": "Server-Side Request Forgery (SSRF)",
+        "fit_reason": "User-controlled RSS URL -> urllib2.urlopen -> fetches arbitrary external/internal resources without validation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-78",
+        "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+        "fit_reason": "URL path used in shell command via %u substitution in browser path without proper escaping",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-377",
+        "cwe_name": "Insecure Temporary File",
+        "fit_reason": "Downloads content to predictable temporary file names without secure creation, race conditions possible",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "URL path extraction via urlparse.path used for temp file naming, potential directory traversal",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1236",
+      "CWE-22",
+      "CWE-377",
+      "CWE-502",
+      "CWE-601",
+      "CWE-643",
+      "CWE-74",
+      "CWE-77",
+      "CWE-770",
+      "CWE-78",
+      "CWE-88",
+      "CWE-89",
+      "CWE-90",
+      "CWE-918",
+      "CWE-93",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 115,
+        "statement": "response = urllib2.urlopen(href)",
+        "cwe_id": "CWE-918",
+        "cwe_name": "Server-Side Request Forgery (SSRF)",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code directly fetches a URL from an external source (RSS feed) using urllib2.urlopen without validating the destination, allowing requests to arbitrary internal/external endpoints."
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "href parameter flows from RSS item links (external source) through _goto() calls to _fork() method, where it's directly passed to urllib2.urlopen() when fetch=True."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "This line is the core SSRF mechanism - if reverted, no external URL fetching would occur when fetch=True, preventing the server from making arbitrary outbound requests."
+          },
+          "security_control": {
+            "score": 0.8,
+            "evidence": "No URL validation, scheme restriction, or destination checking is performed before fetching.",
+            "required_control": "URL validation and destination restriction for external fetches",
+            "control_requirement_evidence": "CWE-918 requires ensuring requests are sent only to expected destinations to prevent internal network scanning or resource access",
+            "existing_controls_checked": [
+              "No validation of URL scheme (http/https/file/etc)",
+              "No allowlist of permitted domains or IP ranges",
+              "No check for internal/private IP addresses"
+            ],
+            "deficiency_evidence": "The code directly passes user-supplied href to urllib2.urlopen without any validation, allowing requests to localhost, internal networks, or arbitrary external endpoints"
+          },
+          "concrete_impact": {
+            "score": 0.7,
+            "evidence": "Allows fetching content from arbitrary internal network resources, potentially exposing internal services or acting as proxy for internal network scanning."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the URL fetching functionality would be removed, preventing the application from making any outbound HTTP requests when processing RSS links with fetch=True.",
+        "supporting_evidence": [
+          "href parameter originates from external RSS feed content controlled by untrusted sources",
+          "urllib2.urlopen fetches arbitrary URLs without validation or restriction",
+          "Code context shows this occurs in a forked process when fetch=True condition is met"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether RSS feed URLs are pre-validated at ingestion time",
+          "Typical usage patterns for fetch parameter (how often fetch=True is used)"
+        ],
+        "review_comment": "The code fetches RSS feed URLs via urllib2.urlopen without validating the destination, allowing SSRF attacks to internal network resources. The href parameter from external RSS feeds flows directly to the network fetch operation. Implement URL validation to restrict allowed schemes and destinations, such as validating URLs against an allowlist of permitted domains and blocking requests to internal IP ranges.",
+        "change_type": "A",
+        "raw_score": 0.8,
+        "score": 0.8
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 115,
+        "statement": "response = urllib2.urlopen(href)",
+        "cwe_id": "CWE-78",
+        "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.35,
+            "evidence": "The demonstrated mechanism involves user-controlled input (href) being incorporated into a shell command via %u substitution in path, but the exact CWE-78 requires special elements that modify OS command structure. The evidence shows URL content being fetched and written to a file, then the file path being substituted, not direct command injection through URL parsing."
+          },
+          "connection": {
+            "score": 0.85,
+            "evidence": "href parameter originates from RSS item links (external content), flows through urllib2.urlopen() to fetch content, writes to temporary file, then substitutes %u placeholder in browser command path (line 142: path = path.replace(\"%u\", href)), which is executed via /bin/sh -c (line 145)."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If the candidate line were removed, the URL fetch would fail, preventing content download to temporary file. The href variable would remain the original URL string (not file path), changing what gets substituted into the browser command. This materially affects whether file paths or URLs reach the shell execution."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "No validation or sanitization of href before URL fetch or before substitution into shell command. The fetch operation downloads arbitrary content to predictable temporary file paths.",
+            "required_control": "Neutralization of special shell metacharacters in substituted values",
+            "control_requirement_evidence": "CWE-78 requires neutralization when user input is incorporated into OS commands. Here, href (URL or file path) replaces %u in a string passed to /bin/sh -c.",
+            "existing_controls_checked": [
+              "No escaping of href value before substitution",
+              "No validation of URL scheme or content",
+              "No sanitization of temporary file name derived from URL path"
+            ],
+            "deficiency_evidence": "href value is directly substituted via string replacement without escaping. If href contains shell metacharacters (when fetch=False) or if temporary file name contains special characters, command injection could occur. However, the demonstrated path shows href becoming a file path when fetch=True, reducing injection risk."
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "Potential for command injection exists if browser configuration path contains injection points or if href contains shell metacharacters when fetch=False. However, the demonstrated path shows href being a file path (tmpnam) when fetch=True, which is less likely to contain injection characters. No concrete injection demonstrated."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the URL fetch would not occur, href would remain the original URL string (not a local file path), and the substitution at line 142 would pass a URL (not file path) to the shell command. This could change injection vectors but doesn't eliminate command construction.",
+        "supporting_evidence": [
+          "href parameter flows from RSS feeds (external content) to urllib2.urlopen()",
+          "path.replace(\"%u\", href) directly substitutes user input into command string",
+          "os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) executes via shell with substituted value",
+          "No escaping or validation of href before substitution"
+        ],
+        "contradicting_evidence": [
+          "When fetch=True, href becomes a temporary file path (tmpnam) generated by the system, not direct user input",
+          "File paths are less likely to contain shell metacharacters than URLs",
+          "The injection would require browser configuration to have injection points beyond %u substitution"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether browser configuration string contains additional injection points beyond %u",
+          "Whether href (URL) contains shell metacharacters when fetch=False",
+          "Whether temporary file name (derived from URL path) could contain shell metacharacters",
+          "Exact format of browser command configuration"
+        ],
+        "review_comment": "The code fetches external URL content and substitutes the URL or resulting file path into a shell command via %u placeholder without escaping. When fetch=False, the original URL string is directly substituted, potentially allowing command injection if the URL contains shell metacharacters. Use proper escaping with shlex.quote() or subprocess.list2cmdline() when substituting href into the shell command, regardless of whether it's a URL or file path.",
+        "change_type": "A",
+        "raw_score": 0.5599999999999999,
+        "score": 0.5599999999999999
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 115,
+        "statement": "response = urllib2.urlopen(href)",
+        "cwe_id": "CWE-377",
+        "cwe_name": "Insecure Temporary File",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.3,
+            "evidence": "The candidate line initiates a download to a temporary file, but CWE-377 specifically addresses insecure creation, permissions, race conditions, and predictable naming of temporary files. The demonstrated behavior shows file creation but lacks evidence of the specific insecure patterns (race conditions, symlink attacks, predictable names with insufficient randomness) that define CWE-377."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The href parameter (externally controlled RSS URL) is fetched via urllib2.urlopen() and written to a temporary file at tmpnam (line 112-124). The temporary file path is later used in shell command execution via path.replace(\"%u\", href) where href becomes tmpnam (line 129, 142)."
+          },
+          "diff_causality": {
+            "score": 0.2,
+            "evidence": "The candidate line (urllib2.urlopen) enables the download that populates the temporary file, but the insecure temporary file creation patterns (predictable naming, race conditions) are established by the surrounding code (tempfile.mkdtemp, os.basename extraction, open(tmpnam, 'w+b')). Reverting only this line would prevent file population but not change the temporary file creation mechanism."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "The required control for CWE-377 is secure temporary file creation with unpredictable names, proper permissions, and atomic operations to prevent race conditions and symlink attacks. The code uses tempfile.mkdtemp() for directory creation (secure) but extracts filename from URL path via os.basename() (predictable) and opens with 'w+b' without O_EXCL or other atomicity guarantees. The deficiency is predictable filename extraction from attacker-controlled URL, but race condition evidence is not demonstrated.",
+            "required_control": "Secure temporary file creation with unpredictable names, proper permissions, and atomic operations",
+            "control_requirement_evidence": "CWE-377 requires protection against predictable temporary file names that enable symlink attacks and race conditions during file creation.",
+            "existing_controls_checked": [
+              "tempfile.mkdtemp() creates secure temporary directory",
+              "os.basename(urllib2.urlparse.urlparse(href).path) extracts predictable filename from URL",
+              "open(tmpnam, 'w+b') opens without atomic creation flags"
+            ],
+            "deficiency_evidence": "Filename is derived from URL path component via os.basename(), making it predictable and controllable by attacker through crafted URLs. File is opened with standard open() without O_EXCL, allowing race conditions between creation and opening."
+          },
+          "concrete_impact": {
+            "score": 0.25,
+            "evidence": "Potential impact includes symlink attacks or file overwrite if attacker can predict temporary filename and create symlink before open(). However, the evidence doesn't demonstrate concurrent access, race windows, or privilege context that would enable actual exploitation. Impact remains speculative."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the download would not occur, leaving the temporary file empty or non-existent, but the insecure temporary file creation pattern (predictable filename from URL, non-atomic open) would remain unchanged in the code structure.",
+        "supporting_evidence": [
+          "Line 90-93: tmppath = urllib2.urlparse.urlparse(href).path; fname = os.path.basename(tmppath) - extracts filename from URL path",
+          "Line 100: tmpnam = tmpdir + '/' + fname - creates predictable temporary file path",
+          "Line 112: tmp = open(tmpnam, 'w+b') - opens file without atomic creation flags"
+        ],
+        "contradicting_evidence": [
+          "Line 99: tmpdir = tempfile.mkdtemp(prefix=\"canto-\") - uses secure temporary directory creation",
+          "The file is created within a securely generated temporary directory, reducing some attack surface"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "Whether race condition window between tmpnam calculation and open() is exploitable",
+          "Privilege context of the process (whether attacker can write to temporary directory)",
+          "Whether symlink attacks are feasible given directory permissions"
+        ],
+        "review_comment": "The code downloads external content to a temporary file with a filename derived from the URL path component, making it predictable. While the temporary directory is securely created, the filename predictability could enable symlink attacks if an attacker can create symlinks in the directory. Replace os.basename() with a securely generated random filename using tempfile.mktemp() or similar, and use atomic file creation with os.open() and O_EXCL flag.",
+        "change_type": "A",
+        "raw_score": 0.35,
+        "score": 0.35
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 115,
+        "statement": "response = urllib2.urlopen(href)",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "CWE-22 requires constructing a pathname that escapes a restricted directory. The demonstrated behavior involves URL fetching and temporary file creation, but no path traversal manipulation is shown."
+          },
+          "connection": {
+            "score": 0.4,
+            "evidence": "User-controlled href parameter flows to urllib2.urlopen for network fetch, then content is written to temporary file. However, the pathname construction uses urlparse.path which extracts only the path component, potentially mitigating traversal."
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "The added line enables URL fetching functionality. If reverted, the fetch capability would be disabled, preventing the entire download and execution flow."
+          },
+          "security_control": {
+            "score": 0.2,
+            "evidence": "",
+            "required_control": "Path validation and sanitization for file operations",
+            "control_requirement_evidence": "CWE-22 requires controls to prevent path traversal when constructing file paths from external input",
+            "existing_controls_checked": [
+              "urlparse.path extraction removes query strings and fragments",
+              "tempfile.mkdtemp creates isolated temporary directory"
+            ],
+            "deficiency_evidence": "No validation of the extracted path component for traversal sequences or malicious patterns"
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "The temporary file is created in an isolated directory, limiting traversal impact. The primary risk appears to be SSRF or command injection rather than path traversal."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the URL fetching functionality would be disabled, preventing both the network request and subsequent file operations, eliminating the entire download and execution chain.",
+        "supporting_evidence": [
+          "href parameter flows from external RSS sources to urllib2.urlopen",
+          "URL path component extracted via urlparse.path for temporary file naming",
+          "Temporary file operations write downloaded content to disk"
+        ],
+        "contradicting_evidence": [
+          "urlparse.path extraction removes traversal-prone components like query strings",
+          "tempfile.mkdtemp creates isolated temporary directories",
+          "The demonstrated behavior focuses on network fetching rather than path manipulation"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether the extracted URL path component contains traversal sequences",
+          "Specific browser command format and whether it enables path traversal",
+          "Downstream handling of the temporary file path"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.32,
+        "score": 0.32
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-4",
+    "filepath": "canto_curses/guibase.py",
+    "changed_line": 273,
+    "statement": "pid = self._fork(browser[\"path\"], url, browser[\"text\"], fetch)",
+    "change_type": "A",
+    "function_name": "_goto",
+    "operation_type": "function_call",
+    "selection_reason": "url (user-controlled) -> passed to _fork -> leads to shell execution and network fetch",
+    "security_relevance_score": 0.6,
+    "code_context": "124:                 tmp.write(r)\n125: \n126:             response.close()\n127:             tmp.close()\n128: \n129:             href = tmpnam\n130: \n131:         # A lot of programs don't appreciate\n132:         # having their fds closed, so instead\n133:         # we dup them to /dev/null.\n134: \n135:         fd = os.open(\"/dev/null\", os.O_RDWR)\n136:         os.dup2(fd, sys.stderr.fileno())\n137: \n138:         if not text:\n139:             os.setpgid(os.getpid(), os.getpid())\n140:             os.dup2(fd, sys.stdout.fileno())\n141: \n142:         path = path.replace(\"%u\", href)\n143:         path = encoder(path)\n144: \n145:         os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])\n146: \n147:         # Just in case.\n148:         sys.exit(0)\n149: \n150:     def _edit(self, text):\n151:         if not self.editor:\n152:             self.editor = os.getenv(\"EDITOR\")\n153:         if not self.editor:\n154:             self.editor = self.input(\"editor: \")\n155: \n156:         # No editor, or cancelled dialog, no change.\n157:         if not self.editor:\n158:             return text\n159: \n160:         self.callbacks[\"pause_interface\"]()\n161: \n162:         # Setup tempfile to edit.\n163:         fd, path = tempfile.mkstemp(text=True)\n164: \n165:         f = os.fdopen(fd, \"w\")\n166:         f.write(encoder(text))\n167:         f.close()\n168: \n169:         # Invoke editor\n170:         logging.info(\"Invoking editor on %s\" % path)\n171:         pid = self._fork(self.editor + \" %u\", path, True)\n172:         pid, status = os.waitpid(pid, 0)\n173: \n174:         if status == 0:\n175:             f = open(path, \"r\")\n176:             r = f.read()\n177:             f.close()\n178:         else:\n179:             self.callbacks[\"set_var\"](\"error_msg\",\n180:                     \"Editor failed! Status = %d\" % (status,))\n181:             r = text\n182: \n183:         # Cleanup temp file.\n184:         os.unlink(path)\n185: \n186:         self.callbacks[\"unpause_interface\"]()\n187: \n188:         return r\n189: \n190:     # Pass-thru for arbitrary, unquoted strings without prompting.\n191: \n192:     def string_or_not(self, args):\n193:         return (True, args, None)\n194: \n195:     # Pass-thru for arbitrary, unquoted strings.\n196:     def string(self, args, prompt):\n197:         if not args:\n198:             args = prompt()\n199:         return (True, args, None)\n200: \n201:     # Parse a string in shell fashion, returning components.\n202: \n203:     def split_string(self, args, prompt):\n204:         if not args:\n205:             args = prompt()\n206: \n207:         r = [ decoder(s) for s in shlex.split(encoder(args)) ]\n208:         return (True, r, None)\n209: \n210:     def one_opt(self, args):\n211:         t, r = self._first_term(args,\n212:                 lambda : self.input(\"opt: \"))\n213: \n214:         try:\n215:             self.callbacks[\"get_opt\"](t)\n216:         except:\n217:             log.error(\"Unknown option: %s\" % t)\n218:             return (False, None, None)\n219:         return (True, t, None)\n220: \n221:     @command_format([(\"opt\", \"one_opt\")])\n222:     def cmd_edit(self, **kwargs):\n223:         t = self.callbacks[\"get_opt\"](kwargs[\"opt\"])\n224:         r = self._edit(t)\n225:         log.info(\"Edited %s to %s\" % (kwargs[\"opt\"], r))\n226:         self.callbacks[\"set_opt\"](kwargs[\"opt\"], r)\n227: \n228:     def _remote_argv(self, argv):\n229:         loc_args = self.callbacks[\"get_var\"](\"location\")\n230:         argv = [argv[0]] + loc_args + argv[1:]\n231: \n232:         log.debug(\"Calling remote: %s\" % argv)\n233: \n234:         out = decoder(subprocess.check_output(argv))\n235: \n236:         log.debug(\"Output:\")\n237:         log.debug(out)\n238: \n239:         # Strip anything that could be misconstrued as style\n240:         # from remote output.\n241: \n242:         out = out.replace(\"%\",\"\\\\%\")\n243: \n244:         log.info(out)\n245: \n246:     def _remote(self, args):\n247:         args = \"canto-remote \" + args\n248:         args = encoder(args)\n249: \n250:         # Add location args, so the remote is connecting\n251:         # to the correct daemon.\n252: \n253:         self._remote_argv(shlex.split(args))\n254: \n255:     def remote_args(self, args):\n256:         return self.string(args, \"remote: \")\n257: \n258:     @command_format([(\"remote_args\",\"remote_args\")])\n259:     def cmd_remote(self, **kwargs):\n260:         self._remote(kwargs[\"remote_args\"])\n261: \n262:     def _goto(self, urls, fetch=False):\n263:         browser = self.callbacks[\"get_conf\"]()[\"browser\"]\n264: \n265:         if not browser[\"path\"]:\n266:             log.error(\"No browser defined! Cannot goto.\")\n267:             return\n268: \n269:         if browser[\"text\"]:\n270:             self.callbacks[\"pause_interface\"]()\n271: \n272:         for url in urls:\n273:             pid = self._fork(browser[\"path\"], url, browser[\"text\"], fetch)\n274:             if browser[\"text\"]:\n275:                 os.waitpid(pid, 0)\n276: \n277:         if browser[\"text\"]:\n278:             self.callbacks[\"unpause_interface\"]()\n279: \n280:     # Like goto, except download the file to /tmp before executing browser.\n281: \n282:     def _fetch(self, urls):\n283:         self._goto(urls, True)\n284: \n285:     def named_key(self, args):\n286:         return self.input_key(args, lambda : self.callbacks[\"input\"](\"key: \"))",
+    "source_summary": "URLs come from user navigation commands; browser path comes from configuration (CantoCurses.browser.path via remote one-config)",
+    "sink_summary": "os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) where path contains browser command with URL substitution",
+    "guard_summary": "No input validation or sanitization on URL before substitution into shell command; browser configuration is trusted without validation",
+    "risk_pattern": "User-controlled URL directly substituted into browser command template and executed via shell without proper escaping or validation",
+    "used_variable_sources": [
+      "browser[\"path\"] from configuration",
+      "url from user input",
+      "browser[\"text\"] from configuration"
+    ],
+    "called_function_context": [
+      "_fork(path, href, text, fetch) executes: path.replace(\"%u\", href) -> encoder(path) -> os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])"
+    ],
+    "enclosing_conditions": [
+      "if browser[\"path\"]: (line 265)",
+      "for url in urls: (line 272)",
+      "if fetch: (line 88 for file download)"
+    ],
+    "context_summary": "The _goto function takes user-provided URLs and passes them to _fork, which substitutes URLs into browser command templates and executes them via shell",
+    "unresolved_facts": [
+      "Exact default browser command configuration",
+      "Whether browser path configuration is user-configurable",
+      "Specific validation in configuration loading process"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-78",
+        "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+        "fit_reason": "User-controlled URL directly substituted into browser command template and executed via /bin/sh -c without escaping shell metacharacters",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-77",
+        "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+        "fit_reason": "Externally influenced URL changes syntax/meaning of command sent to shell interpreter (os.execv)",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-88",
+        "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+        "fit_reason": "URL inserted into command template may contain argument delimiters affecting browser command arguments",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-74",
+        "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+        "fit_reason": "URL used to create browser command template string that is interpreted by shell downstream",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-22",
+      "CWE-425",
+      "CWE-601",
+      "CWE-643",
+      "CWE-685",
+      "CWE-74",
+      "CWE-77",
+      "CWE-770",
+      "CWE-78",
+      "CWE-88",
+      "CWE-89",
+      "CWE-918",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 273,
+        "statement": "pid = self._fork(browser[\"path\"], url, browser[\"text\"], fetch)",
+        "cwe_id": "CWE-78",
+        "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code constructs a shell command by substituting user-controlled URL into a browser command template via path.replace(\"%u\", href) and executes it via os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) without neutralizing shell metacharacters"
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "User-provided URLs from _goto(urls, fetch) are passed to _fork() where they are substituted into browser command template and executed via shell. The path from browser configuration contains the command template with %u placeholder."
+          },
+          "diff_causality": {
+            "score": 0.4,
+            "evidence": "This line calls _fork() but the vulnerable substitution and execution logic exists in the _fork function itself (lines 142-145). The candidate line enables the call chain but doesn't directly contain the injection mechanism."
+          },
+          "security_control": {
+            "score": 0.8,
+            "evidence": "No input validation or sanitization is applied to URLs before shell substitution",
+            "required_control": "Shell metacharacter neutralization or parameterized execution",
+            "control_requirement_evidence": "CWE-78 requires neutralization when user input is incorporated into shell commands to prevent command injection",
+            "existing_controls_checked": [
+              "encoder() function applied to final command (line 143) but after substitution, not to URL input",
+              "No URL validation or shell escaping before substitution into %u placeholder"
+            ],
+            "deficiency_evidence": "URLs are directly substituted into command template without escaping shell metacharacters; encoder() only applies to final command string after injection opportunity exists"
+          },
+          "concrete_impact": {
+            "score": 0.7,
+            "evidence": "Arbitrary command execution is possible if attacker controls URL input and can inject shell metacharacters, allowing full system compromise"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the _fork() call would not execute, preventing the browser command execution entirely, but the vulnerable substitution mechanism in _fork() would remain present for other callers.",
+        "supporting_evidence": [
+          "User-controlled URLs passed to _fork() without validation",
+          "Browser command template uses %u placeholder for URL substitution",
+          "Final command executed via /bin/sh -c without parameterization",
+          "No shell metacharacter escaping applied to URL before substitution"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether browser configuration path is user-configurable and could contain malicious templates",
+          "Specific validation in URL input sources",
+          "Whether encoder() function provides any shell escaping"
+        ],
+        "review_comment": "User-provided URLs are directly substituted into browser command templates and executed via shell without escaping shell metacharacters. The _fork function replaces %u placeholders with raw URLs and passes the command to /bin/sh -c, allowing command injection if URLs contain shell metacharacters. Validate URLs against a safe pattern or use subprocess with argument lists instead of shell execution to prevent injection.",
+        "change_type": "A",
+        "raw_score": 0.7,
+        "score": 0.7
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 273,
+        "statement": "pid = self._fork(browser[\"path\"], url, browser[\"text\"], fetch)",
+        "cwe_id": "CWE-77",
+        "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code constructs a shell command by substituting user-controlled URL into browser command template via path.replace(\"%u\", href) and executes via os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])"
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "User-provided URL flows from _goto(urls) parameter through browser[\"path\"] template substitution to shell execution in _fork function"
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "This line is new (change_type: A) and creates the connection between user URLs and the vulnerable _fork execution path"
+          },
+          "security_control": {
+            "score": 0.7,
+            "evidence": "",
+            "required_control": "Proper neutralization of shell metacharacters in URL before command substitution",
+            "control_requirement_evidence": "CWE-77 requires neutralization when user input is used in shell commands to prevent command injection",
+            "existing_controls_checked": [
+              "encoder() function applied to final path but only after URL substitution, not to URL itself"
+            ],
+            "deficiency_evidence": "URL is substituted directly into command template without escaping shell metacharacters; encoder is applied to the entire command string after substitution, which may not properly escape URL content"
+          },
+          "concrete_impact": {
+            "score": 0.65,
+            "evidence": "Shell command execution with attacker-controlled URL could lead to arbitrary command execution if URL contains shell metacharacters"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the connection between user URLs and shell command execution would be broken, preventing potential command injection via URL manipulation.",
+        "supporting_evidence": [
+          "URL parameter comes from user navigation commands (source_summary)",
+          "browser[\"path\"] contains command template with %u placeholder for URL substitution",
+          "os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) executes substituted command via shell",
+          "No validation or sanitization specifically for URL content before substitution (guard_summary)"
+        ],
+        "contradicting_evidence": [
+          "encoder() function is applied to the final path after URL substitution, though its effectiveness against shell injection is unclear"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "Whether encoder() function properly escapes shell metacharacters",
+          "Whether browser configuration restricts URL format or content",
+          "Specific browser command templates in use"
+        ],
+        "review_comment": "User-controlled URLs are substituted into browser command templates and executed via shell without proper escaping of shell metacharacters. The encoder function is applied after substitution, which may not adequately prevent command injection if URLs contain characters like ;, |, or $. Validate and sanitize URLs before substitution using shell escaping or parameterized execution without shell interpretation.",
+        "change_type": "A",
+        "raw_score": 0.7100000000000001,
+        "score": 0.7100000000000001
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 273,
+        "statement": "pid = self._fork(browser[\"path\"], url, browser[\"text\"], fetch)",
+        "cwe_id": "CWE-88",
+        "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.45,
+            "evidence": "URL is substituted into browser command template via path.replace(\"%u\", href) and executed via shell, potentially allowing argument delimiter injection if URL contains spaces, quotes, or shell metacharacters"
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "User-controlled URL flows directly from _goto parameter through _fork to shell execution: url -> _fork -> path.replace(\"%u\", href) -> encoder(path) -> os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])"
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "This line initiates the command execution chain by calling _fork with user URL. Reverting would prevent URL from reaching shell execution."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "URL substitution into command template lacks argument delimiter neutralization",
+            "required_control": "Proper argument delimitation and shell escaping for user input in command execution",
+            "control_requirement_evidence": "CWE-88 requires proper delimitation when user input affects command arguments to prevent injection",
+            "existing_controls_checked": [
+              "encoder() function applied to final command string",
+              "no URL-specific validation or escaping observed"
+            ],
+            "deficiency_evidence": "URL is directly substituted into command template without escaping shell metacharacters or argument delimiters; encoder() may not handle argument injection scenarios"
+          },
+          "concrete_impact": {
+            "score": 0.35,
+            "evidence": "Potential argument injection could modify browser command behavior, but specific impact depends on browser command template and system configuration"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the URL would not be passed to _fork, preventing any potential argument injection through the browser command execution path.",
+        "supporting_evidence": [
+          "URL parameter flows directly to shell execution via _fork function",
+          "Command template uses %u substitution pattern without argument delimiter escaping",
+          "Execution uses os.execv with /bin/sh -c which interprets shell metacharacters"
+        ],
+        "contradicting_evidence": [
+          "encoder() function is applied to the final command string, though its effectiveness against argument injection is unclear"
+        ],
+        "contradiction_severity": "minor",
+        "unresolved_facts": [
+          "Exact implementation and security properties of encoder() function",
+          "Default browser command template format and argument structure",
+          "Whether browser configuration is user-modifiable or trusted source only"
+        ],
+        "review_comment": "User-provided URLs are substituted into browser command templates and executed via shell without proper argument delimiter neutralization. The %u substitution pattern allows URL content to affect command arguments if it contains spaces, quotes, or shell metacharacters. Use shell escaping or parameterized execution to separate URL from command arguments, such as passing URL as a separate argument rather than string interpolation.",
+        "change_type": "A",
+        "raw_score": 0.51,
+        "score": 0.51
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "canto_curses/guibase.py",
+        "changed_line": 273,
+        "statement": "pid = self._fork(browser[\"path\"], url, browser[\"text\"], fetch)",
+        "cwe_id": "CWE-74",
+        "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code constructs a shell command by substituting user-controlled URL into browser command template via path.replace(\"%u\", href), then executes via os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path])"
+          },
+          "connection": {
+            "score": 0.8,
+            "evidence": "User-provided URL flows from _goto parameter through _fork call to command template substitution and shell execution. The path contains browser[\"path\"] from configuration with %u placeholder replaced by URL."
+          },
+          "diff_causality": {
+            "score": 0.75,
+            "evidence": "This line initiates the _fork call that leads to shell command construction. Reverting would prevent URL substitution into browser command template."
+          },
+          "security_control": {
+            "score": 0.7,
+            "evidence": "No URL sanitization or validation before shell command construction; only basic encoder() function applied after substitution",
+            "required_control": "Proper input validation and shell argument escaping",
+            "control_requirement_evidence": "CWE-74 requires neutralization of special shell metacharacters when constructing shell commands from untrusted input",
+            "existing_controls_checked": [
+              "encoder() function applied post-substitution",
+              "No pre-substitution validation of URL"
+            ],
+            "deficiency_evidence": "URL is substituted directly into command template without validation; encoder() may not handle all shell metacharacters effectively"
+          },
+          "concrete_impact": {
+            "score": 0.65,
+            "evidence": "Arbitrary command execution if URL contains shell metacharacters; demonstrated path shows direct shell execution with substituted content"
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the _fork call would not execute, preventing URL substitution into browser command template and subsequent shell execution.",
+        "supporting_evidence": [
+          "Line 142: path = path.replace(\"%u\", href) - direct substitution of URL into command template",
+          "Line 145: os.execv(\"/bin/sh\", [\"/bin/sh\", \"-c\", path]) - execution via shell interpreter",
+          "Line 273: url parameter passed to _fork from user-controlled navigation input"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Exact implementation of encoder() function and its effectiveness against shell injection",
+          "Whether browser configuration path validation prevents command injection vectors"
+        ],
+        "review_comment": "User-provided URLs are directly substituted into browser command templates and executed via shell without proper validation. The URL replaces %u placeholder in browser[\"path\"] configuration, then the entire command string is passed to /bin/sh -c. Use shlex.quote() on the URL before substitution or pass URL as separate argument to avoid shell interpretation.",
+        "change_type": "A",
+        "raw_score": 0.7499999999999999,
+        "score": 0.7499999999999999
+      }
+    ],
+    "stage4_status": "completed"
+  }
+]

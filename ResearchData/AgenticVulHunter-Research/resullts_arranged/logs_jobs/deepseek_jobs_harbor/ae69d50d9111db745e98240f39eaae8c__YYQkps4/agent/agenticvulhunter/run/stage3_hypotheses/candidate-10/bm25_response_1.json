@@ -1,0 +1,254 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-10",
+      "filepath": "src/sandstorm/backend.c++",
+      "changed_line": 433,
+      "statement": "KJ_SYSCALL(mkdir(grainDir.cStr(), 0777));",
+      "change_type": "A",
+      "function_name": "restoreGrain",
+      "operation_type": "directory_creation",
+      "selection_reason": "user-controlled grain ID -> creates directory with 0777 permissions -> potential permission issues or directory traversal",
+      "security_relevance_score": 0.6,
+      "code_context": "284: \n285:     writeQueue = forked.addBranch();\n286:     return forked.addBranch();\n287:   }\n288: \n289:   kj::Promise<void> done(DoneContext context) override {\n290:     auto forked = writeQueue.then([this,context]() mutable {\n291:       KJ_REQUIRE(inputWriteEnd != nullptr, \"called done() multiple times\");\n292:       inputWriteEnd = nullptr;\n293:       inputWriteFd = nullptr;\n294:     }).fork();\n295: \n296:     writeQueue = forked.addBranch();\n297:     return forked.addBranch();\n298:   }\n299: \n300:   kj::Promise<void> expectSize(ExpectSizeContext context) override {\n301:     // don't care\n302:     return kj::READY_NOW;\n303:   }\n304: \n305:   kj::Promise<void> saveAs(SaveAsContext context) override {\n306:     KJ_REQUIRE(!saveCalled, \"saveAs() already called\");\n307:     saveCalled = true;\n308:     return readAll(*outputReadEnd).then([this,context](kj::String text) mutable {\n309:       unpackProcess.waitForSuccess();\n310: \n311:       auto packageId = validateId(context.getParams().getPackageId());\n312:       auto finalName = kj::str(\"/var/sandstorm/apps/\", packageId);\n313:       bool exists = access(finalName.cStr(), F_OK) >= 0;\n314:       if (!exists) {\n315:         // Write app ID file.\n316:         kj::FdOutputStream(\n317:             raiiOpen(kj::str(finalName, \".appid\"), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC))\n318:             .write(text.begin(), text.size());\n319: \n320:         // Move directory into place.\n321:         KJ_SYSCALL(rename(tmpdir.cStr(), finalName.cStr()));\n322:       }\n323:       KJ_ON_SCOPE_FAILURE(if (!exists) { tryRecursivelyDelete(finalName); });\n324: \n325:       capnp::StreamFdMessageReader reader(raiiOpen(\n326:           kj::str(finalName, \"/sandstorm-manifest\"), O_RDONLY));\n327:       auto manifest = reader.getRoot<spk::Manifest>();\n328: \n329:       capnp::MessageSize sizeHint = manifest.totalSize();\n330:       sizeHint.wordCount += 8 + text.size() / sizeof(capnp::word);\n331:       auto results = context.getResults(sizeHint);\n332:       results.setAppId(trim(text));\n333:       results.setManifest(manifest);\n334:     }, [this](kj::Exception&& e) {\n335:       kj::runCatchingExceptions([&]() { recursivelyDelete(tmpdir); });\n336:       kj::throwRecoverableException(kj::mv(e));\n337:     });\n338:   }\n339: \n340: private:\n341:   kj::AutoCloseFd inputWriteFd;\n342:   kj::AutoCloseFd outputReadFd;\n343:   kj::Maybe<kj::Own<kj::AsyncOutputStream>> inputWriteEnd;\n344:   kj::Own<kj::AsyncInputStream> outputReadEnd;\n345:   kj::Promise<void> writeQueue = kj::READY_NOW;\n346:   kj::String tmpdir;\n347:   Subprocess unpackProcess;\n348:   bool saveCalled = false;\n349: \n350:   static kj::String tempDirname() {\n351:     static uint counter = 0;\n352:     return kj::str(\"/var/sandstorm/tmp/unpacking.\", time(nullptr), \".\", counter++);\n353:   }\n354: \n355:   static Subprocess startProcess(\n356:       kj::AutoCloseFd input, kj::AutoCloseFd output, kj::StringPtr outdir) {\n357:     Subprocess::Options options({\"spk\", \"unpack\", \"-\", outdir});\n358:     options.executable = \"/proc/self/exe\";\n359:     options.stdin = input;\n360:     options.stdout = output;\n361:     return Subprocess(kj::mv(options));\n362:   }\n363: };\n364: \n365: kj::Promise<void> BackendImpl::installPackage(InstallPackageContext context)  {\n366:   context.getResults().setStream(kj::heap<PackageUploadStreamImpl>(*this));\n367:   return kj::READY_NOW;\n368: }\n369: \n370: kj::Promise<void> BackendImpl::getPackage(GetPackageContext context) {\n371:   auto path = kj::str(\"/var/sandstorm/apps/\", validateId(context.getParams().getPackageId()));\n372: \n373:   capnp::StreamFdMessageReader reader(raiiOpen(\n374:       kj::str(path, \"/sandstorm-manifest\"), O_RDONLY));\n375:   auto manifest = reader.getRoot<spk::Manifest>();\n376: \n377:   kj::String appid = sandstorm::readAll(kj::str(path, \".appid\"));\n378: \n379:   capnp::MessageSize sizeHint = manifest.totalSize();\n380:   sizeHint.wordCount += 8 + appid.size() / sizeof(capnp::word);\n381:   auto results = context.getResults(sizeHint);\n382:   results.setAppId(trim(appid));\n383:   results.setManifest(manifest);\n384: \n385:   return kj::READY_NOW;\n386: }\n387: \n388: kj::Promise<void> BackendImpl::deletePackage(DeletePackageContext context) {\n389:   auto path = kj::str(\"/var/sandstorm/apps/\", validateId(context.getParams().getPackageId()));\n390:   if (access(path.cStr(), F_OK) >= 0) {\n391:     tryRecursivelyDelete(path);\n392:   }\n393:   return kj::READY_NOW;\n394: }\n395: \n396: // =======================================================================================\n397: \n398: kj::Promise<void> BackendImpl::backupGrain(BackupGrainContext context) {\n399:   auto params = context.getParams();\n400: \n401:   auto path = kj::str(\"/var/sandstorm/backups/\", params.getBackupId());\n402:   recursivelyCreateParent(path);\n403:   auto grainDir = kj::str(\"/var/sandstorm/grains/\", params.getGrainId());\n404:   Subprocess::Options processOptions({\"backup\", path, grainDir});\n405:   processOptions.executable = \"/proc/self/exe\";\n406:   auto inPipe = Pipe::make();\n407:   processOptions.stdin = inPipe.readEnd;\n408:   Subprocess process(kj::mv(processOptions));\n409:   inPipe.readEnd = nullptr;\n410: \n411:   auto metadata = params.getInfo();\n412:   auto metadataMsg = kj::heap<capnp::MallocMessageBuilder>(metadata.totalSize().wordCount + 4);\n413:   metadataMsg->setRoot(metadata);\n414:   context.releaseParams();\n415:   auto metadataStreamFd = kj::mv(inPipe.writeEnd);\n416:   auto output = ioProvider.wrapOutputFd(\n417:       metadataStreamFd, kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC);\n418:   auto promise = capnp::writeMessage(*output, *metadataMsg);\n419: \n420:   return promise.attach(kj::mv(metadataMsg), kj::mv(metadataStreamFd), kj::mv(output))\n421:       .then([KJ_MVCAP(process)]() mutable {\n422:     // TODO(cleanup): We should probably use a SubprocessSet to wait asynchronously, but that\n423:     //   means we need to use SubprocessSet everywhere...\n424:     process.waitForSuccess();\n425:   });\n426: }\n427: \n428: kj::Promise<void> BackendImpl::restoreGrain(RestoreGrainContext context) {\n429:   auto params = context.getParams();\n430: \n431:   auto path = kj::str(\"/var/sandstorm/backups/\", params.getBackupId());\n432:   auto grainDir = kj::str(\"/var/sandstorm/grains/\", params.getGrainId());\n433:   KJ_SYSCALL(mkdir(grainDir.cStr(), 0777));\n434:   Subprocess::Options processOptions({\"backup\", \"-r\", path, grainDir});\n435:   processOptions.executable = \"/proc/self/exe\";\n436:   auto outPipe = Pipe::make();\n437:   processOptions.stdout = outPipe.writeEnd;\n438:   Subprocess process(kj::mv(processOptions));\n439:   outPipe.writeEnd = nullptr;\n440: \n441:   context.releaseParams();\n442: \n443:   auto input = kj::mv(outPipe.readEnd);\n444:   auto asyncInput = ioProvider.wrapInputFd(input, kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC);\n445: \n446:   auto promise = capnp::readMessage(*asyncInput);\n447:   return promise.attach(kj::mv(input), kj::mv(asyncInput), kj::mv(process))\n448:       .then([context](kj::Own<capnp::MessageReader>&& message) mutable {\n449:     auto metadata = message->getRoot<GrainInfo>();\n450:     context.getResults(capnp::MessageSize { metadata.totalSize().wordCount + 4, 0 })\n451:         .setInfo(metadata);\n452:   });\n453: }\n454: \n455: class BackendImpl::FileUploadStream: public ByteStream::Server {\n456: public:\n457:   FileUploadStream(kj::String finalPath)\n458:       : fd(raiiOpen(dirname(finalPath), O_WRONLY | O_TMPFILE)),\n459:         finalPath(kj::mv(finalPath)) {}\n460: \n461: protected:\n462:   kj::Promise<void> write(WriteContext context) override {\n463:     auto data = context.getParams().getData();\n464:     kj::FdOutputStream(fd.get()).write(data.begin(), data.size());\n465:     return kj::READY_NOW;\n466:   }\n467: \n468:   kj::Promise<void> done(DoneContext context) override {\n469:     KJ_SYSCALL(fdatasync(fd));\n470: \n471:     // Link temporary file into filesystem.\n472:     KJ_SYSCALL(linkat(AT_FDCWD, kj::str(\"/proc/self/fd/\", fd.get()).cStr(),\n473:                       AT_FDCWD, finalPath.cStr(), AT_SYMLINK_FOLLOW));\n474:     return kj::READY_NOW;\n475:   }\n476: \n477:   kj::Promise<void> expectSize(ExpectSizeContext context) override {\n478:     // don't care\n479:     return kj::READY_NOW;\n480:   }\n481: \n482: private:\n483:   kj::AutoCloseFd fd;\n484:   kj::String finalPath;\n485: \n486:   static kj::String dirname(kj::StringPtr path) {\n487:     KJ_IF_MAYBE(pos, path.findLast('/')) {\n488:       return kj::heapString(path.slice(0, *pos));\n489:     } else {\n490:       return kj::heapString(\".\");\n491:     }\n492:   }\n493: };\n494: \n495: kj::Promise<void> BackendImpl::pump(kj::AsyncInputStream& input, ByteStream::Client stream) {\n496:   auto req = stream.writeRequest(capnp::MessageSize { 2100, 0 });\n497:   auto orphanage = capnp::Orphanage::getForMessageContaining(\n498:       kj::implicitCast<ByteStream::WriteParams::Builder>(req));\n499:   auto orphan = orphanage.newOrphan<capnp::Data>(8192);\n500:   auto buffer = orphan.get();\n501: \n502:   return input.tryRead(buffer.begin(), 1, buffer.size())\n503:       .then([&input,KJ_MVCAP(stream),KJ_MVCAP(req),KJ_MVCAP(orphan)](size_t n) mutable\n504:             -> kj::Promise<void> {\n505:     if (n == 0) {\n506:       return kj::READY_NOW;\n507:     }\n508: \n509:     orphan.truncate(n);\n510:     req.adoptData(kj::mv(orphan));\n511: \n512:     // TODO(now): Parallelize writes.\n513:     return req.send().then([&input,KJ_MVCAP(stream)](auto&&) mutable {\n514:       return pump(input, kj::mv(stream));\n515:     });\n516:   });\n517: }\n518: \n519: kj::Promise<void> BackendImpl::pump(kj::InputStream& input, ByteStream::Client stream) {\n520:   auto req = stream.writeRequest(capnp::MessageSize { 2100, 0 });\n521:   auto orphanage = capnp::Orphanage::getForMessageContaining(\n522:       kj::implicitCast<ByteStream::WriteParams::Builder>(req));\n523:   auto orphan = orphanage.newOrphan<capnp::Data>(8192);\n524:   auto buffer = orphan.get();\n525: \n526:   size_t n = input.tryRead(buffer.begin(), 1, buffer.size());\n527:   if (n == 0) {\n528:     return kj::READY_NOW;\n529:   }\n530: \n531:   orphan.truncate(n);\n532:   req.adoptData(kj::mv(orphan));\n533: \n534:   // TODO(now): Parallelize writes.\n535:   return req.send().then([&input,KJ_MVCAP(stream)](auto&&) mutable {\n536:     return pump(input, kj::mv(stream));\n537:   });\n538: }\n539: \n540: kj::Promise<void> BackendImpl::uploadBackup(UploadBackupContext context) {\n541:   auto path = kj::str(\"/var/sandstorm/backups/\", context.getParams().getBackupId());\n542:   context.releaseParams();\n543: \n544:   recursivelyCreateParent(path);\n545: \n546:   context.getResults(capnp::MessageSize { 4, 1 }).setStream(\n547:       kj::heap<FileUploadStream>(kj::mv(path)));\n548:   return kj::READY_NOW;\n549: }\n550: \n551: kj::Promise<void> BackendImpl::downloadBackup(DownloadBackupContext context) {\n552:   auto params = context.getParams();\n553:   auto path = kj::str(\"/var/sandstorm/backups/\", params.getBackupId());\n554:   auto stream = params.getStream();\n555:   context.releaseParams();\n556: \n557:   auto fd = raiiOpen(path, O_RDONLY | O_CLOEXEC);\n558:   struct stat stats;\n559:   KJ_SYSCALL(fstat(fd, &stats));\n560:   auto expectReq = stream.expectSizeRequest();\n561:   expectReq.setSize(stats.st_size);\n562:   auto expectPromise = expectReq.send();\n563: \n564:   auto file = kj::heap<kj::FdInputStream>(kj::mv(fd));\n565: \n566:   auto promise = pump(*file, kj::mv(stream));\n567:   return promise.attach(kj::mv(file), kj::mv(expectPromise));\n568: }\n569: \n570: kj::Promise<void> BackendImpl::deleteBackup(DeleteBackupContext context) {\n571:   auto path = kj::str(\"/var/sandstorm/backups/\", context.getParams().getBackupId());\n572:   while (unlink(path.cStr()) < 0) {\n573:     int error = errno;\n574:     if (error == ENOENT) {\n575:       break;\n576:     } else if (error != EINTR) {\n577:       KJ_FAIL_SYSCALL(\"unlink\", error, path);\n578:     }\n579:   }\n580:   return kj::READY_NOW;\n581: }\n582: ",
+      "source_summary": "grainDir is constructed from user-controlled params.getGrainId() without validation via validateId function",
+      "sink_summary": "Creates directory with world-writable permissions (0777) at /var/sandstorm/grains/<grainId>",
+      "guard_summary": "No validation of grainId parameter; missing validateId call that prevents '.' prefix and '/' characters; uses 0777 permissions instead of secure defaults",
+      "risk_pattern": "Unvalidated user input used directly in directory path creation with excessive permissions (0777), enabling potential directory traversal or permission escalation",
+      "used_variable_sources": [
+        "params.getGrainId()"
+      ],
+      "called_function_context": [
+        "kj::str",
+        "mkdir"
+      ],
+      "enclosing_conditions": [],
+      "context_summary": "Function creates grain directory for backup restoration; other similar functions use validateId but this one does not; recursivelyCreateParent uses same 0777 permissions but for parent directories only",
+      "unresolved_facts": [
+        "Whether grainId values are validated elsewhere in the call chain",
+        "Whether the backup subprocess requires world-writable permissions",
+        "What security model governs grain directory access permissions"
+      ],
+      "language": "",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/function-declaration-conflict",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 32.8158,
+          "raw_bm25_score": 32.8158,
+          "description": "If two functions with the same name are declared in the same scope, one of the declarations overrides the other without warning. This makes the code hard to read and maintain, and may even lead to platform-dependent behavior.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/call/wrong-named-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 31.6356,
+          "raw_bm25_score": 31.6356,
+          "description": "Using a named argument whose name does not correspond to a parameter of the called function or method, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/eval-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.5723,
+          "raw_bm25_score": 28.5723,
+          "description": "The 'eval' function and the 'Function' constructor execute strings as code. This is dangerous and impedes program analysis and understanding. Consequently, these two functions should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.5428,
+          "raw_bm25_score": 26.5428,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/insecure-temporary-file",
+          "cwe_id": "CWE-378",
+          "cwe_name": "Creation of Temporary File With Insecure Permissions",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.5882,
+          "raw_bm25_score": 23.5882,
+          "description": "Creating a temporary file that is accessible by other users can lead to information disclosure and sometimes remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-378. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "external/cwe/cwe-377",
+            "external/cwe/cwe-378",
+            "security"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/unicode-dos",
+          "cwe_id": "CWE-770",
+          "cwe_name": "Allocation of Resources Without Limits or Throttling",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.8492,
+          "raw_bm25_score": 22.8492,
+          "description": "A remote user-controlled data can reach a costly Unicode normalization with either form NFKC or NFKD. On Windows OS, with an attack such as the One Million Unicode Characters, this could lead to a denial of service. And, with the use of special Unicode characters, like U+2100 (℀) or U+2105 (℅), the payload size could be tripled.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-770"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/useless-regexp-character-escape",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.7905,
+          "raw_bm25_score": 21.7905,
+          "description": "Prepending a backslash to an ordinary character in a string does not have any effect, and may make regular expressions constructed from this string behave unexpectedly.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/super-not-enclosing-class",
+          "cwe_id": "CWE-687",
+          "cwe_name": "Function Call With Incorrectly Specified Argument Value",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.595,
+          "raw_bm25_score": 19.595,
+          "description": "Calling super with something other than the enclosing class may cause incorrect object initialization.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-687. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-687"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/call/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 19.493,
+          "raw_bm25_score": 19.493,
+          "description": "Using too many or too few arguments in a call to a function will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-264-permissions-privileges-and-access-controls",
+          "cwe_id": "CWE-264",
+          "cwe_name": "Permissions, Privileges, and Access Controls",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 19.0091,
+          "raw_bm25_score": 19.0091,
+          "description": "Legacy access-control category for failures in permissions, privileges, or authorization enforcement.",
+          "pattern": "cwe-264 permissions privileges access-control authorization acl role privilege owner permission enforcement",
+          "remediation": "Enforce trusted authorization, role, ownership, and permission checks.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-264"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

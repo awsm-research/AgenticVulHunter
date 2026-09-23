@@ -1,0 +1,303 @@
+diff --git a/canto_curses/guibase.py b/canto_curses/guibase.py
+index dacc6e9..a5e2205 100644
+--- a/canto_curses/guibase.py
++++ b/canto_curses/guibase.py
+@@ -1,50 +1,50 @@
+ # -*- coding: utf-8 -*-
+ #Canto-curses - ncurses RSS reader
+ #   Copyright (C) 2010 Jack Miller <jack@codezen.org>
+ #
+ #   This program is free software; you can redistribute it and/or modify
+ #   it under the terms of the GNU General Public License version 2 as 
+ #   published by the Free Software Foundation.
+ 
+-from command import CommandHandler, command_format
++from canto_next.hooks import call_hook, on_hook
+ from canto_next.encoding import encoder, decoder
+ from canto_next.plugins import Plugin
++
++from command import CommandHandler, command_format
++
+ import logging
+ 
+ log = logging.getLogger("COMMON")
+ 
+ import subprocess
+ import tempfile
+ import urllib2
+ import shlex
+ import sys
+ import os
+ 
+ class BasePlugin(Plugin):
+     pass
+ 
+ class GuiBase(CommandHandler):
+     def __init__(self):
+         CommandHandler.__init__(self)
+ 
+         self.plugin_class = BasePlugin
+         self.update_plugin_lookups()
+ 
+-        self.tempdirs = []
+-        self.tempfiles = []
+-
+         self.editor = None
+ 
+     def input(self, prompt):
+         return self.callbacks["input"](prompt)
+ 
+     def int(self, args):
+         t, r = self._int(args, None, None, lambda : self.input("int: "))
+         if t:
+             return (True, t, r)
+         return (False, None, None)
+ 
+     @command_format([])
+     def cmd_destroy(self, **kwargs):
+         self.callbacks["die"](self)
+ 
+@@ -69,53 +69,95 @@ class GuiBase(CommandHandler):
+     def _tag_cfg_set_prompt(self, tag, option, prompt):
+         t = self.callbacks["get_tag_opt"](tag, option)
+         self.callbacks["set_tag_opt"](tag, option, True)
+ 
+         # Same as above, if we're wrapping a prompt, we want
+         # to update the screen.
+ 
+         if not t:
+             self.redraw()
+ 
+         r = self.input(prompt)
+ 
+         self.callbacks["set_tag_opt"](tag, option, t)
+         return r
+ 
+-    def _fork(self, path, href, text):
++    def _fork(self, path, href, text, fetch=False):
++
++        # Prepare temporary files, if fetch.
++
++        if fetch:
++            # Get a path (sans query strings, etc.) for the URL
++            tmppath = urllib2.urlparse.urlparse(href).path
++
++            # Return just the basename of the path (no directories)
++            fname = os.path.basename(tmppath)
++
++            # Grab a temporary directory. This allows us to create a file with
++            # an unperturbed filename so scripts can freely use regex /
++            # extension matching in addition to mimetype detection.
++
++            tmpdir = tempfile.mkdtemp(prefix="canto-")
++            tmpnam = tmpdir + '/' + fname
++
++            on_hook("exit", lambda : (os.unlink(tmpnam)))
++            on_hook("exit", lambda : (os.rmdir(tmpdir)))
++
+         pid = os.fork()
+-        if not pid :
+-            # A lot of programs don't appreciate
+-            # having their fds closed, so instead
+-            # we dup them to /dev/null.
+ 
+-            fd = os.open("/dev/null", os.O_RDWR)
+-            os.dup2(fd, sys.stderr.fileno())
++        # Parents can now bail.
++        if pid:
++            return pid
++
++        if fetch:
++            tmp = open(tmpnam, 'w+b')
++
++            # Grab the HTTP info / prepare to read.
++            response = urllib2.urlopen(href)
++
++            # Grab in kilobyte chunks to avoid wasting memory on something
++            # that's going to be immediately written to disk.
++
++            while True:
++                r = response.read(1024)
++                if not r:
++                    break
++                tmp.write(r)
++
++            response.close()
++            tmp.close()
++
++            href = tmpnam
+ 
+-            if not text:
+-                os.setpgid(os.getpid(), os.getpid())
+-                os.dup2(fd, sys.stdout.fileno())
++        # A lot of programs don't appreciate
++        # having their fds closed, so instead
++        # we dup them to /dev/null.
+ 
+-            path = path.replace("%u", href)
+-            path = encoder(path)
++        fd = os.open("/dev/null", os.O_RDWR)
++        os.dup2(fd, sys.stderr.fileno())
+ 
+-            os.execv("/bin/sh", ["/bin/sh", "-c", path])
++        if not text:
++            os.setpgid(os.getpid(), os.getpid())
++            os.dup2(fd, sys.stdout.fileno())
+ 
+-            # Just in case.
+-            sys.exit(0)
++        path = path.replace("%u", href)
++        path = encoder(path)
+ 
+-        return pid
++        os.execv("/bin/sh", ["/bin/sh", "-c", path])
++
++        # Just in case.
++        sys.exit(0)
+ 
+     def _edit(self, text):
+         if not self.editor:
+             self.editor = os.getenv("EDITOR")
+         if not self.editor:
+             self.editor = self.input("editor: ")
+ 
+         # No editor, or cancelled dialog, no change.
+         if not self.editor:
+             return text
+ 
+         self.callbacks["pause_interface"]()
+ 
+         # Setup tempfile to edit.
+         fd, path = tempfile.mkstemp(text=True)
+@@ -205,92 +247,40 @@ class GuiBase(CommandHandler):
+         args = "canto-remote " + args
+         args = encoder(args)
+ 
+         # Add location args, so the remote is connecting
+         # to the correct daemon.
+ 
+         self._remote_argv(shlex.split(args))
+ 
+     def remote_args(self, args):
+         return self.string(args, "remote: ")
+ 
+     @command_format([("remote_args","remote_args")])
+     def cmd_remote(self, **kwargs):
+         self._remote(kwargs["remote_args"])
+ 
+-    def _goto(self, urls):
++    def _goto(self, urls, fetch=False):
+         browser = self.callbacks["get_conf"]()["browser"]
+ 
+         if not browser["path"]:
+             log.error("No browser defined! Cannot goto.")
+             return
+ 
+         if browser["text"]:
+             self.callbacks["pause_interface"]()
+ 
+         for url in urls:
+-            pid = self._fork(browser["path"], url, browser["text"])
++            pid = self._fork(browser["path"], url, browser["text"], fetch)
+             if browser["text"]:
+                 os.waitpid(pid, 0)
+ 
+         if browser["text"]:
+             self.callbacks["unpause_interface"]()
+ 
+     # Like goto, except download the file to /tmp before executing browser.
+ 
+     def _fetch(self, urls):
+-        for url in urls:
+-            # Get a path (sans query strings, etc.) for the URL
+-            path = urllib2.urlparse.urlparse(url).path
+-
+-            # Return just the basename of the path (no directories)
+-            fname = os.path.basename(path)
+-
+-            # Grab a temporary directory. This allows us to create a file with
+-            # an unperturbed filename so scripts can freely use regex /
+-            # extension matching in addition to mimetype detection.
+-
+-            tmpdir = tempfile.mkdtemp(prefix="canto-")
+-            tmpnam = tmpdir + '/' + fname
+-
+-            tmp = open(tmpnam, 'w+b')
+-
+-            # Grab the HTTP info / prepare to read.
+-            response = urllib2.urlopen(url)
+-
+-            # Grab in kilobyte chunks to avoid wasting memory on something
+-            # that's going to be immediately written to disk.
+-
+-            while True:
+-                r = response.read(1024)
+-                if not r:
+-                    break
+-                tmp.write(r)
+-
+-            response.close()
+-            tmp.close()
+-
+-            # Keep track of tmpdirs to cleanup later.
+-
+-            self.tempdirs.append(tmpdir)
+-            self.tempfiles.append(tmpnam)
+-
+-            # Invoke browser on tempfile.
+-
+-            self._goto([tmp.name])
+-
+-    def clean_tempfiles(self):
+-        log.debug("Cleaning up tempfiles...")
+-        for tf in self.tempfiles:
+-            log.debug("\t%s" % tf)
+-            os.unlink(tf)
+-        self.tempfiles = []
+-
+-        for td in self.tempdirs:
+-            log.debug("\t%s" % td)
+-            os.rmdir(td)
+-        self.tempdirs = []
+-
+-        log.debug("Done!")
++        self._goto(urls, True)
+ 
+     def named_key(self, args):
+         return self.input_key(args, lambda : self.callbacks["input"]("key: "))
+diff --git a/canto_curses/reader.py b/canto_curses/reader.py
+index e7e64c0..93fc699 100644
+--- a/canto_curses/reader.py
++++ b/canto_curses/reader.py
+@@ -22,31 +22,30 @@ log = logging.getLogger("READER")
+ class ReaderPlugin(Plugin):
+     pass
+ 
+ class Reader(TextBox):
+     def __init__(self):
+         TextBox.__init__(self)
+ 
+         self.plugin_class = ReaderPlugin
+         self.update_plugin_lookups()
+ 
+     def init(self, pad, callbacks):
+         TextBox.init(self, pad, callbacks)
+ 
+         self.quote_rgx = re.compile(u"[\\\"](.*?)[\\\"]")
+         on_hook("opt_change", self.on_opt_change)
+-        on_hook("exit", self.clean_tempfiles)
+ 
+     def die(self):
+         remove_hook("opt_change", self.on_opt_change)
+         self.callbacks["set_var"]("reader_item", None)
+         self.callbacks["set_var"]("reader_offset", 0)
+ 
+     def on_opt_change(self, change):
+         if "reader" not in change:
+             return
+ 
+         if "show_description" in change["reader"] or\
+                 "enumerate_links" in change["reader"]:
+             self.refresh()
+ 
+     def on_attributes(self, attributes):

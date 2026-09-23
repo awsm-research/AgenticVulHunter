@@ -1,0 +1,237 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-10",
+      "filepath": "lib/expression/node/IndexNode.js",
+      "changed_line": 138,
+      "statement": "return 'math.index(' + join(dimensions, ', ') + ')';",
+      "change_type": "A",
+      "function_name": "",
+      "operation_type": "security_sensitive_execution",
+      "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+      "security_relevance_score": 0.6,
+      "code_context": "1: 'use strict';\n2: \n3: var map = require('../../utils/array').map;\n4: var join = require('../../utils/array').join;\n5: \n6: function factory (type, config, load, typed) {\n7:   var register = load(require('./compile')).register;\n8:   var compile = load(require('./compile')).compile;\n9:   var Node = load(require('./Node'));\n10:   var RangeNode = load(require('./RangeNode'));\n11:   var SymbolNode = load(require('./SymbolNode'));\n12: \n13:   var Range = load(require('../../type/matrix/Range'));\n14: \n15:   var isArray = Array.isArray;\n16: \n17:   /**\n18:    * @constructor IndexNode\n19:    * @extends Node\n20:    *\n21:    * Describes a subset of a matrix or an object property.\n22:    * Cannot be used on its own, needs to be used within an AccessorNode or\n23:    * AssignmentNode.\n24:    *\n25:    * @param {Node[]} dimensions\n26:    * @param {boolean} [dotNotation=false]  Optional property describing whether\n27:    *                                       this index was written using dot\n28:    *                                       notation like `a.b`, or using bracket\n29:    *                                       notation like `a[\"b\"]` (default).\n30:    *                                       Used to stringify an IndexNode.\n31:    */\n32:   function IndexNode(dimensions, dotNotation) {\n33:     if (!(this instanceof IndexNode)) {\n34:       throw new SyntaxError('Constructor must be called with the new operator');\n35:     }\n36: \n37:     this.dimensions = dimensions;\n38:     this.dotNotation = dotNotation || false;\n39: \n40:     // validate input\n41:     if (!isArray(dimensions)\n42:         || !dimensions.every(function (range) {return range && range.isNode;})) {\n43:       throw new TypeError('Array containing Nodes expected for parameter \"dimensions\"');\n44:     }\n45:     if (this.dotNotation && !this.isObjectProperty()) {\n46:       throw new Error('dotNotation only applicable for object properties');\n47:     }\n48: \n49:     // TODO: deprecated since v3, remove some day\n50:     var deprecated = function () {\n51:       throw new Error('Property `IndexNode.object` is deprecated, use `IndexNode.fn` instead');\n52:     };\n53:     Object.defineProperty(this, 'object', { get: deprecated, set: deprecated });\n54:   }\n55: \n56:   IndexNode.prototype = new Node();\n57: \n58:   IndexNode.prototype.type = 'IndexNode';\n59: \n60:   IndexNode.prototype.isIndexNode = true;\n61: \n62:   /**\n63:    * Compile all range nodes\n64:    *\n65:    * When some of the dimensions has `end` defined, the IndexNode requires\n66:    * a variable `size` to be defined in the current closure, and must contain\n67:    * the size of the matrix that's being handled. To check whether the `size`\n68:    * variable is needed, call IndexNode.needsSize().\n69:    *\n70:    * @param {IndexNode} node        The node to be compiled\n71:    * @param {Object} defs           Object which can be used to define functions\n72:    *                                or constants globally available for the\n73:    *                                compiled expression\n74:    * @param {Object} args           Object with local function arguments, the key is\n75:    *                                the name of the argument, and the value is `true`.\n76:    *                                The object may not be mutated, but must be\n77:    *                                extended instead.\n78:    * @return {string} code\n79:    */\n80:   function compileIndexNode(node, defs, args) {\n81:     // args can be mutated by IndexNode, when dimensions use `end`\n82:     var childArgs = Object.create(args);\n83: \n84:     // helper function to create a Range from start, step and end\n85:     defs.range = function (start, end, step) {\n86:       return new Range(\n87:           (start && start.isBigNumber === true) ? start.toNumber() : start,\n88:           (end   && end.isBigNumber === true)   ? end.toNumber()   : end,\n89:           (step  && step.isBigNumber === true)  ? step.toNumber()  : step\n90:       );\n91:     };\n92: \n93:     // TODO: implement support for bignumber (currently bignumbers are silently\n94:     //       reduced to numbers when changing the value to zero-based)\n95: \n96:     // TODO: Optimization: when the range values are ConstantNodes,\n97:     //       we can beforehand resolve the zero-based value\n98: \n99:     // optimization for a simple object property\n100:     var dimensions = map(node.dimensions, function (range, i) {\n101:       if (range && range.isRangeNode) {\n102:         if (range.needsEnd()) {\n103:           childArgs.end = true;\n104: \n105:           // resolve end and create range\n106:           return '(function () {' +\n107:               'var end = size[' + i + ']; ' +\n108:               'return range(' +\n109:               compile(range.start, defs, childArgs) + ', ' +\n110:               compile(range.end, defs, childArgs) + ', ' +\n111:               (range.step ? compile(range.step, defs, childArgs) : '1') +\n112:               '); ' +\n113:               '})()';\n114:         }\n115:         else {\n116:           // create range\n117:           return 'range(' +\n118:               compile(range.start, defs, childArgs) + ', ' +\n119:               compile(range.end, defs, childArgs) + ', ' +\n120:               (range.step ? compile(range.step, defs, childArgs) : '1') +\n121:               ')';\n122:         }\n123:       }\n124:       if (range.isSymbolNode && range.name === 'end') {\n125:         childArgs.end = true;\n126: \n127:         // resolve the parameter 'end'\n128:         return '(function () {' +\n129:             'var end = size[' + i + ']; ' +\n130:             'return ' + compile(range, defs, childArgs) + '; ' +\n131:             '})()'\n132:       }\n133:       else { // ConstantNode\n134:         return compile(range, defs, childArgs);\n135:       }\n136:     });\n137: \n138:     return 'math.index(' + join(dimensions, ', ') + ')';\n139:   }\n140: \n141:   // register the compile function\n142:   register(IndexNode.prototype.type, compileIndexNode);\n143: \n144:   /**\n145:    * Execute a callback for each of the child nodes of this node\n146:    * @param {function(child: Node, path: string, parent: Node)} callback\n147:    */\n148:   IndexNode.prototype.forEach = function (callback) {\n149:     for (var i = 0; i < this.dimensions.length; i++) {\n150:       callback(this.dimensions[i], 'dimensions[' + i + ']', this);\n151:     }\n152:   };\n153: \n154:   /**\n155:    * Create a new IndexNode having it's childs be the results of calling\n156:    * the provided callback function for each of the childs of the original node.\n157:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n158:    * @returns {IndexNode} Returns a transformed copy of the node\n159:    */\n160:   IndexNode.prototype.map = function (callback) {\n161:     var dimensions = [];\n162:     for (var i = 0; i < this.dimensions.length; i++) {\n163:       dimensions[i] = this._ifNode(callback(this.dimensions[i], 'dimensions[' + i + ']', this));\n164:     }\n165: \n166:     return new IndexNode(dimensions);\n167:   };\n168: \n169:   /**\n170:    * Create a clone of this node, a shallow copy\n171:    * @return {IndexNode}\n172:    */\n173:   IndexNode.prototype.clone = function () {\n174:     return new IndexNode(this.dimensions.slice(0));\n175:   };\n176: \n177:   /**\n178:    * Test whether this IndexNode contains a single property name\n179:    * @return {boolean}\n180:    */\n181:   IndexNode.prototype.isObjectProperty = function () {\n182:     return this.dimensions.length === 1 &&\n183:         this.dimensions[0].isConstantNode &&\n184:         this.dimensions[0].valueType === 'string';\n185:   };\n186: \n187:   /**\n188:    * Returns the property name if IndexNode contains a property.\n189:    * If not, returns null.\n190:    * @return {string | null}\n191:    */\n192:   IndexNode.prototype.getObjectProperty = function () {\n193:     return this.isObjectProperty() ? this.dimensions[0].value : null;\n194:   };\n195: \n196:   /**\n197:    * Get string representation\n198:    * @param {Object} options\n199:    * @return {string} str\n200:    */\n201:   IndexNode.prototype._toString = function (options) {\n202:     // format the parameters like \"[1, 0:5]\"\n203:     return this.dotNotation\n204:         ? ('.' + this.getObjectProperty())\n205:         : ('[' + this.dimensions.join(', ') + ']');\n206:   };\n207: \n208:   /**\n209:    * Get LaTeX representation\n210:    * @param {Object} options\n211:    * @return {string} str\n212:    */\n213:   IndexNode.prototype._toTex = function (options) {\n214:     var dimensions = this.dimensions.map(function (range) {\n215:       return range.toTex(options);\n216:     });\n217: \n218:     return this.dotNotation\n219:         ? ('.' + this.getObjectProperty() + '')\n220:         : ('_{' + dimensions.join(',') + '}');\n221:   };\n222: \n223:   /**\n224:    * Test whether this IndexNode needs the object size, size of the Matrix\n225:    * @return {boolean}\n226:    */\n227:   IndexNode.prototype.needsSize = function () {\n228:     return this.dimensions.some(function (range) {\n229:       return (range.isRangeNode && range.needsEnd()) ||\n230:           (range.isSymbolNode && range.name === 'end');\n231:     });\n232:   };\n233: \n234:   return IndexNode;\n235: }\n236: \n237: exports.name = 'IndexNode';\n238: exports.path = 'expression.node';\n239: exports.factory = factory;",
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/index-out-of-bounds",
+          "cwe_id": "CWE-193",
+          "cwe_name": "Off-by-one Error",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 11.8984,
+          "raw_bm25_score": 11.8984,
+          "description": "An array index is compared to be less than or equal to the 'length' property, and then used in an indexing operation that could be out of bounds.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-193. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "logic",
+            "language-features"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/exit-from-finally",
+          "cwe_id": "CWE-584",
+          "cwe_name": "Return Inside Finally Block",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 7.5856,
+          "raw_bm25_score": 7.5856,
+          "description": "Avoid using unstructured control flow statements (return, continue, or break) inside a 'finally' block.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-584. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "reliability",
+            "maintainability",
+            "language-features",
+            "external/cwe/cwe-584"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/useless-assignment-in-return",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 6.4549,
+          "raw_bm25_score": 6.4549,
+          "description": "An assignment to a local variable in a return statement is useless, since the variable will immediately go out of scope and its value is lost.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/file-system-race",
+          "cwe_id": "CWE-367",
+          "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 6.1238,
+          "raw_bm25_score": 6.1238,
+          "description": "Separately checking the state of a file before operating on it may allow an attacker to modify the file between the two operations.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-367"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "fallback/cwe-125-out-of-bounds-read",
+          "cwe_id": "CWE-125",
+          "cwe_name": "Out-of-bounds Read",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 6.0248,
+          "raw_bm25_score": 6.0248,
+          "description": "A read accesses memory before or beyond the valid buffer range.",
+          "pattern": "cwe-125 out-of-bounds-read buffer-read memory-read index offset length parser decode malformed-input boundary",
+          "remediation": "Check read offsets, indexes, and lengths before buffer access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-125"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "fallback/cwe-119-improper-restriction-of-operations-within-the-bounds-of-a-memory-buffer",
+          "cwe_id": "CWE-119",
+          "cwe_name": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 5.7273,
+          "raw_bm25_score": 5.7273,
+          "description": "Memory operations access outside the intended buffer boundary.",
+          "pattern": "cwe-119 memory-buffer bounds pointer overflow underflow memcpy strcpy allocation index length out-of-bounds read write",
+          "remediation": "Validate buffer sizes, offsets, indexes, and memory-copy lengths.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-119"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/identity-replacement",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 4.9772,
+          "raw_bm25_score": 4.9772,
+          "description": "Replacing a substring with itself has no effect and may indicate a mistake.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output. Implement proper encoding libraries for HTML, JavaScript, URL, and CSS contexts.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-116"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/property-assignment-on-primitive",
+          "cwe_id": "CWE-704",
+          "cwe_name": "Incorrect Type Conversion or Cast",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 4.7594,
+          "raw_bm25_score": 4.7594,
+          "description": "Assigning to a property of a primitive value has no effect and may trigger a runtime error.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-704. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "language-features",
+            "external/cwe/cwe-704"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/missing-token-validation",
+          "cwe_id": "CWE-352",
+          "cwe_name": "Cross-Site Request Forgery (CSRF)",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 4.6797,
+          "raw_bm25_score": 4.6797,
+          "description": "Using cookies without CSRF protection may allow malicious websites to submit requests on behalf of the user.",
+          "pattern": "Find state-changing operations that lack CSRF protection mechanisms",
+          "remediation": "Implement CSRF tokens for all state-changing operations. Use SameSite cookie attributes and validate the Origin/Referer headers.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-352"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/useless-expression",
+          "cwe_id": "CWE-561",
+          "cwe_name": "Dead Code",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 4.641,
+          "raw_bm25_score": 4.641,
+          "description": "An expression that has no effect and is used in a void context is most likely redundant and may indicate a bug.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove dead code through static analysis. Use code coverage tools to identify unreachable code. Implement regular code reviews to eliminate unused functionality.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "useless-code",
+            "external/cwe/cwe-480",
+            "external/cwe/cwe-561"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

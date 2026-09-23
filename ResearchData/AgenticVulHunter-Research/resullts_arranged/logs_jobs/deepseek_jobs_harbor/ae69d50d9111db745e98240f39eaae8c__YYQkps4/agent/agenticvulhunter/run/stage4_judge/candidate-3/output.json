@@ -1,0 +1,248 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "src/sandstorm/backup.c++",
+  "changed_line": 124,
+  "statement": "KJ_SYSCALL(mount(filename.cStr(), \"/tmp/tmp/file.zip\", nullptr, MS_BIND, nullptr));",
+  "change_type": "A",
+  "function_name": "BackupMain::run",
+  "operation_type": "filesystem_mount_operation",
+  "selection_reason": "user-controlled filename -> MS_BIND mount -> potential path traversal or symlink attack",
+  "security_relevance_score": 0.9,
+  "code_context": "1: // Sandstorm - Personal Cloud Sandbox\n2: // Copyright (c) 2015 Sandstorm Development Group, Inc. and contributors\n3: // All rights reserved.\n4: //\n5: // Licensed under the Apache License, Version 2.0 (the \"License\");\n6: // you may not use this file except in compliance with the License.\n7: // You may obtain a copy of the License at\n8: //\n9: //   http://www.apache.org/licenses/LICENSE-2.0\n10: //\n11: // Unless required by applicable law or agreed to in writing, software\n12: // distributed under the License is distributed on an \"AS IS\" BASIS,\n13: // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: // See the License for the specific language governing permissions and\n15: // limitations under the License.\n16: \n17: #include \"backup.h\"\n18: #include \"util.h\"\n19: #include \"version.h\"\n20: #include <kj/debug.h>\n21: #include <sched.h>\n22: #include <sys/mount.h>\n23: #include <sys/syscall.h>\n24: #include <sys/stat.h>\n25: #include <sys/types.h>\n26: \n27: namespace sandstorm {\n28: \n29: class BackupMain: public AbstractMain {\n30: public:\n31:   BackupMain(kj::ProcessContext& context): context(context) {}\n32: \n33:   kj::MainFunc getMain() override {\n34:     return kj::MainBuilder(context, \"Sandstorm version \" SANDSTORM_VERSION,\n35:                            \"Backs up the grain directory in <grain> to <file>, reading the grain \"\n36:                            \"metadata struct on stdin. Or, restores the backup in <file>, \"\n37:                            \"unpacking it to <grain>, and writing the metadata to stdout. In \"\n38:                            \"backup mode, <file> can be `-` to write the data to stdout.\")\n39:         .addOption({'r', \"restore\"}, KJ_BIND_METHOD(*this, setRestore),\n40:                    \"Restore a backup, rather than create a backup.\")\n41:         .addOptionWithArg({\"root\"}, KJ_BIND_METHOD(*this, setRoot), \"<root>\",\n42:                    \"Set the \\\"root directory\\\" to map in, which contains the zip/unzip binaries.\")\n43:         .expectArg(\"<file>\", KJ_BIND_METHOD(*this, setFile))\n44:         .expectArg(\"<grain>\", KJ_BIND_METHOD(*this, run))\n45:         .build();\n46:   }\n47: \n48: private:\n49:   kj::ProcessContext& context;\n50:   bool restore = false;\n51:   kj::StringPtr filename;\n52:   kj::StringPtr root = \"\";\n53: \n54:   bool setRestore() {\n55:     restore = true;\n56:     return true;\n57:   }\n58: \n59:   bool setFile(kj::StringPtr arg) {\n60:     filename = arg;\n61:     return true;\n62:   }\n63: \n64:   bool setRoot(kj::StringPtr arg) {\n65:     root = arg;\n66:     return true;\n67:   }\n68: \n69:   void writeSetgroupsIfPresent(const char *contents) {\n70:     KJ_IF_MAYBE(fd, raiiOpenIfExists(\"/proc/self/setgroups\", O_WRONLY | O_CLOEXEC)) {\n71:       kj::FdOutputStream(kj::mv(*fd)).write(contents, strlen(contents));\n72:     }\n73:   }\n74: \n75:   void writeUserNSMap(const char *type, kj::StringPtr contents) {\n76:     kj::FdOutputStream(raiiOpen(kj::str(\"/proc/self/\", type, \"_map\").cStr(), O_WRONLY | O_CLOEXEC))\n77:         .write(contents.begin(), contents.size());\n78:   }\n79: \n80:   bool run(kj::StringPtr grainDir) {\n81:     uid_t uid = getuid();\n82:     gid_t gid = getgid();\n83: \n84:     KJ_SYSCALL(unshare(CLONE_NEWUSER | CLONE_NEWNS));\n85:     writeSetgroupsIfPresent(\"deny\\n\");\n86:     writeUserNSMap(\"uid\", kj::str(\"1000 \", uid, \" 1\\n\"));\n87:     writeUserNSMap(\"gid\", kj::str(\"1000 \", gid, \" 1\\n\"));\n88: \n89:     // Mount root read-only.\n90:     KJ_SYSCALL(mount(kj::str(root, \"/\").cStr(), \"/tmp\", nullptr,\n91:                      MS_BIND | MS_REC | MS_RDONLY, nullptr));\n92: \n93:     if (access(\"/tmp/dev/null\", F_OK) != 0) {\n94:       // Looks like we need to bind in /dev.\n95:       KJ_SYSCALL(mount(\"/dev\", \"/tmp/dev\", nullptr, MS_BIND, nullptr));\n96:     }\n97: \n98:     // Hide sensitive directories.\n99:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/proc\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n100:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/var\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n101:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/etc\", \"tmpfs\", 0, \"size=32k,nr_inodes=8,mode=000\"));\n102: \n103:     // Mount inner tmpfs.\n104:     KJ_SYSCALL(mount(\"tmpfs\", \"/tmp/tmp\", \"tmpfs\", 0, \"size=8m,nr_inodes=128,mode=777\"));\n105: \n106:     // Bind in the grain's `data` (=`sandbox`).\n107:     if (restore) {\n108:       KJ_SYSCALL(mkdir(kj::str(grainDir, \"/sandbox\").cStr(), 0770));\n109:     }\n110:     KJ_SYSCALL(mkdir(\"/tmp/tmp/data\", 0700));\n111:     KJ_SYSCALL(mount(kj::str(grainDir, \"/sandbox\").cStr(), \"/tmp/tmp/data\", nullptr,\n112:                      MS_BIND | (restore ? 0 : MS_RDONLY), nullptr));\n113: \n114:     // Bind in the grain's `log`. When restoring, we discard the log.\n115:     if (!restore) {\n116:       KJ_SYSCALL(mknod(\"/tmp/tmp/log\", S_IFREG | 0600, 0));\n117:       KJ_SYSCALL(mount(kj::str(grainDir, \"/log\").cStr(), \"/tmp/tmp/log\", nullptr,\n118:                        MS_BIND | MS_RDONLY, nullptr));\n119:     }\n120: \n121:     // Bind in the file.\n122:     if (restore) {\n123:       KJ_SYSCALL(mknod(\"/tmp/tmp/file.zip\", S_IFREG | 0600, 0));\n124:       KJ_SYSCALL(mount(filename.cStr(), \"/tmp/tmp/file.zip\", nullptr, MS_BIND, nullptr));\n125:     } else if (filename != \"-\") {\n126:       // Instead of binding, just open the file and we'll compress to stdout.\n127:       KJ_SYSCALL(dup2(raiiOpen(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC), STDOUT_FILENO));\n128:     }\n129: \n130:     // Use Andy's ridiculous pivot_root trick to place ourselves into the sandbox.\n131:     // See supervisor-main.c++ for more discussion.\n132:     {\n133:       auto oldRootDir = raiiOpen(\"/\", O_RDONLY | O_DIRECTORY | O_CLOEXEC);\n134:       KJ_SYSCALL(syscall(SYS_pivot_root, \"/tmp\", \"/tmp\"));\n135:       KJ_SYSCALL(fchdir(oldRootDir));\n136:       KJ_SYSCALL(umount2(\".\", MNT_DETACH));\n137:       KJ_SYSCALL(chdir(\"/tmp\"));\n138:     }\n139: \n140:     // TODO(someday): Find a zip library that doesn't suck and use it instead of shelling out\n141:     //   to zip/unzip.\n142:     if (restore) {\n143:       Subprocess({\"unzip\", \"-q\", \"file.zip\", \"data/*\", \"metadata\"}).waitForSuccess();\n144: \n145:       // Read metadata file to stdout.\n146:       kj::FdInputStream in(raiiOpen(\"metadata\", O_RDONLY | O_CLOEXEC));\n147:       kj::FdOutputStream out(STDOUT_FILENO);\n148:       pump(in, out);\n149:     } else {\n150:       // Read stdin to metadata file.\n151:       {\n152:         kj::FdInputStream in(STDIN_FILENO);\n153:         kj::FdOutputStream out(raiiOpen(\"metadata\", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC));\n154:         pump(in, out);\n155:       }\n156: \n157:       Subprocess::Options zipOptions({\"zip\", \"-qy@\", \"-\"});\n158:       auto inPipe = Pipe::make();\n159:       zipOptions.stdin = inPipe.readEnd;\n160:       Subprocess zip(kj::mv(zipOptions));\n161:       inPipe.readEnd = nullptr;\n162: \n163:       {\n164:         kj::FdOutputStream out(kj::mv(inPipe.writeEnd));\n165:         for (auto& entry: listDirectory(\".\")) {\n166:           findFilesToZip(entry, out);\n167:         }\n168:       }\n169: \n170:       zip.waitForSuccess();\n171:     }\n172: \n173:     return true;\n174:   }\n175: \n176:   static void pump(kj::InputStream& in, kj::OutputStream& out) {\n177:     byte buffer[4096];\n178:     while (size_t n = in.tryRead(buffer, 1, sizeof(buffer))) {\n179:       out.write(buffer, n);\n180:     }\n181:   }\n182: \n183:   void findFilesToZip(kj::StringPtr path, kj::OutputStream& out) {\n184:     struct stat stats;\n185:     KJ_SYSCALL(lstat(path.cStr(), &stats));\n186:     if (S_ISREG(stats.st_mode) || S_ISLNK(stats.st_mode)) {\n187:       // Regular file or link can be zipped; write to file stream.\n188:       // If the path contains a newline, we cannot correctly pass it to `zip` since `zip` expects\n189:       // one file per line. For security reasons, we must detect and filter out these files.\n190:       // Hopefully this never happens legitimately?\n191:       if (path.findFirst('\\n') == nullptr) {\n192:         kj::ArrayPtr<const byte> pieces[2];\n193:         pieces[0] = path.asBytes();\n194:         pieces[1] = kj::StringPtr(\"\\n\").asBytes();\n195:         out.write(pieces);\n196:       } else {\n197:         KJ_LOG(ERROR, \"tried to backup file containing newlines\", path);\n198:       }\n199:     } else if (S_ISDIR(stats.st_mode)) {\n200:       // Subdirectory; enumerate contents.\n201:       for (auto& entry: listDirectory(path)) {\n202:         findFilesToZip(kj::str(path, '/', entry), out);\n203:       }\n204:     }\n205:   }\n206: };\n207: \n208: kj::Own<AbstractMain> getBackupMain(kj::ProcessContext& context) {\n209:   return kj::heap<BackupMain>(context);\n210: }\n211: \n212: } // namespace sandstorm\n213: ",
+  "source_summary": "filename comes from command-line argument <file> via setFile() without validation",
+  "sink_summary": "MS_BIND mount operation that binds user-specified filename to /tmp/tmp/file.zip inside sandbox",
+  "guard_summary": "No path validation or sanitization before mount; operation only occurs in restore mode (restore=true)",
+  "risk_pattern": "User-controlled filename directly used in bind mount without path validation, allowing potential symlink attacks or path traversal",
+  "used_variable_sources": [
+    "filename (command-line argument)"
+  ],
+  "called_function_context": [
+    "KJ_SYSCALL",
+    "mount",
+    "filename.cStr()"
+  ],
+  "enclosing_conditions": [
+    "if (restore)"
+  ],
+  "context_summary": "In restore mode, binds user-specified backup file to sandbox location for unzip operation",
+  "unresolved_facts": [
+    "Whether raiiOpen performs path validation",
+    "Exact security implications of bind mount with user-controlled source"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "fit_reason": "User-controlled filename used in bind mount without symlink validation, allowing symlink attacks to mount unintended files/directories into sandbox",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "User-controlled path used in mount operation without path validation, potentially allowing traversal outside intended directories",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-367",
+      "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+      "fit_reason": "Potential race condition between path validation (if added) and mount operation, though no current validation exists",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1004",
+    "CWE-208",
+    "CWE-22",
+    "CWE-367",
+    "CWE-425",
+    "CWE-571",
+    "CWE-59",
+    "CWE-628",
+    "CWE-687",
+    "CWE-77",
+    "CWE-78",
+    "CWE-829",
+    "CWE-88",
+    "CWE-89",
+    "CWE-912",
+    "CWE-94"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 124,
+      "statement": "KJ_SYSCALL(mount(filename.cStr(), \"/tmp/tmp/file.zip\", nullptr, MS_BIND, nullptr));",
+      "cwe_id": "CWE-59",
+      "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The code uses user-controlled filename directly in mount() without symlink validation, but CWE-59 specifically addresses link resolution before file access, not mount operations. The mount operation itself may follow symlinks, but this is not the core mechanism of CWE-59."
+        },
+        "connection": {
+          "score": 0.85,
+          "evidence": "User-controlled filename from command-line argument is directly passed to mount() system call as source path. The path flows directly from setFile() method to mount() call with no intermediate validation."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This line is an addition that introduces the bind mount operation. If reverted, the user-controlled filename would not be used to mount any file into the sandbox, eliminating the potential symlink attack vector."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "Required control: symlink validation or canonical path resolution before mount operations. Control requirement evidence: CWE-59 requires preventing unintended resource access through symlinks. Existing controls checked: no path validation before mount call, no symlink checks. Deficiency evidence: filename used directly without resolving symlinks or validating path components.",
+          "required_control": "symlink validation or canonical path resolution",
+          "control_requirement_evidence": "CWE-59 requires preventing unintended resource access through symlinks when accessing files based on filenames",
+          "existing_controls_checked": [
+            "no path validation before mount call",
+            "no symlink resolution checks"
+          ],
+          "deficiency_evidence": "user-controlled filename used directly in mount() without resolving symlinks or validating path components"
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "If filename points to a symlink, it could mount unintended files/directories into the sandbox, potentially exposing sensitive data or allowing unauthorized file access during the restore operation."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the user-controlled filename would not be used to bind mount any file into the sandbox, eliminating the potential for symlink attacks through the mount operation.",
+      "supporting_evidence": [
+        "filename comes from command-line argument without validation",
+        "mount() system call used with MS_BIND flag on user-controlled path",
+        "operation occurs in restore mode when processing backup files"
+      ],
+      "contradicting_evidence": [
+        "CWE-59 specifically addresses file access operations, not mount operations",
+        "The mount operation may inherently follow symlinks as part of its normal behavior"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether the mount() implementation follows symlinks by default",
+        "Whether the sandbox environment restricts symlink creation or traversal",
+        "What security implications a malicious symlink would have in this specific mount context"
+      ],
+      "review_comment": "The code binds a user-controlled filename directly to a sandbox location without symlink validation. In restore mode, an attacker could provide a symlink that mounts unintended files into the sandbox. Resolve symlinks to their canonical path before mounting, or validate that the target is a regular file and not a symlink using lstat().",
+      "change_type": "A",
+      "raw_score": 0.7000000000000001,
+      "score": 0.7000000000000001
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 124,
+      "statement": "KJ_SYSCALL(mount(filename.cStr(), \"/tmp/tmp/file.zip\", nullptr, MS_BIND, nullptr));",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The code uses user-controlled filename directly in mount operation without path validation, but CWE-22 specifically requires traversal outside a restricted directory, which is not clearly demonstrated here since mount() with MS_BIND operates on existing paths rather than resolving relative paths."
+        },
+        "connection": {
+          "score": 0.85,
+          "evidence": "Command-line argument 'filename' is directly connected to mount() system call as source path without intermediate validation or sanitization."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This line is newly added and creates the mount operation that binds user-controlled filename. Reverting would remove the mount entirely."
+        },
+        "security_control": {
+          "score": 0.35,
+          "evidence": "",
+          "required_control": "path validation and canonicalization before filesystem operations",
+          "control_requirement_evidence": "CWE-22 requires validation to prevent path traversal outside intended directories",
+          "existing_controls_checked": [
+            "no path validation before mount() call",
+            "restore mode condition only restricts execution context"
+          ],
+          "deficiency_evidence": "No path validation, sanitization, or canonicalization is performed on the user-supplied filename before using it in mount()"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "Potential for symlink attacks or binding unintended files, but specific traversal outside restricted directory is not clearly demonstrated. The mount occurs within a sandboxed namespace."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the mount operation binding the user-controlled filename would not occur, eliminating the potential path traversal risk.",
+      "supporting_evidence": [
+        "User-controlled filename from command line argument used directly in mount() system call",
+        "No path validation or sanitization performed before mount operation",
+        "Operation occurs in restore mode only, but filename remains user-controlled"
+      ],
+      "contradicting_evidence": [
+        "MS_BIND mount operates on existing paths rather than resolving relative path traversal",
+        "Operation occurs within a sandboxed namespace created by unshare(CLONE_NEWUSER | CLONE_NEWNS)"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether the sandbox namespace effectively restricts path traversal",
+        "Whether raiiOpen performs any path validation",
+        "Specific attack vector for traversing outside intended directories"
+      ],
+      "review_comment": "The code binds a user-controlled filename directly to /tmp/tmp/file.zip without path validation. While this occurs in a sandboxed namespace, the lack of path validation could allow binding unintended files through symlink attacks. Validate and canonicalize the filename path before the mount operation to ensure it points to an intended backup file location.",
+      "change_type": "A",
+      "raw_score": 0.5900000000000001,
+      "score": 0.5900000000000001
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "src/sandstorm/backup.c++",
+      "changed_line": 124,
+      "statement": "KJ_SYSCALL(mount(filename.cStr(), \"/tmp/tmp/file.zip\", nullptr, MS_BIND, nullptr));",
+      "cwe_id": "CWE-367",
+      "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "No evidence of concurrent execution, race conditions, or time-of-check vs time-of-use patterns. The code executes sequentially in a single-threaded backup/restore operation."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "User-controlled filename is connected to mount operation, but no concurrent access or race condition is demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.2,
+          "evidence": "The added line creates a bind mount operation but doesn't introduce or modify any timing-related vulnerability patterns."
+        },
+        "security_control": {
+          "score": 0.15,
+          "evidence": "No TOCTOU-specific controls (like atomic operations or synchronization) are relevant since no concurrent access exists.",
+          "required_control": "atomic operations or synchronization for concurrent resource access",
+          "control_requirement_evidence": "CWE-367 requires concurrent access patterns where resource state can change between check and use",
+          "existing_controls_checked": [
+            "single-threaded sequential execution in backup/restore operation"
+          ],
+          "deficiency_evidence": "No concurrent execution exists to require TOCTOU controls; the operation is sequential"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No demonstrated race condition or concurrent access that could lead to security impact."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the bind mount operation would not occur in restore mode, but no race condition or timing vulnerability would be affected since none exists.",
+      "supporting_evidence": [
+        "User-controlled filename is used as source for bind mount operation"
+      ],
+      "contradicting_evidence": [
+        "Code executes sequentially in a single-threaded context with no concurrent access patterns",
+        "No evidence of time-of-check vs time-of-use race conditions",
+        "The operation occurs in a controlled sandbox environment with no competing processes"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether any concurrent access to the mounted file occurs during the operation",
+        "Whether the backup/restore process has any multi-threaded components"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.17,
+      "score": 0.17
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,376 @@
+{
+  "candidate_id": "candidate-4",
+  "filepath": "anymail/webhooks/base.py",
+  "changed_line": 44,
+  "statement": "basic_auth = get_request_basic_auth(request)",
+  "change_type": "A",
+  "function_name": "validate_request",
+  "operation_type": "authentication_validation",
+  "selection_reason": "request -> get_request_basic_auth -> authentication decision",
+  "security_relevance_score": 0.6,
+  "code_context": "1: import re\n2: import warnings\n3: \n4: import six\n5: from django.http import HttpResponse\n6: from django.utils.decorators import method_decorator\n7: from django.views.decorators.csrf import csrf_exempt\n8: from django.views.generic import View\n9: \n10: from ..exceptions import AnymailInsecureWebhookWarning, AnymailWebhookValidationFailure\n11: from ..utils import get_anymail_setting, collect_all_methods, get_request_basic_auth\n12: \n13: \n14: class AnymailBasicAuthMixin(object):\n15:     \"\"\"Implements webhook basic auth as mixin to AnymailBaseWebhookView.\"\"\"\n16: \n17:     # Whether to warn if basic auth is not configured.\n18:     # For most ESPs, basic auth is the only webhook security,\n19:     # so the default is True. Subclasses can set False if\n20:     # they enforce other security (like signed webhooks).\n21:     warn_if_no_basic_auth = True\n22: \n23:     # List of allowable HTTP basic-auth 'user:pass' strings.\n24:     basic_auth = None  # (Declaring class attr allows override by kwargs in View.as_view.)\n25: \n26:     def __init__(self, **kwargs):\n27:         self.basic_auth = get_anymail_setting('webhook_authorization', default=[],\n28:                                               kwargs=kwargs)  # no esp_name -- auth is shared between ESPs\n29:         # Allow a single string:\n30:         if isinstance(self.basic_auth, six.string_types):\n31:             self.basic_auth = [self.basic_auth]\n32:         if self.warn_if_no_basic_auth and len(self.basic_auth) < 1:\n33:             warnings.warn(\n34:                 \"Your Anymail webhooks are insecure and open to anyone on the web. \"\n35:                 \"You should set WEBHOOK_AUTHORIZATION in your ANYMAIL settings. \"\n36:                 \"See 'Securing webhooks' in the Anymail docs.\",\n37:                 AnymailInsecureWebhookWarning)\n38:         # noinspection PyArgumentList\n39:         super(AnymailBasicAuthMixin, self).__init__(**kwargs)\n40: \n41:     def validate_request(self, request):\n42:         \"\"\"If configured for webhook basic auth, validate request has correct auth.\"\"\"\n43:         if self.basic_auth:\n44:             basic_auth = get_request_basic_auth(request)\n45:             if basic_auth is None or basic_auth not in self.basic_auth:\n46:                 # noinspection PyUnresolvedReferences\n47:                 raise AnymailWebhookValidationFailure(\n48:                     \"Missing or invalid basic auth in Anymail %s webhook\" % self.esp_name)\n49: \n50: \n51: # Mixin note: Django's View.__init__ doesn't cooperate with chaining,\n52: # so all mixins that need __init__ must appear before View in MRO.\n53: class AnymailBaseWebhookView(AnymailBasicAuthMixin, View):\n54:     \"\"\"Base view for processing ESP event webhooks\n55: \n56:     ESP-specific implementations should subclass\n57:     and implement parse_events. They may also\n58:     want to implement validate_request\n59:     if additional security is available.\n60:     \"\"\"\n61: \n62:     def __init__(self, **kwargs):\n63:         super(AnymailBaseWebhookView, self).__init__(**kwargs)\n64:         self.validators = collect_all_methods(self.__class__, 'validate_request')\n65: \n66:     # Subclass implementation:\n67: \n68:     # Where to send events: either ..signals.inbound or ..signals.tracking\n69:     signal = None\n70: \n71:     def validate_request(self, request):\n72:         \"\"\"Check validity of webhook post, or raise AnymailWebhookValidationFailure.\n73: \n74:         AnymailBaseWebhookView includes basic auth validation.\n75:         Subclasses can implement (or provide via mixins) if the ESP supports\n76:         additional validation (such as signature checking).\n77: \n78:         *All* definitions of this method in the class chain (including mixins)\n79:         will be called. There is no need to chain to the superclass.\n80:         (See self.run_validators and collect_all_methods.)\n81:         \"\"\"\n82:         # if request.POST['signature'] != expected_signature:\n83:         #     raise AnymailWebhookValidationFailure(\"...message...\")\n84:         # (else just do nothing)\n85:         pass\n86: \n87:     def parse_events(self, request):\n88:         \"\"\"Return a list of normalized AnymailWebhookEvent extracted from ESP post data.\n89: \n90:         Subclasses must implement.\n91:         \"\"\"\n92:         raise NotImplementedError()\n93: \n94:     # HTTP handlers (subclasses shouldn't need to override):\n95: \n96:     http_method_names = [\"post\", \"head\", \"options\"]\n97: \n98:     @method_decorator(csrf_exempt)\n99:     def dispatch(self, request, *args, **kwargs):\n100:         return super(AnymailBaseWebhookView, self).dispatch(request, *args, **kwargs)\n101: \n102:     def head(self, request, *args, **kwargs):\n103:         # Some ESPs verify the webhook with a HEAD request at configuration time\n104:         return HttpResponse()\n105: \n106:     def post(self, request, *args, **kwargs):\n107:         # Normal Django exception handling will do the right thing:\n108:         # - AnymailWebhookValidationFailure will turn into an HTTP 400 response\n109:         #   (via Django SuspiciousOperation handling)\n110:         # - Any other errors (e.g., in signal dispatch) will turn into HTTP 500\n111:         #   responses (via normal Django error handling). ESPs generally\n112:         #   treat that as \"try again later\".\n113:         self.run_validators(request)\n114:         events = self.parse_events(request)\n115:         esp_name = self.esp_name\n116:         for event in events:\n117:             self.signal.send(sender=self.__class__, event=event, esp_name=esp_name)\n118:         return HttpResponse()\n119: \n120:     # Request validation (subclasses shouldn't need to override):\n121: \n122:     def run_validators(self, request):\n123:         for validator in self.validators:\n124:             validator(self, request)\n125: \n126:     @property\n127:     def esp_name(self):\n128:         \"\"\"\n129:         Read-only name of the ESP for this webhook view.\n130: \n131:         (E.g., MailgunTrackingWebhookView will return \"Mailgun\")\n132:         \"\"\"\n133:         return re.sub(r'(Tracking|Inbox)WebhookView$', \"\", self.__class__.__name__)",
+  "source_summary": "HTTP Authorization header from incoming webhook request, extracted via request.META['HTTP_AUTHORIZATION']",
+  "sink_summary": "Authentication decision that raises AnymailWebhookValidationFailure if credentials are missing or invalid, preventing webhook processing",
+  "guard_summary": "Basic auth validation against configured credentials list; fails closed (raises exception) if auth fails or is missing when required",
+  "risk_pattern": "Webhook authentication bypass if basic auth is not properly configured or if validation logic has flaws",
+  "used_variable_sources": [
+    "request.META['HTTP_AUTHORIZATION']",
+    "self.basic_auth (configured credentials)"
+  ],
+  "called_function_context": [
+    "get_request_basic_auth",
+    "base64.b64decode",
+    "AnymailWebhookValidationFailure"
+  ],
+  "enclosing_conditions": [
+    "if self.basic_auth:",
+    "if basic_auth is None or basic_auth not in self.basic_auth:"
+  ],
+  "context_summary": "Basic auth validation runs as part of webhook request validation chain before processing events; protects against unauthorized webhook access",
+  "unresolved_facts": [
+    "Specific ESP implementations may add additional security controls beyond basic auth",
+    "Default credential configuration practices and strength requirements are unknown"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "Basic auth validation exists but may incorrectly evaluate access; matches authentication decision mechanism",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-208",
+      "cwe_name": "Observable Timing Discrepancy",
+      "fit_reason": "String comparison in basic auth validation may be vulnerable to timing attacks to infer credentials",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-285",
+      "cwe_name": "Improper Authorization",
+      "fit_reason": "General authorization flaw category covering authentication validation weaknesses",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "fit_reason": "Basic auth credential validation and management may have flaws",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "fit_reason": "Webhook access control via basic auth may be improperly enforced",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-113",
+    "CWE-179",
+    "CWE-19",
+    "CWE-20",
+    "CWE-208",
+    "CWE-255",
+    "CWE-284",
+    "CWE-285",
+    "CWE-287",
+    "CWE-425",
+    "CWE-497",
+    "CWE-502",
+    "CWE-523",
+    "CWE-772",
+    "CWE-863",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "anymail/webhooks/base.py",
+      "changed_line": 44,
+      "statement": "basic_auth = get_request_basic_auth(request)",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code performs an authorization check using basic auth, but CWE-863 specifically requires an incorrect check, not just the presence of authorization logic. The evidence shows proper validation logic (checking if credentials are in allowed list) rather than demonstrated incorrectness."
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "External input (HTTP Authorization header) flows directly to the authorization decision point. The path is: request → get_request_basic_auth → basic_auth validation → authentication decision → webhook processing."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this line were removed, the basic auth extraction would be missing, potentially bypassing authentication when basic_auth is configured. However, the validation logic would still fail due to basic_auth being None, maintaining security."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "",
+          "required_control": "Correct authorization validation that properly distinguishes authorized from unauthorized access",
+          "control_requirement_evidence": "CWE-863 requires that authorization checks correctly evaluate access rights",
+          "existing_controls_checked": [
+            "Basic auth validation against configured credentials list",
+            "Exception raising on failed auth"
+          ],
+          "deficiency_evidence": "No evidence of incorrect authorization logic; the validation appears correct (checking presence and membership in allowed list)"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "Potential unauthorized webhook access if authentication is bypassed, but the demonstrated code shows proper fail-closed behavior raising AnymailWebhookValidationFailure on auth failure."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, get_request_basic_auth would not be called, basic_auth would remain unset, and the subsequent check 'if basic_auth is None or basic_auth not in self.basic_auth' would always trigger the None branch, raising an authentication failure exception.",
+      "supporting_evidence": [
+        "Basic auth validation is performed on incoming webhook requests",
+        "Authentication decision gates access to webhook processing functionality"
+      ],
+      "contradicting_evidence": [
+        "The authorization logic appears correct (checking credentials against allowed list)",
+        "Fail-closed behavior raises exception on authentication failure"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether there are specific scenarios where the authorization logic incorrectly allows or denies access",
+        "Configuration of self.basic_auth and potential edge cases in credential validation"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.47000000000000003,
+      "score": 0.47000000000000003
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "anymail/webhooks/base.py",
+      "changed_line": 44,
+      "statement": "basic_auth = get_request_basic_auth(request)",
+      "cwe_id": "CWE-208",
+      "cwe_name": "Observable Timing Discrepancy",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-208 requires observable timing differences between successful and failed operations that reveal security-relevant information. The code performs string comparison but there is no evidence of timing measurement or observable discrepancies."
+        },
+        "connection": {
+          "score": 0.2,
+          "evidence": "The basic auth credential is extracted from the request and compared against configured credentials, but no timing measurement or observable channel is demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.15,
+          "evidence": "The added line extracts basic auth credentials but doesn't create timing measurement capabilities. Reverting this line would remove credential extraction but wouldn't affect timing observability."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "timing-attack-resistant comparison mechanism",
+          "control_requirement_evidence": "CWE-208 requires that timing differences in security decisions are not observable",
+          "existing_controls_checked": [
+            "basic string comparison using 'in' operator",
+            "exception-based failure handling"
+          ],
+          "deficiency_evidence": "No evidence demonstrates timing measurement or that the string comparison is vulnerable to timing attacks. The code uses standard Python 'in' operator without timing analysis."
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No evidence demonstrates that timing differences are observable or exploitable to infer credentials or other security-relevant information."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, basic auth extraction would be removed, but timing measurement capabilities would remain unchanged since no timing measurement is implemented.",
+      "supporting_evidence": [
+        "Basic auth credential comparison using string 'in' operator"
+      ],
+      "contradicting_evidence": [
+        "No timing measurement or observable timing channels are implemented",
+        "Exception-based failure handling doesn't demonstrate timing discrepancies",
+        "The code doesn't measure or expose operation timing"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether Python's 'in' operator for list membership has exploitable timing differences",
+        "Whether timing measurement is feasible in the deployment environment",
+        "Whether the comparison timing is actually observable to attackers"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.13,
+      "score": 0.13
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "anymail/webhooks/base.py",
+      "changed_line": 44,
+      "statement": "basic_auth = get_request_basic_auth(request)",
+      "cwe_id": "CWE-285",
+      "cwe_name": "Improper Authorization",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.3,
+          "evidence": "CWE-285 requires improper authorization, but this code implements proper authorization validation. The mechanism checks credentials against a configured list and fails closed when invalid."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "HTTP request with Authorization header is connected to authentication decision at line 45-48 that prevents webhook processing if credentials are missing or invalid."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were removed, the basic auth extraction would fail, making the validation check at line 45 impossible, effectively disabling the authorization mechanism."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The code implements proper authorization control by validating credentials against a configured list. However, the control strength depends on credential configuration practices.",
+          "required_control": "Proper credential validation and authorization check",
+          "control_requirement_evidence": "CWE-285 requires that authorization checks properly validate credentials before granting access",
+          "existing_controls_checked": [
+            "Basic auth validation against configured credential list",
+            "Fail-closed exception raising on validation failure"
+          ],
+          "deficiency_evidence": "The control appears properly implemented - it validates credentials and fails closed. No deficiency is demonstrated in the code itself."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No concrete security impact is demonstrated as the code implements proper authorization validation rather than bypassing it."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the basic auth extraction would be missing, causing the validation check to always fail due to basic_auth being None, effectively disabling the authorization mechanism entirely.",
+      "supporting_evidence": [
+        "Line 44 extracts HTTP basic auth credentials from incoming request",
+        "Line 45-48 validates credentials against configured list and raises validation failure if invalid"
+      ],
+      "contradicting_evidence": [
+        "The code implements proper authorization validation with fail-closed behavior",
+        "No evidence shows improper authorization - the mechanism correctly validates credentials"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether the configured basic_auth credentials are properly secured and managed",
+        "Whether downstream ESP implementations add additional security controls"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.4800000000000001,
+      "score": 0.4800000000000001
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "anymail/webhooks/base.py",
+      "changed_line": 44,
+      "statement": "basic_auth = get_request_basic_auth(request)",
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.25,
+          "evidence": "CWE-255 is a legacy category grouping credential management weaknesses. The code performs basic auth credential validation but doesn't demonstrate specific credential management errors like insecure storage, transmission, or lifecycle issues."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "HTTP Authorization header from incoming webhook request is extracted and validated against configured credentials list. The path is clear: request → get_request_basic_auth → authentication decision → validation failure if incorrect."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "The added line extracts basic auth credentials from the request, enabling the subsequent validation logic. Without this line, the auth validation would fail to access the credentials needed for comparison."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "",
+          "required_control": "Proper credential validation and management controls",
+          "control_requirement_evidence": "CWE-255 requires demonstrating credential management flaws like insecure storage, weak validation, or transmission issues",
+          "existing_controls_checked": [
+            "Basic auth extraction and validation against configured list",
+            "Exception-based failure handling"
+          ],
+          "deficiency_evidence": "The code implements standard basic auth validation but doesn't demonstrate specific credential management deficiencies required by CWE-255"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "If credentials are misconfigured or validation is bypassed, unauthorized webhook access could occur, but the code shows proper validation logic rather than demonstrating a concrete management error."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the basic auth validation would fail to extract credentials from the request, making the authentication check non-functional and potentially allowing unauthorized access if basic auth is the only security control.",
+      "supporting_evidence": [
+        "Basic auth credential extraction and validation is implemented",
+        "Clear connection from request input to authentication decision",
+        "Proper exception handling for validation failures"
+      ],
+      "contradicting_evidence": [
+        "CWE-255 is a legacy category, not a specific vulnerability mechanism",
+        "The code shows proper credential validation rather than management errors"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether credential storage or transmission has specific weaknesses",
+        "Whether credential lifecycle management has deficiencies"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.45,
+      "score": 0.45
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "anymail/webhooks/base.py",
+      "changed_line": 44,
+      "statement": "basic_auth = get_request_basic_auth(request)",
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The code implements basic authentication validation for webhook access, which is an access control mechanism. However, CWE-284 is a broad category and this specific implementation appears to be a proper authentication check rather than an improper one."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "The request object containing HTTP_AUTHORIZATION header is directly connected to the authentication decision. The basic_auth value extracted from the request is compared against configured credentials, and failure results in AnymailWebhookValidationFailure exception."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The candidate line extracts authentication credentials but is part of a larger validation method. Reverting this specific line would break the authentication check, but the overall access control mechanism exists in the surrounding conditional logic."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "",
+          "required_control": "Proper authentication mechanism for webhook access",
+          "control_requirement_evidence": "CWE-284 requires proper access control; webhooks need authentication to prevent unauthorized access",
+          "existing_controls_checked": [
+            "Basic auth validation against configured credentials list",
+            "Exception-based failure handling"
+          ],
+          "deficiency_evidence": "The evidence shows a functioning authentication check that validates credentials against a configured list and fails closed. No deficiency in the demonstrated mechanism is established."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "The code prevents unauthorized access by raising validation exceptions, but no evidence shows this access control is improper or bypassable. The impact is protective rather than demonstrating vulnerability."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the authentication validation would fail to extract credentials from the request, potentially allowing unauthorized access if the surrounding conditional logic doesn't handle the missing basic_auth variable properly.",
+      "supporting_evidence": [
+        "Basic authentication extraction from HTTP_AUTHORIZATION header",
+        "Credential validation against configured allowlist",
+        "Exception-based failure handling for invalid/missing credentials"
+      ],
+      "contradicting_evidence": [
+        "The code implements proper authentication validation with fail-closed behavior",
+        "No evidence shows the access control is improperly implemented or bypassable"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether the basic auth implementation has specific vulnerabilities (weak credentials, timing attacks, etc.)",
+        "Downstream ESP implementations may add additional security controls"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.41999999999999993,
+      "score": 0.41999999999999993
+    }
+  ],
+  "stage4_status": "completed"
+}

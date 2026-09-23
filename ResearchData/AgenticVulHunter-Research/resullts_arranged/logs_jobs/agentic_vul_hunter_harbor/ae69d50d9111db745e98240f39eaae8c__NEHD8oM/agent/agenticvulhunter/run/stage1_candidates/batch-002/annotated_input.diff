@@ -1,0 +1,390 @@
+[A,src/sandstorm/backend.h,59]     RunningGrain(BackendImpl& backend, kj::String grainId, kj::Own<kj::AsyncIoStream> stream,
+[A,src/sandstorm/backend.h,60]                  SandstormCore::Client&& sandstormCoreFactory);
+[C,src/sandstorm/backend.h,61]     ~RunningGrain() noexcept(false);
+[C,src/sandstorm/backend.h,62] 
+[C,src/sandstorm/backend.h,63]     inline kj::StringPtr getGrainId() { return grainId; }
+[C,src/sandstorm/backend.h,64]     inline kj::Promise<void> onDisconnect() { return client.onDisconnect(); }
+[C,src/sandstorm/backend.h,65] 
+[C,src/sandstorm/backend.h,66]     inline Supervisor::Client getSupervisor() {
+[C,src/sandstorm/backend.h,67]       return client.bootstrap().castAs<Supervisor>();
+[C,src/sandstorm/backend.h,68]     }
+[C,src/sandstorm/backend.h,69] 
+[C,src/sandstorm/backend.h,70]   private:
+[C,src/sandstorm/backend.h,71]     BackendImpl& backend;
+[C,src/sandstorm/backend.h,72]     kj::String grainId;
+[C,src/sandstorm/backend.h,73]     kj::Own<kj::AsyncInputStream> stdout;
+[C,src/sandstorm/backend.h,74]     kj::Own<kj::AsyncIoStream> stream;
+[C,src/sandstorm/backend.h,75]     capnp::TwoPartyClient client;
+[C,src/sandstorm/backend.h,76]   };
+[C,src/sandstorm/backend.h,77] 
+[C,src/sandstorm/backend.h,78]   struct StartingGrain {
+[C,src/sandstorm/backend.h,79]     kj::String grainId;
+[C,src/sandstorm/backend.h,80]     kj::ForkedPromise<Supervisor::Client> promise;
+[C,src/sandstorm/backend.h,81]   };
+[C,src/sandstorm/backend.h,82] 
+[C,src/sandstorm/backend.h,83]   std::map<kj::StringPtr, StartingGrain> supervisors;
+[C,src/sandstorm/backend.h,84] 
+[C,src/sandstorm/backend.h,85]   class PackageUploadStreamImpl;
+[A,src/sandstorm/backend.h,86]   class FileUploadStream;
+[C,src/sandstorm/backend.h,87] 
+[C,src/sandstorm/backend.h,88]   kj::Promise<Supervisor::Client> bootGrain(kj::StringPtr grainId, kj::StringPtr packageId,
+[C,src/sandstorm/backend.h,89]       spk::Manifest::Command::Reader command, bool isNew, bool devMode, bool isRetry);
+[C,src/sandstorm/backend.h,90] 
+[C,src/sandstorm/backend.h,91]   static kj::Promise<void> ignoreAll(kj::AsyncInputStream& input);
+[C,src/sandstorm/backend.h,92]   static kj::Promise<kj::String> readAll(kj::AsyncInputStream& input,
+[C,src/sandstorm/backend.h,93]       kj::Vector<char> soFar = kj::Vector<char>());
+[C,src/sandstorm/backend.h,94] 
+[A,src/sandstorm/backend.h,95]   static kj::Promise<void> pump(kj::AsyncInputStream& input, ByteStream::Client stream);
+[A,src/sandstorm/backend.h,96]   static kj::Promise<void> pump(kj::InputStream& input, ByteStream::Client stream);
+[A,src/sandstorm/backend.h,97] 
+[C,src/sandstorm/backend.h,98]   void taskFailed(kj::Exception&& exception) override;
+[C,src/sandstorm/backend.h,99] };
+[C,src/sandstorm/backend.h,100] 
+[C,src/sandstorm/backend.h,101] }  // namespace sandstorm
+[C,src/sandstorm/backend.h,102] 
+[C,src/sandstorm/backend.h,103] #endif // SANDSTORM_BACKEND_H_
+@@ -0,0 +1,213 @@
+[A,src/sandstorm/backup.c++,1] // Sandstorm - Personal Cloud Sandbox
+[A,src/sandstorm/backup.c++,2] // Copyright (c) 2015 Sandstorm Development Group, Inc. and contributors
+[A,src/sandstorm/backup.c++,3] // All rights reserved.
+[A,src/sandstorm/backup.c++,4] //
+[A,src/sandstorm/backup.c++,5] // Licensed under the Apache License, Version 2.0 (the "License");
+[A,src/sandstorm/backup.c++,6] // you may not use this file except in compliance with the License.
+[A,src/sandstorm/backup.c++,7] // You may obtain a copy of the License at
+[A,src/sandstorm/backup.c++,8] //
+[A,src/sandstorm/backup.c++,9] //   http://www.apache.org/licenses/LICENSE-2.0
+[A,src/sandstorm/backup.c++,10] //
+[A,src/sandstorm/backup.c++,11] // Unless required by applicable law or agreed to in writing, software
+[A,src/sandstorm/backup.c++,12] // distributed under the License is distributed on an "AS IS" BASIS,
+[A,src/sandstorm/backup.c++,13] // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+[A,src/sandstorm/backup.c++,14] // See the License for the specific language governing permissions and
+[A,src/sandstorm/backup.c++,15] // limitations under the License.
+[A,src/sandstorm/backup.c++,16] 
+[A,src/sandstorm/backup.c++,17] #include "backup.h"
+[A,src/sandstorm/backup.c++,18] #include "util.h"
+[A,src/sandstorm/backup.c++,19] #include "version.h"
+[A,src/sandstorm/backup.c++,20] #include <kj/debug.h>
+[A,src/sandstorm/backup.c++,21] #include <sched.h>
+[A,src/sandstorm/backup.c++,22] #include <sys/mount.h>
+[A,src/sandstorm/backup.c++,23] #include <sys/syscall.h>
+[A,src/sandstorm/backup.c++,24] #include <sys/stat.h>
+[A,src/sandstorm/backup.c++,25] #include <sys/types.h>
+[A,src/sandstorm/backup.c++,26] 
+[A,src/sandstorm/backup.c++,27] namespace sandstorm {
+[A,src/sandstorm/backup.c++,28] 
+[A,src/sandstorm/backup.c++,29] class BackupMain: public AbstractMain {
+[A,src/sandstorm/backup.c++,30] public:
+[A,src/sandstorm/backup.c++,31]   BackupMain(kj::ProcessContext& context): context(context) {}
+[A,src/sandstorm/backup.c++,32] 
+[A,src/sandstorm/backup.c++,33]   kj::MainFunc getMain() override {
+[A,src/sandstorm/backup.c++,34]     return kj::MainBuilder(context, "Sandstorm version " SANDSTORM_VERSION,
+[A,src/sandstorm/backup.c++,35]                            "Backs up the grain directory in <grain> to <file>, reading the grain "
+[A,src/sandstorm/backup.c++,36]                            "metadata struct on stdin. Or, restores the backup in <file>, "
+[A,src/sandstorm/backup.c++,37]                            "unpacking it to <grain>, and writing the metadata to stdout. In "
+[A,src/sandstorm/backup.c++,38]                            "backup mode, <file> can be `-` to write the data to stdout.")
+[A,src/sandstorm/backup.c++,39]         .addOption({'r', "restore"}, KJ_BIND_METHOD(*this, setRestore),
+[A,src/sandstorm/backup.c++,40]                    "Restore a backup, rather than create a backup.")
+[A,src/sandstorm/backup.c++,41]         .addOptionWithArg({"root"}, KJ_BIND_METHOD(*this, setRoot), "<root>",
+[A,src/sandstorm/backup.c++,42]                    "Set the \"root directory\" to map in, which contains the zip/unzip binaries.")
+[A,src/sandstorm/backup.c++,43]         .expectArg("<file>", KJ_BIND_METHOD(*this, setFile))
+[A,src/sandstorm/backup.c++,44]         .expectArg("<grain>", KJ_BIND_METHOD(*this, run))
+[A,src/sandstorm/backup.c++,45]         .build();
+[A,src/sandstorm/backup.c++,46]   }
+[A,src/sandstorm/backup.c++,47] 
+[A,src/sandstorm/backup.c++,48] private:
+[A,src/sandstorm/backup.c++,49]   kj::ProcessContext& context;
+[A,src/sandstorm/backup.c++,50]   bool restore = false;
+[A,src/sandstorm/backup.c++,51]   kj::StringPtr filename;
+[A,src/sandstorm/backup.c++,52]   kj::StringPtr root = "";
+[A,src/sandstorm/backup.c++,53] 
+[A,src/sandstorm/backup.c++,54]   bool setRestore() {
+[A,src/sandstorm/backup.c++,55]     restore = true;
+[A,src/sandstorm/backup.c++,56]     return true;
+[A,src/sandstorm/backup.c++,57]   }
+[A,src/sandstorm/backup.c++,58] 
+[A,src/sandstorm/backup.c++,59]   bool setFile(kj::StringPtr arg) {
+[A,src/sandstorm/backup.c++,60]     filename = arg;
+[A,src/sandstorm/backup.c++,61]     return true;
+[A,src/sandstorm/backup.c++,62]   }
+[A,src/sandstorm/backup.c++,63] 
+[A,src/sandstorm/backup.c++,64]   bool setRoot(kj::StringPtr arg) {
+[A,src/sandstorm/backup.c++,65]     root = arg;
+[A,src/sandstorm/backup.c++,66]     return true;
+[A,src/sandstorm/backup.c++,67]   }
+[A,src/sandstorm/backup.c++,68] 
+[A,src/sandstorm/backup.c++,69]   void writeSetgroupsIfPresent(const char *contents) {
+[A,src/sandstorm/backup.c++,70]     KJ_IF_MAYBE(fd, raiiOpenIfExists("/proc/self/setgroups", O_WRONLY | O_CLOEXEC)) {
+[A,src/sandstorm/backup.c++,71]       kj::FdOutputStream(kj::mv(*fd)).write(contents, strlen(contents));
+[A,src/sandstorm/backup.c++,72]     }
+[A,src/sandstorm/backup.c++,73]   }
+[A,src/sandstorm/backup.c++,74] 
+[A,src/sandstorm/backup.c++,75]   void writeUserNSMap(const char *type, kj::StringPtr contents) {
+[A,src/sandstorm/backup.c++,76]     kj::FdOutputStream(raiiOpen(kj::str("/proc/self/", type, "_map").cStr(), O_WRONLY | O_CLOEXEC))
+[A,src/sandstorm/backup.c++,77]         .write(contents.begin(), contents.size());
+[A,src/sandstorm/backup.c++,78]   }
+[A,src/sandstorm/backup.c++,79] 
+[A,src/sandstorm/backup.c++,80]   bool run(kj::StringPtr grainDir) {
+[A,src/sandstorm/backup.c++,81]     uid_t uid = getuid();
+[A,src/sandstorm/backup.c++,82]     gid_t gid = getgid();
+[A,src/sandstorm/backup.c++,83] 
+[A,src/sandstorm/backup.c++,84]     KJ_SYSCALL(unshare(CLONE_NEWUSER | CLONE_NEWNS));
+[A,src/sandstorm/backup.c++,85]     writeSetgroupsIfPresent("deny\n");
+[A,src/sandstorm/backup.c++,86]     writeUserNSMap("uid", kj::str("1000 ", uid, " 1\n"));
+[A,src/sandstorm/backup.c++,87]     writeUserNSMap("gid", kj::str("1000 ", gid, " 1\n"));
+[A,src/sandstorm/backup.c++,88] 
+[A,src/sandstorm/backup.c++,89]     // Mount root read-only.
+[A,src/sandstorm/backup.c++,90]     KJ_SYSCALL(mount(kj::str(root, "/").cStr(), "/tmp", nullptr,
+[A,src/sandstorm/backup.c++,91]                      MS_BIND | MS_REC | MS_RDONLY, nullptr));
+[A,src/sandstorm/backup.c++,92] 
+[A,src/sandstorm/backup.c++,93]     if (access("/tmp/dev/null", F_OK) != 0) {
+[A,src/sandstorm/backup.c++,94]       // Looks like we need to bind in /dev.
+[A,src/sandstorm/backup.c++,95]       KJ_SYSCALL(mount("/dev", "/tmp/dev", nullptr, MS_BIND, nullptr));
+[A,src/sandstorm/backup.c++,96]     }
+[A,src/sandstorm/backup.c++,97] 
+[A,src/sandstorm/backup.c++,98]     // Hide sensitive directories.
+[A,src/sandstorm/backup.c++,99]     KJ_SYSCALL(mount("tmpfs", "/tmp/proc", "tmpfs", 0, "size=32k,nr_inodes=8,mode=000"));
+[A,src/sandstorm/backup.c++,100]     KJ_SYSCALL(mount("tmpfs", "/tmp/var", "tmpfs", 0, "size=32k,nr_inodes=8,mode=000"));
+[A,src/sandstorm/backup.c++,101]     KJ_SYSCALL(mount("tmpfs", "/tmp/etc", "tmpfs", 0, "size=32k,nr_inodes=8,mode=000"));
+[A,src/sandstorm/backup.c++,102] 
+[A,src/sandstorm/backup.c++,103]     // Mount inner tmpfs.
+[A,src/sandstorm/backup.c++,104]     KJ_SYSCALL(mount("tmpfs", "/tmp/tmp", "tmpfs", 0, "size=8m,nr_inodes=128,mode=777"));
+[A,src/sandstorm/backup.c++,105] 
+[A,src/sandstorm/backup.c++,106]     // Bind in the grain's `data` (=`sandbox`).
+[A,src/sandstorm/backup.c++,107]     if (restore) {
+[A,src/sandstorm/backup.c++,108]       KJ_SYSCALL(mkdir(kj::str(grainDir, "/sandbox").cStr(), 0770));
+[A,src/sandstorm/backup.c++,109]     }
+[A,src/sandstorm/backup.c++,110]     KJ_SYSCALL(mkdir("/tmp/tmp/data", 0700));
+[A,src/sandstorm/backup.c++,111]     KJ_SYSCALL(mount(kj::str(grainDir, "/sandbox").cStr(), "/tmp/tmp/data", nullptr,
+[A,src/sandstorm/backup.c++,112]                      MS_BIND | (restore ? 0 : MS_RDONLY), nullptr));
+[A,src/sandstorm/backup.c++,113] 
+[A,src/sandstorm/backup.c++,114]     // Bind in the grain's `log`. When restoring, we discard the log.
+[A,src/sandstorm/backup.c++,115]     if (!restore) {
+[A,src/sandstorm/backup.c++,116]       KJ_SYSCALL(mknod("/tmp/tmp/log", S_IFREG | 0600, 0));
+[A,src/sandstorm/backup.c++,117]       KJ_SYSCALL(mount(kj::str(grainDir, "/log").cStr(), "/tmp/tmp/log", nullptr,
+[A,src/sandstorm/backup.c++,118]                        MS_BIND | MS_RDONLY, nullptr));
+[A,src/sandstorm/backup.c++,119]     }
+[A,src/sandstorm/backup.c++,120] 
+[A,src/sandstorm/backup.c++,121]     // Bind in the file.
+[A,src/sandstorm/backup.c++,122]     if (restore) {
+[A,src/sandstorm/backup.c++,123]       KJ_SYSCALL(mknod("/tmp/tmp/file.zip", S_IFREG | 0600, 0));
+[A,src/sandstorm/backup.c++,124]       KJ_SYSCALL(mount(filename.cStr(), "/tmp/tmp/file.zip", nullptr, MS_BIND, nullptr));
+[A,src/sandstorm/backup.c++,125]     } else if (filename != "-") {
+[A,src/sandstorm/backup.c++,126]       // Instead of binding, just open the file and we'll compress to stdout.
+[A,src/sandstorm/backup.c++,127]       KJ_SYSCALL(dup2(raiiOpen(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC), STDOUT_FILENO));
+[A,src/sandstorm/backup.c++,128]     }
+[A,src/sandstorm/backup.c++,129] 
+[A,src/sandstorm/backup.c++,130]     // Use Andy's ridiculous pivot_root trick to place ourselves into the sandbox.
+[A,src/sandstorm/backup.c++,131]     // See supervisor-main.c++ for more discussion.
+[A,src/sandstorm/backup.c++,132]     {
+[A,src/sandstorm/backup.c++,133]       auto oldRootDir = raiiOpen("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+[A,src/sandstorm/backup.c++,134]       KJ_SYSCALL(syscall(SYS_pivot_root, "/tmp", "/tmp"));
+[A,src/sandstorm/backup.c++,135]       KJ_SYSCALL(fchdir(oldRootDir));
+[A,src/sandstorm/backup.c++,136]       KJ_SYSCALL(umount2(".", MNT_DETACH));
+[A,src/sandstorm/backup.c++,137]       KJ_SYSCALL(chdir("/tmp"));
+[A,src/sandstorm/backup.c++,138]     }
+[A,src/sandstorm/backup.c++,139] 
+[A,src/sandstorm/backup.c++,140]     // TODO(someday): Find a zip library that doesn't suck and use it instead of shelling out
+[A,src/sandstorm/backup.c++,141]     //   to zip/unzip.
+[A,src/sandstorm/backup.c++,142]     if (restore) {
+[A,src/sandstorm/backup.c++,143]       Subprocess({"unzip", "-q", "file.zip", "data/*", "metadata"}).waitForSuccess();
+[A,src/sandstorm/backup.c++,144] 
+[A,src/sandstorm/backup.c++,145]       // Read metadata file to stdout.
+[A,src/sandstorm/backup.c++,146]       kj::FdInputStream in(raiiOpen("metadata", O_RDONLY | O_CLOEXEC));
+[A,src/sandstorm/backup.c++,147]       kj::FdOutputStream out(STDOUT_FILENO);
+[A,src/sandstorm/backup.c++,148]       pump(in, out);
+[A,src/sandstorm/backup.c++,149]     } else {
+[A,src/sandstorm/backup.c++,150]       // Read stdin to metadata file.
+[A,src/sandstorm/backup.c++,151]       {
+[A,src/sandstorm/backup.c++,152]         kj::FdInputStream in(STDIN_FILENO);
+[A,src/sandstorm/backup.c++,153]         kj::FdOutputStream out(raiiOpen("metadata", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC));
+[A,src/sandstorm/backup.c++,154]         pump(in, out);
+[A,src/sandstorm/backup.c++,155]       }
+[A,src/sandstorm/backup.c++,156] 
+[A,src/sandstorm/backup.c++,157]       Subprocess::Options zipOptions({"zip", "-qy@", "-"});
+[A,src/sandstorm/backup.c++,158]       auto inPipe = Pipe::make();
+[A,src/sandstorm/backup.c++,159]       zipOptions.stdin = inPipe.readEnd;
+[A,src/sandstorm/backup.c++,160]       Subprocess zip(kj::mv(zipOptions));
+[A,src/sandstorm/backup.c++,161]       inPipe.readEnd = nullptr;
+[A,src/sandstorm/backup.c++,162] 
+[A,src/sandstorm/backup.c++,163]       {
+[A,src/sandstorm/backup.c++,164]         kj::FdOutputStream out(kj::mv(inPipe.writeEnd));
+[A,src/sandstorm/backup.c++,165]         for (auto& entry: listDirectory(".")) {
+[A,src/sandstorm/backup.c++,166]           findFilesToZip(entry, out);
+[A,src/sandstorm/backup.c++,167]         }
+[A,src/sandstorm/backup.c++,168]       }
+[A,src/sandstorm/backup.c++,169] 
+[A,src/sandstorm/backup.c++,170]       zip.waitForSuccess();
+[A,src/sandstorm/backup.c++,171]     }
+[A,src/sandstorm/backup.c++,172] 
+[A,src/sandstorm/backup.c++,173]     return true;
+[A,src/sandstorm/backup.c++,174]   }
+[A,src/sandstorm/backup.c++,175] 
+[A,src/sandstorm/backup.c++,176]   static void pump(kj::InputStream& in, kj::OutputStream& out) {
+[A,src/sandstorm/backup.c++,177]     byte buffer[4096];
+[A,src/sandstorm/backup.c++,178]     while (size_t n = in.tryRead(buffer, 1, sizeof(buffer))) {
+[A,src/sandstorm/backup.c++,179]       out.write(buffer, n);
+[A,src/sandstorm/backup.c++,180]     }
+[A,src/sandstorm/backup.c++,181]   }
+[A,src/sandstorm/backup.c++,182] 
+[A,src/sandstorm/backup.c++,183]   void findFilesToZip(kj::StringPtr path, kj::OutputStream& out) {
+[A,src/sandstorm/backup.c++,184]     struct stat stats;
+[A,src/sandstorm/backup.c++,185]     KJ_SYSCALL(lstat(path.cStr(), &stats));
+[A,src/sandstorm/backup.c++,186]     if (S_ISREG(stats.st_mode) || S_ISLNK(stats.st_mode)) {
+[A,src/sandstorm/backup.c++,187]       // Regular file or link can be zipped; write to file stream.
+[A,src/sandstorm/backup.c++,188]       // If the path contains a newline, we cannot correctly pass it to `zip` since `zip` expects
+[A,src/sandstorm/backup.c++,189]       // one file per line. For security reasons, we must detect and filter out these files.
+[A,src/sandstorm/backup.c++,190]       // Hopefully this never happens legitimately?
+[A,src/sandstorm/backup.c++,191]       if (path.findFirst('\n') == nullptr) {
+[A,src/sandstorm/backup.c++,192]         kj::ArrayPtr<const byte> pieces[2];
+[A,src/sandstorm/backup.c++,193]         pieces[0] = path.asBytes();
+[A,src/sandstorm/backup.c++,194]         pieces[1] = kj::StringPtr("\n").asBytes();
+[A,src/sandstorm/backup.c++,195]         out.write(pieces);
+[A,src/sandstorm/backup.c++,196]       } else {
+[A,src/sandstorm/backup.c++,197]         KJ_LOG(ERROR, "tried to backup file containing newlines", path);
+[A,src/sandstorm/backup.c++,198]       }
+[A,src/sandstorm/backup.c++,199]     } else if (S_ISDIR(stats.st_mode)) {
+[A,src/sandstorm/backup.c++,200]       // Subdirectory; enumerate contents.
+[A,src/sandstorm/backup.c++,201]       for (auto& entry: listDirectory(path)) {
+[A,src/sandstorm/backup.c++,202]         findFilesToZip(kj::str(path, '/', entry), out);
+[A,src/sandstorm/backup.c++,203]       }
+[A,src/sandstorm/backup.c++,204]     }
+[A,src/sandstorm/backup.c++,205]   }
+[A,src/sandstorm/backup.c++,206] };
+[A,src/sandstorm/backup.c++,207] 
+[A,src/sandstorm/backup.c++,208] kj::Own<AbstractMain> getBackupMain(kj::ProcessContext& context) {
+[A,src/sandstorm/backup.c++,209]   return kj::heap<BackupMain>(context);
+[A,src/sandstorm/backup.c++,210] }
+[A,src/sandstorm/backup.c++,211] 
+[A,src/sandstorm/backup.c++,212] } // namespace sandstorm
+[A,src/sandstorm/backup.c++,213] 
+@@ -0,0 +1,29 @@
+[A,src/sandstorm/backup.h,1] // Sandstorm - Personal Cloud Sandbox
+[A,src/sandstorm/backup.h,2] // Copyright (c) 2015 Sandstorm Development Group, Inc. and contributors
+[A,src/sandstorm/backup.h,3] // All rights reserved.
+[A,src/sandstorm/backup.h,4] //
+[A,src/sandstorm/backup.h,5] // Licensed under the Apache License, Version 2.0 (the "License");
+[A,src/sandstorm/backup.h,6] // you may not use this file except in compliance with the License.
+[A,src/sandstorm/backup.h,7] // You may obtain a copy of the License at
+[A,src/sandstorm/backup.h,8] //
+[A,src/sandstorm/backup.h,9] //   http://www.apache.org/licenses/LICENSE-2.0
+[A,src/sandstorm/backup.h,10] //
+[A,src/sandstorm/backup.h,11] // Unless required by applicable law or agreed to in writing, software
+[A,src/sandstorm/backup.h,12] // distributed under the License is distributed on an "AS IS" BASIS,
+[A,src/sandstorm/backup.h,13] // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+[A,src/sandstorm/backup.h,14] // See the License for the specific language governing permissions and
+[A,src/sandstorm/backup.h,15] // limitations under the License.
+[A,src/sandstorm/backup.h,16] 
+[A,src/sandstorm/backup.h,17] #ifndef SANDSTORM_BACKUP_H_
+[A,src/sandstorm/backup.h,18] #define SANDSTORM_BACKUP_H_
+[A,src/sandstorm/backup.h,19] 
+[A,src/sandstorm/backup.h,20] #include "abstract-main.h"
+[A,src/sandstorm/backup.h,21] 
+[A,src/sandstorm/backup.h,22] namespace sandstorm {
+[A,src/sandstorm/backup.h,23] 
+[A,src/sandstorm/backup.h,24] kj::Own<AbstractMain> getBackupMain(kj::ProcessContext& context);
+[A,src/sandstorm/backup.h,25] // Get the main class for the "backup" command, which creates or restores a grain backup.
+[A,src/sandstorm/backup.h,26] 
+[A,src/sandstorm/backup.h,27] } // namespace sandstorm
+[A,src/sandstorm/backup.h,28] 
+[A,src/sandstorm/backup.h,29] #endif // SANDSTORM_BACKUP_H_
+@@ -47,30 +47,31 @@
+[C,src/sandstorm/run-bundle.c++,47] #include <ctype.h>
+[C,src/sandstorm/run-bundle.c++,48] #include <time.h>
+[C,src/sandstorm/run-bundle.c++,49] #include <stdio.h>  // rename()
+[C,src/sandstorm/run-bundle.c++,50] #include <sys/socket.h>
+[C,src/sandstorm/run-bundle.c++,51] #include <sys/un.h>
+[C,src/sandstorm/run-bundle.c++,52] #include <netdb.h>
+[C,src/sandstorm/run-bundle.c++,53] #include <dirent.h>
+[C,src/sandstorm/run-bundle.c++,54] 
+[C,src/sandstorm/run-bundle.c++,55] #include "version.h"
+[C,src/sandstorm/run-bundle.c++,56] #include "send-fd.h"
+[C,src/sandstorm/run-bundle.c++,57] #include "supervisor.h"
+[C,src/sandstorm/run-bundle.c++,58] #include "util.h"
+[C,src/sandstorm/run-bundle.c++,59] #include "spk.h"
+[C,src/sandstorm/run-bundle.c++,60] #include "minibox.h"
+[C,src/sandstorm/run-bundle.c++,61] #include "backend.h"
+[A,src/sandstorm/run-bundle.c++,62] #include "backup.h"
+[C,src/sandstorm/run-bundle.c++,63] 
+[C,src/sandstorm/run-bundle.c++,64] namespace sandstorm {
+[C,src/sandstorm/run-bundle.c++,65] 
+[C,src/sandstorm/run-bundle.c++,66] // We use SIGALRM to timeout waitpid()s.
+[C,src/sandstorm/run-bundle.c++,67] static bool alarmed = false;
+[C,src/sandstorm/run-bundle.c++,68] void alarmHandler(int) {
+[C,src/sandstorm/run-bundle.c++,69]   alarmed = true;
+[C,src/sandstorm/run-bundle.c++,70] }
+[C,src/sandstorm/run-bundle.c++,71] void registerAlarmHandler() {
+[C,src/sandstorm/run-bundle.c++,72]   struct sigaction action;
+[C,src/sandstorm/run-bundle.c++,73]   memset(&action, 0, sizeof(action));
+[C,src/sandstorm/run-bundle.c++,74]   action.sa_handler = &alarmHandler;
+[C,src/sandstorm/run-bundle.c++,75]   KJ_SYSCALL(sigaction(SIGALRM, &action, nullptr));
+[C,src/sandstorm/run-bundle.c++,76] }
+[C,src/sandstorm/run-bundle.c++,77] 
+@@ -509,30 +510,33 @@ public:
+[C,src/sandstorm/run-bundle.c++,510]           "If in doubt, re-run the Sandstorm installer for help.");
+[C,src/sandstorm/run-bundle.c++,511]     }
+[C,src/sandstorm/run-bundle.c++,512]   }
+[C,src/sandstorm/run-bundle.c++,513] 
+[C,src/sandstorm/run-bundle.c++,514]   kj::MainFunc getMain() {
+[C,src/sandstorm/run-bundle.c++,515]     static const char* VERSION = "Sandstorm version " SANDSTORM_VERSION;
+[C,src/sandstorm/run-bundle.c++,516] 
+[C,src/sandstorm/run-bundle.c++,517]     {
+[C,src/sandstorm/run-bundle.c++,518]       auto programName = context.getProgramName();
+[C,src/sandstorm/run-bundle.c++,519]       if (programName.endsWith("supervisor")) {  // historically "sandstorm-supervisor"
+[C,src/sandstorm/run-bundle.c++,520]         alternateMain = kj::heap<SupervisorMain>(context);
+[C,src/sandstorm/run-bundle.c++,521]         return alternateMain->getMain();
+[C,src/sandstorm/run-bundle.c++,522]       } else if (programName == "spk" || programName.endsWith("/spk")) {
+[C,src/sandstorm/run-bundle.c++,523]         alternateMain = getSpkMain(context);
+[C,src/sandstorm/run-bundle.c++,524]         return alternateMain->getMain();
+[A,src/sandstorm/run-bundle.c++,525]       } else if (programName == "backup" || programName.endsWith("/backup")) {
+[A,src/sandstorm/run-bundle.c++,526]         alternateMain = getBackupMain(context);
+[A,src/sandstorm/run-bundle.c++,527]         return alternateMain->getMain();
+[C,src/sandstorm/run-bundle.c++,528]       } else if (programName == "minibox" || programName.endsWith("/minibox")) {
+[C,src/sandstorm/run-bundle.c++,529]         alternateMain = getMiniboxMain(context);
+[C,src/sandstorm/run-bundle.c++,530]         return alternateMain->getMain();
+[C,src/sandstorm/run-bundle.c++,531]       }
+[C,src/sandstorm/run-bundle.c++,532]     }
+[C,src/sandstorm/run-bundle.c++,533] 
+[C,src/sandstorm/run-bundle.c++,534]     return kj::MainBuilder(context, VERSION,
+[C,src/sandstorm/run-bundle.c++,535]             "Controls the Sandstorm server.\n\n"
+[C,src/sandstorm/run-bundle.c++,536]             "Something not working? Check the logs in SANDSTORM_HOME/var/log.")
+[C,src/sandstorm/run-bundle.c++,537]         .addSubCommand("start",
+[C,src/sandstorm/run-bundle.c++,538]             [this]() {
+[C,src/sandstorm/run-bundle.c++,539]               return kj::MainBuilder(context, VERSION, "Starts the Sandstorm server (default).")
+[C,src/sandstorm/run-bundle.c++,540]                   .callAfterParsing(KJ_BIND_METHOD(*this, start))
+[C,src/sandstorm/run-bundle.c++,541]                   .build();
+[C,src/sandstorm/run-bundle.c++,542]             },
+@@ -1788,30 +1792,34 @@ private:
+[C,src/sandstorm/run-bundle.c++,1792]       auto outFd = raiiOpen("/var/mongo/passwd", O_WRONLY | O_CREAT | O_EXCL, 0640);
+[C,src/sandstorm/run-bundle.c++,1793]       if (runningAsRoot) { KJ_SYSCALL(fchown(outFd, config.uids.uid, config.uids.gid)); }
+[C,src/sandstorm/run-bundle.c++,1794]       kj::FdOutputStream((int)outFd).write(password.begin(), password.size());
+[C,src/sandstorm/run-bundle.c++,1795]     }
+[C,src/sandstorm/run-bundle.c++,1796]   }
+[C,src/sandstorm/run-bundle.c++,1797] 
+[C,src/sandstorm/run-bundle.c++,1798]   pid_t startBackend(const Config& config) {
+[C,src/sandstorm/run-bundle.c++,1799]     int pipeFds[2];
+[C,src/sandstorm/run-bundle.c++,1800]     KJ_SYSCALL(pipe2(pipeFds, O_CLOEXEC));
+[C,src/sandstorm/run-bundle.c++,1801]     kj::AutoCloseFd inPipe(pipeFds[0]);
+[C,src/sandstorm/run-bundle.c++,1802]     kj::AutoCloseFd outPipe(pipeFds[1]);
+[C,src/sandstorm/run-bundle.c++,1803] 
+[C,src/sandstorm/run-bundle.c++,1804]     Subprocess process([&]() -> int {
+[C,src/sandstorm/run-bundle.c++,1805]       inPipe = nullptr;
+[C,src/sandstorm/run-bundle.c++,1806] 
+[A,src/sandstorm/run-bundle.c++,1807]       // Mainly to cause Cap'n Proto to log exceptions being returned over RPC so we can see the
+[A,src/sandstorm/run-bundle.c++,1808]       // stack traces.
+[A,src/sandstorm/run-bundle.c++,1809]       kj::_::Debug::setLogLevel(kj::LogSeverity::INFO);
+[A,src/sandstorm/run-bundle.c++,1810] 
+[C,src/sandstorm/run-bundle.c++,1811]       kj::StringPtr socketPath = Backend::SOCKET_PATH;
+[C,src/sandstorm/run-bundle.c++,1812]       sandstorm::recursivelyCreateParent(socketPath);
+[C,src/sandstorm/run-bundle.c++,1813]       unlink(socketPath.cStr());
+[C,src/sandstorm/run-bundle.c++,1814] 
+[C,src/sandstorm/run-bundle.c++,1815]       auto io = kj::setupAsyncIo();
+[C,src/sandstorm/run-bundle.c++,1816]       auto& network = io.provider->getNetwork();
+[C,src/sandstorm/run-bundle.c++,1817]       auto listener = network.parseAddress(kj::str("unix:", socketPath))
+[C,src/sandstorm/run-bundle.c++,1818]           .wait(io.waitScope)->listen();
+[C,src/sandstorm/run-bundle.c++,1819] 
+[C,src/sandstorm/run-bundle.c++,1820]       if (runningAsRoot) {
+[C,src/sandstorm/run-bundle.c++,1821]         // Make socket available to server user.
+[C,src/sandstorm/run-bundle.c++,1822]         KJ_SYSCALL(chmod(socketPath.cStr(), 0770));
+[C,src/sandstorm/run-bundle.c++,1823]         KJ_SYSCALL(chown(socketPath.cStr(), 0, config.uids.gid));
+[C,src/sandstorm/run-bundle.c++,1824]       }
+[C,src/sandstorm/run-bundle.c++,1825] 

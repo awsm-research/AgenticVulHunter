@@ -1,0 +1,333 @@
+{
+  "candidate_id": "candidate-6",
+  "filepath": "pcsd/pcs.rb",
+  "changed_line": 1912,
+  "statement": "def get_parsed_local_sbd_config()",
+  "change_type": "A",
+  "function_name": "get_parsed_local_sbd_config",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+  "security_relevance_score": 0.6,
+  "code_context": "1763:       }\n1764:     }\n1765:   }\n1766:   return all_nodes_attr\n1767: end\n1768: \n1769: def status_v1_to_v2(status)\n1770:   new_status = status.select { |k,_|\n1771:     [:cluster_name, :username, :is_cman_with_udpu_transport,\n1772:      :need_ring1_address, :cluster_settings, :constraints, :groups,\n1773:      :corosync_online, :corosync_offline, :pacemaker_online, :pacemaker_standby,\n1774:      :pacemaker_offline, :acls, :fence_levels\n1775:     ].include?(k)\n1776:   }\n1777:   new_status[:node_attr] = node_attrs_to_v2(status[:node_attr])\n1778: \n1779:   resources = ClusterEntity::make_resources_tree(\n1780:     ClusterEntity::get_primitives_from_status_v1(status[:resources])\n1781:   )\n1782:   resources_hash = []\n1783:   resources.each { |r|\n1784:     resources_hash << r.to_status('2')\n1785:   }\n1786:   new_status[:resource_list] = resources_hash\n1787:   new_status[:node] = status.select { |k,_|\n1788:     [:uptime, :corosync, :pacemaker, :cman, :corosync_enabled,\n1789:      :pacemaker_enabled, :pcsd_enabled\n1790:     ].include?(k)\n1791:   }\n1792: \n1793:   new_status[:node].update(\n1794:     {\n1795:       :id => status[:node_id],\n1796:       :quorum => nil,\n1797:       :warning_list => [],\n1798:       :error_list => [],\n1799:       :status => (new_status[:node][:corosync] and\n1800:         new_status[:node][:pacemaker]) ? \"online\" : \"offline\",\n1801:       :status_version => '1'\n1802:     }\n1803:   )\n1804:   new_status[:status_version] = '1'\n1805: \n1806:   return new_status\n1807: end\n1808: \n1809: def allowed_for_local_cluster(auth_user, action)\n1810:   pcs_config = PCSConfig.new(Cfgsync::PcsdSettings.from_file().text())\n1811:   return pcs_config.permissions_local.allows?(\n1812:     auth_user[:username], auth_user[:usergroups], action\n1813:   )\n1814: end\n1815: \n1816: def allowed_for_superuser(auth_user)\n1817:   $logger.debug(\n1818:     \"permission check superuser username=#{auth_user[:username]} groups=#{auth_user[:usergroups]}\"\n1819:   )\n1820:   if SUPERUSER != auth_user[:username]\n1821:     $logger.debug('permission denied')\n1822:     return false\n1823:   end\n1824:   $logger.debug('permission granted for superuser')\n1825:   return true\n1826: end\n1827: \n1828: def get_default_overview_node_list(clustername)\n1829:   nodes = get_cluster_nodes clustername\n1830:   node_list = []\n1831:   nodes.each { |node|\n1832:     node_list << {\n1833:       'error_list' => [],\n1834:       'warning_list' => [],\n1835:       'status' => 'unknown',\n1836:       'quorum' => false,\n1837:       'name' => node\n1838:     }\n1839:   }\n1840:   return node_list\n1841: end\n1842: \n1843: def is_service_enabled?(service)\n1844:   if ISSYSTEMCTL\n1845:     cmd = ['systemctl', 'is-enabled', \"#{service}.service\"]\n1846:   else\n1847:     cmd = ['chkconfig', service]\n1848:   end\n1849:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1850:   return (retcode == 0)\n1851: end\n1852: \n1853: def is_service_running?(service)\n1854:   if ISSYSTEMCTL\n1855:     cmd = ['systemctl', 'status', \"#{service}.service\"]\n1856:   else\n1857:     cmd = ['service', service, 'status']\n1858:   end\n1859:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1860:   return (retcode == 0)\n1861: end\n1862: \n1863: def is_service_installed?(service)\n1864:   unless ISSYSTEMCTL\n1865:     raise NotImplementedException.new('Not supported on non systemd systems.')\n1866:   end\n1867:   stdout, _, retcode = run_cmd(\n1868:     PCSAuth.getSuperuserAuth(), PCS, 'resource', 'list', 'systemd'\n1869:   )\n1870:   if retcode != 0\n1871:     return nil\n1872:   end\n1873:   stdout.each { |line|\n1874:     if line.strip() == \"systemd:#{service}\"\n1875:       return true\n1876:     end\n1877:   }\n1878:   return false\n1879: end\n1880: \n1881: def enable_service(service)\n1882:   if ISSYSTEMCTL\n1883:     cmd = ['systemctl', 'enable', \"#{service}.service\"]\n1884:   else\n1885:     cmd = ['chkconfig', service, 'on']\n1886:   end\n1887:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1888:   return (retcode == 0)\n1889: end\n1890: \n1891: def disable_service(service)\n1892:   if ISSYSTEMCTL\n1893:     cmd = ['systemctl', 'disable', \"#{service}.service\"]\n1894:   else\n1895:     cmd = ['chkconfig', service, 'off']\n1896:   end\n1897:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1898:   return (retcode == 0)\n1899: end\n1900: \n1901: def set_cluster_prop_force(auth_user, prop, val)\n1902:   cmd = [PCS, 'property', 'set', \"#{prop}=#{val}\", '--force']\n1903:   if pacemaker_running?\n1904:     _, _, retcode = run_cmd(auth_user, *cmd)\n1905:   else\n1906:     cmd += ['-f', CIB_PATH]\n1907:     _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1908:   end\n1909:   return (retcode == 0)\n1910: end\n1911: \n1912: def get_parsed_local_sbd_config()\n1913:   cmd = [PCS, 'stonith', 'sbd', 'local_config_in_json']\n1914:   out, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1915:   if retcode != 0\n1916:     return nil\n1917:   end\n1918:   begin\n1919:     return JSON.parse(out.join(' '))\n1920:   rescue JSON::ParserError\n1921:     return nil\n1922:   end\n1923: end",
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-311",
+      "cwe_name": "Missing Encryption of Sensitive Data",
+      "fit_reason": "The function parses SBD configuration which may contain sensitive data, and there is no evidence of encryption being applied to this sensitive data.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "fit_reason": "The function performs JSON parsing without sufficient validation or error handling that could lead to incorrect processing of structured data.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-534",
+      "cwe_name": "Information Exposure Through Debug Log Files",
+      "fit_reason": "There is potential for sensitive information from SBD config to be exposed through debug logging if such logs are not properly sanitized.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-471",
+      "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+      "fit_reason": "If the SBD configuration is assumed to be immutable but can be modified by an attacker, this could lead to security issues.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "fit_reason": "SBD configurations may contain credentials or sensitive information related to system access, and improper handling of such data is possible.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-125",
+    "CWE-19",
+    "CWE-255",
+    "CWE-311",
+    "CWE-425",
+    "CWE-471",
+    "CWE-534",
+    "CWE-668",
+    "CWE-77",
+    "CWE-863"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "pcsd/pcs.rb",
+      "changed_line": 1912,
+      "statement": "def get_parsed_local_sbd_config()",
+      "cwe_id": "CWE-311",
+      "cwe_name": "Missing Encryption of Sensitive Data",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The function retrieves SBD configuration which may contain sensitive data, but does not encrypt it. However, the mechanism of missing encryption is not directly demonstrated as the function only parses and returns the config without explicitly handling encryption."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The function retrieves SBD configuration from a command output that may contain sensitive data (e.g., device paths, passwords). The data flows directly from system command execution to return value without encryption."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this function were removed or modified to include encryption, it would materially change the security posture by protecting sensitive SBD configuration data. The patch introduces a function that exposes unencrypted sensitive data."
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "No encryption control is demonstrated for the sensitive SBD configuration data. The function directly returns parsed JSON without any encryption or obfuscation.",
+          "required_control": "Encryption of sensitive data",
+          "control_requirement_evidence": "CWE-311 requires that sensitive data be encrypted before storage or transmission, and this function retrieves and returns sensitive configuration data without encryption.",
+          "existing_controls_checked": [
+            "No encryption or obfuscation controls observed in the function",
+            "No cryptographic libraries or functions called within the function"
+          ],
+          "deficiency_evidence": "The function directly returns parsed JSON from a system command that may contain sensitive data (e.g., passwords, device paths) without any encryption or protection mechanism."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "If the SBD configuration contains sensitive information like passwords or device paths, an attacker with access to the system could potentially read this unencrypted data, leading to unauthorized access to storage devices and potential compromise of cluster integrity."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the function that retrieves and returns SBD configuration data without encryption would not exist, preventing exposure of potentially sensitive configuration information in plaintext.",
+      "supporting_evidence": [
+        "Function retrieves SBD configuration from system command output",
+        "SBD configurations often contain sensitive data like passwords or device paths",
+        "No encryption or obfuscation is applied to the returned data",
+        "The function directly returns parsed JSON without any cryptographic protection"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Exact nature of sensitive data in SBD configuration is not fully specified",
+        "Whether the system command output actually contains encryption keys or passwords is not confirmed"
+      ],
+      "review_comment": "The function retrieves SBD configuration data that may contain sensitive information without encryption. The data flows directly from system command execution to return value without any cryptographic protection. This exposes potentially sensitive cluster configuration data in plaintext. Implement encryption of sensitive data before returning it from this function.",
+      "change_type": "A",
+      "raw_score": 0.64,
+      "score": 0.64
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "pcsd/pcs.rb",
+      "changed_line": 1912,
+      "statement": "def get_parsed_local_sbd_config()",
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The function performs JSON parsing but does not validate or sanitize the parsed data before use, which aligns with a general data processing error. However, it does not demonstrate a specific mechanism like injection, incorrect calculation, or malformed data handling that is characteristic of CWE-19."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The function receives unvalidated JSON output from a system command and parses it without checking the structure or content. The parsed data is then used in downstream operations, indicating a connection between the input (JSON) and processing."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this function were reverted to a version without JSON parsing or validation, it would remove the potential for incorrect data handling from untrusted JSON input. The change introduces a new path where raw command output is directly parsed."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "There is no validation or sanitization of the parsed JSON data before use, which is a required control for preventing incorrect processing of structured data. The function assumes that the JSON output from the system command is valid and correctly formatted.",
+          "required_control": "Input validation and sanitization of structured data",
+          "control_requirement_evidence": "CWE-19 requires that data processing be safe and validated to prevent incorrect handling of input, especially when dealing with structured formats like JSON.",
+          "existing_controls_checked": [
+            "No explicit validation or sanitization of parsed JSON data",
+            "No checks for expected structure or content in the parsed output"
+          ],
+          "deficiency_evidence": "The function directly parses and returns the output of a system command without validating that it conforms to expected JSON structure or content, which is a deficiency in handling structured data."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "If the JSON parsing fails due to malformed input or if the parsed data is not as expected, it could lead to incorrect behavior or errors in downstream processing. However, the specific impact depends on how the returned data is used, which is not fully demonstrated."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the function would either not parse JSON at all or would use a different method that includes validation or sanitization of input before processing. This would prevent incorrect handling of potentially malformed or maliciously crafted JSON data.",
+      "supporting_evidence": [
+        "Function directly parses output from system command without validation",
+        "JSON parsing is done with no error handling beyond rescue block for ParserError",
+        "The parsed data is returned and used in downstream operations"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "How the returned data is used downstream",
+        "Whether the system command output can be controlled by an attacker",
+        "Specific impact of malformed JSON on downstream processing"
+      ],
+      "review_comment": "The function parses JSON without validation, which could lead to incorrect data handling if the input is malformed or malicious. The parsed data is returned and used in downstream operations, creating a potential vulnerability. Ensure that all structured data from external sources is validated before use.",
+      "change_type": "A",
+      "raw_score": 0.6,
+      "score": 0.6
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "pcsd/pcs.rb",
+      "changed_line": 1912,
+      "statement": "def get_parsed_local_sbd_config()",
+      "cwe_id": "CWE-534",
+      "cwe_name": "Information Exposure Through Debug Log Files",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "The function get_parsed_local_sbd_config() does not directly log or expose information in debug logs. It parses SBD configuration and returns a parsed JSON object, without any logging behavior."
+        },
+        "connection": {
+          "score": 0.0,
+          "evidence": "There is no demonstrated connection between the function's output and any debug logging mechanism that would lead to sensitive information exposure."
+        },
+        "diff_causality": {
+          "score": 0.0,
+          "evidence": "The patch introduces a new function for parsing SBD configuration but does not introduce or modify any logging behavior, so it cannot be the cause of debug log exposure."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "No evidence of logging or debug output is present in the function. The function simply parses and returns data without any logging mechanism.",
+          "required_control": "No logging or sanitization control required for this CWE as the function does not log",
+          "control_requirement_evidence": "CWE-534 requires logging sensitive information to debug files, but this function only parses and returns data without logging.",
+          "existing_controls_checked": [
+            "No logging mechanism found in the function"
+          ],
+          "deficiency_evidence": "The function does not perform any logging or output sensitive data to logs."
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "There is no evidence that this function causes information exposure through debug log files, as it does not perform any logging operations."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the get_parsed_local_sbd_config() function would not exist, and there would be no mechanism to parse SBD configuration in JSON format. However, since this function does not log or expose sensitive information, reverting it would not prevent any debug log exposure.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "The function get_parsed_local_sbd_config() only parses and returns a JSON object without logging or exposing sensitive data to logs."
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.0,
+      "score": 0.0
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "pcsd/pcs.rb",
+      "changed_line": 1912,
+      "statement": "def get_parsed_local_sbd_config()",
+      "cwe_id": "CWE-471",
+      "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.8,
+          "evidence": "The function get_parsed_local_sbd_config() retrieves SBD configuration data using a command that may be influenced by attacker-controlled inputs or environment, and the result is parsed without validation of immutability."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The function executes a system command (PCS stonith sbd local_config_in_json) which could potentially be influenced by an attacker if the environment or command arguments are not properly secured, connecting to the vulnerable operation."
+        },
+        "diff_causality": {
+          "score": 0.7,
+          "evidence": "If this function were removed or modified to enforce immutability checks, it would prevent potential modification of SBD configuration data by an attacker. The patch directly addresses how SBD config is retrieved and parsed."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "There is no explicit validation or control to ensure that the SBD configuration data returned by this function is immutable or has not been tampered with, which is required for CWE-471.",
+          "required_control": "Immutable data verification",
+          "control_requirement_evidence": "CWE-471 requires that assumed-immutable data be protected from modification by attackers. The function retrieves SBD config without checking its integrity or immutability.",
+          "existing_controls_checked": [
+            "No explicit validation of the parsed JSON output for tampering",
+            "No cryptographic signature verification of the configuration file",
+            "No access control checks on the command execution environment"
+          ],
+          "deficiency_evidence": "The function directly calls a system command and parses its output without verifying that the data has not been modified or tampered with, which is a core requirement for preventing MAID vulnerabilities."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "If an attacker can modify the SBD configuration file, they could potentially manipulate the behavior of the SBD (Service Based Decision) mechanism, leading to potential denial of service or unauthorized access."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the function get_parsed_local_sbd_config would not exist, and any code attempting to retrieve local SBD configuration would fail or use a different method that might include immutability checks.",
+      "supporting_evidence": [
+        "The function directly calls a system command to retrieve SBD configuration",
+        "The output is parsed without validation of data integrity or immutability",
+        "SBD configurations are security-sensitive and assumed to be immutable"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the command execution environment is fully secured from attacker influence",
+        "Whether the SBD configuration file itself is protected against modification by unauthorized users"
+      ],
+      "review_comment": "The function get_parsed_local_sbd_config() retrieves SBD configuration data without verifying its immutability, which could allow an attacker to modify assumed-immutable data. The system command execution environment and access controls on the configuration file should be reviewed to ensure that SBD configurations cannot be tampered with.",
+      "change_type": "A",
+      "raw_score": 0.5999999999999999,
+      "score": 0.5999999999999999
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "pcsd/pcs.rb",
+      "changed_line": 1912,
+      "statement": "def get_parsed_local_sbd_config()",
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "cwe_relationship": "family_compatible",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The function retrieves SBD (System/Service Based Detection) local configuration in JSON format, which may contain credentials or sensitive information. However, the mechanism of credential management error is not directly demonstrated; it's only a potential source of credentials."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The function calls run_cmd with superuser authentication and retrieves output that may contain credentials. The data flows from system command execution to JSON parsing without explicit credential sanitization or validation, creating a potential path for sensitive data exposure."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this function were removed or modified to not parse SBD configuration, the risk of credential exposure from SBD config would be reduced. The patch introduces handling of SBD local config which could expose credentials if not properly managed."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "There is no explicit validation or sanitization of credentials in the retrieved SBD configuration before it's returned. The function directly returns parsed JSON without checking for credential fields or applying appropriate controls.",
+          "required_control": "Credential sanitization or validation",
+          "control_requirement_evidence": "CWE-255 requires proper management of credentials, including their storage and handling to prevent exposure. This function retrieves SBD config which may contain credentials but does not validate or sanitize them.",
+          "existing_controls_checked": [
+            "JSON parsing without credential checks",
+            "Direct return of parsed output"
+          ],
+          "deficiency_evidence": "The function directly returns the result of JSON.parse(out.join(' ')) without any checks for sensitive fields or sanitization. No controls are in place to prevent credential exposure."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "If SBD configuration contains credentials and they are returned unfiltered, an attacker could potentially access them through this function. However, the impact is speculative without evidence of actual credential presence in the config or exploitation path."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the system would not parse SBD local configuration for credentials, reducing potential exposure of sensitive information from that source.",
+      "supporting_evidence": [
+        "Function retrieves SBD configuration which may contain credentials",
+        "Direct return of parsed JSON without credential validation",
+        "Uses superuser authentication to execute command"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the SBD configuration actually contains credentials",
+        "Whether the returned data is properly sanitized or filtered",
+        "Whether downstream components validate or handle credentials appropriately"
+      ],
+      "review_comment": "The function retrieves SBD local configuration which may contain credentials. No validation or sanitization of credential fields is performed before returning the parsed JSON. This creates a potential exposure risk if the configuration contains sensitive information. Implement credential filtering or validation to prevent unauthorized access to system credentials.",
+      "change_type": "A",
+      "raw_score": 0.48,
+      "score": 0.48
+    }
+  ],
+  "stage4_status": "completed"
+}

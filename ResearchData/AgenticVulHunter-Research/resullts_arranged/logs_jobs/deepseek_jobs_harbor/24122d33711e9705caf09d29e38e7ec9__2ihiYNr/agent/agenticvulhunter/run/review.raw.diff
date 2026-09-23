@@ -1,0 +1,414 @@
+diff --git a/cf_spec/fixtures/hhvm_app/index.php b/cf_spec/fixtures/hhvm_app/index.php
+index 147cebcdd..c45448ebb 100644
+--- a/cf_spec/fixtures/hhvm_app/index.php
++++ b/cf_spec/fixtures/hhvm_app/index.php
+@@ -1 +1,3 @@
+ <?php phpinfo(); ?>
++
++Expect .profile.d to set HTTPD_SERVER_ADMIN=<?php echo getenv("HTTPD_SERVER_ADMIN"); ?>
+diff --git a/cf_spec/fixtures/php_app_with_profile_d/.profile.d/test.sh b/cf_spec/fixtures/php_app_with_profile_d/.profile.d/test.sh
+new file mode 100644
+index 000000000..749c0578b
+--- /dev/null
++++ b/cf_spec/fixtures/php_app_with_profile_d/.profile.d/test.sh
+@@ -0,0 +1 @@
++export TEST_ENV_VAR="Generic Environment Variable"
+\ No newline at end of file
+diff --git a/cf_spec/fixtures/php_app_with_profile_d/index.php b/cf_spec/fixtures/php_app_with_profile_d/index.php
+new file mode 100644
+index 000000000..7436d672f
+--- /dev/null
++++ b/cf_spec/fixtures/php_app_with_profile_d/index.php
+@@ -0,0 +1 @@
++<?php echo phpinfo() ?>
+diff --git a/cf_spec/integration/deploy_an_hhvm_app_spec.rb b/cf_spec/integration/deploy_an_hhvm_app_spec.rb
+index 2e43df0c3..f53eb39b3 100644
+--- a/cf_spec/integration/deploy_an_hhvm_app_spec.rb
++++ b/cf_spec/integration/deploy_an_hhvm_app_spec.rb
+@@ -8,30 +8,31 @@ describe 'CF PHP Buildpack' do
+   after do
+     Machete::CF::DeleteApp.new.execute(app)
+   end
+ 
+   context 'deploying a basic HHVM app' do
+     let(:app_name) { 'hhvm_app' }
+ 
+     specify do
+       expect(app).to be_running
+ 
+       expect(app).to have_logged 'Installing HHVM'
+       expect(app).to have_logged 'HHVM 3.2'
+ 
+       browser.visit_path('/')
+       expect(browser).to have_body('HipHop')
++      expect(browser).to have_body('Expect .profile.d to set HTTPD_SERVER_ADMIN=admin@localhost')
+ 
+       assert_offline_mode_has_no_internet_traffic
+     end
+   end
+ 
+   context 'deploying a basic HHVM app with runtime defined in composer.json' do
+     let(:app_name) { 'composer_hhvm_app' }
+ 
+     specify do
+       expect(app).to be_running
+ 
+       expect(app).to have_logged 'Installing HHVM'
+       expect(app).to have_logged 'HHVM 3.2'
+ 
+       browser.visit_path('/')
+diff --git a/cf_spec/integration/profile_d_sets_environment_variables_spec.rb b/cf_spec/integration/profile_d_sets_environment_variables_spec.rb
+new file mode 100644
+index 000000000..30d641a2a
+--- /dev/null
++++ b/cf_spec/integration/profile_d_sets_environment_variables_spec.rb
+@@ -0,0 +1,20 @@
++$: << 'cf_spec'
++require 'cf_spec_helper'
++
++describe 'CF PHP Buildpack' do
++  subject(:app) { Machete.deploy_app(app_name, {env: {'COMPOSER_GITHUB_OAUTH_TOKEN' => ENV['COMPOSER_GITHUB_OAUTH_TOKEN']}}) }
++  let(:browser) { Machete::Browser.new(app) }
++
++  after do
++    Machete::CF::DeleteApp.new.execute(app)
++  end
++
++  context 'deploying a PHP app with .profile.d directory' do
++    let(:app_name) { 'php_app_with_profile_d' }
++
++    it "sets environment variables via .profile.d script" do
++      browser.visit_path('/')
++      expect(browser).to have_body('HTTPD_SERVER_ADMIN')
++    end
++  end
++end
+diff --git a/defaults/config/php/5.4.x/php-fpm.conf b/defaults/config/php/5.4.x/php-fpm.conf
+index 32b76fa6b..ec4872448 100644
+--- a/defaults/config/php/5.4.x/php-fpm.conf
++++ b/defaults/config/php/5.4.x/php-fpm.conf
+@@ -474,30 +474,31 @@ ping.response = pong
+ ; process time (several ms).
+ ; Default Value: no
+ ;catch_workers_output = yes
+ 
+ ; Limits the extensions of the main script FPM will allow to parse. This can
+ ; prevent configuration mistakes on the web server side. You should only limit
+ ; FPM to .php extensions to prevent malicious users to use other extensions to
+ ; exectute php code.
+ ; Note: set an empty value to allow all extensions.
+ ; Default Value: .php
+ ;security.limit_extensions = .php .php3 .php4 .php5
+  
+ ; Pass environment variables like LD_LIBRARY_PATH. All $VARIABLEs are taken from
+ ; the current environment.
+ ; Default Value: clean env
++clear_env = no
+ 
+ ; build pack rewrites this to the list of environment variables at compile time
+ ;  produces a list like "env[<var>] = $<var>"
+ #{PHP_ENV}
+ 
+ ; Additional php.ini defines, specific to this pool of workers. These settings
+ ; overwrite the values previously defined in the php.ini. The directives are the
+ ; same as the PHP SAPI:
+ ;   php_value/php_flag             - you can set classic ini defines which can
+ ;                                    be overwritten from PHP call 'ini_set'. 
+ ;   php_admin_value/php_admin_flag - these directives won't be overwritten by
+ ;                                     PHP call 'ini_set'
+ ; For php_*flag, valid values are on, off, 1, 0, true, false, yes or no.
+ 
+ ; Defining 'extension' will load the corresponding shared extension from
+diff --git a/lib/build_pack_utils/builder.py b/lib/build_pack_utils/builder.py
+index bc7d7b4f8..d49d74d00 100644
+--- a/lib/build_pack_utils/builder.py
++++ b/lib/build_pack_utils/builder.py
+@@ -820,31 +820,34 @@ class SaveBuilder(object):
+         # run service_environment on all extensions, pool the results
+         #  into one dict, duplicates are grouped in a list and kept
+         #  in the same order.
+         all_extns_env = defaultdict(list)
+ 
+         def process(env):
+             for key, val in env.iteritems():
+                 if hasattr(val, 'append'):
+                     all_extns_env[key].extend(val)
+                 else:
+                     all_extns_env[key].append(val)
+         process_extensions(self._builder._ctx, 'service_environment', process)
+         # Write pool of environment items to disk, a single item is
+         #  written in 'key=val' format, while lists are written as
+         #  'key=val:val:val' where ':' is os.pathsep.
+-        envPath = os.path.join(self._builder._ctx['BUILD_DIR'], '.env')
++        profile_d_directory = os.path.join(self._builder._ctx['BUILD_DIR'], '.profile.d')
++        if not os.path.exists(profile_d_directory):
++            os.makedirs(profile_d_directory)
++        envPath = os.path.join(profile_d_directory, 'bp_env_vars.sh')
+         with open(envPath, 'at') as envFile:
+             for key, val in all_extns_env.iteritems():
+                 if len(val) == 0:
+                     val = ''
+                 elif len(val) == 1:
+                     val = val[0]
+                 elif len(val) > 1:
+                     val = os.pathsep.join(val)
+                 envFile.write("export %s=%s\n" % (key, val))
+         return self
+ 
+     def process_list(self):
+         def process(cmds):
+             procPath = os.path.join(self._builder._ctx['BUILD_DIR'], '.procs')
+             with open(procPath, 'at') as procFile:
+diff --git a/lib/compile_helpers.py b/lib/compile_helpers.py
+index 73cb5bfd4..db0d71fc8 100644
+--- a/lib/compile_helpers.py
++++ b/lib/compile_helpers.py
+@@ -39,30 +39,32 @@ def setup_webdir_if_it_doesnt_exist(ctx):
+         webdirPath = os.path.join(ctx['BUILD_DIR'], ctx['WEBDIR'])
+         if not os.path.exists(webdirPath):
+             fu = FileUtil(FakeBuilder(ctx), move=True)
+             fu.under('BUILD_DIR')
+             fu.into('WEBDIR')
+             fu.where_name_does_not_match(
+                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp'))
+             fu.where_name_does_not_match(
+                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.extensions'))
+             fu.where_name_does_not_match(
+                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.bp-config'))
+             fu.where_name_does_not_match(
+                 '^%s$' % os.path.join(ctx['BUILD_DIR'], 'manifest.yml'))
+             fu.where_name_does_not_match(
+                 '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], ctx['LIBDIR']))
++            fu.where_name_does_not_match(
++                '^%s/.*$' % os.path.join(ctx['BUILD_DIR'], '.profile.d'))
+             fu.done()
+ 
+ 
+ def log_bp_version(ctx):
+     version_file = os.path.join(ctx['BP_DIR'], 'VERSION')
+     if os.path.exists(version_file):
+         print '-------> Buildpack version %s' % open(version_file).read()
+ 
+ 
+ def setup_log_dir(ctx):
+     os.makedirs(os.path.join(ctx['BUILD_DIR'], 'logs'))
+ 
+ 
+ def load_binary_index(ctx):
+     index_path = os.path.join(ctx['BP_DIR'], 'binaries',
+diff --git a/lib/env/__init__.py b/lib/env/__init__.py
+deleted file mode 100644
+index e69de29bb..000000000
+diff --git a/lib/env/extension.py b/lib/env/extension.py
+deleted file mode 100644
+index ca73ef017..000000000
+--- a/lib/env/extension.py
++++ /dev/null
+@@ -1,18 +0,0 @@
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements.  See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License.  You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-
+-def preprocess_commands(ctx):
+-    return (('source', '$HOME/.env'),)
+diff --git a/tests/common/components.py b/tests/common/components.py
+index 5b3676df6..05fec12c2 100644
+--- a/tests/common/components.py
++++ b/tests/common/components.py
+@@ -66,34 +66,34 @@ class PhpAssertHelper(object):
+ 
+     def assert_contents_of_procs_file(self, build_dir):
+         fah = FileAssertHelper()
+         fah.expect().path(build_dir, '.procs').exists()
+         tfah = TextFileAssertHelper()
+         (tfah.expect()
+             .on_file(build_dir, '.procs')
+             .any_line()
+                 .equals('php-fpm: $HOME/php/sbin/php-fpm -p '  # noqa
+                         '"$HOME/php/etc" -y "$HOME/php/etc/php-fpm.conf"'
+                         ' -c "$HOME/php/etc"\n')
+                 .equals('php-fpm-logs: tail -F $HOME/logs/php-fpm.log\n'))
+ 
+     def assert_contents_of_env_file(self, build_dir):
+         fah = FileAssertHelper()
+-        fah.expect().path(build_dir, '.env').exists()
++        fah.expect().path(build_dir, '.profile.d', 'bp_env_vars.sh').exists()
+         tfah = TextFileAssertHelper()
+         (tfah.expect()
+-            .on_file(build_dir, '.env')
++            .on_file(build_dir, '.profile.d', 'bp_env_vars.sh')
+             .any_line()
+                 .equals('export '
+                         'PATH=$PATH:$HOME/php/bin:$HOME/php/sbin\n')  # noqa
+                 .equals('export '
+                         'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/php/lib\n')
+                 .equals('export PHPRC=$HOME/php/etc\n'))
+ 
+     def assert_files_installed(self, build_dir):
+         fah = FileAssertHelper()
+         (fah.expect()
+             .root(build_dir, 'php')
+                 .path('etc', 'php-fpm.conf')  # noqa
+                 .path('etc', 'php.ini')
+                 .path('sbin', 'php-fpm')
+                 .path('bin')
+@@ -119,34 +119,34 @@ class HttpdAssertHelper(object):
+             .equals('$HOME/.bp/bin/rewrite "$HOME/httpd/conf"\n'))
+ 
+     def assert_contents_of_procs_file(self, build_dir):
+         fah = FileAssertHelper()
+         fah.expect().path(build_dir, '.procs').exists()
+         tfah = TextFileAssertHelper()
+         (tfah.expect()
+             .on_file(build_dir, '.procs')
+             .any_line()
+                 .equals('httpd: $HOME/httpd/bin/apachectl -f '  # noqa
+                         '"$HOME/httpd/conf/httpd.conf" -k start '
+                         '-DFOREGROUND\n'))
+ 
+     def assert_contents_of_env_file(self, build_dir):
+         fah = FileAssertHelper()
+-        fah.expect().path(build_dir, '.env').exists()
++        fah.expect().path(build_dir, '.profile.d', 'bp_env_vars.sh').exists()
+         tfah = TextFileAssertHelper()
+         (tfah.expect()
+-            .on_file(build_dir, '.env')
++            .on_file(build_dir, '.profile.d', 'bp_env_vars.sh')
+             .any_line()
+             .equals('export HTTPD_SERVER_ADMIN=dan@mikusa.com\n'))
+ 
+     def assert_web_dir_exists(self, build_dir, web_dir):
+         fah = FileAssertHelper()
+         (fah.expect()
+             .path(build_dir, web_dir)
+             .exists())
+ 
+     def assert_files_installed(self, build_dir):
+         fah = FileAssertHelper()
+         (fah.expect()
+             .root(build_dir, 'httpd', 'conf')
+                 .path('httpd.conf')  # noqa
+                 .root('extra')
+@@ -311,34 +311,34 @@ class HhvmAssertHelper(object):
+                     '-c "$HOME/hhvm/etc/php.ini" "$@"; }\n'))
+ 
+     def assert_contents_of_procs_file(self, build_dir):
+         fah = FileAssertHelper()
+         fah.expect().path(build_dir, '.procs').exists()
+         tfah = TextFileAssertHelper()
+         (tfah.expect()
+             .on_file(build_dir, '.procs')
+             .any_line()
+                 .equals('hhvm: $HOME/hhvm/usr/bin/hhvm --mode server '  # noqa
+                         '-c $HOME/hhvm/etc/server.ini '
+                         '-c $HOME/hhvm/etc/php.ini\n'))
+ 
+     def assert_contents_of_env_file(self, build_dir):
+         fah = FileAssertHelper()
+-        fah.expect().path(build_dir, '.env').exists()
++        fah.expect().path(build_dir, '.profile.d', 'bp_env_vars.sh').exists()
+         tfah = TextFileAssertHelper()
+         (tfah.expect()
+-            .on_file(build_dir, '.env')
++            .on_file(build_dir, '.profile.d', 'bp_env_vars.sh')
+             .any_line()
+             .equals('export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:'
+                     '$HOME/hhvm/usr/lib/hhvm\n')
+             .equals('export PATH=$PATH:$HOME/hhvm/usr/bin\n'))
+ 
+     def assert_files_installed(self, build_dir):
+         fah = FileAssertHelper()
+         (fah.expect()
+             .root(build_dir, 'hhvm')
+                 .path('usr', 'bin', 'hhvm')  # noqa
+             .root(build_dir, 'hhvm', 'usr', 'lib', 'hhvm', reset=True)
+                 .path('libboost_program_options.so.1.55.0')
+                 .path('libevent-2.0.so.5')
+                 .path('libicuuc.so.48')
+                 .path('libjemalloc.so.1')
+diff --git a/tests/data/app-with-profile-d/.profile.d/dontdelete.sh b/tests/data/app-with-profile-d/.profile.d/dontdelete.sh
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/data/app-with-profile-d/index.php b/tests/data/app-with-profile-d/index.php
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/test_compile.py b/tests/test_compile.py
+index 5972b3a66..9009e6775 100644
+--- a/tests/test_compile.py
++++ b/tests/test_compile.py
+@@ -119,15 +119,26 @@ class TestCompileApp5(BaseCompileApp):
+         none.assert_downloads_from_output(output)
+         # confirm httpd and nginx are not installed
+         none.assert_no_web_server_is_installed(self.build_dir)
+         # confirm start script
+         bp.assert_start_script_is_correct(self.build_dir)
+         php.assert_start_script_is_correct(self.build_dir)
+         # confirm bp utils installed
+         bp.assert_scripts_are_installed(self.build_dir)
+         # check env & proc files
+         none.assert_contents_of_procs_file(self.build_dir)
+         php.assert_contents_of_env_file(self.build_dir)
+         # webdir exists
+         none.assert_no_web_dir(self.build_dir, self.opts.get_webdir())
+         # check php cli installed
+         none.assert_files_installed(self.build_dir)
++
++
++class TestCompileWithProfileD(BaseCompileApp):
++    def __init__(self):
++        self.app_name = 'app-with-profile-d'
++
++    def testProfileDNotOverridden(self):
++        ErrorHelper().compile(self.bp)
++        fah = FileAssertHelper()
++        fah.expect().path(self.build_dir, '.profile.d', 'dontdelete.sh').exists()
++
+diff --git a/tests/test_extension_helper.py b/tests/test_extension_helper.py
+index f0dca8348..ab13b324f 100644
+--- a/tests/test_extension_helper.py
++++ b/tests/test_extension_helper.py
+@@ -24,31 +24,31 @@ class TestPHPExtensionHelper(object):
+             shutil.rmtree(self.build_dir)
+ 
+     def test_basic(self):
+         ctx = utils.FormattedDict({
+             'BUILD_DIR': self.build_dir,
+             'PHP_VERSION': '5.4.32'
+         })
+         ext = PHPExtensionHelper(ctx)
+         ext.load_config()
+         eq_(2, len(ext._ctx))
+         eq_({}, ext._services)
+         eq_({}, ext._application)
+         eq_(os.path.join(self.phpCfgDir, 'php.ini'), ext._php_ini_path)
+         eq_(os.path.join(self.phpCfgDir, 'php-fpm.conf'), ext._php_fpm_path)
+         eq_(1822, len(ext._php_ini._lines))
+-        eq_(517, len(ext._php_fpm._lines))
++        eq_(518, len(ext._php_fpm._lines))
+         eq_('20100525', ext._php_api)
+         eq_(False, ext._should_compile())
+         eq_(False, ext._should_configure())
+         eq_(None, ext.configure())
+         eq_((), ext.preprocess_commands())
+         eq_({}, ext.service_commands())
+         eq_({}, ext.service_environment())
+         eq_(0, ext.compile(None))
+ 
+     def test_merge_defaults(self):
+         ctx = utils.FormattedDict({
+             'BUILD_DIR': self.build_dir,
+             'PHP_VERSION': '5.4.32',
+             'SOME_JUNK': 'jkl;'
+         })

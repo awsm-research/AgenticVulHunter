@@ -1,0 +1,741 @@
+@@ -35,31 +35,32 @@ from glance.api import common
+[C,glance/api/v1/images.py,35] from glance.api import policy
+[C,glance/api/v1/images.py,36] import glance.api.v1
+[C,glance/api/v1/images.py,37] from glance import context
+[C,glance/api/v1/images.py,38] from glance.api.v1 import controller
+[C,glance/api/v1/images.py,39] from glance.api.v1 import filters
+[C,glance/api/v1/images.py,40] from glance.common import exception
+[C,glance/api/v1/images.py,41] from glance.common import utils
+[C,glance/api/v1/images.py,42] from glance.common import wsgi
+[C,glance/api/v1/images.py,43] from glance import notifier
+[C,glance/api/v1/images.py,44] from glance.openstack.common import cfg
+[C,glance/api/v1/images.py,45] import glance.openstack.common.log as logging
+[C,glance/api/v1/images.py,46] from glance import registry
+[C,glance/api/v1/images.py,47] from glance.store import (create_stores,
+[C,glance/api/v1/images.py,48]                           get_from_backend,
+[C,glance/api/v1/images.py,49]                           get_size_from_backend,
+[D,glance/api/v1/images.py,50]                           schedule_delete_from_backend,
+[A,glance/api/v1/images.py,50]                           safe_delete_from_backend,
+[A,glance/api/v1/images.py,51]                           schedule_delayed_delete_from_backend,
+[C,glance/api/v1/images.py,52]                           get_store_from_location,
+[C,glance/api/v1/images.py,53]                           get_store_from_scheme)
+[C,glance/api/v1/images.py,54] 
+[C,glance/api/v1/images.py,55] 
+[C,glance/api/v1/images.py,56] LOG = logging.getLogger(__name__)
+[C,glance/api/v1/images.py,57] SUPPORTED_PARAMS = glance.api.v1.SUPPORTED_PARAMS
+[C,glance/api/v1/images.py,58] SUPPORTED_FILTERS = glance.api.v1.SUPPORTED_FILTERS
+[C,glance/api/v1/images.py,59] 
+[C,glance/api/v1/images.py,60] 
+[C,glance/api/v1/images.py,61] # Defined at module level due to _is_opt_registered
+[C,glance/api/v1/images.py,62] # identity check (not equality).
+[C,glance/api/v1/images.py,63] default_store_opt = cfg.StrOpt('default_store', default='file')
+[C,glance/api/v1/images.py,64] 
+[C,glance/api/v1/images.py,65] CONF = cfg.CONF
+[C,glance/api/v1/images.py,66] CONF.register_opt(default_store_opt)
+@@ -746,32 +747,39 @@ class Controller(controller.BaseController):
+[C,glance/api/v1/images.py,747] 
+[C,glance/api/v1/images.py,748]         image = self.get_image_meta_or_404(req, id)
+[C,glance/api/v1/images.py,749]         if image['protected']:
+[C,glance/api/v1/images.py,750]             msg = _("Image is protected")
+[C,glance/api/v1/images.py,751]             LOG.debug(msg)
+[C,glance/api/v1/images.py,752]             raise HTTPForbidden(explanation=msg,
+[C,glance/api/v1/images.py,753]                                 request=req,
+[C,glance/api/v1/images.py,754]                                 content_type="text/plain")
+[C,glance/api/v1/images.py,755] 
+[C,glance/api/v1/images.py,756]         # The image's location field may be None in the case
+[C,glance/api/v1/images.py,757]         # of a saving or queued image, therefore don't ask a backend
+[C,glance/api/v1/images.py,758]         # to delete the image if the backend doesn't yet store it.
+[C,glance/api/v1/images.py,759]         # See https://bugs.launchpad.net/glance/+bug/747799
+[C,glance/api/v1/images.py,760]         try:
+[C,glance/api/v1/images.py,761]             if image['location']:
+[D,glance/api/v1/images.py,761]                 schedule_delete_from_backend(image['location'],
+[A,glance/api/v1/images.py,762]                 if CONF.delayed_delete:
+[A,glance/api/v1/images.py,763]                     schedule_delayed_delete_from_backend(image['location'], id)
+[A,glance/api/v1/images.py,764]                     registry.update_image_metadata(req.context, id,
+[A,glance/api/v1/images.py,765]                                                   {'status': 'pending_delete'})
+[A,glance/api/v1/images.py,766]                 else:
+[A,glance/api/v1/images.py,767]                     safe_delete_from_backend(image['location'],
+[C,glance/api/v1/images.py,768]                                              req.context, id)
+[A,glance/api/v1/images.py,769]                     registry.update_image_metadata(req.context, id,
+[A,glance/api/v1/images.py,770]                                                    {'status': 'deleted'})
+[C,glance/api/v1/images.py,771]             registry.delete_image_metadata(req.context, id)
+[C,glance/api/v1/images.py,772]         except exception.NotFound, e:
+[C,glance/api/v1/images.py,773]             msg = ("Failed to find image to delete: %(e)s" % locals())
+[C,glance/api/v1/images.py,774]             for line in msg.split('\n'):
+[C,glance/api/v1/images.py,775]                 LOG.info(line)
+[C,glance/api/v1/images.py,776]             self.notifier.info('image.delete', msg)
+[C,glance/api/v1/images.py,777]             raise HTTPNotFound(explanation=msg,
+[C,glance/api/v1/images.py,778]                                request=req,
+[C,glance/api/v1/images.py,779]                                content_type="text/plain")
+[C,glance/api/v1/images.py,780]         except exception.Forbidden, e:
+[C,glance/api/v1/images.py,781]             msg = ("Forbidden to delete image: %(e)s" % locals())
+[C,glance/api/v1/images.py,782]             for line in msg.split('\n'):
+[C,glance/api/v1/images.py,783]                 LOG.info(line)
+[C,glance/api/v1/images.py,784]             self.notifier.info('image.delete', msg)
+[C,glance/api/v1/images.py,785]             raise HTTPForbidden(explanation=msg,
+@@ -4,43 +4,42 @@
+[C,glance/api/v2/__init__.py,4] #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+[C,glance/api/v2/__init__.py,5] #    not use this file except in compliance with the License. You may obtain
+[C,glance/api/v2/__init__.py,6] #    a copy of the License at
+[C,glance/api/v2/__init__.py,7] #
+[C,glance/api/v2/__init__.py,8] #         http://www.apache.org/licenses/LICENSE-2.0
+[C,glance/api/v2/__init__.py,9] #
+[C,glance/api/v2/__init__.py,10] #    Unless required by applicable law or agreed to in writing, software
+[C,glance/api/v2/__init__.py,11] #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+[C,glance/api/v2/__init__.py,12] #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+[C,glance/api/v2/__init__.py,13] #    License for the specific language governing permissions and limitations
+[C,glance/api/v2/__init__.py,14] #    under the License.
+[C,glance/api/v2/__init__.py,15] 
+[C,glance/api/v2/__init__.py,16] import webob.exc
+[C,glance/api/v2/__init__.py,17] 
+[C,glance/api/v2/__init__.py,18] from glance.common import exception
+[D,glance/api/v2/__init__.py,19] from glance.store import set_acls
+[C,glance/api/v2/__init__.py,19] 
+[C,glance/api/v2/__init__.py,20] 
+[D,glance/api/v2/__init__.py,22] def update_image_read_acl(req, db_api, image):
+[A,glance/api/v2/__init__.py,21] def update_image_read_acl(req, store_api, db_api, image):
+[C,glance/api/v2/__init__.py,22]     """Helper function to set ACL permissions on images in the image store"""
+[C,glance/api/v2/__init__.py,23]     location_uri = image['location']
+[C,glance/api/v2/__init__.py,24]     public = image['is_public']
+[C,glance/api/v2/__init__.py,25]     image_id = image['id']
+[C,glance/api/v2/__init__.py,26]     if location_uri:
+[C,glance/api/v2/__init__.py,27]         try:
+[C,glance/api/v2/__init__.py,28]             read_tenants = []
+[C,glance/api/v2/__init__.py,29]             write_tenants = []
+[C,glance/api/v2/__init__.py,30]             members = db_api.image_member_find(req.context,
+[C,glance/api/v2/__init__.py,31]                                                image_id=image_id)
+[C,glance/api/v2/__init__.py,32]             for member in members:
+[C,glance/api/v2/__init__.py,33]                 if not member['deleted']:
+[C,glance/api/v2/__init__.py,34]                     if member['can_share']:
+[C,glance/api/v2/__init__.py,35]                         write_tenants.append(member['member'])
+[C,glance/api/v2/__init__.py,36]                     else:
+[C,glance/api/v2/__init__.py,37]                         read_tenants.append(member['member'])
+[D,glance/api/v2/__init__.py,39]             set_acls(req.context, location_uri, public=public,
+[D,glance/api/v2/__init__.py,40]                      read_tenants=read_tenants,
+[D,glance/api/v2/__init__.py,41]                      write_tenants=write_tenants)
+[A,glance/api/v2/__init__.py,38]             store_api.set_acls(req.context, location_uri, public=public,
+[A,glance/api/v2/__init__.py,39]                                read_tenants=read_tenants,
+[A,glance/api/v2/__init__.py,40]                                write_tenants=write_tenants)
+[C,glance/api/v2/__init__.py,41]         except exception.UnknownScheme:
+[C,glance/api/v2/__init__.py,42]             msg = _("Store for image_id not found: %s") % image_id
+[C,glance/api/v2/__init__.py,43]             raise webob.exc.HTTPBadRequest(explanation=msg,
+[C,glance/api/v2/__init__.py,44]                                            request=req,
+[C,glance/api/v2/__init__.py,45]                                            content_type='text/plain')
+@@ -46,31 +46,31 @@ class ImageDataController(object):
+[C,glance/api/v2/image_data.py,46]         """Authorize an action against our policies"""
+[C,glance/api/v2/image_data.py,47]         try:
+[C,glance/api/v2/image_data.py,48]             self.policy.enforce(req.context, action, {})
+[C,glance/api/v2/image_data.py,49]         except exception.Forbidden:
+[C,glance/api/v2/image_data.py,50]             raise webob.exc.HTTPForbidden()
+[C,glance/api/v2/image_data.py,51] 
+[C,glance/api/v2/image_data.py,52]     @utils.mutating
+[C,glance/api/v2/image_data.py,53]     def upload(self, req, image_id, data, size):
+[C,glance/api/v2/image_data.py,54]         image = self._get_image(req.context, image_id)
+[C,glance/api/v2/image_data.py,55]         try:
+[C,glance/api/v2/image_data.py,56]             location, size, checksum = self.store_api.add_to_backend(
+[C,glance/api/v2/image_data.py,57]                     req.context, 'file', image_id, data, size)
+[C,glance/api/v2/image_data.py,58]         except exception.Duplicate:
+[C,glance/api/v2/image_data.py,59]             raise webob.exc.HTTPConflict()
+[C,glance/api/v2/image_data.py,60]         else:
+[D,glance/api/v2/image_data.py,61]             v2.update_image_read_acl(req, self.db_api, image)
+[A,glance/api/v2/image_data.py,61]             v2.update_image_read_acl(req, self.store_api, self.db_api, image)
+[C,glance/api/v2/image_data.py,62]             values = {'location': location, 'size': size, 'checksum': checksum}
+[C,glance/api/v2/image_data.py,63]             self.db_api.image_update(req.context, image_id, values)
+[C,glance/api/v2/image_data.py,64]             updated_image = self._get_image(req.context, image_id)
+[C,glance/api/v2/image_data.py,65]             self.notifier.info('image.upload', updated_image)
+[C,glance/api/v2/image_data.py,66] 
+[C,glance/api/v2/image_data.py,67]     def download(self, req, image_id):
+[C,glance/api/v2/image_data.py,68]         self._enforce(req, 'download_image')
+[C,glance/api/v2/image_data.py,69]         ctx = req.context
+[C,glance/api/v2/image_data.py,70]         image = self._get_image(ctx, image_id)
+[C,glance/api/v2/image_data.py,71]         location = image['location']
+[C,glance/api/v2/image_data.py,72]         if location:
+[C,glance/api/v2/image_data.py,73]             image_data, image_size = self.store_api.get_from_backend(ctx,
+[C,glance/api/v2/image_data.py,74]                                                                      location)
+[C,glance/api/v2/image_data.py,75]             #NOTE(bcwaldon): This is done to match the behavior of the v1 API.
+[C,glance/api/v2/image_data.py,76]             # The store should always return a size that matches what we have
+@@ -19,43 +19,47 @@ import json
+[C,glance/api/v2/images.py,19] import urllib
+[C,glance/api/v2/images.py,20] 
+[C,glance/api/v2/images.py,21] import webob.exc
+[C,glance/api/v2/images.py,22] 
+[C,glance/api/v2/images.py,23] from glance.api import policy
+[C,glance/api/v2/images.py,24] import glance.api.v2 as v2
+[C,glance/api/v2/images.py,25] from glance.common import exception
+[C,glance/api/v2/images.py,26] from glance.common import utils
+[C,glance/api/v2/images.py,27] from glance.common import wsgi
+[C,glance/api/v2/images.py,28] import glance.db
+[C,glance/api/v2/images.py,29] import glance.notifier
+[C,glance/api/v2/images.py,30] from glance.openstack.common import cfg
+[C,glance/api/v2/images.py,31] import glance.openstack.common.log as logging
+[C,glance/api/v2/images.py,32] from glance.openstack.common import timeutils
+[C,glance/api/v2/images.py,33] import glance.schema
+[A,glance/api/v2/images.py,34] import glance.store
+[C,glance/api/v2/images.py,35] 
+[C,glance/api/v2/images.py,36] 
+[C,glance/api/v2/images.py,37] LOG = logging.getLogger(__name__)
+[C,glance/api/v2/images.py,38] 
+[C,glance/api/v2/images.py,39] CONF = cfg.CONF
+[C,glance/api/v2/images.py,40] 
+[C,glance/api/v2/images.py,41] 
+[C,glance/api/v2/images.py,42] class ImagesController(object):
+[D,glance/api/v2/images.py,42]     def __init__(self, db_api=None, policy_enforcer=None, notifier=None):
+[A,glance/api/v2/images.py,43]     def __init__(self, db_api=None, policy_enforcer=None, notifier=None,
+[A,glance/api/v2/images.py,44]             store_api=None):
+[C,glance/api/v2/images.py,45]         self.db_api = db_api or glance.db.get_api()
+[C,glance/api/v2/images.py,46]         self.db_api.configure_db()
+[C,glance/api/v2/images.py,47]         self.policy = policy_enforcer or policy.Enforcer()
+[C,glance/api/v2/images.py,48]         self.notifier = notifier or glance.notifier.Notifier()
+[A,glance/api/v2/images.py,49]         self.store_api = store_api or glance.store
+[A,glance/api/v2/images.py,50]         self.store_api.create_stores()
+[C,glance/api/v2/images.py,51] 
+[C,glance/api/v2/images.py,52]     def _enforce(self, req, action):
+[C,glance/api/v2/images.py,53]         """Authorize an action against our policies"""
+[C,glance/api/v2/images.py,54]         try:
+[C,glance/api/v2/images.py,55]             self.policy.enforce(req.context, action, {})
+[C,glance/api/v2/images.py,56]         except exception.Forbidden:
+[C,glance/api/v2/images.py,57]             raise webob.exc.HTTPForbidden()
+[C,glance/api/v2/images.py,58] 
+[C,glance/api/v2/images.py,59]     def _normalize_properties(self, image):
+[C,glance/api/v2/images.py,60]         """Convert the properties from the stored format to a dict
+[C,glance/api/v2/images.py,61] 
+[C,glance/api/v2/images.py,62]         The db api returns a list of dicts that look like
+[C,glance/api/v2/images.py,63]         {'name': <key>, 'value': <value>}, while it expects a format
+[C,glance/api/v2/images.py,64]         like {<key>: <value>} in image create and update calls. This
+[C,glance/api/v2/images.py,65]         function takes the extra step that the db api should be
+@@ -88,31 +92,31 @@ class ImagesController(object):
+[C,glance/api/v2/images.py,92]         if is_public:
+[C,glance/api/v2/images.py,93]             self._enforce(req, 'publicize_image')
+[C,glance/api/v2/images.py,94]         image['owner'] = req.context.owner
+[C,glance/api/v2/images.py,95]         image['status'] = 'queued'
+[C,glance/api/v2/images.py,96] 
+[C,glance/api/v2/images.py,97]         tags = self._extract_tags(image)
+[C,glance/api/v2/images.py,98] 
+[C,glance/api/v2/images.py,99]         image = dict(self.db_api.image_create(req.context, image))
+[C,glance/api/v2/images.py,100] 
+[C,glance/api/v2/images.py,101]         if tags is not None:
+[C,glance/api/v2/images.py,102]             self.db_api.image_tag_set_all(req.context, image['id'], tags)
+[C,glance/api/v2/images.py,103]             image['tags'] = tags
+[C,glance/api/v2/images.py,104]         else:
+[C,glance/api/v2/images.py,105]             image['tags'] = []
+[C,glance/api/v2/images.py,106] 
+[D,glance/api/v2/images.py,103]         v2.update_image_read_acl(req, self.db_api, image)
+[A,glance/api/v2/images.py,107]         v2.update_image_read_acl(req, self.store_api, self.db_api, image)
+[C,glance/api/v2/images.py,108]         image = self._normalize_properties(dict(image))
+[C,glance/api/v2/images.py,109]         self.notifier.info('image.update', image)
+[C,glance/api/v2/images.py,110]         return image
+[C,glance/api/v2/images.py,111] 
+[C,glance/api/v2/images.py,112]     def index(self, req, marker=None, limit=None, sort_key='created_at',
+[C,glance/api/v2/images.py,113]               sort_dir='desc', filters={}):
+[C,glance/api/v2/images.py,114]         self._enforce(req, 'get_images')
+[C,glance/api/v2/images.py,115]         filters['deleted'] = False
+[C,glance/api/v2/images.py,116]         #NOTE(bcwaldon): is_public=True gets public images and those
+[C,glance/api/v2/images.py,117]         # owned by the authenticated tenant
+[C,glance/api/v2/images.py,118]         result = {}
+[C,glance/api/v2/images.py,119]         filters.setdefault('is_public', True)
+[C,glance/api/v2/images.py,120]         if limit is None:
+[C,glance/api/v2/images.py,121]             limit = CONF.limit_param_default
+[C,glance/api/v2/images.py,122]         limit = min(CONF.api_limit_max, limit)
+@@ -152,51 +156,63 @@ class ImagesController(object):
+[C,glance/api/v2/images.py,156]         self._enforce(req, 'modify_image')
+[C,glance/api/v2/images.py,157]         is_public = image.get('is_public')
+[C,glance/api/v2/images.py,158]         if is_public:
+[C,glance/api/v2/images.py,159]             self._enforce(req, 'publicize_image')
+[C,glance/api/v2/images.py,160]         tags = self._extract_tags(image)
+[C,glance/api/v2/images.py,161] 
+[C,glance/api/v2/images.py,162]         try:
+[C,glance/api/v2/images.py,163]             image = self.db_api.image_update(req.context, image_id, image)
+[C,glance/api/v2/images.py,164]         except (exception.NotFound, exception.Forbidden):
+[C,glance/api/v2/images.py,165]             msg = ("Failed to find image %(image_id)s to update" % locals())
+[C,glance/api/v2/images.py,166]             LOG.info(msg)
+[C,glance/api/v2/images.py,167]             raise webob.exc.HTTPNotFound(explanation=msg)
+[C,glance/api/v2/images.py,168] 
+[C,glance/api/v2/images.py,169]         image = self._normalize_properties(dict(image))
+[C,glance/api/v2/images.py,170] 
+[D,glance/api/v2/images.py,167]         v2.update_image_read_acl(req, self.db_api, image)
+[A,glance/api/v2/images.py,171]         v2.update_image_read_acl(req, self.store_api, self.db_api, image)
+[C,glance/api/v2/images.py,172] 
+[C,glance/api/v2/images.py,173]         if tags is not None:
+[C,glance/api/v2/images.py,174]             self.db_api.image_tag_set_all(req.context, image_id, tags)
+[C,glance/api/v2/images.py,175]             image['tags'] = tags
+[C,glance/api/v2/images.py,176]         else:
+[C,glance/api/v2/images.py,177]             self._append_tags(req.context, image)
+[C,glance/api/v2/images.py,178] 
+[C,glance/api/v2/images.py,179]         self.notifier.info('image.update', image)
+[C,glance/api/v2/images.py,180]         return image
+[C,glance/api/v2/images.py,181] 
+[C,glance/api/v2/images.py,182]     @utils.mutating
+[C,glance/api/v2/images.py,183]     def delete(self, req, image_id):
+[C,glance/api/v2/images.py,184]         self._enforce(req, 'delete_image')
+[C,glance/api/v2/images.py,185]         image = self._get_image(req.context, image_id)
+[C,glance/api/v2/images.py,186] 
+[C,glance/api/v2/images.py,187]         if image['protected']:
+[C,glance/api/v2/images.py,188]             msg = _("Unable to delete as image %(image_id)s is protected"
+[C,glance/api/v2/images.py,189]                     % locals())
+[C,glance/api/v2/images.py,190]             raise webob.exc.HTTPForbidden(explanation=msg)
+[C,glance/api/v2/images.py,191] 
+[A,glance/api/v2/images.py,192]         if image['location']:
+[A,glance/api/v2/images.py,193]             if CONF.delayed_delete:
+[A,glance/api/v2/images.py,194]                 self.store_api.schedule_delayed_delete_from_backend(
+[A,glance/api/v2/images.py,195]                                 image['location'], id)
+[A,glance/api/v2/images.py,196]                 self.db_api.image_update(req.context, image_id,
+[A,glance/api/v2/images.py,197]                                          {'status': 'pending_delete'})
+[A,glance/api/v2/images.py,198]             else:
+[A,glance/api/v2/images.py,199]                 self.store_api.safe_delete_from_backend(image['location'],
+[A,glance/api/v2/images.py,200]                                                         req.context, id)
+[A,glance/api/v2/images.py,201]                 self.db_api.image_update(req.context, image_id,
+[A,glance/api/v2/images.py,202]                                          {'status': 'deleted'})
+[A,glance/api/v2/images.py,203] 
+[C,glance/api/v2/images.py,204]         try:
+[C,glance/api/v2/images.py,205]             self.db_api.image_destroy(req.context, image_id)
+[C,glance/api/v2/images.py,206]         except (exception.NotFound, exception.Forbidden):
+[C,glance/api/v2/images.py,207]             msg = ("Failed to find image %(image_id)s to delete" % locals())
+[C,glance/api/v2/images.py,208]             LOG.info(msg)
+[C,glance/api/v2/images.py,209]             raise webob.exc.HTTPNotFound()
+[C,glance/api/v2/images.py,210]         else:
+[C,glance/api/v2/images.py,211]             self.notifier.info('image.delete', image)
+[C,glance/api/v2/images.py,212] 
+[C,glance/api/v2/images.py,213] 
+[C,glance/api/v2/images.py,214] class RequestDeserializer(wsgi.JSONRequestDeserializer):
+[C,glance/api/v2/images.py,215]     def __init__(self, schema=None):
+[C,glance/api/v2/images.py,216]         super(RequestDeserializer, self).__init__()
+[C,glance/api/v2/images.py,217]         self.schema = schema or get_schema()
+[C,glance/api/v2/images.py,218] 
+@@ -12,31 +12,30 @@
+[C,glance/store/__init__.py,12] #    Unless required by applicable law or agreed to in writing, software
+[C,glance/store/__init__.py,13] #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+[C,glance/store/__init__.py,14] #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+[C,glance/store/__init__.py,15] #    License for the specific language governing permissions and limitations
+[C,glance/store/__init__.py,16] #    under the License.
+[C,glance/store/__init__.py,17] 
+[C,glance/store/__init__.py,18] import os
+[C,glance/store/__init__.py,19] import sys
+[C,glance/store/__init__.py,20] import time
+[C,glance/store/__init__.py,21] 
+[C,glance/store/__init__.py,22] from glance.common import exception
+[C,glance/store/__init__.py,23] from glance.common import utils
+[C,glance/store/__init__.py,24] from glance.openstack.common import cfg
+[C,glance/store/__init__.py,25] from glance.openstack.common import importutils
+[C,glance/store/__init__.py,26] import glance.openstack.common.log as logging
+[D,glance/store/__init__.py,27] from glance import registry
+[C,glance/store/__init__.py,27] from glance.store import location
+[C,glance/store/__init__.py,28] 
+[C,glance/store/__init__.py,29] LOG = logging.getLogger(__name__)
+[C,glance/store/__init__.py,30] 
+[C,glance/store/__init__.py,31] store_opts = [
+[C,glance/store/__init__.py,32]     cfg.ListOpt('known_stores',
+[C,glance/store/__init__.py,33]                 default=['glance.store.filesystem.Store',
+[C,glance/store/__init__.py,34]                          'glance.store.http.Store',
+[C,glance/store/__init__.py,35]                          'glance.store.rbd.Store',
+[C,glance/store/__init__.py,36]                          'glance.store.s3.Store',
+[C,glance/store/__init__.py,37]                          'glance.store.swift.Store',
+[C,glance/store/__init__.py,38]                         ]),
+[C,glance/store/__init__.py,39]     cfg.StrOpt('scrubber_datadir',
+[C,glance/store/__init__.py,40]                default='/var/lib/glance/scrubber'),
+[C,glance/store/__init__.py,41]     cfg.BoolOpt('delayed_delete', default=False),
+@@ -242,68 +241,63 @@ def delete_from_backend(context, uri, **kwargs):
+[C,glance/store/__init__.py,241]         raise exception.StoreDeleteNotSupported
+[C,glance/store/__init__.py,242] 
+[C,glance/store/__init__.py,243] 
+[C,glance/store/__init__.py,244] def get_store_from_location(uri):
+[C,glance/store/__init__.py,245]     """
+[C,glance/store/__init__.py,246]     Given a location (assumed to be a URL), attempt to determine
+[C,glance/store/__init__.py,247]     the store from the location.  We use here a simple guess that
+[C,glance/store/__init__.py,248]     the scheme of the parsed URL is the store...
+[C,glance/store/__init__.py,249] 
+[C,glance/store/__init__.py,250]     :param uri: Location to check for the store
+[C,glance/store/__init__.py,251]     """
+[C,glance/store/__init__.py,252]     loc = location.get_location_from_uri(uri)
+[C,glance/store/__init__.py,253]     return loc.store_name
+[C,glance/store/__init__.py,254] 
+[C,glance/store/__init__.py,255] 
+[D,glance/store/__init__.py,257] def schedule_delete_from_backend(uri, context, image_id, **kwargs):
+[D,glance/store/__init__.py,258]     """
+[D,glance/store/__init__.py,259]     Given a uri and a time, schedule the deletion of an image.
+[D,glance/store/__init__.py,260]     """
+[D,glance/store/__init__.py,261]     if not CONF.delayed_delete:
+[D,glance/store/__init__.py,262]         registry.update_image_metadata(context, image_id,
+[D,glance/store/__init__.py,263]                                        {'status': 'deleted'})
+[D,glance/store/__init__.py,264]         try:
+[D,glance/store/__init__.py,265]             return delete_from_backend(context, uri, **kwargs)
+[D,glance/store/__init__.py,266]         except (UnsupportedBackend,
+[D,glance/store/__init__.py,267]                 exception.StoreDeleteNotSupported,
+[D,glance/store/__init__.py,268]                 exception.NotFound):
+[D,glance/store/__init__.py,269]             exc_type = sys.exc_info()[0].__name__
+[D,glance/store/__init__.py,270]             msg = (_("Failed to delete image at %s from store (%s)") %
+[D,glance/store/__init__.py,271]                    (uri, exc_type))
+[D,glance/store/__init__.py,272]             LOG.error(msg)
+[D,glance/store/__init__.py,273]         finally:
+[D,glance/store/__init__.py,274]             # avoid falling through to the delayed deletion logic
+[D,glance/store/__init__.py,275]             return
+[D,glance/store/__init__.py,276] 
+[A,glance/store/__init__.py,256] def safe_delete_from_backend(uri, context, image_id, **kwargs):
+[A,glance/store/__init__.py,257]     """Given a uri, delete an image from the store."""
+[A,glance/store/__init__.py,258]     try:
+[A,glance/store/__init__.py,259]         return delete_from_backend(context, uri, **kwargs)
+[A,glance/store/__init__.py,260]     except exception.NotFound:
+[A,glance/store/__init__.py,261]         msg = _('Failed to delete image in store at URI: %s')
+[A,glance/store/__init__.py,262]         LOG.warn(msg % uri)
+[A,glance/store/__init__.py,263]     except exception.StoreDeleteNotSupported as e:
+[A,glance/store/__init__.py,264]         LOG.warn(str(e))
+[A,glance/store/__init__.py,265]     except UnsupportedBackend:
+[A,glance/store/__init__.py,266]         exc_type = sys.exc_info()[0].__name__
+[A,glance/store/__init__.py,267]         msg = (_('Failed to delete image at %s from store (%s)') %
+[A,glance/store/__init__.py,268]                (uri, exc_type))
+[A,glance/store/__init__.py,269]         LOG.error(msg)
+[A,glance/store/__init__.py,270] 
+[A,glance/store/__init__.py,271] 
+[A,glance/store/__init__.py,272] def schedule_delayed_delete_from_backend(uri, image_id, **kwargs):
+[A,glance/store/__init__.py,273]     """Given a uri, schedule the deletion of an image."""
+[C,glance/store/__init__.py,274]     datadir = CONF.scrubber_datadir
+[C,glance/store/__init__.py,275]     delete_time = time.time() + CONF.scrub_time
+[C,glance/store/__init__.py,276]     file_path = os.path.join(datadir, str(image_id))
+[C,glance/store/__init__.py,277]     utils.safe_mkdirs(datadir)
+[C,glance/store/__init__.py,278] 
+[C,glance/store/__init__.py,279]     if os.path.exists(file_path):
+[C,glance/store/__init__.py,280]         msg = _("Image id %(image_id)s already queued for delete") % {
+[C,glance/store/__init__.py,281]                 'image_id': image_id}
+[C,glance/store/__init__.py,282]         raise exception.Duplicate(msg)
+[C,glance/store/__init__.py,283] 
+[C,glance/store/__init__.py,284]     with open(file_path, 'w') as f:
+[C,glance/store/__init__.py,285]         f.write('\n'.join([uri, str(int(delete_time))]))
+[C,glance/store/__init__.py,286]     os.chmod(file_path, 0600)
+[C,glance/store/__init__.py,287]     os.utime(file_path, (delete_time, delete_time))
+[C,glance/store/__init__.py,288] 
+[D,glance/store/__init__.py,292]     registry.update_image_metadata(context, image_id,
+[D,glance/store/__init__.py,293]                                    {'status': 'pending_delete'})
+[D,glance/store/__init__.py,294] 
+[C,glance/store/__init__.py,289] 
+[C,glance/store/__init__.py,290] def add_to_backend(context, scheme, image_id, data, size):
+[C,glance/store/__init__.py,291]     store = get_store_from_scheme(context, scheme)
+[C,glance/store/__init__.py,292]     return store.add(image_id, data, size)
+[C,glance/store/__init__.py,293] 
+[C,glance/store/__init__.py,294] 
+[C,glance/store/__init__.py,295] def set_acls(context, location_uri, public=False, read_tenants=[],
+[C,glance/store/__init__.py,296]              write_tenants=[]):
+[C,glance/store/__init__.py,297]     scheme = get_store_from_location(location_uri)
+[C,glance/store/__init__.py,298]     store = get_store_from_scheme(context, scheme)
+[C,glance/store/__init__.py,299]     try:
+[C,glance/store/__init__.py,300]         store.set_acls(location.get_location_from_uri(location_uri),
+[C,glance/store/__init__.py,301]                        public=public,
+[C,glance/store/__init__.py,302]                        read_tenants=read_tenants,
+[C,glance/store/__init__.py,303]                        write_tenants=write_tenants)
+@@ -11,31 +11,31 @@
+[C,glance/tests/unit/test_http_store.py,11] #
+[C,glance/tests/unit/test_http_store.py,12] #    Unless required by applicable law or agreed to in writing, software
+[C,glance/tests/unit/test_http_store.py,13] #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+[C,glance/tests/unit/test_http_store.py,14] #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+[C,glance/tests/unit/test_http_store.py,15] #    License for the specific language governing permissions and limitations
+[C,glance/tests/unit/test_http_store.py,16] #    under the License.
+[C,glance/tests/unit/test_http_store.py,17] 
+[C,glance/tests/unit/test_http_store.py,18] import stubout
+[C,glance/tests/unit/test_http_store.py,19] 
+[C,glance/tests/unit/test_http_store.py,20] from glance.common import config
+[C,glance/tests/unit/test_http_store.py,21] from glance.common import exception
+[C,glance/tests/unit/test_http_store.py,22] from glance import context
+[C,glance/tests/unit/test_http_store.py,23] from glance.db.sqlalchemy import api as db_api
+[C,glance/tests/unit/test_http_store.py,24] from glance.registry import configure_registry_client
+[C,glance/tests/unit/test_http_store.py,25] from glance.store import (delete_from_backend,
+[D,glance/tests/unit/test_http_store.py,26]                           schedule_delete_from_backend)
+[A,glance/tests/unit/test_http_store.py,26]                           safe_delete_from_backend)
+[C,glance/tests/unit/test_http_store.py,27] from glance.store.http import Store, MAX_REDIRECTS
+[C,glance/tests/unit/test_http_store.py,28] from glance.store.location import get_location_from_uri
+[C,glance/tests/unit/test_http_store.py,29] from glance.tests.unit import base
+[C,glance/tests/unit/test_http_store.py,30] from glance.tests import utils, stubs as test_stubs
+[C,glance/tests/unit/test_http_store.py,31] 
+[C,glance/tests/unit/test_http_store.py,32] 
+[C,glance/tests/unit/test_http_store.py,33] # The response stack is used to return designated responses in order;
+[C,glance/tests/unit/test_http_store.py,34] # however when it's empty a default 200 OK response is returned from
+[C,glance/tests/unit/test_http_store.py,35] # FakeHTTPConnection below.
+[C,glance/tests/unit/test_http_store.py,36] FAKE_RESPONSE_STACK = []
+[C,glance/tests/unit/test_http_store.py,37] 
+[C,glance/tests/unit/test_http_store.py,38] 
+[C,glance/tests/unit/test_http_store.py,39] def stub_out_http_backend(stubs):
+[C,glance/tests/unit/test_http_store.py,40]     """
+[C,glance/tests/unit/test_http_store.py,41]     Stubs out the httplib.HTTPRequest.getresponse to return
+@@ -173,18 +173,18 @@ class TestHttpStore(base.StoreClearingUnitTest):
+[C,glance/tests/unit/test_http_store.py,173]         self.assertEqual(chunks, expected_returns)
+[C,glance/tests/unit/test_http_store.py,174] 
+[C,glance/tests/unit/test_http_store.py,175]     def test_http_delete_raise_error(self):
+[C,glance/tests/unit/test_http_store.py,176]         uri = "https://netloc/path/to/file.tar.gz"
+[C,glance/tests/unit/test_http_store.py,177]         loc = get_location_from_uri(uri)
+[C,glance/tests/unit/test_http_store.py,178]         ctx = context.RequestContext()
+[C,glance/tests/unit/test_http_store.py,179]         self.assertRaises(NotImplementedError, self.store.delete, loc)
+[C,glance/tests/unit/test_http_store.py,180]         self.assertRaises(exception.StoreDeleteNotSupported,
+[C,glance/tests/unit/test_http_store.py,181]                           delete_from_backend, ctx, uri)
+[C,glance/tests/unit/test_http_store.py,182] 
+[C,glance/tests/unit/test_http_store.py,183]     def test_http_schedule_delete_swallows_error(self):
+[C,glance/tests/unit/test_http_store.py,184]         uri = "https://netloc/path/to/file.tar.gz"
+[C,glance/tests/unit/test_http_store.py,185]         ctx = context.RequestContext()
+[C,glance/tests/unit/test_http_store.py,186]         stub_out_registry_image_update(self.stubs)
+[C,glance/tests/unit/test_http_store.py,187]         try:
+[D,glance/tests/unit/test_http_store.py,188]             schedule_delete_from_backend(uri, ctx, 'image_id')
+[A,glance/tests/unit/test_http_store.py,188]             safe_delete_from_backend(uri, ctx, 'image_id')
+[C,glance/tests/unit/test_http_store.py,189]         except exception.StoreDeleteNotSupported:
+[C,glance/tests/unit/test_http_store.py,190]             self.fail('StoreDeleteNotSupported should be swallowed')
+@@ -19,97 +19,111 @@ import glance.context
+[C,glance/tests/unit/utils.py,19] import glance.db.simple.api as simple_db
+[C,glance/tests/unit/utils.py,20] import glance.openstack.common.log as logging
+[C,glance/tests/unit/utils.py,21] 
+[C,glance/tests/unit/utils.py,22] 
+[C,glance/tests/unit/utils.py,23] LOG = logging.getLogger(__name__)
+[C,glance/tests/unit/utils.py,24] 
+[C,glance/tests/unit/utils.py,25] UUID1 = 'c80a1a6c-bd1f-41c5-90ee-81afedb1d58d'
+[C,glance/tests/unit/utils.py,26] UUID2 = '971ec09a-8067-4bc8-a91f-ae3557f1c4c7'
+[C,glance/tests/unit/utils.py,27] 
+[C,glance/tests/unit/utils.py,28] TENANT1 = '6838eb7b-6ded-434a-882c-b344c77fe8df'
+[C,glance/tests/unit/utils.py,29] TENANT2 = '2c014f32-55eb-467d-8fcb-4bd706012f81'
+[C,glance/tests/unit/utils.py,30] 
+[C,glance/tests/unit/utils.py,31] USER1 = '54492ba0-f4df-4e4e-be62-27f4d76b29cf'
+[C,glance/tests/unit/utils.py,32] USER2 = '0b3b3006-cb76-4517-ae32-51397e22c754'
+[C,glance/tests/unit/utils.py,33] 
+[A,glance/tests/unit/utils.py,34] BASE_URI = 'swift+http://storeurl.com/container'
+[A,glance/tests/unit/utils.py,35] 
+[C,glance/tests/unit/utils.py,36] 
+[C,glance/tests/unit/utils.py,37] def get_fake_request(path='', method='POST', is_admin=False):
+[C,glance/tests/unit/utils.py,38]     req = wsgi.Request.blank(path)
+[C,glance/tests/unit/utils.py,39]     req.method = method
+[C,glance/tests/unit/utils.py,40] 
+[C,glance/tests/unit/utils.py,41]     kwargs = {
+[C,glance/tests/unit/utils.py,42]             'user': USER1,
+[C,glance/tests/unit/utils.py,43]             'tenant': TENANT1,
+[C,glance/tests/unit/utils.py,44]             'roles': [],
+[C,glance/tests/unit/utils.py,45]             'is_admin': is_admin,
+[C,glance/tests/unit/utils.py,46]         }
+[C,glance/tests/unit/utils.py,47] 
+[C,glance/tests/unit/utils.py,48]     req.context = glance.context.RequestContext(**kwargs)
+[C,glance/tests/unit/utils.py,49] 
+[C,glance/tests/unit/utils.py,50]     return req
+[C,glance/tests/unit/utils.py,51] 
+[C,glance/tests/unit/utils.py,52] 
+[C,glance/tests/unit/utils.py,53] class FakeDB(object):
+[C,glance/tests/unit/utils.py,54] 
+[C,glance/tests/unit/utils.py,55]     def __init__(self):
+[C,glance/tests/unit/utils.py,56]         self.reset()
+[C,glance/tests/unit/utils.py,57]         self.init_db()
+[C,glance/tests/unit/utils.py,58] 
+[C,glance/tests/unit/utils.py,59]     @staticmethod
+[C,glance/tests/unit/utils.py,60]     def init_db():
+[C,glance/tests/unit/utils.py,61]         images = [
+[C,glance/tests/unit/utils.py,62]             {'id': UUID1, 'owner': TENANT1,
+[D,glance/tests/unit/utils.py,61]              'location': 'swift+http://storeurl.com/container/%s' % UUID1},
+[A,glance/tests/unit/utils.py,63]              'location': '%s/%s' % (BASE_URI, UUID1)},
+[C,glance/tests/unit/utils.py,64]             {'id': UUID2, 'owner': TENANT1},
+[C,glance/tests/unit/utils.py,65]         ]
+[C,glance/tests/unit/utils.py,66]         [simple_db.image_create(None, image) for image in images]
+[C,glance/tests/unit/utils.py,67] 
+[C,glance/tests/unit/utils.py,68]         members = [
+[C,glance/tests/unit/utils.py,69]             {'image_id': UUID1, 'member': TENANT1, 'can_share': True},
+[C,glance/tests/unit/utils.py,70]             {'image_id': UUID1, 'member': TENANT2, 'can_share': False},
+[C,glance/tests/unit/utils.py,71]         ]
+[C,glance/tests/unit/utils.py,72]         [simple_db.image_member_create(None, member) for member in members]
+[C,glance/tests/unit/utils.py,73] 
+[C,glance/tests/unit/utils.py,74]         simple_db.image_tag_set_all(None, UUID1, ['ping', 'pong'])
+[C,glance/tests/unit/utils.py,75] 
+[C,glance/tests/unit/utils.py,76]     @staticmethod
+[C,glance/tests/unit/utils.py,77]     def reset():
+[C,glance/tests/unit/utils.py,78]         simple_db.DATA = {
+[C,glance/tests/unit/utils.py,79]             'images': {},
+[C,glance/tests/unit/utils.py,80]             'members': [],
+[C,glance/tests/unit/utils.py,81]             'tags': {},
+[C,glance/tests/unit/utils.py,82]         }
+[C,glance/tests/unit/utils.py,83] 
+[C,glance/tests/unit/utils.py,84]     def __getattr__(self, key):
+[C,glance/tests/unit/utils.py,85]         return getattr(simple_db, key)
+[C,glance/tests/unit/utils.py,86] 
+[C,glance/tests/unit/utils.py,87] 
+[C,glance/tests/unit/utils.py,88] class FakeStoreAPI(object):
+[C,glance/tests/unit/utils.py,89]     def __init__(self):
+[C,glance/tests/unit/utils.py,90]         self.data = {
+[D,glance/tests/unit/utils.py,89]             'swift+http://storeurl.com/container/%s' % UUID1: ('XXX', 3),
+[A,glance/tests/unit/utils.py,91]             '%s/%s' % (BASE_URI, UUID1): ('XXX', 3),
+[C,glance/tests/unit/utils.py,92]         }
+[C,glance/tests/unit/utils.py,93] 
+[C,glance/tests/unit/utils.py,94]     def create_stores(self):
+[C,glance/tests/unit/utils.py,95]         pass
+[C,glance/tests/unit/utils.py,96] 
+[A,glance/tests/unit/utils.py,97]     def set_acls(*_args, **_kwargs):
+[A,glance/tests/unit/utils.py,98]         pass
+[A,glance/tests/unit/utils.py,99] 
+[C,glance/tests/unit/utils.py,100]     def get_from_backend(self, context, location):
+[C,glance/tests/unit/utils.py,101]         try:
+[C,glance/tests/unit/utils.py,102]             return self.data[location]
+[C,glance/tests/unit/utils.py,103]         except KeyError:
+[C,glance/tests/unit/utils.py,104]             raise exception.NotFound()
+[C,glance/tests/unit/utils.py,105] 
+[A,glance/tests/unit/utils.py,106]     def safe_delete_from_backend(self, uri, context, id, **kwargs):
+[A,glance/tests/unit/utils.py,107]         try:
+[A,glance/tests/unit/utils.py,108]             del self.data[uri]
+[A,glance/tests/unit/utils.py,109]         except KeyError:
+[A,glance/tests/unit/utils.py,110]             pass
+[A,glance/tests/unit/utils.py,111] 
+[A,glance/tests/unit/utils.py,112]     def schedule_delayed_delete_from_backend(self, uri, id, **kwargs):
+[A,glance/tests/unit/utils.py,113]         pass
+[A,glance/tests/unit/utils.py,114] 
+[C,glance/tests/unit/utils.py,115]     def get_size_from_backend(self, context, location):
+[C,glance/tests/unit/utils.py,116]         return self.get_from_backend(context, location)[1]
+[C,glance/tests/unit/utils.py,117] 
+[C,glance/tests/unit/utils.py,118]     def add_to_backend(self, context, scheme, image_id, data, size):
+[C,glance/tests/unit/utils.py,119]         for location in self.data.keys():
+[C,glance/tests/unit/utils.py,120]             if image_id in location:
+[C,glance/tests/unit/utils.py,121]                 raise exception.Duplicate()
+[C,glance/tests/unit/utils.py,122]         self.data[image_id] = (data, size or len(data))
+[C,glance/tests/unit/utils.py,123]         checksum = 'Z'
+[C,glance/tests/unit/utils.py,124]         return (image_id, size, checksum)
+[C,glance/tests/unit/utils.py,125] 
+[C,glance/tests/unit/utils.py,126] 
+[C,glance/tests/unit/utils.py,127] class FakePolicyEnforcer(object):
+[C,glance/tests/unit/utils.py,128]     def __init__(self, *_args, **kwargs):
+[C,glance/tests/unit/utils.py,129]         self.rules = {}
+@@ -22,30 +22,32 @@ import glance.api.v2.images
+[C,glance/tests/unit/v2/test_images_resource.py,22] from glance.common import utils
+[C,glance/tests/unit/v2/test_images_resource.py,23] from glance.openstack.common import cfg
+[C,glance/tests/unit/v2/test_images_resource.py,24] import glance.schema
+[C,glance/tests/unit/v2/test_images_resource.py,25] from glance.tests.unit import base
+[C,glance/tests/unit/v2/test_images_resource.py,26] import glance.tests.unit.utils as unit_test_utils
+[C,glance/tests/unit/v2/test_images_resource.py,27] import glance.tests.utils as test_utils
+[C,glance/tests/unit/v2/test_images_resource.py,28] import glance.store
+[C,glance/tests/unit/v2/test_images_resource.py,29] 
+[C,glance/tests/unit/v2/test_images_resource.py,30] 
+[C,glance/tests/unit/v2/test_images_resource.py,31] DATETIME = datetime.datetime(2012, 5, 16, 15, 27, 36, 325355)
+[C,glance/tests/unit/v2/test_images_resource.py,32] ISOTIME = '2012-05-16T15:27:36Z'
+[C,glance/tests/unit/v2/test_images_resource.py,33] 
+[C,glance/tests/unit/v2/test_images_resource.py,34] 
+[C,glance/tests/unit/v2/test_images_resource.py,35] CONF = cfg.CONF
+[C,glance/tests/unit/v2/test_images_resource.py,36] 
+[A,glance/tests/unit/v2/test_images_resource.py,37] BASE_URI = unit_test_utils.BASE_URI
+[A,glance/tests/unit/v2/test_images_resource.py,38] 
+[C,glance/tests/unit/v2/test_images_resource.py,39] 
+[C,glance/tests/unit/v2/test_images_resource.py,40] UUID1 = 'c80a1a6c-bd1f-41c5-90ee-81afedb1d58d'
+[C,glance/tests/unit/v2/test_images_resource.py,41] UUID2 = 'a85abd86-55b3-4d5b-b0b4-5d0a6e6042fc'
+[C,glance/tests/unit/v2/test_images_resource.py,42] UUID3 = '971ec09a-8067-4bc8-a91f-ae3557f1c4c7'
+[C,glance/tests/unit/v2/test_images_resource.py,43] UUID4 = '6bbe7cc2-eae7-4c0f-b50d-a7160b0c6a86'
+[C,glance/tests/unit/v2/test_images_resource.py,44] 
+[C,glance/tests/unit/v2/test_images_resource.py,45] TENANT1 = '6838eb7b-6ded-434a-882c-b344c77fe8df'
+[C,glance/tests/unit/v2/test_images_resource.py,46] TENANT2 = '2c014f32-55eb-467d-8fcb-4bd706012f81'
+[C,glance/tests/unit/v2/test_images_resource.py,47] TENANT3 = '5a3e60e8-cfa9-4a9e-a90a-62b42cea92b8'
+[C,glance/tests/unit/v2/test_images_resource.py,48] TENANT4 = 'c6c87f25-8a94-47ed-8c83-053c25f42df4'
+[C,glance/tests/unit/v2/test_images_resource.py,49] 
+[C,glance/tests/unit/v2/test_images_resource.py,50] 
+[C,glance/tests/unit/v2/test_images_resource.py,51] def _fixture(id, **kwargs):
+[C,glance/tests/unit/v2/test_images_resource.py,52]     obj = {
+[C,glance/tests/unit/v2/test_images_resource.py,53]         'id': id,
+@@ -64,41 +66,43 @@ def _fixture(id, **kwargs):
+[C,glance/tests/unit/v2/test_images_resource.py,66]         'deleted': False,
+[C,glance/tests/unit/v2/test_images_resource.py,67]         'min_ram': None,
+[C,glance/tests/unit/v2/test_images_resource.py,68]         'min_disk': None,
+[C,glance/tests/unit/v2/test_images_resource.py,69]     }
+[C,glance/tests/unit/v2/test_images_resource.py,70]     obj.update(kwargs)
+[C,glance/tests/unit/v2/test_images_resource.py,71]     return obj
+[C,glance/tests/unit/v2/test_images_resource.py,72] 
+[C,glance/tests/unit/v2/test_images_resource.py,73] 
+[C,glance/tests/unit/v2/test_images_resource.py,74] class TestImagesController(test_utils.BaseTestCase):
+[C,glance/tests/unit/v2/test_images_resource.py,75] 
+[C,glance/tests/unit/v2/test_images_resource.py,76]     def setUp(self):
+[C,glance/tests/unit/v2/test_images_resource.py,77]         super(TestImagesController, self).setUp()
+[C,glance/tests/unit/v2/test_images_resource.py,78]         self.db = unit_test_utils.FakeDB()
+[C,glance/tests/unit/v2/test_images_resource.py,79]         self.policy = unit_test_utils.FakePolicyEnforcer()
+[C,glance/tests/unit/v2/test_images_resource.py,80]         self.notifier = unit_test_utils.FakeNotifier()
+[A,glance/tests/unit/v2/test_images_resource.py,81]         self.store = unit_test_utils.FakeStoreAPI()
+[C,glance/tests/unit/v2/test_images_resource.py,82]         self._create_images()
+[C,glance/tests/unit/v2/test_images_resource.py,83]         self.controller = glance.api.v2.images.ImagesController(self.db,
+[C,glance/tests/unit/v2/test_images_resource.py,84]                                                                 self.policy,
+[D,glance/tests/unit/v2/test_images_resource.py,82]                                                                 self.notifier)
+[A,glance/tests/unit/v2/test_images_resource.py,85]                                                                 self.notifier,
+[A,glance/tests/unit/v2/test_images_resource.py,86]                                                                 self.store)
+[C,glance/tests/unit/v2/test_images_resource.py,87]         glance.store.create_stores()
+[C,glance/tests/unit/v2/test_images_resource.py,88] 
+[C,glance/tests/unit/v2/test_images_resource.py,89]     def _create_images(self):
+[C,glance/tests/unit/v2/test_images_resource.py,90]         self.db.reset()
+[C,glance/tests/unit/v2/test_images_resource.py,91]         self.images = [
+[C,glance/tests/unit/v2/test_images_resource.py,92]             _fixture(UUID1, owner=TENANT1, name='1', size=256, is_public=True,
+[D,glance/tests/unit/v2/test_images_resource.py,89]                      location='swift+http://example.com/container/%s' % UUID1),
+[A,glance/tests/unit/v2/test_images_resource.py,93]                      location='%s/%s' % (BASE_URI, UUID1)),
+[C,glance/tests/unit/v2/test_images_resource.py,94]             _fixture(UUID2, owner=TENANT1, name='2', size=512, is_public=True),
+[C,glance/tests/unit/v2/test_images_resource.py,95]             _fixture(UUID3, owner=TENANT3, name='3', size=512, is_public=True),
+[C,glance/tests/unit/v2/test_images_resource.py,96]             _fixture(UUID4, owner=TENANT4, name='4', size=1024),
+[C,glance/tests/unit/v2/test_images_resource.py,97]         ]
+[C,glance/tests/unit/v2/test_images_resource.py,98]         [self.db.image_create(None, image) for image in self.images]
+[C,glance/tests/unit/v2/test_images_resource.py,99] 
+[C,glance/tests/unit/v2/test_images_resource.py,100]         self.db.image_tag_set_all(None, UUID1, ['ping', 'pong'])
+[C,glance/tests/unit/v2/test_images_resource.py,101] 
+[C,glance/tests/unit/v2/test_images_resource.py,102]     def test_index(self):
+[C,glance/tests/unit/v2/test_images_resource.py,103]         self.config(limit_param_default=1, api_limit_max=3)
+[C,glance/tests/unit/v2/test_images_resource.py,104]         request = unit_test_utils.get_fake_request()
+[C,glance/tests/unit/v2/test_images_resource.py,105]         output = self.controller.index(request)
+[C,glance/tests/unit/v2/test_images_resource.py,106]         self.assertEqual(1, len(output['images']))
+[C,glance/tests/unit/v2/test_images_resource.py,107]         actual = set([image['id'] for image in output['images']])
+[C,glance/tests/unit/v2/test_images_resource.py,108]         expected = set([UUID3])
+@@ -381,38 +385,72 @@ class TestImagesController(test_utils.BaseTestCase):
+[C,glance/tests/unit/v2/test_images_resource.py,385] 
+[C,glance/tests/unit/v2/test_images_resource.py,386]     def test_update_duplicate_tags(self):
+[C,glance/tests/unit/v2/test_images_resource.py,387]         request = unit_test_utils.get_fake_request()
+[C,glance/tests/unit/v2/test_images_resource.py,388]         image = {'tags': ['ping', 'ping']}
+[C,glance/tests/unit/v2/test_images_resource.py,389]         output = self.controller.update(request, UUID1, image)
+[C,glance/tests/unit/v2/test_images_resource.py,390]         self.assertEqual(['ping'], output['tags'])
+[C,glance/tests/unit/v2/test_images_resource.py,391]         output_log = self.notifier.get_log()
+[C,glance/tests/unit/v2/test_images_resource.py,392]         expected_log = {'notification_type': "INFO",
+[C,glance/tests/unit/v2/test_images_resource.py,393]                         'event_type': "image.update",
+[C,glance/tests/unit/v2/test_images_resource.py,394]                         'payload': output,
+[C,glance/tests/unit/v2/test_images_resource.py,395]         }
+[C,glance/tests/unit/v2/test_images_resource.py,396]         self.assertEqual(output_log, expected_log)
+[C,glance/tests/unit/v2/test_images_resource.py,397] 
+[C,glance/tests/unit/v2/test_images_resource.py,398]     def test_delete(self):
+[C,glance/tests/unit/v2/test_images_resource.py,399]         request = unit_test_utils.get_fake_request()
+[A,glance/tests/unit/v2/test_images_resource.py,400]         self.assertTrue(filter(lambda k: UUID1 in k, self.store.data))
+[C,glance/tests/unit/v2/test_images_resource.py,401]         try:
+[C,glance/tests/unit/v2/test_images_resource.py,402]             image = self.controller.delete(request, UUID1)
+[C,glance/tests/unit/v2/test_images_resource.py,403]             output_log = self.notifier.get_log()
+[C,glance/tests/unit/v2/test_images_resource.py,404]             self.assertEqual(output_log['notification_type'], "INFO")
+[C,glance/tests/unit/v2/test_images_resource.py,405]             self.assertEqual(output_log['event_type'], "image.delete")
+[C,glance/tests/unit/v2/test_images_resource.py,406]         except Exception as e:
+[C,glance/tests/unit/v2/test_images_resource.py,407]             self.fail("Delete raised exception: %s" % e)
+[C,glance/tests/unit/v2/test_images_resource.py,408] 
+[A,glance/tests/unit/v2/test_images_resource.py,409]         deleted_img = self.db.image_get(request.context, UUID1,
+[A,glance/tests/unit/v2/test_images_resource.py,410]                                         force_show_deleted=True)
+[A,glance/tests/unit/v2/test_images_resource.py,411]         self.assertTrue(deleted_img['deleted'])
+[A,glance/tests/unit/v2/test_images_resource.py,412]         self.assertEqual(deleted_img['status'], 'deleted')
+[A,glance/tests/unit/v2/test_images_resource.py,413]         self.assertFalse(filter(lambda k: UUID1 in k, self.store.data))
+[A,glance/tests/unit/v2/test_images_resource.py,414] 
+[A,glance/tests/unit/v2/test_images_resource.py,415]     def test_delete_not_in_store(self):
+[A,glance/tests/unit/v2/test_images_resource.py,416]         request = unit_test_utils.get_fake_request()
+[A,glance/tests/unit/v2/test_images_resource.py,417]         self.assertTrue(filter(lambda k: UUID1 in k, self.store.data))
+[A,glance/tests/unit/v2/test_images_resource.py,418]         for k in self.store.data:
+[A,glance/tests/unit/v2/test_images_resource.py,419]             if UUID1 in k:
+[A,glance/tests/unit/v2/test_images_resource.py,420]                 del self.store.data[k]
+[A,glance/tests/unit/v2/test_images_resource.py,421]                 break
+[A,glance/tests/unit/v2/test_images_resource.py,422] 
+[A,glance/tests/unit/v2/test_images_resource.py,423]         self.controller.delete(request, UUID1)
+[A,glance/tests/unit/v2/test_images_resource.py,424]         deleted_img = self.db.image_get(request.context, UUID1,
+[A,glance/tests/unit/v2/test_images_resource.py,425]                                         force_show_deleted=True)
+[A,glance/tests/unit/v2/test_images_resource.py,426]         self.assertTrue(deleted_img['deleted'])
+[A,glance/tests/unit/v2/test_images_resource.py,427]         self.assertEqual(deleted_img['status'], 'deleted')
+[A,glance/tests/unit/v2/test_images_resource.py,428]         self.assertFalse(filter(lambda k: UUID1 in k, self.store.data))
+[A,glance/tests/unit/v2/test_images_resource.py,429] 
+[A,glance/tests/unit/v2/test_images_resource.py,430]     def test_delayed_delete(self):
+[A,glance/tests/unit/v2/test_images_resource.py,431]         self.config(delayed_delete=True)
+[A,glance/tests/unit/v2/test_images_resource.py,432]         request = unit_test_utils.get_fake_request()
+[A,glance/tests/unit/v2/test_images_resource.py,433]         self.assertTrue(filter(lambda k: UUID1 in k, self.store.data))
+[A,glance/tests/unit/v2/test_images_resource.py,434] 
+[A,glance/tests/unit/v2/test_images_resource.py,435]         self.controller.delete(request, UUID1)
+[A,glance/tests/unit/v2/test_images_resource.py,436]         deleted_img = self.db.image_get(request.context, UUID1,
+[A,glance/tests/unit/v2/test_images_resource.py,437]                                         force_show_deleted=True)
+[A,glance/tests/unit/v2/test_images_resource.py,438]         self.assertTrue(deleted_img['deleted'])
+[A,glance/tests/unit/v2/test_images_resource.py,439]         self.assertEqual(deleted_img['status'], 'pending_delete')
+[A,glance/tests/unit/v2/test_images_resource.py,440]         self.assertTrue(filter(lambda k: UUID1 in k, self.store.data))
+[A,glance/tests/unit/v2/test_images_resource.py,441] 
+[C,glance/tests/unit/v2/test_images_resource.py,442]     def test_delete_non_existent(self):
+[C,glance/tests/unit/v2/test_images_resource.py,443]         request = unit_test_utils.get_fake_request()
+[C,glance/tests/unit/v2/test_images_resource.py,444]         self.assertRaises(webob.exc.HTTPNotFound, self.controller.delete,
+[C,glance/tests/unit/v2/test_images_resource.py,445]                           request, utils.generate_uuid())
+[C,glance/tests/unit/v2/test_images_resource.py,446] 
+[C,glance/tests/unit/v2/test_images_resource.py,447]     def test_index_with_invalid_marker(self):
+[C,glance/tests/unit/v2/test_images_resource.py,448]         fake_uuid = utils.generate_uuid()
+[C,glance/tests/unit/v2/test_images_resource.py,449]         request = unit_test_utils.get_fake_request()
+[C,glance/tests/unit/v2/test_images_resource.py,450]         self.assertRaises(webob.exc.HTTPBadRequest,
+[C,glance/tests/unit/v2/test_images_resource.py,451]                           self.controller.index, request, marker=fake_uuid)
+[C,glance/tests/unit/v2/test_images_resource.py,452] 
+[C,glance/tests/unit/v2/test_images_resource.py,453] 
+[C,glance/tests/unit/v2/test_images_resource.py,454] class TestImagesControllerPolicies(base.IsolatedUnitTest):
+[C,glance/tests/unit/v2/test_images_resource.py,455] 
+[C,glance/tests/unit/v2/test_images_resource.py,456]     def setUp(self):

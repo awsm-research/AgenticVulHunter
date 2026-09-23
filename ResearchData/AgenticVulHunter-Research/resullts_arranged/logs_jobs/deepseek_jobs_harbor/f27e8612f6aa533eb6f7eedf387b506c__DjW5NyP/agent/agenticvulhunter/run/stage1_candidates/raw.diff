@@ -1,0 +1,373 @@
+diff --git a/glance-test/file with space.html b/glance-test/file with space.html
+new file mode 100644
+index 0000000..cc3f0d8
+--- /dev/null
++++ b/glance-test/file with space.html	
+@@ -0,0 +1 @@
++hey, now!
+\ No newline at end of file
+diff --git a/glance-test/file.txt b/glance-test/file.txt
+new file mode 100644
+index 0000000..1ad728e
+--- /dev/null
++++ b/glance-test/file.txt
+@@ -0,0 +1 @@
++howdy!
+\ No newline at end of file
+diff --git a/glance-test/index.html b/glance-test/index.html
+new file mode 100644
+index 0000000..13f8eb4
+--- /dev/null
++++ b/glance-test/index.html
+@@ -0,0 +1 @@
++wee
+diff --git a/index.js b/index.js
+index 0e1ef6c..7110d46 100644
+--- a/index.js
++++ b/index.js
+@@ -5,107 +5,124 @@ var fs = require('fs'),
+     http = require('http'),
+     EventEmitter = require('events').EventEmitter,
+     util = require('util'),
+     path = require('path'),
+     colorConsole = require('colorize').console,
+     htmlls = require('html-ls'),
+     defaults = {
+       port: 61403,
+       indexing: false,
+       indices: [],
+       dir: process.cwd(),
+       verbose: false,
+       nodot: false
+     }
+ 
++module.exports.Glance = Glance
++
+ function Glance(options) {
+   if (!(this instanceof Glance)) return new Glance(options)
+ 
+   options = xtend(defaults, options || {})
+ 
+   this.port = options.port
+   this.indexing = options.indexing
+   this.indices = options.indices
+-  this.dir = options.dir
++  this.dir = path.normalize(options.dir)
+   this.verbose = options.verbose
+   this.nodot = options.nodot
+ 
+-  this.dir = path.normalize(this.dir)
+-
+   return this
+ }
+ 
+-util.inherits(Glance, EventEmitter);
++util.inherits(Glance, EventEmitter)
+ 
+-Glance.prototype.start = function () {
+-  this.on('error', function (errorCode, request) {
+-    if (this.verbose) colorConsole.log(['#red[ERR', errorCode, '] ',
+-      request.ip, ' on #bold[', request.fullPath, ']'].join(''))
+-    showError(errorCode, request.response)
+-  })
+-
+-  this.on('read', function (request) {
+-    if (this.verbose) colorConsole.log(['#green[INFO] ', request.ip,
+-      ' read #bold[', request.fullPath, ']'].join(''))
+-  })
++Glance.prototype.start = function startGlance() {
++  this.on('error', on_error)
++  this.on('read', on_read)
+ 
+   this.server = http.createServer(this.serveRequest.bind(this))
+     .listen(this.port)
+ 
+   if (this.verbose) colorConsole.log(['#magenta[glance] ',
+     'serving #bold[', this.dir, '] on port #green[', this.port, ']'].join(''))
+ 
++  function on_read(request) {
++    if (this.verbose) colorConsole.log(['#green[INFO] ', request.ip,
++      ' read #bold[', request.fullPath, ']'].join(''))
++  }
++
++  function on_error(errorCode, request) {
++    if (this.verbose) colorConsole.log(['#red[ERR', errorCode, '] ',
++      request.ip, ' on #bold[', request.fullPath, ']'].join(''))
++    showError(errorCode, request.response)
++  }
++
+ }
+ 
+-Glance.prototype.stop = function () {
++Glance.prototype.stop = function stopGlance() {
+   this.server && this.server.close()
+ }
+ 
+-Glance.prototype.serveRequest = function (req, res) {
+-  var request = {
+-      fullPath: path.join(this.dir,
+-        decodeURIComponent(parse(req.url).pathname)),
+-      ip: req.socket.remoteAddress,
+-      method: req.method.toLowerCase(),
+-      response: res
+-  }
+-  if (request.method != 'get') return this.emit('error', 405, request)
+-  if (this.nodot && /^\./.test(path.basename(request.fullPath))) {
+-    return this.emit('error', 404, request)
++Glance.prototype.serveRequest = function glanceRequest(req, res) {
++  var self = this,
++      request = {}
++
++  request.fullPath = path.join(
++    self.dir,
++    decodeURIComponent(parse(req.url).pathname)
++  )
++  request.ip = req.socket.remoteAddress
++  request.method = req.method.toLowerCase()
++  request.response = res
++
++  if (request.method !== 'get') return self.emit('error', 405, request)
++  if (self.nodot && /^\./.test(path.basename(request.fullPath))) {
++    return self.emit('error', 404, request)
+   }
+-  fs.stat(request.fullPath, function (err, stat) {
+-    if (err) return this.emit('error', 404, request)
+-    if (stat.isDirectory()) {
+-      if (!this.indexing) return this.emit('error', 403, request)
+-      if (this.indices && this.indices.length) {
+-        for (var i = 0, l = this.indices.length; i < l; ++i) {
+-          if (fs.existsSync(path.join(request.fullPath, this.indices[i]))) {
+-            req.url = path.join(req.url, this.indices[i])
+-            return this.serveRequest(req, res)
+-          }
++  fs.stat(request.fullPath, stat_file)
++
++  function stat_file(err, stat) {
++    if (err) return self.emit('error', 404, request)
++    if (!stat.isDirectory()) {
++      self.emit('read', request)
++      
++      res.writeHead(200, { 'Content-Type': mime.lookup(request.fullPath) })
++      return fs.createReadStream(request.fullPath).pipe(res)
++    }
++
++    if (!self.indexing) return self.emit('error', 403, request)
++    if (!self.indices || !self.indices.length) return list_files()
++
++    var indices = self.indices.slice()
++
++    !function find_index(index_test) {
++      fs.exists(path.join(request.fullPath, index_test), check)
++      function check(has_index) {
++        if (has_index) {
++          req.url = path.join(req.url, index_test)
++          return self.serveRequest(req, res)
+         }
++
++        if (!indices.length) return list_files()
++        find_index(indices.shift())
+       }
++    }(indices.shift())
++
++    function list_files() {
+       var listPath = request.fullPath.replace(/\/$/, '')
+       res.writeHead(200, { 'Content-Type': 'text/html' })
+-      htmlls(listPath, { hideDot: this.nodot }).pipe(res)
++      htmlls(listPath, { hideDot: self.nodot }).pipe(res)
+ 
+-      return this.emit('read', request)
++      return self.emit('read', request)
+     }
+-    this.emit('read', request)
+-    
+-    res.writeHead(200, { 'Content-Type': mime.lookup(request.fullPath) })
+-    fs.createReadStream(request.fullPath).pipe(res)
+-  
+-  }.bind(this))
+-
++  }
+ }
+ 
+ function showError(errorCode, res) {
+   res.writeHead(errorCode)
+   fs.createReadStream(__dirname + '/errors/' + errorCode + '.html').pipe(res)
+ }
+ 
+-module.exports.createGlance = function (options) {
++module.exports.createGlance = function createGlance(options) {
+   return new Glance(options)
+ }
+-
+-module.exports.Glance = Glance
+diff --git a/package.json b/package.json
+index 32812ec..d8e2519 100644
+--- a/package.json
++++ b/package.json
+@@ -17,20 +17,20 @@
+     "file",
+     "server",
+     "utility",
+     "util",
+     "fileserver"
+   ],
+   "author": "jesse keane",
+   "license": "MIT",
+   "bugs": {
+     "url": "https://github.com/jarofghosts/glance/issues"
+   },
+   "preferGlobal": true,
+   "dependencies": {
+     "commander": "~1.2.0",
+     "mime": "~1.2.9",
+-    "html-ls": ">= 0.0.6",
++    "html-ls": "0.1.0",
+     "colorize": "~0.1.0",
+     "xtend": "~2.0.6"
+   }
+ }
+diff --git a/test/test.js b/test/test.js
+index d55baf1..72500b0 100644
+--- a/test/test.js
++++ b/test/test.js
+@@ -1,94 +1,84 @@
+ var assert = require('assert'),
+     fs = require('fs'),
+     glance = require('../index.js'),
+-    http = require('http');
++    http = require('http')
+ 
+-fs.mkdirSync('glance-test');
+-fs.writeFileSync('glance-test/file.txt', 'howdy!');
+-fs.writeFileSync('glance-test/index.html', 'wee');
+-fs.writeFileSync('glance-test/file with space.html', 'hey, now!');
+-
+-var glanceServer = glance.createGlance({ port: 16661, dir: './glance-test' });
++var glanceServer = glance.createGlance({ port: 1666, dir: './glance-test' })
+ 
+ assert.doesNotThrow(function () {
+   glanceServer.start()
+-});
++})
+ 
+-http.get('http://localhost:16661/file.txt', function (res) {
+-  var text = '';
+-  assert.equal(res.statusCode, 200);
+-  assert.equal(res.headers['content-type'], 'text/plain');
++http.get('http://localhost:1666/file.txt', function (res) {
++  var text = ''
++  assert.equal(res.statusCode, 200)
++  assert.equal(res.headers['content-type'], 'text/plain')
+   res.on('data', function (data) {
+-    text += data;
+-  });
++    text += data
++  })
+   res.on('end', function () {
+     assert.equal(text, 'howdy!');
+-    testUri();
+-  });
+-});
++    testUri()
++  })
++})
++
+ function testUri() {
+-  http.get('http://localhost:16661/file%20with%20space.html', function (res) {
+-    var uritext = '';
+-    assert.equal(res.statusCode, 200);
+-    assert.equal(res.headers['content-type'], 'text/html');
++  http.get('http://localhost:1666/file%20with%20space.html', function (res) {
++    var uritext = ''
++    assert.equal(res.statusCode, 200)
++    assert.equal(res.headers['content-type'], 'text/html')
+     res.on('data', function (data) {
+-      uritext += data;
+-    });
++      uritext += data
++    })
+     res.on('end', function () {
+-      assert.equal(uritext, 'hey, now!');
+-      testError();
+-    });
+-  });
++      assert.equal(uritext, 'hey, now!')
++      testError()
++    })
++  })
+ }
++
+ function testError() {
+-  http.get('http://localhost:16661/nofile.md', function (res) {
+-    assert.equal(res.statusCode, 404);
+-    res.on('data', function (data) {})
+-    res.on('end', testDirList);
+-  });
++  http.get('http://localhost:1666/nofile.md', function (res) {
++    assert.equal(res.statusCode, 404)
++    testDirList()
++  })
+ }
+ function testDirList() {
+-  http.get('http://localhost:16661/', function (res) {
+-    assert.equal(res.statusCode, 403);
+-    res.on('data', function () {});
+-    res.on('end', testIndices);
+-  });
++  http.get('http://localhost:1666/', function (res) {
++    assert.equal(res.statusCode, 403)
++    testIndices()
++  })
+ }
+ function testIndices() {
+   var data = []
+   glanceServer.indexing = true
+   glanceServer.indices = ['index.html']
+-  http.get('http://localhost:16661/', function (res) {
++
++  http.get('http://localhost:1666/', function (res) {
+     assert.equal(res.statusCode, 200)
+     res.on('data', data.push.bind(data))
+     res.on('end', function () {
+-      assert.equal(data.join(''), 'wee')
++      assert.equal(data.join(''), 'wee\n')
+       testMethod()
+     })
+   })
+ }
+ function testMethod() {
+-  ['POST', 'DELETE', 'PUT'].forEach(function (method) {
++  var pass = 0
++  ;['POST', 'DELETE', 'PUT'].forEach(function (method) {
+     var req = http.request({
+       host: 'localhost',
+-      port: 16661,
++      port: 1666,
+       path: '/file.txt',
+       method: method
+     }, function (res) {
+-      assert.equal(res.statusCode, 405);
+-      res.on('data', function () {});
+-    });
+-    req.on('error', function (e) {
+-      console.log(e);
+-    });
+-    req.end();
+-  });
+-  setTimeout(tearDown, 500);
+-}
+-function tearDown() {
+-  glanceServer.stop();
+-  fs.unlinkSync('glance-test/file.txt');
+-  fs.unlinkSync('glance-test/index.html');
+-  fs.unlinkSync('glance-test/file with space.html');
+-  fs.rmdirSync('glance-test');
++      pass++
++      assert.equal(res.statusCode, 405)
++      if (pass == 3) {
++        glanceServer.stop()
++        process.exit(0)
++      }
++    })
++    req.end()
++  })
+ }

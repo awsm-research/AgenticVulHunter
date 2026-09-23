@@ -1,0 +1,893 @@
+@@ -167,39 +167,38 @@ ActivityStats = new Mongo.Collection("activityStats");
+[C,shell/lib/db.js,167] //   monthly: Contains stats counts pertaining to the last thirty days before the timestamp.
+[C,shell/lib/db.js,168] //
+[C,shell/lib/db.js,169] // Each of daily, weekly, and monthly contains:
+[C,shell/lib/db.js,170] //   activeUsers: The number of unique users who have used a grain on the server in the time
+[C,shell/lib/db.js,171] //       interval. Only counts logged-in users.
+[C,shell/lib/db.js,172] //   activeGrains: The number of unique grains that have been used in the time interval.
+[C,shell/lib/db.js,173] 
+[C,shell/lib/db.js,174] DeleteStats = new Mongo.Collection("deleteStats");
+[C,shell/lib/db.js,175] // Contains records of objects that were deleted, for stat-keeping purposes.
+[C,shell/lib/db.js,176] //
+[C,shell/lib/db.js,177] // Each contains:
+[C,shell/lib/db.js,178] //   type: "grain" or "user" or "appDemoUser"
+[C,shell/lib/db.js,179] //   lastActive: Date of the user's or grain's last activity.
+[C,shell/lib/db.js,180] 
+[C,shell/lib/db.js,181] FileTokens = new Mongo.Collection("fileTokens");
+[D,shell/lib/db.js,182] // Tokens corresponding to files that will be accessed and later cleaned up by the server. This
+[D,shell/lib/db.js,183] // is specifically used in routes like backupGrain/restoreGrain where the route is server-side,
+[D,shell/lib/db.js,184] // and thus needs its own form of authentication.
+[D,shell/lib/db.js,185] // (see https://github.com/EventedMind/iron-router/issues/649)
+[A,shell/lib/db.js,182] // Tokens corresponding to backup files that are currently stored on the server. A user receives
+[A,shell/lib/db.js,183] // a token when they create a backup file (either by uploading it, or by backing up one of their
+[A,shell/lib/db.js,184] // grains) and may use the token to read the file (either to download it, or to restore a new
+[A,shell/lib/db.js,185] // grain from it).
+[C,shell/lib/db.js,186] //
+[C,shell/lib/db.js,187] // Each contains:
+[D,shell/lib/db.js,188] //   _id:       random. Since they're unguessable, they're also used as the token
+[D,shell/lib/db.js,189] //   filePath:  Text path on the local filesystem. Probably will be in /tmp
+[D,shell/lib/db.js,190] //   name:      Text name that should be presented to users for this token
+[A,shell/lib/db.js,188] //   _id:       The unguessable token string.
+[A,shell/lib/db.js,189] //   name:      Suggested filename.
+[C,shell/lib/db.js,190] //   timestamp: File creation time. Used to figure out when the token and file should be wiped.
+[C,shell/lib/db.js,191] 
+[C,shell/lib/db.js,192] ApiTokens = new Mongo.Collection("apiTokens");
+[C,shell/lib/db.js,193] // Access tokens for APIs exported by apps.
+[C,shell/lib/db.js,194] //
+[C,shell/lib/db.js,195] // Originally API tokens were only used by external users through the HTTP API endpoint. However,
+[C,shell/lib/db.js,196] // now they are also used to implement SturdyRefs, not just held by external users, but also when
+[C,shell/lib/db.js,197] // an app holds a SturdyRef to another app within the same server. See the various `save()`,
+[C,shell/lib/db.js,198] // `restore()`, and `drop()` methods in `grain.capnp` (on `SansdtormApi`, `AppPersistent`, and
+[C,shell/lib/db.js,199] // `MainView`) -- the fields of type `Data` are API tokens.
+[C,shell/lib/db.js,200] //
+[C,shell/lib/db.js,201] // Each contains:
+[C,shell/lib/db.js,202] //   _id:       A SHA-256 hash of the token.
+[C,shell/lib/db.js,203] //   grainId:   The grain servicing this API. (Not present if the API isn't serviced by a grain.)
+[C,shell/lib/db.js,204] //   userId:    The `_id` of the user (in the users table) to whom this token should be attributed.
+@@ -3,373 +3,232 @@
+[C,shell/server/backup.js,3] // All rights reserved.
+[C,shell/server/backup.js,4] //
+[C,shell/server/backup.js,5] // Licensed under the Apache License, Version 2.0 (the "License");
+[C,shell/server/backup.js,6] // you may not use this file except in compliance with the License.
+[C,shell/server/backup.js,7] // You may obtain a copy of the License at
+[C,shell/server/backup.js,8] //
+[C,shell/server/backup.js,9] //   http://www.apache.org/licenses/LICENSE-2.0
+[C,shell/server/backup.js,10] //
+[C,shell/server/backup.js,11] // Unless required by applicable law or agreed to in writing, software
+[C,shell/server/backup.js,12] // distributed under the License is distributed on an "AS IS" BASIS,
+[C,shell/server/backup.js,13] // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+[C,shell/server/backup.js,14] // See the License for the specific language governing permissions and
+[C,shell/server/backup.js,15] // limitations under the License.
+[C,shell/server/backup.js,16] 
+[C,shell/server/backup.js,17] var ChildProcess = Npm.require("child_process");
+[D,shell/server/backup.js,18] var Fs = Npm.require("fs");
+[C,shell/server/backup.js,18] var Future = Npm.require("fibers/future");
+[D,shell/server/backup.js,20] var Path = Npm.require("path");
+[C,shell/server/backup.js,19] var Promise = Npm.require("es6-promise").Promise;
+[C,shell/server/backup.js,20] var Capnp = Npm.require("capnp");
+[C,shell/server/backup.js,21] 
+[C,shell/server/backup.js,22] var GrainInfo = Capnp.importSystem("sandstorm/grain.capnp").GrainInfo;
+[C,shell/server/backup.js,23] 
+[D,shell/server/backup.js,26] var TMPDIR = "/tmp";
+[C,shell/server/backup.js,24] var TOKEN_CLEANUP_MINUTES = 15;
+[C,shell/server/backup.js,25] var TOKEN_CLEANUP_TIMER = TOKEN_CLEANUP_MINUTES * 60 * 1000;
+[C,shell/server/backup.js,26] 
+[D,shell/server/backup.js,30] var mkdir = Meteor.wrapAsync(Fs.mkdir),
+[D,shell/server/backup.js,31]     readFile = Meteor.wrapAsync(Fs.readFile),
+[D,shell/server/backup.js,32]     writeFile = Meteor.wrapAsync(Fs.writeFile);
+[D,shell/server/backup.js,33] 
+[D,shell/server/backup.js,34] function recursiveRmdir(dir) {
+[D,shell/server/backup.js,35]   Fs.readdirSync(dir).forEach(function (filename) {
+[D,shell/server/backup.js,36]     filename = Path.join(dir, filename);
+[D,shell/server/backup.js,37]     if(Fs.lstatSync(filename).isDirectory()) {
+[D,shell/server/backup.js,38]       recursiveRmdir(filename);
+[D,shell/server/backup.js,39]     } else {
+[D,shell/server/backup.js,40]       Fs.unlinkSync(filename);
+[D,shell/server/backup.js,41]     }
+[D,shell/server/backup.js,42]   });
+[D,shell/server/backup.js,43]   Fs.rmdirSync(dir);
+[D,shell/server/backup.js,44] };
+[D,shell/server/backup.js,45] 
+[D,shell/server/backup.js,46] function recursiveRmdirIfExists(dir) {
+[D,shell/server/backup.js,47]   if (Fs.existsSync(dir)) {
+[D,shell/server/backup.js,48]     if (Fs.lstatSync(dir).isDirectory()) {
+[D,shell/server/backup.js,49]       recursiveRmdir(dir);
+[D,shell/server/backup.js,50]     } else {
+[D,shell/server/backup.js,51]       Fs.unlinkSync(dir);
+[D,shell/server/backup.js,52]     }
+[D,shell/server/backup.js,53]   }
+[D,shell/server/backup.js,54] }
+[D,shell/server/backup.js,55] 
+[D,shell/server/backup.js,56] function walkAndWriteFiles(dir, writeStream, replaceRoot, originalRoot) {
+[D,shell/server/backup.js,57]   originalRoot = originalRoot || dir;
+[D,shell/server/backup.js,58]   var files = Fs.readdirSync(dir);
+[D,shell/server/backup.js,59]   files.forEach(function (name) {
+[D,shell/server/backup.js,60]     name = dir + "/" + name;
+[D,shell/server/backup.js,61] 
+[D,shell/server/backup.js,62]     // Filter out file paths with a newline in them
+[D,shell/server/backup.js,63]     if (name.indexOf("\n") !== -1) {
+[D,shell/server/backup.js,64]       return;
+[D,shell/server/backup.js,65]     }
+[D,shell/server/backup.js,66] 
+[D,shell/server/backup.js,67]     var fileStat = Fs.lstatSync(name);
+[D,shell/server/backup.js,68]     if (fileStat.isDirectory()) {
+[D,shell/server/backup.js,69]       walkAndWriteFiles(name, writeStream, replaceRoot, originalRoot);
+[D,shell/server/backup.js,70]     } else if (fileStat.isFile() || fileStat.isSymbolicLink()) {
+[D,shell/server/backup.js,71]       name = replaceRoot + name.slice(originalRoot.length);
+[D,shell/server/backup.js,72]       writeStream.write(name + "\n");
+[D,shell/server/backup.js,73]     }
+[D,shell/server/backup.js,74]   });
+[D,shell/server/backup.js,75] 
+[D,shell/server/backup.js,76]   // Include empty directories
+[D,shell/server/backup.js,77]   if (files.length === 0) {
+[D,shell/server/backup.js,78]     // Filter out file paths with a newline in them
+[D,shell/server/backup.js,79]     if (dir.indexOf("\n") !== -1) {
+[D,shell/server/backup.js,80]       return;
+[D,shell/server/backup.js,81]     }
+[D,shell/server/backup.js,82]     dir = replaceRoot + dir.slice(originalRoot.length);
+[D,shell/server/backup.js,83]     writeStream.write(dir + "\n");
+[D,shell/server/backup.js,84]   }
+[A,shell/server/backup.js,27] function cleanupToken(tokenId) {
+[A,shell/server/backup.js,28]   check(tokenId, String);
+[A,shell/server/backup.js,29]   waitPromise(sandstormBackend.deleteBackup(tokenId));
+[A,shell/server/backup.js,30]   FileTokens.remove({_id: tokenId});
+[C,shell/server/backup.js,31] }
+[C,shell/server/backup.js,32] 
+[C,shell/server/backup.js,33] Meteor.startup(function () {
+[C,shell/server/backup.js,34]   // Cleanup tokens every TOKEN_CLEANUP_MINUTES
+[C,shell/server/backup.js,35]   Meteor.setInterval(function () {
+[C,shell/server/backup.js,36]     var queryDate = new Date(Date.now() - TOKEN_CLEANUP_TIMER);
+[C,shell/server/backup.js,37] 
+[C,shell/server/backup.js,38]     FileTokens.find({timestamp: {$lt: queryDate}}).forEach(function (token) {
+[D,shell/server/backup.js,93]       Meteor.call("cleanupToken", token._id);
+[A,shell/server/backup.js,39]       cleanupToken(token._id);
+[C,shell/server/backup.js,40]     });
+[C,shell/server/backup.js,41]   }, TOKEN_CLEANUP_TIMER);
+[C,shell/server/backup.js,42] });
+[C,shell/server/backup.js,43] 
+[C,shell/server/backup.js,44] Meteor.methods({
+[C,shell/server/backup.js,45]   backupGrain: function (grainId) {
+[C,shell/server/backup.js,46]     check(grainId, String);
+[C,shell/server/backup.js,47]     var grain = Grains.findOne(grainId);
+[C,shell/server/backup.js,48]     if (!grain || !this.userId || grain.userId !== this.userId) {
+[C,shell/server/backup.js,49]       throw new Meteor.Error(403, "Unauthorized", "User is not the owner of this grain");
+[C,shell/server/backup.js,50]     }
+[C,shell/server/backup.js,51] 
+[C,shell/server/backup.js,52]     this.unblock();
+[C,shell/server/backup.js,53] 
+[D,shell/server/backup.js,108]     var fut = new Future();
+[D,shell/server/backup.js,109] 
+[D,shell/server/backup.js,110]     var id = Random.id();
+[C,shell/server/backup.js,54]     var token = {
+[D,shell/server/backup.js,112]       _id: id,
+[D,shell/server/backup.js,113]       filePath: Path.join(TMPDIR, "/", id),
+[A,shell/server/backup.js,55]       _id: Random.id(),
+[C,shell/server/backup.js,56]       timestamp: new Date(),
+[C,shell/server/backup.js,57]       name: grain.title
+[C,shell/server/backup.js,58]     };
+[C,shell/server/backup.js,59] 
+[D,shell/server/backup.js,118]     mkdir(token.filePath);
+[D,shell/server/backup.js,119] 
+[C,shell/server/backup.js,60]     // TODO(soon): does the grain need to be offline?
+[C,shell/server/backup.js,61] 
+[C,shell/server/backup.js,62]     var grainInfo = _.pick(grain, "appId", "appVersion", "title");
+[D,shell/server/backup.js,123]     writeFile(Path.join(token.filePath, "metadata"), Capnp.serialize(GrainInfo, grainInfo));
+[D,shell/server/backup.js,124] 
+[D,shell/server/backup.js,125]     var proc = ChildProcess.spawn(sandstormExe("minibox"), [
+[D,shell/server/backup.js,126]         // Mount root directory read-only, but hide /proc, /var, and /etc.
+[D,shell/server/backup.js,127]         "-r/=/", "-h/proc", "-h/var", "-h/etc",
+[D,shell/server/backup.js,128]         // Map /tmp to the backup tempdir, so that any other temp stuff is hidden.
+[D,shell/server/backup.js,129]         // Make this the current directory.
+[D,shell/server/backup.js,130]         "-w/tmp=" + token.filePath, "-d/tmp",
+[D,shell/server/backup.js,131]         // Map in things which we want to pack into the zip. We only need to do this because the
+[D,shell/server/backup.js,132]         // zip tool has no way to transform names when zipping, so we have to fool it into thinking
+[D,shell/server/backup.js,133]         // that these nodes are actually located where we want them.
+[D,shell/server/backup.js,134]         "-r/tmp/data=" + Path.join(SANDSTORM_GRAINDIR, grainId, "sandbox"),
+[D,shell/server/backup.js,135]         "-r/tmp/log=" + Path.join(SANDSTORM_GRAINDIR, grainId, "log"),
+[D,shell/server/backup.js,136]         // Run zip!
+[D,shell/server/backup.js,137]         "--", "zip", "-y", "backup.zip", "-@"], {stdio: ["pipe", "ignore", "ignore"]});
+[D,shell/server/backup.js,138]     proc.on("exit", function (code) {
+[D,shell/server/backup.js,139]       fut.return(code);
+[D,shell/server/backup.js,140]     });
+[D,shell/server/backup.js,141]     proc.on("error", function (err) {
+[D,shell/server/backup.js,142]       recursiveRmdirIfExists(token.filePath);
+[D,shell/server/backup.js,143]       fut.throw(new Meteor.Error(500, "Error in zipping procces"));
+[D,shell/server/backup.js,144]     });
+[D,shell/server/backup.js,145]     proc.stdin.write("metadata\n");
+[D,shell/server/backup.js,146]     proc.stdin.write("log\n");
+[D,shell/server/backup.js,147]     walkAndWriteFiles(Path.join(SANDSTORM_GRAINDIR, grainId, "sandbox"), proc.stdin, "data");
+[D,shell/server/backup.js,148]     proc.stdin.end();
+[D,shell/server/backup.js,149] 
+[D,shell/server/backup.js,150]     var code = fut.wait();
+[D,shell/server/backup.js,151]     if (code !== 0) {
+[D,shell/server/backup.js,152]       recursiveRmdirIfExists(token.filePath);
+[D,shell/server/backup.js,153]       throw new Meteor.Error(500, "Zip process failed.");
+[D,shell/server/backup.js,154]     }
+[C,shell/server/backup.js,63] 
+[C,shell/server/backup.js,64]     FileTokens.insert(token);
+[A,shell/server/backup.js,65]     waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));
+[C,shell/server/backup.js,66] 
+[D,shell/server/backup.js,158]     return id;
+[A,shell/server/backup.js,67]     return token._id;
+[C,shell/server/backup.js,68]   },
+[C,shell/server/backup.js,69] 
+[C,shell/server/backup.js,70]   restoreGrain: function (tokenId) {
+[A,shell/server/backup.js,71]     check(tokenId, String);
+[C,shell/server/backup.js,72]     var token = FileTokens.findOne(tokenId);
+[D,shell/server/backup.js,163]     if (!token) {
+[D,shell/server/backup.js,164]       throw new Meteor.Error(403, "Unauthorized", "Token was not found");
+[A,shell/server/backup.js,73]     if (!token || !isSignedUpOrDemo()) {
+[A,shell/server/backup.js,74]       throw new Meteor.Error(403, "Unauthorized",
+[A,shell/server/backup.js,75]           "Token was not found, or user cannot create grains");
+[C,shell/server/backup.js,76]     }
+[C,shell/server/backup.js,77] 
+[C,shell/server/backup.js,78]     this.unblock();
+[C,shell/server/backup.js,79] 
+[C,shell/server/backup.js,80]     var grainId = Random.id(22);
+[D,shell/server/backup.js,170]     var grainDir = Path.join(SANDSTORM_GRAINDIR, grainId);
+[D,shell/server/backup.js,171]     var grainSandboxDir = Path.join(grainDir, "sandbox");
+[D,shell/server/backup.js,172]     Fs.mkdirSync(grainDir);
+[D,shell/server/backup.js,173]     Fs.mkdirSync(grainSandboxDir);
+[C,shell/server/backup.js,81] 
+[C,shell/server/backup.js,82]     try {
+[D,shell/server/backup.js,176]       var fut = new Future();
+[D,shell/server/backup.js,177] 
+[D,shell/server/backup.js,178]       var proc = ChildProcess.spawn(sandstormExe("minibox"), [
+[D,shell/server/backup.js,179]           // Mount root directory read-only, but hide /proc, /var, and /etc.
+[D,shell/server/backup.js,180]           "-r/=/", "-h/proc", "-h/var", "-h/etc",
+[D,shell/server/backup.js,181]           // Map /tmp to the backup tempdir, so that any other temp stuff is hidden.
+[D,shell/server/backup.js,182]           // Make this the current directory.
+[D,shell/server/backup.js,183]           "-w/tmp=" + token.filePath, "-d/tmp",
+[D,shell/server/backup.js,184]           // Map /tmp/data to the grain's sandbox directory so data is unpacked directly to the
+[D,shell/server/backup.js,185]           // place we want.
+[D,shell/server/backup.js,186]           "-w/tmp/data=" + grainSandboxDir,
+[D,shell/server/backup.js,187]           "--", "unzip", "-o", "backup.zip"], {stdio: "ignore"});
+[D,shell/server/backup.js,188]       proc.on("exit", function (code) {
+[D,shell/server/backup.js,189]         fut.return(code);
+[D,shell/server/backup.js,190]       });
+[D,shell/server/backup.js,191]       proc.on("error", function (err) {
+[D,shell/server/backup.js,192]         fut.throw(new Meteor.Error(500, "Error in unzipping procces"));
+[D,shell/server/backup.js,193]       });
+[D,shell/server/backup.js,194] 
+[D,shell/server/backup.js,195]       var code = fut.wait();
+[D,shell/server/backup.js,196]       if (code !== 0) {
+[D,shell/server/backup.js,197]         Meteor.call("cleanupToken", tokenId);
+[D,shell/server/backup.js,198]         throw new Meteor.Error(500, "Unzip process failed.");
+[D,shell/server/backup.js,199]       }
+[D,shell/server/backup.js,200] 
+[D,shell/server/backup.js,201]       var metadata = Path.join(token.filePath, "metadata");
+[D,shell/server/backup.js,202]       var grainInfoBuf = readFile(metadata);
+[D,shell/server/backup.js,203]       var grainInfo = Capnp.parse(GrainInfo, grainInfoBuf);
+[A,shell/server/backup.js,83]       var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;
+[C,shell/server/backup.js,84]       if (!grainInfo.appId) {
+[D,shell/server/backup.js,205]           throw new Meteor.Error(500,
+[D,shell/server/backup.js,206]                                  "Metadata object for uploaded grain has no AppId");
+[A,shell/server/backup.js,85]           throw new Meteor.Error(500, "Metadata object for uploaded grain has no AppId");
+[C,shell/server/backup.js,86]       }
+[C,shell/server/backup.js,87] 
+[C,shell/server/backup.js,88]       var action = UserActions.findOne({appId: grainInfo.appId, userId: this.userId});
+[C,shell/server/backup.js,89]       if (!action) {
+[C,shell/server/backup.js,90]         throw new Meteor.Error(500,
+[C,shell/server/backup.js,91]                                "App id for uploaded grain not installed",
+[C,shell/server/backup.js,92]                                "App Id: " + grainInfo.appId);
+[C,shell/server/backup.js,93]       }
+[C,shell/server/backup.js,94]       if (action.appVersion < grainInfo.appVersion) {
+[C,shell/server/backup.js,95]         throw new Meteor.Error(500,
+[C,shell/server/backup.js,96]                                "App version for uploaded grain is newer than any " +
+[C,shell/server/backup.js,97]                                "installed version. You need to upgrade your app first",
+[C,shell/server/backup.js,98]                                "New version: " + grainInfo.appVersion +
+[C,shell/server/backup.js,99]                                ", Old version: " + action.appVersion);
+[C,shell/server/backup.js,100]       }
+[C,shell/server/backup.js,101] 
+[C,shell/server/backup.js,102]       Grains.insert({
+[C,shell/server/backup.js,103]         _id: grainId,
+[C,shell/server/backup.js,104]         packageId: action.packageId,
+[C,shell/server/backup.js,105]         appId: action.appId,
+[C,shell/server/backup.js,106]         appVersion: action.appVersion,
+[C,shell/server/backup.js,107]         userId: this.userId,
+[C,shell/server/backup.js,108]         title: grainInfo.title,
+[C,shell/server/backup.js,109]         private: true
+[C,shell/server/backup.js,110]       });
+[D,shell/server/backup.js,232]     } catch (err) {
+[D,shell/server/backup.js,233]       recursiveRmdirIfExists(grainDir);
+[D,shell/server/backup.js,234]       throw err;
+[A,shell/server/backup.js,111]     } finally {
+[A,shell/server/backup.js,112]       cleanupToken(tokenId);
+[C,shell/server/backup.js,113]     }
+[C,shell/server/backup.js,114] 
+[D,shell/server/backup.js,237]     Meteor.call("cleanupToken", tokenId);
+[C,shell/server/backup.js,115]     return grainId;
+[C,shell/server/backup.js,116]   },
+[D,shell/server/backup.js,240] 
+[D,shell/server/backup.js,241]   cleanupToken: function (tokenId) {
+[D,shell/server/backup.js,242]     var token = FileTokens.findOne(tokenId);
+[D,shell/server/backup.js,243]     if (!token) {
+[D,shell/server/backup.js,244]       return;
+[D,shell/server/backup.js,245]     }
+[D,shell/server/backup.js,246]     recursiveRmdirIfExists(token.filePath);
+[D,shell/server/backup.js,247]     FileTokens.remove({_id: tokenId});
+[D,shell/server/backup.js,248]   }
+[C,shell/server/backup.js,117] });
+[C,shell/server/backup.js,118] 
+[D,shell/server/backup.js,251] doGrainUpload = function (stream) {
+[D,shell/server/backup.js,252]   return new Promise(function (resolve, reject) {
+[D,shell/server/backup.js,253]     var id = Random.id();
+[D,shell/server/backup.js,254]     var token = {
+[D,shell/server/backup.js,255]       _id: id,
+[D,shell/server/backup.js,256]       filePath: Path.join(TMPDIR, "/", id),
+[D,shell/server/backup.js,257]       timestamp: new Date()
+[D,shell/server/backup.js,258]     };
+[D,shell/server/backup.js,259]     mkdir(token.filePath);
+[D,shell/server/backup.js,260]     var backupFile = Path.join(token.filePath, "backup.zip");
+[D,shell/server/backup.js,261] 
+[D,shell/server/backup.js,262]     var file = Fs.createWriteStream(backupFile);
+[D,shell/server/backup.js,263] 
+[D,shell/server/backup.js,264]     stream.on("end", function () {
+[D,shell/server/backup.js,265]       try {
+[D,shell/server/backup.js,266]         file.end();
+[D,shell/server/backup.js,267]         resolve(token);
+[D,shell/server/backup.js,268]       } catch (err) {
+[D,shell/server/backup.js,269]         recursiveRmdirIfExists(token.filePath);
+[D,shell/server/backup.js,270]         reject(err);
+[D,shell/server/backup.js,271]       }
+[D,shell/server/backup.js,272]     });
+[D,shell/server/backup.js,273]     stream.on("error", function (err) {
+[D,shell/server/backup.js,274]       // TODO(soon):  This event does"t seem to fire if the user leaves the page mid-upload.
+[D,shell/server/backup.js,275]       try {
+[D,shell/server/backup.js,276]         file.end();
+[D,shell/server/backup.js,277]         recursiveRmdirIfExists(token.filePath);
+[D,shell/server/backup.js,278]         reject(err);
+[D,shell/server/backup.js,279]       } catch (err2) {
+[D,shell/server/backup.js,280]         recursiveRmdirIfExists(token.filePath);
+[D,shell/server/backup.js,281]         reject(err2);
+[D,shell/server/backup.js,282]       }
+[D,shell/server/backup.js,283]     });
+[D,shell/server/backup.js,284] 
+[D,shell/server/backup.js,285]     stream.pipe(file);
+[D,shell/server/backup.js,286]   });
+[D,shell/server/backup.js,287] };
+[D,shell/server/backup.js,288] 
+[C,shell/server/backup.js,119] Router.map(function () {
+[C,shell/server/backup.js,120]   this.route("downloadBackup", {
+[C,shell/server/backup.js,121]     where: "server",
+[C,shell/server/backup.js,122]     path: "/downloadBackup/:tokenId",
+[C,shell/server/backup.js,123]     action: function () {
+[D,shell/server/backup.js,294]       var fut = new Future();
+[D,shell/server/backup.js,295]       var response = this.response;
+[C,shell/server/backup.js,124]       var token = FileTokens.findOne(this.params.tokenId);
+[D,shell/server/backup.js,297]       var backupFile = Path.join(token.filePath, "backup.zip");
+[D,shell/server/backup.js,298] 
+[D,shell/server/backup.js,299]       var fileSize, file;
+[D,shell/server/backup.js,300]       try {
+[D,shell/server/backup.js,301]         fileSize = Fs.statSync(backupFile).size;
+[D,shell/server/backup.js,302]         file = Fs.createReadStream(backupFile);
+[D,shell/server/backup.js,303]       } catch (error) {
+[A,shell/server/backup.js,125]       var response = this.response;
+[A,shell/server/backup.js,126]       if (!token) {
+[C,shell/server/backup.js,127]         response.writeHead(404, {"Content-Type": "text/plain"});
+[C,shell/server/backup.js,128]         return response.end("File does not exist");
+[C,shell/server/backup.js,129]       }
+[C,shell/server/backup.js,130] 
+[D,shell/server/backup.js,308]       file.on("error", function (error) {
+[D,shell/server/backup.js,309]         // TODO(someday): this might not work if error occurs after open?
+[D,shell/server/backup.js,310]         response.writeHead(404, {"Content-Type": "text/plain"});
+[D,shell/server/backup.js,311]         response.write("Failed to archive");
+[D,shell/server/backup.js,312]         fut.return();
+[D,shell/server/backup.js,313]       });
+[D,shell/server/backup.js,314] 
+[D,shell/server/backup.js,315]       file.on("end", function () {
+[D,shell/server/backup.js,316]         fut.return();
+[D,shell/server/backup.js,317]       });
+[D,shell/server/backup.js,318] 
+[D,shell/server/backup.js,319]       file.on("open", function () {
+[D,shell/server/backup.js,320]         var filename = token.name + ".zip";
+[D,shell/server/backup.js,321]         // Make first character be alpha-numeric
+[D,shell/server/backup.js,322]         filename = filename.replace(/^[^A-Za-z0-9_]/, "_");
+[D,shell/server/backup.js,323]         // Remove non filesystem characters
+[D,shell/server/backup.js,324]         filename = filename.replace(new RegExp("[\\\\/:*?\"<>|]","g"), "");
+[D,shell/server/backup.js,325] 
+[D,shell/server/backup.js,326]         response.writeHead(200, headers = {
+[D,shell/server/backup.js,327]           "Content-Length": fileSize,
+[D,shell/server/backup.js,328]           "Content-Type": "application/zip",
+[D,shell/server/backup.js,329]           "Content-Disposition": "attachment;filename=\"" + filename + "\""
+[D,shell/server/backup.js,330]         });
+[D,shell/server/backup.js,331]       });
+[A,shell/server/backup.js,131]       var started = false;
+[A,shell/server/backup.js,132]       var filename = (token.name.replace(/["\n]/g, "") || "backup") + ".zip";
+[A,shell/server/backup.js,133]       var sawEnd = false;
+[A,shell/server/backup.js,134] 
+[A,shell/server/backup.js,135]       var stream = {
+[A,shell/server/backup.js,136]         expectSize: function (size) {
+[A,shell/server/backup.js,137]           if (!started) {
+[A,shell/server/backup.js,138]             started = true;
+[A,shell/server/backup.js,139]             response.writeHead(200, {
+[A,shell/server/backup.js,140]               "Content-Length": size,
+[A,shell/server/backup.js,141]               "Content-Type": "application/zip",
+[A,shell/server/backup.js,142]               "Content-Disposition": "attachment;filename=\"" + filename + "\""
+[A,shell/server/backup.js,143]             });
+[A,shell/server/backup.js,144]           }
+[A,shell/server/backup.js,145]         },
+[A,shell/server/backup.js,146]         write: function (data) {
+[A,shell/server/backup.js,147]           if (!started) {
+[A,shell/server/backup.js,148]             started = true;
+[A,shell/server/backup.js,149]             response.writeHead(200, {
+[A,shell/server/backup.js,150]               "Content-Type": "application/zip",
+[A,shell/server/backup.js,151]               "Content-Disposition": "attachment;filename=\"" + filename + "\""
+[A,shell/server/backup.js,152]             });
+[A,shell/server/backup.js,153]           }
+[A,shell/server/backup.js,154]           response.write(data);
+[A,shell/server/backup.js,155]         },
+[A,shell/server/backup.js,156]         done: function (data) {
+[A,shell/server/backup.js,157]           if (!started) {
+[A,shell/server/backup.js,158]             started = true;
+[A,shell/server/backup.js,159]             response.writeHead(200, {
+[A,shell/server/backup.js,160]               "Content-Length": 0,
+[A,shell/server/backup.js,161]               "Content-Type": "application/zip",
+[A,shell/server/backup.js,162]               "Content-Disposition": "attachment;filename=\"" + filename + "\""
+[A,shell/server/backup.js,163]             });
+[A,shell/server/backup.js,164]           }
+[A,shell/server/backup.js,165]           sawEnd = true;
+[A,shell/server/backup.js,166]           response.end();
+[A,shell/server/backup.js,167]         }
+[A,shell/server/backup.js,168]       };
+[C,shell/server/backup.js,169] 
+[D,shell/server/backup.js,333]       file.pipe(this.response);
+[A,shell/server/backup.js,170]       waitPromise(sandstormBackend.downloadBackup(this.params.tokenId, stream));
+[C,shell/server/backup.js,171] 
+[D,shell/server/backup.js,335]       fut.wait();
+[A,shell/server/backup.js,172]       if (!sawEnd) {
+[A,shell/server/backup.js,173]         console.error("backend failed to call done() when downloading backup");
+[A,shell/server/backup.js,174]         if (!started) {
+[A,shell/server/backup.js,175]           throw new Meteor.Error(500, "backend failed to produce data");
+[A,shell/server/backup.js,176]         }
+[A,shell/server/backup.js,177]         response.end();
+[A,shell/server/backup.js,178]       }
+[C,shell/server/backup.js,179] 
+[D,shell/server/backup.js,337]       Meteor.call("cleanupToken", this.params.tokenId);
+[D,shell/server/backup.js,338]       return this.response.end();
+[A,shell/server/backup.js,180]       cleanupToken(this.params.tokenId);
+[C,shell/server/backup.js,181]     }
+[C,shell/server/backup.js,182]   });
+[C,shell/server/backup.js,183] 
+[C,shell/server/backup.js,184]   this.route("uploadBackup", {
+[C,shell/server/backup.js,185]     where: "server",
+[C,shell/server/backup.js,186]     path: "/uploadBackup",
+[C,shell/server/backup.js,187]     action: function () {
+[C,shell/server/backup.js,188]       if (this.request.method === "POST") {
+[C,shell/server/backup.js,189]         var request = this.request;
+[C,shell/server/backup.js,190]         try {
+[D,shell/server/backup.js,349]           var self = this;
+[D,shell/server/backup.js,350]           var token = promiseToFuture(doGrainUpload(request)).wait();
+[A,shell/server/backup.js,191]           var token = {
+[A,shell/server/backup.js,192]             _id: Random.id(),
+[A,shell/server/backup.js,193]             timestamp: new Date()
+[A,shell/server/backup.js,194]           };
+[A,shell/server/backup.js,195]           var stream = sandstormBackend.uploadBackup(token._id).stream;
+[A,shell/server/backup.js,196] 
+[C,shell/server/backup.js,197]           FileTokens.insert(token);
+[D,shell/server/backup.js,352]           self.response.writeHead(200, {
+[A,shell/server/backup.js,198] 
+[A,shell/server/backup.js,199]           waitPromise(new Promise(function (resolve, reject) {
+[A,shell/server/backup.js,200]             request.on("data", function (data) {
+[A,shell/server/backup.js,201]               stream.write(data);
+[A,shell/server/backup.js,202]             });
+[A,shell/server/backup.js,203]             request.on("end", function () {
+[A,shell/server/backup.js,204]               resolve(stream.done());
+[A,shell/server/backup.js,205]             });
+[A,shell/server/backup.js,206]             request.on("error", function (err) {
+[A,shell/server/backup.js,207]               stream.close();
+[A,shell/server/backup.js,208]             });
+[A,shell/server/backup.js,209]           }));
+[A,shell/server/backup.js,210] 
+[A,shell/server/backup.js,211]           this.response.writeHead(200, {
+[C,shell/server/backup.js,212]             "Content-Length": token._id.length,
+[C,shell/server/backup.js,213]             "Content-Type": "text/plain"
+[C,shell/server/backup.js,214]           });
+[D,shell/server/backup.js,356]           self.response.write(token._id);
+[D,shell/server/backup.js,357]           self.response.end();
+[A,shell/server/backup.js,215]           this.response.write(token._id);
+[A,shell/server/backup.js,216]           this.response.end();
+[C,shell/server/backup.js,217]         } catch(error) {
+[C,shell/server/backup.js,218]           console.error(error.stack);
+[D,shell/server/backup.js,360]           self.response.writeHead(500, {
+[A,shell/server/backup.js,219]           this.response.writeHead(500, {
+[C,shell/server/backup.js,220]             "Content-Type": "text/plain"
+[C,shell/server/backup.js,221]           });
+[D,shell/server/backup.js,363]           self.response.write(error.stack);
+[D,shell/server/backup.js,364]           self.response.end();
+[A,shell/server/backup.js,222]           this.response.write(error.stack);
+[A,shell/server/backup.js,223]           this.response.end();
+[C,shell/server/backup.js,224]         }
+[C,shell/server/backup.js,225]       } else {
+[C,shell/server/backup.js,226]         this.response.writeHead(405, {
+[C,shell/server/backup.js,227]           "Content-Type": "text/plain"
+[C,shell/server/backup.js,228]         });
+[C,shell/server/backup.js,229]         this.response.write("You can only POST here.");
+[C,shell/server/backup.js,230]         this.response.end();
+[C,shell/server/backup.js,231]       }
+[C,shell/server/backup.js,232]     }
+[C,shell/server/backup.js,233]   });
+[C,shell/server/backup.js,234] });
+@@ -6,30 +6,31 @@
+[C,src/sandstorm/backend.c++,6] // you may not use this file except in compliance with the License.
+[C,src/sandstorm/backend.c++,7] // You may obtain a copy of the License at
+[C,src/sandstorm/backend.c++,8] //
+[C,src/sandstorm/backend.c++,9] //   http://www.apache.org/licenses/LICENSE-2.0
+[C,src/sandstorm/backend.c++,10] //
+[C,src/sandstorm/backend.c++,11] // Unless required by applicable law or agreed to in writing, software
+[C,src/sandstorm/backend.c++,12] // distributed under the License is distributed on an "AS IS" BASIS,
+[C,src/sandstorm/backend.c++,13] // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+[C,src/sandstorm/backend.c++,14] // See the License for the specific language governing permissions and
+[C,src/sandstorm/backend.c++,15] // limitations under the License.
+[C,src/sandstorm/backend.c++,16] 
+[C,src/sandstorm/backend.c++,17] #include "backend.h"
+[C,src/sandstorm/backend.c++,18] #include <kj/debug.h>
+[C,src/sandstorm/backend.c++,19] #include "util.h"
+[C,src/sandstorm/backend.c++,20] #include <capnp/serialize.h>
+[A,src/sandstorm/backend.c++,21] #include <capnp/serialize-async.h>
+[C,src/sandstorm/backend.c++,22] #include <stdio.h>  // rename()
+[C,src/sandstorm/backend.c++,23] 
+[C,src/sandstorm/backend.c++,24] namespace sandstorm {
+[C,src/sandstorm/backend.c++,25] 
+[C,src/sandstorm/backend.c++,26] static kj::StringPtr validateId(kj::StringPtr id) {
+[C,src/sandstorm/backend.c++,27]   KJ_REQUIRE(!id.startsWith(".") && id.findFirst('/') == nullptr, id);
+[C,src/sandstorm/backend.c++,28]   return id;
+[C,src/sandstorm/backend.c++,29] }
+[C,src/sandstorm/backend.c++,30] 
+[C,src/sandstorm/backend.c++,31] static void tryRecursivelyDelete(kj::StringPtr path) {
+[C,src/sandstorm/backend.c++,32]   static uint counter = 0;
+[C,src/sandstorm/backend.c++,33]   auto tmpPath = kj::str("/var/sandstorm/tmp/deleting.", time(nullptr), ".", counter++);
+[C,src/sandstorm/backend.c++,34] 
+[C,src/sandstorm/backend.c++,35]   while (rename(path.cStr(), tmpPath.cStr()) < 0) {
+[C,src/sandstorm/backend.c++,36]     int error = errno;
+@@ -184,31 +185,32 @@ kj::Promise<kj::String> BackendImpl::readAll(kj::AsyncInputStream& input, kj::Ve
+[C,src/sandstorm/backend.c++,185]   soFar.resize(soFar.size() + 4096);
+[C,src/sandstorm/backend.c++,186]   return input.tryRead(soFar.end() - 4096, 4096, 4096)
+[C,src/sandstorm/backend.c++,187]       .then([KJ_MVCAP(soFar),&input](size_t n) mutable -> kj::Promise<kj::String> {
+[C,src/sandstorm/backend.c++,188]     if (n < 4096) {
+[C,src/sandstorm/backend.c++,189]       // Must be EOF.
+[C,src/sandstorm/backend.c++,190]       soFar.resize(soFar.size() - 4096 + n);
+[C,src/sandstorm/backend.c++,191]       soFar.add('\0');
+[C,src/sandstorm/backend.c++,192]       return kj::String(soFar.releaseAsArray());
+[C,src/sandstorm/backend.c++,193]     } else {
+[C,src/sandstorm/backend.c++,194]       return readAll(input, kj::mv(soFar));
+[C,src/sandstorm/backend.c++,195]     }
+[C,src/sandstorm/backend.c++,196]   });
+[C,src/sandstorm/backend.c++,197] }
+[C,src/sandstorm/backend.c++,198] 
+[C,src/sandstorm/backend.c++,199] BackendImpl::RunningGrain::RunningGrain(
+[D,src/sandstorm/backend.c++,199]     BackendImpl& backend, kj::String grainId, kj::Own<kj::AsyncIoStream> stream, SandstormCore::Client&& core)
+[A,src/sandstorm/backend.c++,200]     BackendImpl& backend, kj::String grainId, kj::Own<kj::AsyncIoStream> stream,
+[A,src/sandstorm/backend.c++,201]     SandstormCore::Client&& core)
+[C,src/sandstorm/backend.c++,202]     : backend(backend), grainId(kj::mv(grainId)),
+[C,src/sandstorm/backend.c++,203]       stream(kj::mv(stream)), client(*this->stream, kj::mv(core)) {}
+[C,src/sandstorm/backend.c++,204] 
+[C,src/sandstorm/backend.c++,205] BackendImpl::RunningGrain::~RunningGrain() noexcept(false) {
+[C,src/sandstorm/backend.c++,206]   backend.supervisors.erase(grainId);
+[C,src/sandstorm/backend.c++,207] }
+[C,src/sandstorm/backend.c++,208] 
+[C,src/sandstorm/backend.c++,209] kj::Promise<void> BackendImpl::startGrain(StartGrainContext context) {
+[C,src/sandstorm/backend.c++,210]   auto params = context.getParams();
+[C,src/sandstorm/backend.c++,211]   return bootGrain(validateId(params.getGrainId()),
+[C,src/sandstorm/backend.c++,212]                    validateId(params.getPackageId()), params.getCommand(),
+[C,src/sandstorm/backend.c++,213]                    params.getIsNew(), params.getDevMode(), false)
+[C,src/sandstorm/backend.c++,214]       .then([context](Supervisor::Client client) mutable {
+[C,src/sandstorm/backend.c++,215]     context.getResults().setSupervisor(kj::mv(client));
+[C,src/sandstorm/backend.c++,216]   });
+@@ -379,17 +381,204 @@ kj::Promise<void> BackendImpl::getPackage(GetPackageContext context) {
+[C,src/sandstorm/backend.c++,381]   auto results = context.getResults(sizeHint);
+[C,src/sandstorm/backend.c++,382]   results.setAppId(trim(appid));
+[C,src/sandstorm/backend.c++,383]   results.setManifest(manifest);
+[C,src/sandstorm/backend.c++,384] 
+[C,src/sandstorm/backend.c++,385]   return kj::READY_NOW;
+[C,src/sandstorm/backend.c++,386] }
+[C,src/sandstorm/backend.c++,387] 
+[C,src/sandstorm/backend.c++,388] kj::Promise<void> BackendImpl::deletePackage(DeletePackageContext context) {
+[C,src/sandstorm/backend.c++,389]   auto path = kj::str("/var/sandstorm/apps/", validateId(context.getParams().getPackageId()));
+[C,src/sandstorm/backend.c++,390]   if (access(path.cStr(), F_OK) >= 0) {
+[C,src/sandstorm/backend.c++,391]     tryRecursivelyDelete(path);
+[C,src/sandstorm/backend.c++,392]   }
+[C,src/sandstorm/backend.c++,393]   return kj::READY_NOW;
+[C,src/sandstorm/backend.c++,394] }
+[C,src/sandstorm/backend.c++,395] 
+[A,src/sandstorm/backend.c++,396] // =======================================================================================
+[A,src/sandstorm/backend.c++,397] 
+[A,src/sandstorm/backend.c++,398] kj::Promise<void> BackendImpl::backupGrain(BackupGrainContext context) {
+[A,src/sandstorm/backend.c++,399]   auto params = context.getParams();
+[A,src/sandstorm/backend.c++,400] 
+[A,src/sandstorm/backend.c++,401]   auto path = kj::str("/var/sandstorm/backups/", params.getBackupId());
+[A,src/sandstorm/backend.c++,402]   recursivelyCreateParent(path);
+[A,src/sandstorm/backend.c++,403]   auto grainDir = kj::str("/var/sandstorm/grains/", params.getGrainId());
+[A,src/sandstorm/backend.c++,404]   Subprocess::Options processOptions({"backup", path, grainDir});
+[A,src/sandstorm/backend.c++,405]   processOptions.executable = "/proc/self/exe";
+[A,src/sandstorm/backend.c++,406]   auto inPipe = Pipe::make();
+[A,src/sandstorm/backend.c++,407]   processOptions.stdin = inPipe.readEnd;
+[A,src/sandstorm/backend.c++,408]   Subprocess process(kj::mv(processOptions));
+[A,src/sandstorm/backend.c++,409]   inPipe.readEnd = nullptr;
+[A,src/sandstorm/backend.c++,410] 
+[A,src/sandstorm/backend.c++,411]   auto metadata = params.getInfo();
+[A,src/sandstorm/backend.c++,412]   auto metadataMsg = kj::heap<capnp::MallocMessageBuilder>(metadata.totalSize().wordCount + 4);
+[A,src/sandstorm/backend.c++,413]   metadataMsg->setRoot(metadata);
+[A,src/sandstorm/backend.c++,414]   context.releaseParams();
+[A,src/sandstorm/backend.c++,415]   auto metadataStreamFd = kj::mv(inPipe.writeEnd);
+[A,src/sandstorm/backend.c++,416]   auto output = ioProvider.wrapOutputFd(
+[A,src/sandstorm/backend.c++,417]       metadataStreamFd, kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC);
+[A,src/sandstorm/backend.c++,418]   auto promise = capnp::writeMessage(*output, *metadataMsg);
+[A,src/sandstorm/backend.c++,419] 
+[A,src/sandstorm/backend.c++,420]   return promise.attach(kj::mv(metadataMsg), kj::mv(metadataStreamFd), kj::mv(output))
+[A,src/sandstorm/backend.c++,421]       .then([KJ_MVCAP(process)]() mutable {
+[A,src/sandstorm/backend.c++,422]     // TODO(cleanup): We should probably use a SubprocessSet to wait asynchronously, but that
+[A,src/sandstorm/backend.c++,423]     //   means we need to use SubprocessSet everywhere...
+[A,src/sandstorm/backend.c++,424]     process.waitForSuccess();
+[A,src/sandstorm/backend.c++,425]   });
+[A,src/sandstorm/backend.c++,426] }
+[A,src/sandstorm/backend.c++,427] 
+[A,src/sandstorm/backend.c++,428] kj::Promise<void> BackendImpl::restoreGrain(RestoreGrainContext context) {
+[A,src/sandstorm/backend.c++,429]   auto params = context.getParams();
+[A,src/sandstorm/backend.c++,430] 
+[A,src/sandstorm/backend.c++,431]   auto path = kj::str("/var/sandstorm/backups/", params.getBackupId());
+[A,src/sandstorm/backend.c++,432]   auto grainDir = kj::str("/var/sandstorm/grains/", params.getGrainId());
+[A,src/sandstorm/backend.c++,433]   KJ_SYSCALL(mkdir(grainDir.cStr(), 0777));
+[A,src/sandstorm/backend.c++,434]   Subprocess::Options processOptions({"backup", "-r", path, grainDir});
+[A,src/sandstorm/backend.c++,435]   processOptions.executable = "/proc/self/exe";
+[A,src/sandstorm/backend.c++,436]   auto outPipe = Pipe::make();
+[A,src/sandstorm/backend.c++,437]   processOptions.stdout = outPipe.writeEnd;
+[A,src/sandstorm/backend.c++,438]   Subprocess process(kj::mv(processOptions));
+[A,src/sandstorm/backend.c++,439]   outPipe.writeEnd = nullptr;
+[A,src/sandstorm/backend.c++,440] 
+[A,src/sandstorm/backend.c++,441]   context.releaseParams();
+[A,src/sandstorm/backend.c++,442] 
+[A,src/sandstorm/backend.c++,443]   auto input = kj::mv(outPipe.readEnd);
+[A,src/sandstorm/backend.c++,444]   auto asyncInput = ioProvider.wrapInputFd(input, kj::LowLevelAsyncIoProvider::ALREADY_CLOEXEC);
+[A,src/sandstorm/backend.c++,445] 
+[A,src/sandstorm/backend.c++,446]   auto promise = capnp::readMessage(*asyncInput);
+[A,src/sandstorm/backend.c++,447]   return promise.attach(kj::mv(input), kj::mv(asyncInput), kj::mv(process))
+[A,src/sandstorm/backend.c++,448]       .then([context](kj::Own<capnp::MessageReader>&& message) mutable {
+[A,src/sandstorm/backend.c++,449]     auto metadata = message->getRoot<GrainInfo>();
+[A,src/sandstorm/backend.c++,450]     context.getResults(capnp::MessageSize { metadata.totalSize().wordCount + 4, 0 })
+[A,src/sandstorm/backend.c++,451]         .setInfo(metadata);
+[A,src/sandstorm/backend.c++,452]   });
+[A,src/sandstorm/backend.c++,453] }
+[A,src/sandstorm/backend.c++,454] 
+[A,src/sandstorm/backend.c++,455] class BackendImpl::FileUploadStream: public ByteStream::Server {
+[A,src/sandstorm/backend.c++,456] public:
+[A,src/sandstorm/backend.c++,457]   FileUploadStream(kj::String finalPath)
+[A,src/sandstorm/backend.c++,458]       : fd(raiiOpen(dirname(finalPath), O_WRONLY | O_TMPFILE)),
+[A,src/sandstorm/backend.c++,459]         finalPath(kj::mv(finalPath)) {}
+[A,src/sandstorm/backend.c++,460] 
+[A,src/sandstorm/backend.c++,461] protected:
+[A,src/sandstorm/backend.c++,462]   kj::Promise<void> write(WriteContext context) override {
+[A,src/sandstorm/backend.c++,463]     auto data = context.getParams().getData();
+[A,src/sandstorm/backend.c++,464]     kj::FdOutputStream(fd.get()).write(data.begin(), data.size());
+[A,src/sandstorm/backend.c++,465]     return kj::READY_NOW;
+[A,src/sandstorm/backend.c++,466]   }
+[A,src/sandstorm/backend.c++,467] 
+[A,src/sandstorm/backend.c++,468]   kj::Promise<void> done(DoneContext context) override {
+[A,src/sandstorm/backend.c++,469]     KJ_SYSCALL(fdatasync(fd));
+[A,src/sandstorm/backend.c++,470] 
+[A,src/sandstorm/backend.c++,471]     // Link temporary file into filesystem.
+[A,src/sandstorm/backend.c++,472]     KJ_SYSCALL(linkat(AT_FDCWD, kj::str("/proc/self/fd/", fd.get()).cStr(),
+[A,src/sandstorm/backend.c++,473]                       AT_FDCWD, finalPath.cStr(), AT_SYMLINK_FOLLOW));
+[A,src/sandstorm/backend.c++,474]     return kj::READY_NOW;
+[A,src/sandstorm/backend.c++,475]   }
+[A,src/sandstorm/backend.c++,476] 
+[A,src/sandstorm/backend.c++,477]   kj::Promise<void> expectSize(ExpectSizeContext context) override {
+[A,src/sandstorm/backend.c++,478]     // don't care
+[A,src/sandstorm/backend.c++,479]     return kj::READY_NOW;
+[A,src/sandstorm/backend.c++,480]   }
+[A,src/sandstorm/backend.c++,481] 
+[A,src/sandstorm/backend.c++,482] private:
+[A,src/sandstorm/backend.c++,483]   kj::AutoCloseFd fd;
+[A,src/sandstorm/backend.c++,484]   kj::String finalPath;
+[A,src/sandstorm/backend.c++,485] 
+[A,src/sandstorm/backend.c++,486]   static kj::String dirname(kj::StringPtr path) {
+[A,src/sandstorm/backend.c++,487]     KJ_IF_MAYBE(pos, path.findLast('/')) {
+[A,src/sandstorm/backend.c++,488]       return kj::heapString(path.slice(0, *pos));
+[A,src/sandstorm/backend.c++,489]     } else {
+[A,src/sandstorm/backend.c++,490]       return kj::heapString(".");
+[A,src/sandstorm/backend.c++,491]     }
+[A,src/sandstorm/backend.c++,492]   }
+[A,src/sandstorm/backend.c++,493] };
+[A,src/sandstorm/backend.c++,494] 
+[A,src/sandstorm/backend.c++,495] kj::Promise<void> BackendImpl::pump(kj::AsyncInputStream& input, ByteStream::Client stream) {
+[A,src/sandstorm/backend.c++,496]   auto req = stream.writeRequest(capnp::MessageSize { 2100, 0 });
+[A,src/sandstorm/backend.c++,497]   auto orphanage = capnp::Orphanage::getForMessageContaining(
+[A,src/sandstorm/backend.c++,498]       kj::implicitCast<ByteStream::WriteParams::Builder>(req));
+[A,src/sandstorm/backend.c++,499]   auto orphan = orphanage.newOrphan<capnp::Data>(8192);
+[A,src/sandstorm/backend.c++,500]   auto buffer = orphan.get();
+[A,src/sandstorm/backend.c++,501] 
+[A,src/sandstorm/backend.c++,502]   return input.tryRead(buffer.begin(), 1, buffer.size())
+[A,src/sandstorm/backend.c++,503]       .then([&input,KJ_MVCAP(stream),KJ_MVCAP(req),KJ_MVCAP(orphan)](size_t n) mutable
+[A,src/sandstorm/backend.c++,504]             -> kj::Promise<void> {
+[A,src/sandstorm/backend.c++,505]     if (n == 0) {
+[A,src/sandstorm/backend.c++,506]       return kj::READY_NOW;
+[A,src/sandstorm/backend.c++,507]     }
+[A,src/sandstorm/backend.c++,508] 
+[A,src/sandstorm/backend.c++,509]     orphan.truncate(n);
+[A,src/sandstorm/backend.c++,510]     req.adoptData(kj::mv(orphan));
+[A,src/sandstorm/backend.c++,511] 
+[A,src/sandstorm/backend.c++,512]     // TODO(now): Parallelize writes.
+[A,src/sandstorm/backend.c++,513]     return req.send().then([&input,KJ_MVCAP(stream)](auto&&) mutable {
+[A,src/sandstorm/backend.c++,514]       return pump(input, kj::mv(stream));
+[A,src/sandstorm/backend.c++,515]     });
+[A,src/sandstorm/backend.c++,516]   });
+[A,src/sandstorm/backend.c++,517] }
+[A,src/sandstorm/backend.c++,518] 
+[A,src/sandstorm/backend.c++,519] kj::Promise<void> BackendImpl::pump(kj::InputStream& input, ByteStream::Client stream) {
+[A,src/sandstorm/backend.c++,520]   auto req = stream.writeRequest(capnp::MessageSize { 2100, 0 });
+[A,src/sandstorm/backend.c++,521]   auto orphanage = capnp::Orphanage::getForMessageContaining(
+[A,src/sandstorm/backend.c++,522]       kj::implicitCast<ByteStream::WriteParams::Builder>(req));
+[A,src/sandstorm/backend.c++,523]   auto orphan = orphanage.newOrphan<capnp::Data>(8192);
+[A,src/sandstorm/backend.c++,524]   auto buffer = orphan.get();
+[A,src/sandstorm/backend.c++,525] 
+[A,src/sandstorm/backend.c++,526]   size_t n = input.tryRead(buffer.begin(), 1, buffer.size());
+[A,src/sandstorm/backend.c++,527]   if (n == 0) {
+[A,src/sandstorm/backend.c++,528]     return kj::READY_NOW;
+[A,src/sandstorm/backend.c++,529]   }
+[A,src/sandstorm/backend.c++,530] 
+[A,src/sandstorm/backend.c++,531]   orphan.truncate(n);
+[A,src/sandstorm/backend.c++,532]   req.adoptData(kj::mv(orphan));
+[A,src/sandstorm/backend.c++,533] 
+[A,src/sandstorm/backend.c++,534]   // TODO(now): Parallelize writes.
+[A,src/sandstorm/backend.c++,535]   return req.send().then([&input,KJ_MVCAP(stream)](auto&&) mutable {
+[A,src/sandstorm/backend.c++,536]     return pump(input, kj::mv(stream));
+[A,src/sandstorm/backend.c++,537]   });
+[A,src/sandstorm/backend.c++,538] }
+[A,src/sandstorm/backend.c++,539] 
+[A,src/sandstorm/backend.c++,540] kj::Promise<void> BackendImpl::uploadBackup(UploadBackupContext context) {
+[A,src/sandstorm/backend.c++,541]   auto path = kj::str("/var/sandstorm/backups/", context.getParams().getBackupId());
+[A,src/sandstorm/backend.c++,542]   context.releaseParams();
+[A,src/sandstorm/backend.c++,543] 
+[A,src/sandstorm/backend.c++,544]   recursivelyCreateParent(path);
+[A,src/sandstorm/backend.c++,545] 
+[A,src/sandstorm/backend.c++,546]   context.getResults(capnp::MessageSize { 4, 1 }).setStream(
+[A,src/sandstorm/backend.c++,547]       kj::heap<FileUploadStream>(kj::mv(path)));
+[A,src/sandstorm/backend.c++,548]   return kj::READY_NOW;
+[A,src/sandstorm/backend.c++,549] }
+[A,src/sandstorm/backend.c++,550] 
+[A,src/sandstorm/backend.c++,551] kj::Promise<void> BackendImpl::downloadBackup(DownloadBackupContext context) {
+[A,src/sandstorm/backend.c++,552]   auto params = context.getParams();
+[A,src/sandstorm/backend.c++,553]   auto path = kj::str("/var/sandstorm/backups/", params.getBackupId());
+[A,src/sandstorm/backend.c++,554]   auto stream = params.getStream();
+[A,src/sandstorm/backend.c++,555]   context.releaseParams();
+[A,src/sandstorm/backend.c++,556] 
+[A,src/sandstorm/backend.c++,557]   auto fd = raiiOpen(path, O_RDONLY | O_CLOEXEC);
+[A,src/sandstorm/backend.c++,558]   struct stat stats;
+[A,src/sandstorm/backend.c++,559]   KJ_SYSCALL(fstat(fd, &stats));
+[A,src/sandstorm/backend.c++,560]   auto expectReq = stream.expectSizeRequest();
+[A,src/sandstorm/backend.c++,561]   expectReq.setSize(stats.st_size);
+[A,src/sandstorm/backend.c++,562]   auto expectPromise = expectReq.send();
+[A,src/sandstorm/backend.c++,563] 
+[A,src/sandstorm/backend.c++,564]   auto file = kj::heap<kj::FdInputStream>(kj::mv(fd));
+[A,src/sandstorm/backend.c++,565] 
+[A,src/sandstorm/backend.c++,566]   auto promise = pump(*file, kj::mv(stream));
+[A,src/sandstorm/backend.c++,567]   return promise.attach(kj::mv(file), kj::mv(expectPromise));
+[A,src/sandstorm/backend.c++,568] }
+[A,src/sandstorm/backend.c++,569] 
+[A,src/sandstorm/backend.c++,570] kj::Promise<void> BackendImpl::deleteBackup(DeleteBackupContext context) {
+[A,src/sandstorm/backend.c++,571]   auto path = kj::str("/var/sandstorm/backups/", context.getParams().getBackupId());
+[A,src/sandstorm/backend.c++,572]   while (unlink(path.cStr()) < 0) {
+[A,src/sandstorm/backend.c++,573]     int error = errno;
+[A,src/sandstorm/backend.c++,574]     if (error == ENOENT) {
+[A,src/sandstorm/backend.c++,575]       break;
+[A,src/sandstorm/backend.c++,576]     } else if (error != EINTR) {
+[A,src/sandstorm/backend.c++,577]       KJ_FAIL_SYSCALL("unlink", error, path);
+[A,src/sandstorm/backend.c++,578]     }
+[A,src/sandstorm/backend.c++,579]   }
+[A,src/sandstorm/backend.c++,580]   return kj::READY_NOW;
+[A,src/sandstorm/backend.c++,581] }
+[A,src/sandstorm/backend.c++,582] 
+[C,src/sandstorm/backend.c++,583] } // namespace sandstorm
+[C,src/sandstorm/backend.c++,584] 
+@@ -30,43 +30,54 @@ interface Backend {
+[C,src/sandstorm/backend.capnp,30]   # "/var/sandstorm/socket/backend".
+[C,src/sandstorm/backend.capnp,31] 
+[C,src/sandstorm/backend.capnp,32]   const socketPath :Text = "/var/sandstorm/socket/backend";
+[C,src/sandstorm/backend.capnp,33] 
+[C,src/sandstorm/backend.capnp,34]   startGrain @0 (ownerId :Text, grainId :Text, packageId :Text,
+[C,src/sandstorm/backend.capnp,35]                  command :Package.Manifest.Command, isNew :Bool, devMode :Bool = false)
+[C,src/sandstorm/backend.capnp,36]              -> (supervisor :Supervisor);
+[C,src/sandstorm/backend.capnp,37]   # Start a grain.
+[C,src/sandstorm/backend.capnp,38] 
+[C,src/sandstorm/backend.capnp,39]   getGrain @1 (ownerId :Text, grainId :Text) -> (supervisor :Supervisor);
+[C,src/sandstorm/backend.capnp,40]   # Get the grain if it's running, or throw a DISCONNECTED exception otherwise.
+[C,src/sandstorm/backend.capnp,41] 
+[C,src/sandstorm/backend.capnp,42]   deleteGrain @2 (ownerId :Text, grainId :Text);
+[C,src/sandstorm/backend.capnp,43]   # Delete a grain from disk. Succeeds silently if the grain doesn't exist.
+[C,src/sandstorm/backend.capnp,44] 
+[A,src/sandstorm/backend.capnp,45]   # ----------------------------------------------------------------------------
+[A,src/sandstorm/backend.capnp,46] 
+[C,src/sandstorm/backend.capnp,47]   installPackage @3 () -> (stream :PackageUploadStream);
+[C,src/sandstorm/backend.capnp,48]   interface PackageUploadStream extends(Util.ByteStream) {
+[C,src/sandstorm/backend.capnp,49]     saveAs @0 (packageId :Text) -> (appId :Text, manifest :Package.Manifest);
+[C,src/sandstorm/backend.capnp,50]   }
+[C,src/sandstorm/backend.capnp,51] 
+[C,src/sandstorm/backend.capnp,52]   getPackage @4 (packageId :Text) -> (appId :Text, manifest :Package.Manifest);
+[C,src/sandstorm/backend.capnp,53]   # Get info from an already-installed package.
+[C,src/sandstorm/backend.capnp,54] 
+[C,src/sandstorm/backend.capnp,55]   deletePackage @5 (packageId :Text);
+[C,src/sandstorm/backend.capnp,56]   # Delete a package from disk. Succeeds silently if the package doesn't exist.
+[C,src/sandstorm/backend.capnp,57] 
+[D,src/sandstorm/backend.capnp,56]   backupGrain @6 (ownerId :Text, grainId :Text, info :GrainInfo, stream :Util.ByteStream);
+[D,src/sandstorm/backend.capnp,57]   # Makes a .zip of the contents of the given grain and writes the content to `stream`.
+[A,src/sandstorm/backend.capnp,58]   # ----------------------------------------------------------------------------
+[A,src/sandstorm/backend.capnp,59]   # backups
+[C,src/sandstorm/backend.capnp,60] 
+[D,src/sandstorm/backend.capnp,59]   restoreGrain @7 (ownerId :Text, grainId :Text) -> (stream :GrainUploadStream);
+[D,src/sandstorm/backend.capnp,60]   # Upload a .zip created with backupGrain() and unpack it into a new grain.
+[A,src/sandstorm/backend.capnp,61]   backupGrain @6 (backupId :Text, ownerId :Text, grainId :Text, info :GrainInfo);
+[A,src/sandstorm/backend.capnp,62]   # Makes a .zip of the contents of the given grain and stores it as a backup file.
+[C,src/sandstorm/backend.capnp,63] 
+[D,src/sandstorm/backend.capnp,62]   interface GrainUploadStream extends(Util.ByteStream) {
+[D,src/sandstorm/backend.capnp,63]     getInfo @0 () -> (info :GrainInfo);
+[D,src/sandstorm/backend.capnp,64]   }
+[A,src/sandstorm/backend.capnp,64]   restoreGrain @7 (backupId :Text, ownerId :Text, grainId :Text) -> (info :GrainInfo);
+[A,src/sandstorm/backend.capnp,65]   # Unpack a stored backup into a new grain.
+[A,src/sandstorm/backend.capnp,66] 
+[A,src/sandstorm/backend.capnp,67]   uploadBackup @8 (backupId :Text) -> (stream :Util.ByteStream);
+[A,src/sandstorm/backend.capnp,68]   # Upload a zip to create a new backup. If `stream.done()` does not get called and return
+[A,src/sandstorm/backend.capnp,69]   # successfully, the backup wasn't saved.
+[A,src/sandstorm/backend.capnp,70] 
+[A,src/sandstorm/backend.capnp,71]   downloadBackup @9 (backupId :Text, stream :Util.ByteStream);
+[A,src/sandstorm/backend.capnp,72]   # Download a stored backup, writing it to `stream`.
+[A,src/sandstorm/backend.capnp,73] 
+[A,src/sandstorm/backend.capnp,74]   deleteBackup @10 (backupId :Text);
+[A,src/sandstorm/backend.capnp,75]   # Delete a stored backup form disk. Succeeds silently if the backup doesn't exist.
+[C,src/sandstorm/backend.capnp,76] }
+[C,src/sandstorm/backend.capnp,77] 
+[C,src/sandstorm/backend.capnp,78] interface SandstormCoreFactory {
+[C,src/sandstorm/backend.capnp,79]   # Interface that the Sandstorm front-end exports to the backend for creating a SandstormCore
+[C,src/sandstorm/backend.capnp,80]   # for a grain. Eventually, we'll move away from implementing SandstormCore in the front-end and
+[C,src/sandstorm/backend.capnp,81]   # have it be implemented in the backend. This interface will go away then.
+[C,src/sandstorm/backend.capnp,82]   getSandstormCore @0 (grainId :Text) -> (core :SandstormCore);
+[C,src/sandstorm/backend.capnp,83] }
+@@ -12,77 +12,92 @@
+[C,src/sandstorm/backend.h,12] // distributed under the License is distributed on an "AS IS" BASIS,
+[C,src/sandstorm/backend.h,13] // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+[C,src/sandstorm/backend.h,14] // See the License for the specific language governing permissions and
+[C,src/sandstorm/backend.h,15] // limitations under the License.
+[C,src/sandstorm/backend.h,16] 
+[C,src/sandstorm/backend.h,17] #ifndef SANDSTORM_BACKEND_H_
+[C,src/sandstorm/backend.h,18] #define SANDSTORM_BACKEND_H_
+[C,src/sandstorm/backend.h,19] 
+[C,src/sandstorm/backend.h,20] #include <sandstorm/backend.capnp.h>
+[C,src/sandstorm/backend.h,21] #include <map>
+[C,src/sandstorm/backend.h,22] #include <kj/async-io.h>
+[C,src/sandstorm/backend.h,23] #include <capnp/rpc-twoparty.h>
+[C,src/sandstorm/backend.h,24] #include <kj/one-of.h>
+[C,src/sandstorm/backend.h,25] #include <kj/vector.h>
+[C,src/sandstorm/backend.h,26] 
+[A,src/sandstorm/backend.h,27] namespace kj {
+[A,src/sandstorm/backend.h,28]   class InputStream;
+[A,src/sandstorm/backend.h,29] }
+[A,src/sandstorm/backend.h,30] 
+[C,src/sandstorm/backend.h,31] namespace sandstorm {
+[C,src/sandstorm/backend.h,32] 
+[C,src/sandstorm/backend.h,33] class BackendImpl: public Backend::Server, private kj::TaskSet::ErrorHandler {
+[C,src/sandstorm/backend.h,34] public:
+[D,src/sandstorm/backend.h,31]   BackendImpl(kj::LowLevelAsyncIoProvider& ioProvider, kj::Network& network, SandstormCoreFactory::Client&& sandstormCoreFactory);
+[A,src/sandstorm/backend.h,35]   BackendImpl(kj::LowLevelAsyncIoProvider& ioProvider, kj::Network& network,
+[A,src/sandstorm/backend.h,36]               SandstormCoreFactory::Client&& sandstormCoreFactory);
+[C,src/sandstorm/backend.h,37] 
+[C,src/sandstorm/backend.h,38] protected:
+[C,src/sandstorm/backend.h,39]   kj::Promise<void> startGrain(StartGrainContext context) override;
+[C,src/sandstorm/backend.h,40]   kj::Promise<void> getGrain(GetGrainContext context) override;
+[C,src/sandstorm/backend.h,41]   kj::Promise<void> deleteGrain(DeleteGrainContext context) override;
+[C,src/sandstorm/backend.h,42]   kj::Promise<void> installPackage(InstallPackageContext context) override;
+[C,src/sandstorm/backend.h,43]   kj::Promise<void> getPackage(GetPackageContext context) override;
+[C,src/sandstorm/backend.h,44]   kj::Promise<void> deletePackage(DeletePackageContext context) override;
+[A,src/sandstorm/backend.h,45]   kj::Promise<void> backupGrain(BackupGrainContext context) override;
+[A,src/sandstorm/backend.h,46]   kj::Promise<void> restoreGrain(RestoreGrainContext context) override;
+[A,src/sandstorm/backend.h,47]   kj::Promise<void> uploadBackup(UploadBackupContext context) override;
+[A,src/sandstorm/backend.h,48]   kj::Promise<void> downloadBackup(DownloadBackupContext context) override;
+[A,src/sandstorm/backend.h,49]   kj::Promise<void> deleteBackup(DeleteBackupContext context) override;
+[C,src/sandstorm/backend.h,50] 
+[C,src/sandstorm/backend.h,51] private:
+[C,src/sandstorm/backend.h,52]   kj::LowLevelAsyncIoProvider& ioProvider;
+[C,src/sandstorm/backend.h,53]   kj::Network& network;
+[C,src/sandstorm/backend.h,54]   SandstormCoreFactory::Client coreFactory;
+[C,src/sandstorm/backend.h,55]   kj::TaskSet tasks;
+[C,src/sandstorm/backend.h,56] 
+[C,src/sandstorm/backend.h,57]   class RunningGrain {
+[C,src/sandstorm/backend.h,58]   public:
+[D,src/sandstorm/backend.h,49]     RunningGrain(BackendImpl& backend, kj::String grainId, kj::Own<kj::AsyncIoStream> stream, SandstormCore::Client&& sandstormCoreFactory);

@@ -1,0 +1,229 @@
+{
+  "candidate_id": "candidate-6",
+  "filepath": "src/wagtail_2fa/views.py",
+  "changed_line": 138,
+  "statement": "class DeviceQRCodeView(OtpRequiredMixin, View):",
+  "change_type": "A",
+  "function_name": "DeviceQRCodeView",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "observable input/state (view class inheritance) -> exact operation (adding OtpRequiredMixin) -> security-sensitive effect (enforces OTP requirement for device QR code view)",
+  "security_relevance_score": 0.75,
+  "code_context": "1: import qrcode\n2: import qrcode.image.svg\n3: from django.conf import settings\n4: from django.contrib.auth import REDIRECT_FIELD_NAME\n5: from django.contrib.auth.views import SuccessURLAllowedHostsMixin\n6: from django.http import HttpResponse\n7: from django.shortcuts import resolve_url\n8: from django.urls import reverse\n9: from django.utils.decorators import method_decorator\n10: from django.utils.functional import cached_property\n11: from django.utils.http import is_safe_url\n12: from django.views.decorators.cache import never_cache\n13: from django.views.decorators.debug import sensitive_post_parameters\n14: from django.views.generic import (\n15:     DeleteView, FormView, ListView, UpdateView, View)\n16: from django_otp import login as otp_login\n17: from django_otp.plugins.otp_totp.models import TOTPDevice\n18: \n19: from wagtail_2fa import forms, utils\n20: from wagtail_2fa.mixins import OtpRequiredMixin\n21: \n22: \n23: class LoginView(SuccessURLAllowedHostsMixin, FormView):\n24:     template_name = \"wagtail_2fa/otp_form.html\"\n25:     form_class = forms.TokenForm\n26:     redirect_field_name = REDIRECT_FIELD_NAME\n27: \n28:     @method_decorator(sensitive_post_parameters())\n29:     @method_decorator(never_cache)\n30:     def dispatch(self, *args, **kwargs):\n31:         return super().dispatch(*args, **kwargs)\n32: \n33:     def get_form_kwargs(self):\n34:         kwargs = super().get_form_kwargs()\n35:         kwargs[\"user\"] = self.request.user\n36:         return kwargs\n37: \n38:     def get_context_data(self, *args, **kwargs):\n39:         context = super().get_context_data(*args, **kwargs)\n40:         context[self.redirect_field_name] = self.get_redirect_url()\n41:         return context\n42: \n43:     def form_valid(self, form):\n44:         otp_login(self.request, self.request.user.otp_device)\n45:         return super().form_valid(form)\n46: \n47:     def get_redirect_url(self):\n48:         \"\"\"Return the user-originating redirect URL if it's safe.\"\"\"\n49:         redirect_to = self.request.POST.get(\n50:             self.redirect_field_name, self.request.GET.get(self.redirect_field_name, \"\")\n51:         )\n52:         url_is_safe = is_safe_url(\n53:             url=redirect_to,\n54:             allowed_hosts=self.get_success_url_allowed_hosts(),\n55:             require_https=self.request.is_secure(),\n56:         )\n57:         return redirect_to if url_is_safe else \"\"\n58: \n59:     def get_success_url(self):\n60:         url = self.get_redirect_url()\n61:         return url or resolve_url(settings.LOGIN_REDIRECT_URL)\n62: \n63: \n64: class DeviceListView(OtpRequiredMixin, ListView):\n65:     template_name = \"wagtail_2fa/device_list.html\"\n66: \n67:     # require OTP if configured\n68:     if_configured = True\n69: \n70:     def get_queryset(self):\n71:         return TOTPDevice.objects.devices_for_user(self.kwargs['user_id'], confirmed=True)\n72: \n73:     def get_context_data(self, **kwargs):\n74:         context = super().get_context_data(**kwargs)\n75:         context['user_id'] = int(self.kwargs['user_id'])\n76:         return context\n77: \n78: \n79: class DeviceCreateView(OtpRequiredMixin, FormView):\n80:     form_class = forms.DeviceForm\n81:     template_name = \"wagtail_2fa/device_form.html\"\n82: \n83:     # require OTP if configured\n84:     if_configured = True\n85: \n86:     def get_form_kwargs(self):\n87:         kwargs = super().get_form_kwargs()\n88:         kwargs[\"user\"] = self.request.user\n89:         kwargs[\"instance\"] = self.device\n90:         return kwargs\n91: \n92:     def form_valid(self, form):\n93:         form.save()\n94:         utils.delete_unconfirmed_devices(form.user)\n95: \n96:         if not self.request.user.is_verified():\n97:             otp_login(self.request, form.instance)\n98:         return super().form_valid(form)\n99: \n100:     def get_success_url(self):\n101:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n102: \n103:     @cached_property\n104:     def device(self):\n105:         if self.request.method.lower() == \"get\":\n106:             return utils.new_unconfirmed_device(self.request.user)\n107:         else:\n108:             return utils.get_unconfirmed_device(self.request.user)\n109: \n110: \n111: class DeviceUpdateView(OtpRequiredMixin, UpdateView):\n112:     form_class = forms.DeviceForm\n113:     template_name = \"wagtail_2fa/device_form.html\"\n114: \n115:     def get_queryset(self):\n116:         return TOTPDevice.objects.devices_for_user(self.request.user, confirmed=True)\n117: \n118:     def get_form_kwargs(self):\n119:         kwargs = super().get_form_kwargs()\n120:         kwargs[\"user\"] = self.request.user\n121:         return kwargs\n122: \n123:     def get_success_url(self):\n124:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.user.id})\n125: \n126: \n127: class DeviceDeleteView(OtpRequiredMixin, DeleteView):\n128:     template_name = \"wagtail_2fa/device_confirm_delete.html\"\n129: \n130:     def get_queryset(self):\n131:         device = TOTPDevice.objects.get(**self.kwargs)\n132:         return TOTPDevice.objects.devices_for_user(device.user, confirmed=True)\n133: \n134:     def get_success_url(self):\n135:         return reverse('wagtail_2fa_device_list', kwargs={'user_id': self.request.POST.get('user_id')})\n136: \n137: \n138: class DeviceQRCodeView(OtpRequiredMixin, View):\n139:     # require OTP if configured\n140:     if_configured = True\n141: \n142:     def get(self, request):\n143:         device = utils.get_unconfirmed_device(self.request.user)\n144:         img = qrcode.make(device.config_url, image_factory=qrcode.image.svg.SvgImage)\n145:         response = HttpResponse(content_type=\"image/svg+xml\")\n146:         img.save(response)\n147: \n148:         return response",
+  "source_summary": "The view inherits from OtpRequiredMixin which requires OTP verification for access. The device QR code is generated using get_unconfirmed_device() which retrieves the first unconfirmed TOTP device for the user.",
+  "sink_summary": "The view returns an HTTP response containing a QR code image (SVG format) that encodes the configuration URL for a TOTP device. This is a security-sensitive output as it contains authentication information.",
+  "guard_summary": "The view uses OtpRequiredMixin which enforces OTP requirement before allowing access to the QR code generation. The mixin checks if user is verified or if OTP is configured but not required (if_configured = True).",
+  "risk_pattern": "The DeviceQRCodeView requires OTP verification before generating a QR code for TOTP device setup, ensuring that only authenticated and verified users can generate device configuration information.",
+  "used_variable_sources": [
+    "request.user"
+  ],
+  "called_function_context": [
+    "utils.get_unconfirmed_device(self.request.user)",
+    "TOTPDevice.objects.devices_for_user(user, confirmed=False).first()"
+  ],
+  "enclosing_conditions": [
+    "OtpRequiredMixin test() method checks user.is_verified() or (self.if_configured and user.is_authenticated and not user_has_device(user))"
+  ],
+  "context_summary": "The DeviceQRCodeView class inherits from OtpRequiredMixin and View. It requires OTP verification before allowing access to generate a QR code for TOTP device setup. The view uses get_unconfirmed_device() to retrieve the user's unconfirmed device and generates an SVG QR code containing the device configuration URL.",
+  "unresolved_facts": [],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "fit_reason": "The DeviceQRCodeView requires OTP verification but the mechanism of accessing unconfirmed device configuration URLs directly could allow forced browsing if not properly secured",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "While OtpRequiredMixin is used, there may be incorrect authorization logic in how the unconfirmed device is retrieved and validated for QR code generation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-200",
+      "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+      "fit_reason": "The view exposes TOTP device configuration URLs in QR codes which contain sensitive authentication information",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-113",
+    "CWE-116",
+    "CWE-200",
+    "CWE-208",
+    "CWE-425",
+    "CWE-561",
+    "CWE-628",
+    "CWE-685",
+    "CWE-79",
+    "CWE-863",
+    "CWE-93",
+    "CWE-94"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 138,
+      "statement": "class DeviceQRCodeView(OtpRequiredMixin, View):",
+      "cwe_id": "CWE-425",
+      "cwe_name": "Direct Request ('Forced Browsing')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "The mechanism of CWE-425 involves unauthorized access to restricted resources through direct URL requests without proper authorization checks. The DeviceQRCodeView does enforce OTP verification via OtpRequiredMixin, which contradicts the core mechanism of forced browsing."
+        },
+        "connection": {
+          "score": 0.0,
+          "evidence": "There is no demonstrated connection between externally controlled input and the vulnerable operation in DeviceQRCodeView. The view generates a QR code for a user's unconfirmed device, which requires OTP verification, not direct access to restricted resources."
+        },
+        "diff_causality": {
+          "score": 0.0,
+          "evidence": "The addition of OtpRequiredMixin to DeviceQRCodeView does not introduce or remove a vulnerability related to forced browsing. The change enforces OTP requirement, which is contrary to the mechanism of CWE-425."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "The view uses OtpRequiredMixin which enforces OTP verification before allowing access to the QR code generation. This control prevents unauthorized access, directly contradicting the requirements for CWE-425.",
+          "required_control": "Authorization enforcement",
+          "control_requirement_evidence": "CWE-425 requires that all restricted URLs or resources are properly authorized, preventing direct access without proper authentication.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin enforces OTP verification before accessing DeviceQRCodeView"
+          ],
+          "deficiency_evidence": "No deficiency found; the view correctly implements authorization enforcement via OtpRequiredMixin."
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "There is no concrete security consequence demonstrated for CWE-425 in this context. The view properly enforces OTP verification, preventing unauthorized access to QR code generation."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the DeviceQRCodeView would not inherit OtpRequiredMixin and would not enforce OTP verification before generating a QR code. This could potentially allow unauthorized access to device configuration information, but this is not a direct mechanism of CWE-425 as it requires proper authorization enforcement rather than bypassing it.",
+      "supporting_evidence": [
+        "The DeviceQRCodeView inherits OtpRequiredMixin which enforces OTP verification before allowing access to the QR code generation",
+        "The view uses get_unconfirmed_device() to retrieve a user's unconfirmed device for QR code generation"
+      ],
+      "contradicting_evidence": [
+        "OtpRequiredMixin enforces OTP verification, preventing unauthorized access to DeviceQRCodeView",
+        "The view requires OTP verification before generating a QR code for TOTP device setup"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.0,
+      "score": 0.0
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 138,
+      "statement": "class DeviceQRCodeView(OtpRequiredMixin, View):",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The DeviceQRCodeView uses OtpRequiredMixin which performs authorization checks, but the mechanism involves retrieving an unconfirmed device for QR code generation. If the authorization check is bypassed or incorrectly implemented, it could allow unauthorized access to generate QR codes for TOTP devices."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "The view inherits from OtpRequiredMixin which enforces OTP verification. However, the connection between the authorization check and the QR code generation is not fully clear - it's possible that the unconfirmed device retrieval bypasses proper authorization checks or allows access to information that should be restricted."
+        },
+        "diff_causality": {
+          "score": 0.65,
+          "evidence": "If this line were reverted (removing OtpRequiredMixin), the DeviceQRCodeView would no longer require OTP verification, which would directly expose the QR code generation to unauthorized access. The addition of OtpRequiredMixin is a security control that prevents unauthorized access."
+        },
+        "security_control": {
+          "score": 0.55,
+          "evidence": "The view uses OtpRequiredMixin which enforces OTP requirement. However, the mechanism for retrieving unconfirmed devices (get_unconfirmed_device) may not be properly authorized or validated, potentially allowing an attacker to access QR codes for devices they shouldn't have access to.",
+          "required_control": "Authorization check on device retrieval",
+          "control_requirement_evidence": "CWE-863 requires correct authorization checks when accessing resources. The unconfirmed device retrieval must ensure that only the owner can access their own unconfirmed device.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin enforces OTP verification",
+            "get_unconfirmed_device() function retrieves device for user"
+          ],
+          "deficiency_evidence": "The code does not explicitly verify that the retrieved unconfirmed device belongs to the requesting user beyond the user context. If get_unconfirmed_device() returns any unconfirmed device without proper authorization checks, it could allow incorrect authorization."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "If an attacker can bypass or incorrectly authorize access to generate QR codes for TOTP devices, they could potentially gain unauthorized access to authentication information that allows them to set up their own TOTP devices with the target user's credentials."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, removing OtpRequiredMixin from DeviceQRCodeView, then the view would no longer require OTP verification for accessing the QR code generation endpoint. This would allow any authenticated user to generate QR codes for TOTP devices without proper authorization checks, directly exposing a potential path for incorrect authorization.",
+      "supporting_evidence": [
+        "The DeviceQRCodeView inherits from OtpRequiredMixin which enforces OTP requirement",
+        "The view retrieves an unconfirmed device using utils.get_unconfirmed_device() function",
+        "The QR code contains configuration information that could be used to set up TOTP authentication"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether get_unconfirmed_device() properly validates ownership of the device",
+        "Whether the authorization check in OtpRequiredMixin is sufficient to prevent incorrect authorization"
+      ],
+      "review_comment": "The DeviceQRCodeView uses OtpRequiredMixin which enforces OTP verification, but there's a potential for incorrect authorization if the unconfirmed device retrieval doesn't properly validate user ownership. The view should ensure that only the authenticated user can access their own unconfirmed device for QR code generation. Add explicit authorization checks to verify that the retrieved device belongs to the requesting user.",
+      "change_type": "A",
+      "raw_score": 0.67,
+      "score": 0.67
+    },
+    {
+      "candidate_id": "candidate-6",
+      "filepath": "src/wagtail_2fa/views.py",
+      "changed_line": 138,
+      "statement": "class DeviceQRCodeView(OtpRequiredMixin, View):",
+      "cwe_id": "CWE-200",
+      "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 1.0,
+          "evidence": "The DeviceQRCodeView generates and returns a QR code containing TOTP device configuration URLs, which are sensitive authentication information. This directly matches CWE-200's mechanism of exposing sensitive information to unauthorized actors."
+        },
+        "connection": {
+          "score": 0.8,
+          "evidence": "The view inherits from OtpRequiredMixin which enforces OTP verification. However, the sensitive information (TOTP device config URL) is exposed before the user has completed full authentication. The connection path is: user accesses DeviceQRCodeView -> OtpRequiredMixin allows access -> QR code with config URL is generated and returned."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted (removing OtpRequiredMixin), the view would no longer require OTP verification, potentially allowing unauthorized access to sensitive information. The patch adds a security control by requiring OTP before generating the QR code."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "The OtpRequiredMixin provides some protection but is not sufficient on its own. The view still exposes sensitive TOTP configuration URLs to users who have passed OTP verification, which may be insufficient for preventing unauthorized access if the OTP token itself is compromised or if the user has access to multiple devices.",
+          "required_control": "Proper access control and authentication enforcement",
+          "control_requirement_evidence": "CWE-200 requires that sensitive information not be exposed to unauthorized actors. The system must ensure only explicitly authorized users can access sensitive data.",
+          "existing_controls_checked": [
+            "OtpRequiredMixin enforces OTP requirement",
+            "DeviceQRCodeView inherits from OtpRequiredMixin"
+          ],
+          "deficiency_evidence": "While the view requires OTP verification, it does not validate that the user is authorized to access the specific device configuration information. The system exposes TOTP config URLs to any authenticated user who can pass OTP verification."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "The concrete impact is that an attacker with access to a user's OTP token could potentially generate QR codes for TOTP devices, allowing them to set up authentication devices and gain unauthorized access to the system."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, removing OtpRequiredMixin from DeviceQRCodeView, then users would be able to access the QR code generation endpoint without OTP verification. This would expose TOTP device configuration URLs to any user who can reach the endpoint, significantly increasing the risk of unauthorized access to authentication information.",
+      "supporting_evidence": [
+        "The DeviceQRCodeView generates and returns a QR code containing TOTP device configuration URLs",
+        "The view inherits from OtpRequiredMixin which enforces OTP verification before access",
+        "TOTP device configuration URLs contain sensitive authentication information"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the user's OTP token is sufficient to prevent unauthorized access to TOTP configuration information",
+        "Whether additional authorization checks are needed beyond OTP verification for accessing device configuration URLs"
+      ],
+      "review_comment": "The DeviceQRCodeView exposes TOTP device configuration URLs in QR codes, which contain sensitive authentication information. While it requires OTP verification, this may not be sufficient to prevent unauthorized access if the OTP token is compromised. The view should ensure that only authorized users can access specific device configuration information beyond basic OTP verification.",
+      "change_type": "A",
+      "raw_score": 0.76,
+      "score": 0.76
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,390 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "lib/socket.js",
+  "changed_line": 389,
+  "statement": "this._listener._connection.states.parse(cookies, (ignoreErr, state, failed) => {",
+  "change_type": "A",
+  "function_name": "_authenticate",
+  "operation_type": "cookie_parsing_callback",
+  "selection_reason": "cookie parsing callback parameter renamed to ignoreErr -> may indicate error suppression in authentication flow",
+  "security_relevance_score": 0.5,
+  "code_context": "240:         });\n241:     };\n242: \n243:     Items.serial(request.subs || [], each, (err) => {\n244: \n245:         if (err) {\n246:             return this._error(err, { type: 'hello', id: request.id, path: err.path });\n247:         }\n248: \n249:         if (this._listener._settings.onConnection) {\n250:             this._listener._settings.onConnection(this);\n251:         }\n252: \n253:         return this._send(response);\n254:     });\n255: };\n256: \n257: \n258: internals.Socket.prototype._processRequest = function (request) {\n259: \n260:     let method = request.method;\n261:     if (!method) {\n262:         return this._error(Boom.badRequest('Message missing method'), request);\n263:     }\n264: \n265:     let path = request.path;\n266:     if (!path) {\n267:         return this._error(Boom.badRequest('Message missing path'), request);\n268:     }\n269: \n270:     if (request.headers &&\n271:         internals.caseInsensitiveKey(request.headers, 'authorization')) {\n272: \n273:         return this._error(Boom.badRequest('Cannot include an Authorization header'), request);\n274:     }\n275: \n276:     if (path[0] !== '/') {              // Route id\n277:         const route = this._listener._connection.lookup(path);\n278:         if (!route) {\n279:             return this._error(Boom.notFound(), request);\n280:         }\n281: \n282:         path = route.path;\n283:         method = route.method;\n284: \n285:         if (method === '*') {\n286:             return this._error(Boom.badRequest('Cannot use route id with wildcard method route config'), request);\n287:         }\n288:     }\n289: \n290:     if (this._listener._settings.auth &&\n291:         path === this._listener._settings.auth.endpoint) {\n292: \n293:         return this._error(Boom.notFound(), request);\n294:     }\n295: \n296:     const shot = {\n297:         method: method,\n298:         url: path,\n299:         payload: request.payload,\n300:         headers: request.headers,\n301:         credentials: this.auth.credentials,\n302:         artifacts: this.auth.artifacts,\n303:         plugins: {\n304:             nes: {\n305:                 socket: this\n306:             }\n307:         }\n308:     };\n309: \n310:     this._listener._connection.inject(shot, (res) => {\n311: \n312:         const response = {\n313:             type: 'request',\n314:             id: request.id,\n315:             statusCode: res.statusCode,\n316:             payload: res.result,\n317:             headers: this._filterHeaders(res.headers)\n318:         };\n319: \n320:         return this._send(response);\n321:     });\n322: };\n323: \n324: \n325: internals.Socket.prototype._processMessage = function (request) {\n326: \n327:     if (!this._listener._settings.onMessage) {\n328:         return this._error(Boom.notImplemented(), request);\n329:     }\n330: \n331:     this._listener._settings.onMessage(this, request.message, (message) => {\n332: \n333:         if (message instanceof Error) {\n334:             return this._error(message, request);\n335:         }\n336: \n337:         const response = {\n338:             type: 'message',\n339:             id: request.id,\n340:             message: message\n341:         };\n342: \n343:         return this._send(response);\n344:     });\n345: };\n346: \n347: \n348: internals.Socket.prototype._processSubscription = function (request) {\n349: \n350:     this._listener._subscribe(request.path, this, (err) => {\n351: \n352:         if (err) {\n353:             return this._error(err, request);\n354:         }\n355: \n356:         const response = {\n357:             type: 'sub',\n358:             id: request.id,\n359:             path: request.path\n360:         };\n361: \n362:         return this._send(response);\n363:     });\n364: };\n365: \n366: \n367: internals.Socket.prototype._processUnsubscribe = function (request) {\n368: \n369:     const sub = this._subscriptions[request.path];\n370:     if (sub) {\n371:         sub.remove(this, request.path);\n372:         delete this._subscriptions[request.path];\n373:     }\n374: };\n375: \n376: \n377: internals.Socket.prototype._authenticate = function () {\n378: \n379:     const config = this._listener._settings.auth;\n380:     if (!config) {\n381:         return;\n382:     }\n383: \n384:     const cookies = this._ws.upgradeReq.headers.cookie;\n385:     if (!cookies) {\n386:         return;\n387:     }\n388: \n389:     this._listener._connection.states.parse(cookies, (ignoreErr, state, failed) => {\n390: \n391:         const auth = state[config.cookie];\n392:         if (auth) {\n393:             this.auth = {\n394:                 isAuthenticated: true,\n395:                 credentials: auth.credentials,\n396:                 artifacts: auth.artifacts\n397:             };\n398:         }\n399:     });\n400: };\n401: \n402: \n403: internals.Socket.prototype._filterHeaders = function (headers) {\n404: \n405:     const filter = this._listener._settings.headers;\n406:     if (!filter) {\n407:         return undefined;\n408:     }\n409: \n410:     if (filter === '*') {\n411:         return headers;\n412:     }\n413: \n414:     const filtered = {};\n415:     const fields = Object.keys(headers);\n416:     for (let i = 0; i < fields.length; ++i) {\n417:         const field = fields[i];\n418:         if (filter.indexOf(field.toLowerCase()) !== -1) {\n419:             filtered[field] = headers[field];\n420:         }\n421:     }\n422: \n423:     return filtered;\n424: };\n425: \n426: \n427: internals.parse = function (message, next) {\n428: \n429:     let obj = null;\n430:     let error = null;\n431: \n432:     try {\n433:         obj = JSON.parse(message);\n434:     }\n435:     catch (err) {\n436:         error = err;\n437:     }\n438: \n439:     return next(error, obj);\n440: };\n441: \n442: \n443: internals.stringify = function (message, next) {\n444: \n445:     let string = null;\n446:     let error = null;\n447: \n448:     try {\n449:         string = JSON.stringify(message);\n450:     }\n451:     catch (err) {\n452:         error = err;\n453:     }\n454: \n455:     return next(error, string);\n456: };\n457: \n458: \n459: internals.caseInsensitiveKey = function (object, key) {\n460: \n461:     const keys = Object.keys(object);\n462:     for (let i = 0; i < keys.length; ++i) {\n463:         const current = keys[i];\n464:         if (key === current.toLowerCase()) {\n465:             return object[current];\n466:         }\n467:     }\n468: \n469:     return undefined;\n470: };",
+  "source_summary": "Cookies from WebSocket upgrade request headers (this._ws.upgradeReq.headers.cookie). The cookies contain authentication state stored by the server.",
+  "sink_summary": "Authentication state extraction: state[config.cookie] -> this.auth credentials and artifacts. Used later for subscription authorization checks.",
+  "guard_summary": "Authentication config check (lines 379-382). Cookie presence check (lines 384-387). Subscription-time auth checks in listener._subscribe (lines 306-348) verify credentials and scope if auth mode is 'required'. No error handling for cookie parsing failures - error parameter named 'ignoreErr' and not used.",
+  "risk_pattern": "Cookie parsing errors are ignored in authentication callback. If cookie parsing fails (tampered, malformed, or corrupted data), authentication may silently fail, potentially leaving socket without proper auth state while not reporting error.",
+  "used_variable_sources": [
+    "this._ws.upgradeReq.headers.cookie",
+    "this._listener._settings.auth",
+    "config.cookie"
+  ],
+  "called_function_context": [
+    "this._listener._connection.states.parse"
+  ],
+  "enclosing_conditions": [
+    "if (!config) return;",
+    "if (!cookies) return;"
+  ],
+  "context_summary": "In _authenticate method called during WebSocket connection setup. Parses cookies to extract authentication state. Sets this.auth if valid auth cookie found. Error from parse callback is ignored (parameter named ignoreErr).",
+  "unresolved_facts": [
+    "Exact behavior of states.parse on error: whether it calls callback with null/empty state, what 'failed' parameter indicates",
+    "Whether other parts of system properly handle missing this.auth when auth is required",
+    "Whether cookie parsing failures could lead to authentication bypass or only to failed authentication"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "fit_reason": "Cookie parsing errors are ignored during authentication state extraction, leading to potential incorrect handling of structured authentication data",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "fit_reason": "Cookie input from WebSocket upgrade headers is parsed but parsing errors are ignored, bypassing validation of authentication state",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "fit_reason": "Authentication state may be incorrectly set due to ignored parsing errors, leading to improper authorization decisions",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "fit_reason": "Cookie-based credential parsing errors are suppressed, potentially leading to incorrect authentication state management",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "fit_reason": "Ignored parsing errors in authentication callback may result in missing or incorrect access control state",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1004",
+    "CWE-1275",
+    "CWE-19",
+    "CWE-20",
+    "CWE-254",
+    "CWE-255",
+    "CWE-284",
+    "CWE-311",
+    "CWE-352",
+    "CWE-425",
+    "CWE-563",
+    "CWE-639",
+    "CWE-676",
+    "CWE-704",
+    "CWE-783",
+    "CWE-829",
+    "CWE-843",
+    "CWE-863",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/socket.js",
+      "changed_line": 389,
+      "statement": "this._listener._connection.states.parse(cookies, (ignoreErr, state, failed) => {",
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "CWE-19 is a broad category for data processing errors. The code shows cookie parsing with ignored errors, which is a data processing issue, but not the specific mechanism defined by any particular CWE."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "Cookies from WebSocket upgrade headers (attacker-controlled) are directly passed to states.parse() function, and the parsed state is used to set authentication credentials."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "The parameter name 'ignoreErr' indicates this change intentionally suppresses error handling during cookie parsing, materially changing error propagation behavior."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "",
+          "required_control": "error handling and validation for cookie parsing",
+          "control_requirement_evidence": "CWE-19 requires proper data processing including error handling when parsing structured authentication data",
+          "existing_controls_checked": [
+            "cookie presence check (lines 384-387)",
+            "downstream subscription auth checks in listener._subscribe"
+          ],
+          "deficiency_evidence": "Error parameter is explicitly named 'ignoreErr' and unused, indicating intentional suppression of parsing errors without alternative validation"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "Potential authentication state inconsistency if cookie parsing fails silently, but downstream auth checks may still prevent unauthorized access."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, cookie parsing errors would potentially be handled differently, possibly preventing silent authentication failures.",
+      "supporting_evidence": [
+        "Cookie parsing callback parameter explicitly named 'ignoreErr' indicating intentional error suppression",
+        "Parsed authentication state directly used to set socket credentials without error validation",
+        "Cookies come from WebSocket upgrade headers (attacker-controlled input)"
+      ],
+      "contradicting_evidence": [
+        "Downstream subscription authorization checks exist that may catch missing/invalid authentication",
+        "Authentication config and cookie presence are validated before parsing"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether states.parse() provides any default error handling when callback ignores errors",
+        "Exact behavior when cookie parsing fails - whether state is null, empty, or contains partial data",
+        "Whether downstream auth checks adequately handle missing/inconsistent auth state"
+      ],
+      "review_comment": "The cookie parsing callback ignores errors by naming the parameter 'ignoreErr' and not using it. If cookie parsing fails due to malformed or tampered data, authentication state may be silently inconsistent. Ensure proper error handling for cookie parsing failures and validate that authentication state is correctly established before use.",
+      "change_type": "A",
+      "raw_score": 0.5,
+      "score": 0.5
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/socket.js",
+      "changed_line": 389,
+      "statement": "this._listener._connection.states.parse(cookies, (ignoreErr, state, failed) => {",
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The code receives cookie input from WebSocket headers but the callback parameter is named 'ignoreErr' suggesting parsing errors are intentionally ignored, which could bypass validation of authentication state integrity."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "Cookies from WebSocket upgrade headers (this._ws.upgradeReq.headers.cookie) are directly passed to states.parse() and the resulting state is used to set authentication credentials (this.auth)."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "The change introduces the 'ignoreErr' parameter name, which suggests an intentional design decision to suppress cookie parsing errors during authentication."
+        },
+        "security_control": {
+          "score": 0.35,
+          "evidence": "",
+          "required_control": "Input validation for cookie format and integrity before authentication state extraction",
+          "control_requirement_evidence": "CWE-20 requires validating inputs before processing; cookies containing authentication state require validation to ensure they are properly formatted and not tampered with",
+          "existing_controls_checked": [
+            "Cookie presence check (lines 384-387)",
+            "Downstream subscription authorization checks in listener._subscribe"
+          ],
+          "deficiency_evidence": "The code checks for cookie presence but does not validate cookie format or handle parsing errors; the 'ignoreErr' parameter name suggests errors are intentionally ignored, potentially allowing malformed cookies to bypass authentication state validation"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "If cookie parsing fails due to malformed input, authentication state may be incorrectly set or remain unset, potentially affecting authorization decisions for WebSocket subscriptions."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the error handling behavior for cookie parsing would change, potentially making parsing errors visible and requiring proper handling instead of being ignored.",
+      "supporting_evidence": [
+        "Cookie input comes from WebSocket upgrade request headers (this._ws.upgradeReq.headers.cookie)",
+        "Callback parameter is explicitly named 'ignoreErr' suggesting intentional error suppression",
+        "Parsed state is used to set authentication credentials (this.auth) for authorization decisions"
+      ],
+      "contradicting_evidence": [
+        "The code does check for cookie presence before parsing (lines 384-387)",
+        "Downstream subscription authorization checks exist that may catch missing authentication"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Exact behavior of states.parse() when cookies are malformed - whether it returns empty state or throws",
+        "Whether downstream authorization checks properly handle missing/invalid authentication state",
+        "Whether ignoring parsing errors could lead to authentication bypass or only to failed authentication"
+      ],
+      "review_comment": "The cookie parsing callback uses 'ignoreErr' parameter name, suggesting parsing errors are intentionally suppressed. While cookie presence is checked, the format and integrity of cookie data is not validated before extracting authentication state. If cookie parsing fails due to malformed input, authentication state may be incorrectly handled. Validate cookie format and handle parsing errors explicitly rather than ignoring them to ensure proper authentication state validation.",
+      "change_type": "A",
+      "raw_score": 0.5,
+      "score": 0.5
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/socket.js",
+      "changed_line": 389,
+      "statement": "this._listener._connection.states.parse(cookies, (ignoreErr, state, failed) => {",
+      "cwe_id": "CWE-863",
+      "cwe_name": "Incorrect Authorization",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "CWE-863 requires incorrect authorization checks, but the demonstrated behavior shows error suppression in authentication state parsing, not an authorization decision logic flaw"
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "Cookies from WebSocket upgrade request headers are parsed to extract authentication state (state[config.cookie]), which is used to set this.auth credentials for subsequent authorization checks"
+        },
+        "diff_causality": {
+          "score": 0.45,
+          "evidence": "The change introduces 'ignoreErr' parameter naming, suggesting error suppression intent, but the actual error handling behavior (whether errors were already ignored) is unclear from the diff alone"
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "",
+          "required_control": "Proper error handling and validation of authentication state parsing",
+          "control_requirement_evidence": "CWE-863 requires correct authorization decisions, which depend on reliable authentication state",
+          "existing_controls_checked": [
+            "Authentication config check (lines 379-382)",
+            "Cookie presence check (lines 384-387)",
+            "Subscription-time auth checks in listener._subscribe"
+          ],
+          "deficiency_evidence": "Error parameter is named 'ignoreErr' and unused, but evidence doesn't demonstrate that parsing errors actually lead to incorrect authorization rather than failed authentication"
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "Impact is speculative - if cookie parsing fails silently, socket might have incomplete auth state, but no evidence shows this leads to authorization bypass rather than authentication failure"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the error parameter might have a different name, but the actual error handling behavior might remain unchanged if the callback implementation already ignored errors.",
+      "supporting_evidence": [
+        "Cookie parsing callback parameter renamed to 'ignoreErr' suggesting error suppression intent",
+        "Authentication state from cookies directly sets this.auth credentials used for authorization",
+        "No error handling code visible in the callback for parsing failures"
+      ],
+      "contradicting_evidence": [
+        "The code checks for authentication config and cookie presence before parsing",
+        "Subscription-time authorization checks exist downstream that may properly handle missing authentication"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether states.parse callback is actually called with errors that should be handled",
+        "Whether downstream authorization checks properly handle missing/incomplete auth state",
+        "Whether silent parsing failures lead to authorization bypass or just authentication failure",
+        "What the 'failed' parameter indicates and how it's used"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.41,
+      "score": 0.41
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/socket.js",
+      "changed_line": 389,
+      "statement": "this._listener._connection.states.parse(cookies, (ignoreErr, state, failed) => {",
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "CWE-255 is a broad category for credential management issues. The code shows authentication state extraction from cookies but doesn't demonstrate the full scope of credential management errors defined by this CWE family."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "Cookies from WebSocket upgrade headers (attacker-controlled) are parsed to extract authentication state, which is then stored in this.auth for later authorization checks during subscriptions."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "The added line introduces cookie parsing with error suppression. If reverted, cookie parsing errors would need to be handled differently, potentially affecting authentication state management."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "",
+          "required_control": "Proper error handling for credential parsing operations",
+          "control_requirement_evidence": "CWE-255 requires proper management of credential validation and error conditions to prevent authentication bypass or incorrect state",
+          "existing_controls_checked": [
+            "Authentication config check",
+            "Cookie presence check",
+            "Downstream subscription authorization"
+          ],
+          "deficiency_evidence": "Error parameter is named 'ignoreErr' and unused, suggesting parsing failures are intentionally ignored, but impact on authentication state is unclear from evidence"
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Impact is speculative - parsing errors might lead to missing authentication state, but downstream subscription checks may still prevent unauthorized access. No demonstrated authentication bypass."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, cookie parsing would need alternative error handling, potentially making parsing failures more visible or requiring different authentication state management.",
+      "supporting_evidence": [
+        "Cookie parsing callback parameter named 'ignoreErr' suggests intentional error suppression",
+        "Authentication state extracted from parsed cookies and stored in this.auth",
+        "Cookies come from WebSocket upgrade request headers (attacker-controlled input)"
+      ],
+      "contradicting_evidence": [
+        "Downstream subscription authorization checks exist that may prevent unauthorized access even with missing auth state",
+        "Authentication config and cookie presence are checked before parsing"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether states.parse callback is called with valid state on parsing errors",
+        "Whether downstream subscription authorization properly handles missing this.auth",
+        "Whether ignored parsing errors could lead to authentication bypass or only failed authentication"
+      ],
+      "review_comment": "The cookie parsing callback ignores errors by naming the parameter 'ignoreErr' and not using it. While authentication config and cookie presence are checked, parsing failures may result in incorrect authentication state. Ensure cookie parsing errors are properly handled to maintain consistent authentication state, either by rejecting the connection or setting appropriate unauthenticated state.",
+      "change_type": "A",
+      "raw_score": 0.48,
+      "score": 0.48
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "lib/socket.js",
+      "changed_line": 389,
+      "statement": "this._listener._connection.states.parse(cookies, (ignoreErr, state, failed) => {",
+      "cwe_id": "CWE-284",
+      "cwe_name": "Improper Access Control",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "CWE-284 requires improper restriction of access, but the demonstrated mechanism is error suppression in authentication state parsing, not direct access control bypass. The connection to improper access control is indirect and speculative."
+        },
+        "connection": {
+          "score": 0.45,
+          "evidence": "Cookies from WebSocket upgrade request headers are parsed to extract authentication state. If parsing fails, the error is ignored, potentially leaving the socket without proper auth credentials that would be used for downstream authorization checks."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "The added line introduces a callback that ignores parsing errors. If reverted, cookie parsing errors would need to be handled differently, potentially preventing the silent failure scenario."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "",
+          "required_control": "Proper error handling and validation of authentication state parsing",
+          "control_requirement_evidence": "CWE-284 requires proper access control enforcement, which depends on reliable authentication state determination",
+          "existing_controls_checked": [
+            "Authentication config check (lines 379-382)",
+            "Cookie presence check (lines 384-387)",
+            "Subscription-time auth checks in listener._subscribe"
+          ],
+          "deficiency_evidence": "The error parameter is named 'ignoreErr' and not used, suggesting parsing failures are intentionally ignored, potentially bypassing authentication state validation"
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "Impact is speculative - if cookie parsing fails and downstream authorization relies on this.auth being properly set, access might be incorrectly granted. However, the evidence doesn't demonstrate this specific failure path or consequence."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the cookie parsing callback would need different error handling, potentially preventing silent authentication state failures.",
+      "supporting_evidence": [
+        "Cookie parsing callback parameter named 'ignoreErr' suggests intentional error suppression",
+        "Authentication state from cookies is used to set this.auth credentials for downstream authorization",
+        "The method is called during WebSocket connection setup when authentication state is established"
+      ],
+      "contradicting_evidence": [
+        "Downstream subscription authorization checks exist that may prevent unauthorized access even if authentication fails",
+        "The code checks for authentication config and cookie presence before parsing"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether downstream authorization properly handles missing this.auth when authentication is required",
+        "What specific conditions cause states.parse to fail and what state/failed parameters contain on failure",
+        "Whether cookie parsing failures could actually lead to authentication bypass or only to failed authentication"
+      ],
+      "review_comment": "The cookie parsing callback ignores errors by naming the parameter 'ignoreErr' and not using it. If cookie parsing fails due to malformed or tampered data, authentication state may be incorrectly determined. Ensure parsing errors are properly handled to maintain reliable authentication state for downstream authorization checks. Handle parsing failures by either rejecting the connection or treating it as unauthenticated rather than silently proceeding.",
+      "change_type": "A",
+      "raw_score": 0.41,
+      "score": 0.41
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,300 @@
+diff --git a/glance/api/v1/images.py b/glance/api/v1/images.py
+index 3970873b5..b127c35f1 100644
+--- a/glance/api/v1/images.py
++++ b/glance/api/v1/images.py
+@@ -809,45 +809,45 @@ class Controller(controller.BaseController):
+         :raises HttpBadRequest if image registry is invalid
+         :raises HttpNotFound if image or any chunk is not available
+         :raises HttpUnauthorized if image or any chunk is not
+                 deleteable by the requesting user
+         """
+         self._enforce(req, 'delete_image')
+ 
+         image = self.get_image_meta_or_404(req, id)
+         if image['protected']:
+             msg = _("Image is protected")
+             LOG.debug(msg)
+             raise HTTPForbidden(explanation=msg,
+                                 request=req,
+                                 content_type="text/plain")
+ 
+-        # The image's location field may be None in the case
+-        # of a saving or queued image, therefore don't ask a backend
+-        # to delete the image if the backend doesn't yet store it.
+-        # See https://bugs.launchpad.net/glance/+bug/747799
++        status = 'deleted'
+         try:
++            # The image's location field may be None in the case
++            # of a saving or queued image, therefore don't ask a backend
++            # to delete the image if the backend doesn't yet store it.
++            # See https://bugs.launchpad.net/glance/+bug/747799
+             if image['location']:
+                 if CONF.delayed_delete:
++                    status = 'pending_delete'
+                     schedule_delayed_delete_from_backend(image['location'], id)
+-                    registry.update_image_metadata(req.context, id,
+-                                                  {'status': 'pending_delete'})
+                 else:
+                     safe_delete_from_backend(image['location'],
+                                              req.context, id)
+-                    registry.update_image_metadata(req.context, id,
+-                                                   {'status': 'deleted'})
++
++            registry.update_image_metadata(req.context, id, {'status': status})
+             registry.delete_image_metadata(req.context, id)
+         except exception.NotFound, e:
+             msg = ("Failed to find image to delete: %(e)s" % locals())
+             for line in msg.split('\n'):
+                 LOG.info(line)
+             self.notifier.info('image.delete', msg)
+             raise HTTPNotFound(explanation=msg,
+                                request=req,
+                                content_type="text/plain")
+         except exception.Forbidden, e:
+             msg = ("Forbidden to delete image: %(e)s" % locals())
+             for line in msg.split('\n'):
+                 LOG.info(line)
+             self.notifier.info('image.delete', msg)
+             raise HTTPForbidden(explanation=msg,
+diff --git a/glance/api/v2/images.py b/glance/api/v2/images.py
+index 568691610..0773ca578 100644
+--- a/glance/api/v2/images.py
++++ b/glance/api/v2/images.py
+@@ -256,43 +256,42 @@ class ImagesController(object):
+         if key not in updates:
+             msg = _("Property %s does not exist.")
+             raise webob.exc.HTTPConflict(msg % key)
+         del updates[key]
+ 
+     @utils.mutating
+     def delete(self, req, image_id):
+         self._enforce(req, 'delete_image')
+         image = self._get_image(req.context, image_id)
+ 
+         if image['protected']:
+             msg = _("Unable to delete as image %(image_id)s is protected"
+                     % locals())
+             raise webob.exc.HTTPForbidden(explanation=msg)
+ 
++        status = 'deleted'
+         if image['location']:
+             if CONF.delayed_delete:
++                status = 'pending_delete'
+                 self.store_api.schedule_delayed_delete_from_backend(
+                                 image['location'], id)
+-                self.db_api.image_update(req.context, image_id,
+-                                         {'status': 'pending_delete'})
+             else:
+                 self.store_api.safe_delete_from_backend(image['location'],
+                                                         req.context, id)
+-                self.db_api.image_update(req.context, image_id,
+-                                         {'status': 'deleted'})
+ 
+         try:
++            self.db_api.image_update(req.context, image_id, {'status': status})
+             self.db_api.image_destroy(req.context, image_id)
+         except (exception.NotFound, exception.Forbidden):
+             msg = ("Failed to find image %(image_id)s to delete" % locals())
+             LOG.info(msg)
+             raise webob.exc.HTTPNotFound()
+         else:
+             self.notifier.info('image.delete', image)
+ 
+ 
+ class RequestDeserializer(wsgi.JSONRequestDeserializer):
+ 
+     _readonly_properties = ['created_at', 'updated_at', 'status', 'checksum',
+             'size', 'direct_url', 'self', 'file', 'schema']
+     _reserved_properties = ['owner', 'is_public', 'location',
+             'deleted', 'deleted_at']
+diff --git a/glance/tests/unit/v1/test_api.py b/glance/tests/unit/v1/test_api.py
+index 17941ec07..dfb5e8a8a 100644
+--- a/glance/tests/unit/v1/test_api.py
++++ b/glance/tests/unit/v1/test_api.py
+@@ -2904,69 +2904,116 @@ class TestGlanceAPI(base.IsolatedUnitTest):
+         res = req.get_response(self.api)
+         self.assertEqual(res.status_int, 403)
+ 
+     def test_delete_image(self):
+         req = webob.Request.blank("/images/%s" % UUID2)
+         req.method = 'DELETE'
+         res = req.get_response(self.api)
+         self.assertEquals(res.status_int, 200)
+ 
+         req = webob.Request.blank("/images/%s" % UUID2)
+         req.method = 'GET'
+         res = req.get_response(self.api)
+         self.assertEquals(res.status_int, webob.exc.HTTPNotFound.code,
+                           res.body)
+ 
++        req = webob.Request.blank("/images/%s" % UUID2)
++        req.method = 'HEAD'
++        res = req.get_response(self.api)
++        self.assertEquals(res.status_int, 200)
++        self.assertEquals(res.headers['x-image-meta-deleted'], 'True')
++        self.assertEquals(res.headers['x-image-meta-status'], 'deleted')
++
+     def test_delete_non_exists_image(self):
+         req = webob.Request.blank("/images/%s" % _gen_uuid())
+         req.method = 'DELETE'
+         res = req.get_response(self.api)
+         self.assertEquals(res.status_int, webob.exc.HTTPNotFound.code)
+ 
+     def test_delete_queued_image(self):
+-        """
+-        Here, we try to delete an image that is in the queued state.
++        """Delete an image in a queued state
++
+         Bug #747799 demonstrated that trying to DELETE an image
+         that had had its save process killed manually results in failure
+         because the location attribute is None.
++
++        Bug #1048851 demonstrated that the status was not properly
++        being updated to 'deleted' from 'queued'.
+         """
+-        # Add an image by reserving a place in the database for an image
+-        # without really any attributes or information on the image and then
+-        # later doing an update with the image body and other attributes.
+-        # We will stop the process after the reservation stage, then
+-        # try to delete the image.
+         fixture_headers = {'x-image-meta-store': 'file',
+                            'x-image-meta-disk-format': 'vhd',
+                            'x-image-meta-container-format': 'ovf',
+                            'x-image-meta-name': 'fake image #3'}
+ 
+         req = webob.Request.blank("/images")
+         req.method = 'POST'
+         for k, v in fixture_headers.iteritems():
+             req.headers[k] = v
+         res = req.get_response(self.api)
+         self.assertEquals(res.status_int, httplib.CREATED)
+ 
+         res_body = json.loads(res.body)['image']
+         self.assertEquals('queued', res_body['status'])
+ 
+         # Now try to delete the image...
+         req = webob.Request.blank("/images/%s" % res_body['id'])
+         req.method = 'DELETE'
+         res = req.get_response(self.api)
+         self.assertEquals(res.status_int, 200)
+ 
++        req = webob.Request.blank('/images/%s' % res_body['id'])
++        req.method = 'HEAD'
++        res = req.get_response(self.api)
++        self.assertEquals(res.status_int, 200)
++        self.assertEquals(res.headers['x-image-meta-deleted'], 'True')
++        self.assertEquals(res.headers['x-image-meta-status'], 'deleted')
++
++    def test_delete_queued_image_delayed_delete(self):
++        """Delete an image in a queued state when delayed_delete is on
++
++        Bug #1048851 demonstrated that the status was not properly
++        being updated to 'deleted' from 'queued'.
++        """
++        self.config(delayed_delete=True)
++        fixture_headers = {'x-image-meta-store': 'file',
++                           'x-image-meta-disk-format': 'vhd',
++                           'x-image-meta-container-format': 'ovf',
++                           'x-image-meta-name': 'fake image #3'}
++
++        req = webob.Request.blank("/images")
++        req.method = 'POST'
++        for k, v in fixture_headers.iteritems():
++            req.headers[k] = v
++        res = req.get_response(self.api)
++        self.assertEquals(res.status_int, httplib.CREATED)
++
++        res_body = json.loads(res.body)['image']
++        self.assertEquals('queued', res_body['status'])
++
++        # Now try to delete the image...
++        req = webob.Request.blank("/images/%s" % res_body['id'])
++        req.method = 'DELETE'
++        res = req.get_response(self.api)
++        self.assertEquals(res.status_int, 200)
++
++        req = webob.Request.blank('/images/%s' % res_body['id'])
++        req.method = 'HEAD'
++        res = req.get_response(self.api)
++        self.assertEquals(res.status_int, 200)
++        self.assertEquals(res.headers['x-image-meta-deleted'], 'True')
++        self.assertEquals(res.headers['x-image-meta-status'], 'deleted')
++
+     def test_delete_protected_image(self):
+         fixture_headers = {'x-image-meta-store': 'file',
+                            'x-image-meta-name': 'fake image #3',
+                            'x-image-meta-disk-format': 'vhd',
+                            'x-image-meta-container-format': 'ovf',
+                            'x-image-meta-protected': 'True'}
+ 
+         req = webob.Request.blank("/images")
+         req.method = 'POST'
+         for k, v in fixture_headers.iteritems():
+             req.headers[k] = v
+         res = req.get_response(self.api)
+         self.assertEquals(res.status_int, httplib.CREATED)
+ 
+         res_body = json.loads(res.body)['image']
+diff --git a/glance/tests/unit/v2/test_images_resource.py b/glance/tests/unit/v2/test_images_resource.py
+index 711dec16d..d48f383df 100644
+--- a/glance/tests/unit/v2/test_images_resource.py
++++ b/glance/tests/unit/v2/test_images_resource.py
+@@ -536,30 +536,58 @@ class TestImagesController(test_utils.BaseTestCase):
+         self.assertTrue(filter(lambda k: UUID1 in k, self.store.data))
+         try:
+             image = self.controller.delete(request, UUID1)
+             output_log = self.notifier.get_log()
+             self.assertEqual(output_log['notification_type'], "INFO")
+             self.assertEqual(output_log['event_type'], "image.delete")
+         except Exception as e:
+             self.fail("Delete raised exception: %s" % e)
+ 
+         deleted_img = self.db.image_get(request.context, UUID1,
+                                         force_show_deleted=True)
+         self.assertTrue(deleted_img['deleted'])
+         self.assertEqual(deleted_img['status'], 'deleted')
+         self.assertFalse(filter(lambda k: UUID1 in k, self.store.data))
+ 
++    def test_delete_queued_updates_status(self):
++        """Ensure status of queued image is updated (LP bug #1048851)"""
++        request = unit_test_utils.get_fake_request()
++        image = self.db.image_create(request.context, {'status': 'queued'})
++        image_id = image['id']
++        self.controller.delete(request, image_id)
++
++        image = self.db.image_get(request.context, image_id,
++                                  force_show_deleted=True)
++        self.assertTrue(image['deleted'])
++        self.assertEqual(image['status'], 'deleted')
++
++    def test_delete_queued_updates_status_delayed_delete(self):
++        """
++        Ensure status of queued image is updated (LP bug #1048851)
++        to 'deleted' when delayed_delete isenabled
++        """
++        self.config(delayed_delete=True)
++        request = unit_test_utils.get_fake_request()
++        image = self.db.image_create(request.context, {'status': 'queued'})
++        image_id = image['id']
++        self.controller.delete(request, image_id)
++
++        image = self.db.image_get(request.context, image_id,
++                                  force_show_deleted=True)
++        self.assertTrue(image['deleted'])
++        self.assertEqual(image['status'], 'deleted')
++
+     def test_delete_not_in_store(self):
+         request = unit_test_utils.get_fake_request()
+         self.assertTrue(filter(lambda k: UUID1 in k, self.store.data))
+         for k in self.store.data:
+             if UUID1 in k:
+                 del self.store.data[k]
+                 break
+ 
+         self.controller.delete(request, UUID1)
+         deleted_img = self.db.image_get(request.context, UUID1,
+                                         force_show_deleted=True)
+         self.assertTrue(deleted_img['deleted'])
+         self.assertEqual(deleted_img['status'], 'deleted')
+         self.assertFalse(filter(lambda k: UUID1 in k, self.store.data))
+ 

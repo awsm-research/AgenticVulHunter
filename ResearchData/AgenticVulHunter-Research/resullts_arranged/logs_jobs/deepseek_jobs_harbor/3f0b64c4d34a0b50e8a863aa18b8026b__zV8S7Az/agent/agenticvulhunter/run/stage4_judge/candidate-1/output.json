@@ -1,0 +1,378 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "index.js",
+  "changed_line": 25,
+  "statement": "if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }",
+  "change_type": "A",
+  "function_name": "IntegrityMetadata.constructor",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "strict mode option -> algorithm whitelist validation -> rejects non-spec algorithms that were previously accepted",
+  "security_relevance_score": 0.9,
+  "code_context": "1: 'use strict'\n2: \n3: const crypto = require('crypto')\n4: const Transform = require('stream').Transform\n5: \n6: const SPEC_ALGORITHMS = ['sha256', 'sha384', 'sha512']\n7: \n8: const BASE64_REGEX = /[a-z0-9+/]+(?:=?=?)/i\n9: const SRI_REGEX = /^([^-]+)-([^?]+)([?\\S*]*)$/\n10: const STRICT_SRI_REGEX = /^([^-]+)-([A-Za-z0-9+/]+(?:=?=?))([?\\x21-\\x7E]*)$/\n11: const VCHAR_REGEX = /[\\x21-\\x7E]+/\n12: \n13: class IntegrityMetadata {\n14:   constructor (metadata, opts) {\n15:     const strict = !!(opts && opts.strict)\n16:     this.source = metadata.trim()\n17:     // 3.1. Integrity metadata\n18:     // https://w3c.github.io/webappsec-subresource-integrity/#integrity-metadata-description\n19:     const match = this.source.match(\n20:       strict\n21:       ? STRICT_SRI_REGEX\n22:       : SRI_REGEX\n23:     )\n24:     if (!match) { return }\n25:     if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }\n26:     this.algorithm = match[1]\n27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {",
+  "source_summary": "Integrity metadata strings from user input via parse() function, which processes SRI (Subresource Integrity) strings that can come from external sources like HTTP headers or configuration",
+  "sink_summary": "Algorithm validation affects cryptographic hash selection in checkData() and checkStream() functions, which use the algorithm to compute and verify data integrity",
+  "guard_summary": "Added strict mode algorithm whitelist validation using SPEC_ALGORITHMS array; without this guard, non-standard algorithms could be accepted in strict mode",
+  "risk_pattern": "Strict mode previously accepted non-standard hash algorithms that could lead to weaker cryptographic validation or algorithm confusion attacks",
+  "used_variable_sources": [
+    "metadata parameter (user input)",
+    "opts.strict flag (configuration)",
+    "SPEC_ALGORITHMS constant (hardcoded whitelist)"
+  ],
+  "called_function_context": [
+    "parse() -> _parse() -> IntegrityMetadata constructor",
+    "checkData() -> parse() -> IntegrityMetadata constructor"
+  ],
+  "enclosing_conditions": [
+    "if (strict) condition enables the algorithm validation",
+    "preceded by regex pattern matching validation"
+  ],
+  "context_summary": "The added validation ensures that in strict mode, only SHA-256, SHA-384, and SHA-512 algorithms are accepted for SRI validation, preventing potentially weak or non-standard algorithms from being used in security-critical integrity checks",
+  "unresolved_facts": [
+    "Specific external sources of SRI strings in production usage",
+    "Whether non-strict mode usage in production could bypass this protection",
+    "Impact of algorithm confusion attacks in this specific cryptographic context"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-327",
+      "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+      "fit_reason": "Strict mode previously allowed non-standard algorithms that could be weak or broken, enabling algorithm downgrade attacks",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-328",
+      "cwe_name": "Use of Weak Hash",
+      "fit_reason": "Missing algorithm whitelist validation could allow weak hash algorithms in cryptographic integrity verification",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "fit_reason": "Insufficient validation of algorithm parameter in SRI strings allows bypass of intended security controls",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-693",
+      "cwe_name": "Protection Mechanism Failure",
+      "fit_reason": "Strict mode protection mechanism failed to properly validate cryptographic algorithms before the fix",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-807",
+      "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+      "fit_reason": "Cryptographic algorithm selection relied on untrusted input without proper validation in strict mode",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1004",
+    "CWE-134",
+    "CWE-193",
+    "CWE-20",
+    "CWE-327",
+    "CWE-328",
+    "CWE-471",
+    "CWE-563",
+    "CWE-639",
+    "CWE-676",
+    "CWE-693",
+    "CWE-730",
+    "CWE-807",
+    "CWE-843",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "index.js",
+      "changed_line": 25,
+      "statement": "if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }",
+      "cwe_id": "CWE-327",
+      "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The added validation prevents non-standard cryptographic algorithms from being accepted in strict mode, directly addressing the core mechanism of CWE-327 by restricting algorithm selection to known secure options (SHA-256, SHA-384, SHA-512)"
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "User-provided SRI strings from external sources (HTTP headers, configuration) flow through parse() -> _parse() -> IntegrityMetadata constructor to the algorithm validation, then to cryptographic hash computation in checkData() and checkStream() functions"
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If this candidate line were reverted, strict mode would accept any algorithm name that passes the regex pattern, potentially allowing weak or broken cryptographic algorithms to be used for integrity validation"
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "The patch adds algorithm allowlist validation that was previously missing in strict mode",
+          "required_control": "Algorithm allowlist validation for cryptographic operations",
+          "control_requirement_evidence": "CWE-327 requires restricting cryptographic algorithms to known secure options to prevent use of broken or weak algorithms",
+          "existing_controls_checked": [
+            "regex pattern validation (line 19-23) only validates format, not algorithm security",
+            "non-strict mode still accepts arbitrary algorithms but is intended for compatibility"
+          ],
+          "deficiency_evidence": "Without this control, strict mode would accept any algorithm name matching the regex pattern, potentially including weak algorithms like MD5 or SHA1"
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "Accepting weak cryptographic algorithms could lead to integrity verification bypass, data modification, or spoofing if an attacker can provide malicious content with a weak hash algorithm"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would accept any algorithm name that matches the regex pattern, potentially allowing weak or broken cryptographic algorithms to be used for Subresource Integrity validation, undermining the security guarantees of strict mode.",
+      "supporting_evidence": [
+        "SPEC_ALGORITHMS constant defines only SHA-256, SHA-384, SHA-512 as approved algorithms",
+        "Strict mode is explicitly designed for security-critical applications per code comments",
+        "The validation occurs before algorithm selection for cryptographic operations in checkData() and checkStream()",
+        "Code comments reference W3C Subresource Integrity specification requiring restricted algorithm set"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether non-strict mode usage in production could bypass this protection",
+        "Specific external attack vectors for algorithm downgrade in this context",
+        "Evidence of actual weak algorithms being accepted before this patch"
+      ],
+      "review_comment": "The patch adds critical algorithm allowlist validation in strict mode, restricting cryptographic hash algorithms to W3C-specified secure options (SHA-256, SHA-384, SHA-512). This prevents potential algorithm downgrade attacks where an attacker could specify weak algorithms that might be vulnerable to collision or preimage attacks. Ensure strict mode is used in security-critical contexts and consider whether non-strict mode should also implement similar restrictions.",
+      "change_type": "A",
+      "raw_score": 0.8,
+      "score": 0.8
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "index.js",
+      "changed_line": 25,
+      "statement": "if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }",
+      "cwe_id": "CWE-328",
+      "cwe_name": "Use of Weak Hash",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The patch adds algorithm whitelist validation, which prevents weak hash algorithms from being accepted. However, CWE-328 specifically addresses the use of weak hashes, while this prevents selection of weak algorithms rather than fixing an existing weak hash usage."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "User-provided SRI strings from external sources (HTTP headers, configuration) flow through parse() to IntegrityMetadata constructor, where the algorithm is extracted and used for cryptographic verification in checkData() and checkStream() functions."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "If this line were reverted, strict mode would accept any algorithm name that passes regex validation, potentially allowing weak or non-standard algorithms in security-critical integrity checks."
+        },
+        "security_control": {
+          "score": 0.65,
+          "evidence": "The patch clearly adds algorithm whitelist validation that was previously missing in strict mode.",
+          "required_control": "Algorithm whitelist validation for cryptographic operations",
+          "control_requirement_evidence": "CWE-328 requires preventing weak hash algorithms from being used in security-critical contexts. The SRI specification mandates specific strong algorithms for integrity verification.",
+          "existing_controls_checked": [
+            "Regex pattern validation (lines 9-10) only validates format, not algorithm strength",
+            "Non-strict mode continues to accept any algorithm name"
+          ],
+          "deficiency_evidence": "Before the patch, strict mode lacked algorithm validation, allowing potentially weak algorithms. The patch adds SPEC_ALGORITHMS whitelist to restrict to SHA-256, SHA-384, SHA-512."
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "The patch prevents algorithm confusion attacks where weak or non-standard algorithms could be accepted, but the specific security impact depends on whether weak algorithms would actually be used downstream and their cryptographic properties."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would accept any algorithm name that matches the regex pattern, potentially allowing weak or non-standard hash algorithms to be used in cryptographic integrity verification.",
+      "supporting_evidence": [
+        "Added algorithm whitelist validation using SPEC_ALGORITHMS constant containing only strong algorithms (sha256, sha384, sha512)",
+        "The validation occurs in IntegrityMetadata constructor which processes user-provided SRI strings",
+        "The algorithm is used downstream in checkData() and checkStream() for cryptographic verification"
+      ],
+      "contradicting_evidence": [
+        "The code doesn't actually use weak hashes - it prevents their selection",
+        "Non-strict mode continues to accept any algorithm, suggesting this is a strict-mode enhancement rather than vulnerability fix"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether weak algorithms were actually being used or could be exploited in practice",
+        "Specific attack scenarios where algorithm confusion would lead to security bypass",
+        "Downstream usage patterns that would make weak algorithm acceptance exploitable"
+      ],
+      "review_comment": "The patch adds algorithm whitelist validation in strict mode, restricting accepted hash algorithms to SHA-256, SHA-384, and SHA-512. This prevents potentially weak or non-standard algorithms from being used in cryptographic integrity verification when strict mode is enabled. Ensure strict mode is used in security-critical contexts where SRI validation occurs.",
+      "change_type": "A",
+      "raw_score": 0.63,
+      "score": 0.63
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "index.js",
+      "changed_line": 25,
+      "statement": "if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }",
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The added line implements explicit input validation by checking if the algorithm from user input matches a whitelist of acceptable cryptographic algorithms (SHA-256, SHA-384, SHA-512)"
+        },
+        "connection": {
+          "score": 0.9,
+          "evidence": "User-provided SRI strings containing algorithm names flow directly from metadata parameter through regex parsing to this validation check, then to cryptographic hash selection in checkData() and checkStream() functions"
+        },
+        "diff_causality": {
+          "score": 0.95,
+          "evidence": "Without this line, strict mode would accept any algorithm name that passes the regex pattern, including potentially weak or non-standard algorithms; with this line, only spec-compliant algorithms are accepted in strict mode"
+        },
+        "security_control": {
+          "score": 0.8,
+          "evidence": "Algorithm whitelist validation is required for CWE-20 to prevent injection of non-standard or weak algorithms",
+          "required_control": "Algorithm whitelist validation for cryptographic operations",
+          "control_requirement_evidence": "CWE-20 requires validation that input properties are safe for processing; for cryptographic algorithms, this means restricting to known secure algorithms",
+          "existing_controls_checked": [
+            "regex pattern validation (lines 8-10)",
+            "strict mode flag (line 15)",
+            "downstream cryptographic usage in checkData/checkStream"
+          ],
+          "deficiency_evidence": "Before this patch, strict mode lacked algorithm validation, allowing non-standard algorithms to pass through to cryptographic operations"
+        },
+        "concrete_impact": {
+          "score": 0.75,
+          "evidence": "Accepting non-standard algorithms could lead to weaker cryptographic validation, algorithm confusion attacks, or bypass of integrity checks when SRI strings are used for subresource validation"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would accept any algorithm name that matches the regex pattern, including potentially weak or non-standard algorithms that could compromise cryptographic integrity checks.",
+      "supporting_evidence": [
+        "User input flows from metadata parameter through parse() function to IntegrityMetadata constructor",
+        "The validation uses a hardcoded whitelist (SPEC_ALGORITHMS) of approved cryptographic algorithms",
+        "The algorithm is used downstream in checkData() and checkStream() for cryptographic hash computation",
+        "Strict mode is explicitly designed for spec-compliant security validation"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Specific production usage patterns for strict vs non-strict mode",
+        "Whether non-standard algorithms could actually lead to exploitable conditions in this cryptographic context"
+      ],
+      "review_comment": "The patch adds algorithm whitelist validation in strict mode, ensuring only SHA-256, SHA-384, and SHA-512 algorithms are accepted for SRI integrity checks. This prevents potentially weak or non-standard algorithms from being used in cryptographic validation. The validation occurs at the input parsing stage, rejecting invalid algorithms before they reach cryptographic operations. Ensure strict mode is enabled in security-critical contexts where SRI validation is performed.",
+      "change_type": "A",
+      "raw_score": 0.85,
+      "score": 0.85
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "index.js",
+      "changed_line": 25,
+      "statement": "if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }",
+      "cwe_id": "CWE-693",
+      "cwe_name": "Protection Mechanism Failure",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The added validation represents a protection mechanism (algorithm whitelist) that was missing or incomplete. CWE-693 describes protection mechanism failure, but typically refers to mechanisms that fail to provide sufficient defense, not mechanisms being added to address a deficiency."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "User-supplied SRI strings via parse() function flow to IntegrityMetadata constructor where algorithm validation occurs. The validation directly affects which cryptographic algorithms are accepted for integrity verification in checkData() and checkStream() functions."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "If this candidate line were reverted, strict mode would accept non-standard hash algorithms that were previously rejected. The patch materially adds protection by enforcing algorithm whitelist validation in strict mode."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "",
+          "required_control": "Algorithm validation/whitelisting for cryptographic operations",
+          "control_requirement_evidence": "CWE-693 requires protection mechanisms to provide sufficient defense; cryptographic algorithm validation is a standard protection against algorithm confusion and weak algorithm attacks",
+          "existing_controls_checked": [
+            "regex pattern validation (lines 19-23)",
+            "strict mode flag (line 15)",
+            "downstream cryptographic usage in checkData/checkStream"
+          ],
+          "deficiency_evidence": "Before the patch, strict mode lacked algorithm whitelist validation, allowing non-standard algorithms to pass through to cryptographic operations"
+        },
+        "concrete_impact": {
+          "score": 0.5,
+          "evidence": "Potential algorithm confusion could lead to weaker cryptographic validation or acceptance of compromised resources, but the exact exploit scenario depends on downstream usage and attacker capabilities not fully demonstrated."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would accept non-standard hash algorithms that don't meet the W3C Subresource Integrity specification, potentially allowing weaker or non-standard algorithms to be used in cryptographic integrity validation.",
+      "supporting_evidence": [
+        "Added algorithm whitelist validation using SPEC_ALGORITHMS constant containing only SHA-256, SHA-384, SHA-512",
+        "Validation occurs in strict mode when processing user-supplied SRI strings",
+        "The protection mechanism addresses W3C specification compliance for cryptographic algorithm restrictions"
+      ],
+      "contradicting_evidence": [
+        "CWE-693 typically describes protection mechanisms that fail during operation, not mechanisms being added to fix deficiencies",
+        "The patch adds protection rather than demonstrating a failure of existing protection"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether non-strict mode usage in production could bypass this protection",
+        "Specific exploit scenarios demonstrating concrete security impact",
+        "Downstream validation that might mitigate the algorithm acceptance issue"
+      ],
+      "review_comment": "The patch adds algorithm whitelist validation in strict mode to ensure only W3C-specified hash algorithms (SHA-256, SHA-384, SHA-512) are accepted for Subresource Integrity validation. This prevents potentially weak or non-standard algorithms from being used in cryptographic integrity checks. Ensure strict mode is enabled in security-critical contexts where SRI validation occurs.",
+      "change_type": "A",
+      "raw_score": 0.62,
+      "score": 0.62
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "index.js",
+      "changed_line": 25,
+      "statement": "if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }",
+      "cwe_id": "CWE-807",
+      "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The patch adds validation for algorithm selection, but CWE-807 specifically requires a protection mechanism that relies on untrusted input. Here, the validation IS the protection mechanism being added, not a pre-existing one being bypassed."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "User-supplied SRI strings (metadata parameter) flow directly to algorithm selection via regex matching (match[1]), which then affects cryptographic hash selection in checkData() and checkStream() functions."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "If this line were reverted, strict mode would accept non-standard algorithms from untrusted input. The patch materially creates algorithm validation where none existed in strict mode."
+        },
+        "security_control": {
+          "score": 0.65,
+          "evidence": "The patch adds algorithm whitelist validation using SPEC_ALGORITHMS constant",
+          "required_control": "Algorithm whitelist validation for cryptographic operations",
+          "control_requirement_evidence": "CWE-807 requires validation when security decisions rely on untrusted input; here the algorithm choice affects cryptographic integrity verification",
+          "existing_controls_checked": [
+            "regex pattern validation (lines 19-23) only validates format, not algorithm safety"
+          ],
+          "deficiency_evidence": "Before patch: no algorithm validation in strict mode allowed arbitrary algorithm selection; after patch: only SPEC_ALGORITHMS are accepted"
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "Accepting non-standard algorithms could lead to weaker cryptographic validation or algorithm confusion attacks, though specific exploit scenarios are not demonstrated."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would accept any algorithm name from untrusted SRI strings, potentially allowing weak or non-standard algorithms to be used for cryptographic integrity verification.",
+      "supporting_evidence": [
+        "User input flows from parse() function through metadata parameter to algorithm selection",
+        "Algorithm choice directly affects cryptographic hash computation in checkData() and checkStream()",
+        "Strict mode previously lacked algorithm validation despite being intended for security-critical usage"
+      ],
+      "contradicting_evidence": [
+        "CWE-807 requires a pre-existing protection mechanism that relies on untrusted input; here the patch adds the protection mechanism itself"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether non-strict mode usage in production could bypass this protection",
+        "Specific exploit scenarios for algorithm confusion in this cryptographic context",
+        "Downstream validation that might prevent unsafe algorithm usage"
+      ],
+      "review_comment": "The patch adds necessary algorithm whitelist validation for strict mode, preventing untrusted SRI strings from specifying non-standard cryptographic algorithms. This addresses a security gap where algorithm selection relied on external input without proper validation. Ensure strict mode is used in security-critical contexts where SRI validation occurs.",
+      "change_type": "A",
+      "raw_score": 0.65,
+      "score": 0.65
+    }
+  ],
+  "stage4_status": "completed"
+}

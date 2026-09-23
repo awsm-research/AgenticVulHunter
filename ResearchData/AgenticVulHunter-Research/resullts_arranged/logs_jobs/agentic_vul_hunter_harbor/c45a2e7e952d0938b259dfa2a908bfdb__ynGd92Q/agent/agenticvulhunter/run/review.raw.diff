@@ -1,0 +1,1859 @@
+diff --git a/pcs/cli/common/lib_wrapper.py b/pcs/cli/common/lib_wrapper.py
+index 0381836a0..909b43514 100644
+--- a/pcs/cli/common/lib_wrapper.py
++++ b/pcs/cli/common/lib_wrapper.py
+@@ -124,28 +124,29 @@ def load_module(env, middleware_factory, name):
+                 "start": qdevice.qdevice_start,
+                 "stop": qdevice.qdevice_stop,
+                 "kill": qdevice.qdevice_kill,
+                 "enable": qdevice.qdevice_enable,
+                 "disable": qdevice.qdevice_disable,
+             }
+         )
+     if name == "sbd":
+         return bind_all(
+             env,
+             middleware.build(),
+             {
+                 "enable_sbd": sbd.enable_sbd,
+                 "disable_sbd": sbd.disable_sbd,
+                 "get_cluster_sbd_status": sbd.get_cluster_sbd_status,
+-                "get_cluster_sbd_config": sbd.get_cluster_sbd_config
++                "get_cluster_sbd_config": sbd.get_cluster_sbd_config,
++                "get_local_sbd_config": sbd.get_local_sbd_config,
+             }
+         )
+ 
+     raise Exception("No library part '{0}'".format(name))
+ 
+ class Library(object):
+     def __init__(self, env, middleware_factory):
+         self.env = env
+         self.middleware_factory = middleware_factory
+ 
+     def __getattr__(self, name):
+         return get_module(self.env, self.middleware_factory, name)
+diff --git a/pcs/lib/commands/sbd.py b/pcs/lib/commands/sbd.py
+index d8f100afa..875758f4c 100644
+--- a/pcs/lib/commands/sbd.py
++++ b/pcs/lib/commands/sbd.py
+@@ -329,22 +329,27 @@ def get_cluster_sbd_config(lib_env):
+     tools.run_parallel(get_sbd_config, [([node], {}) for node in node_list])
+     lib_env.report_processor.process_list(report_item_list)
+ 
+     if not len(config_list):
+         return []
+ 
+     for node in node_list:
+         if node not in successful_node_list:
+             config_list.append({
+                 "node": node,
+                 "config": None
+             })
+     return config_list
+ 
+ 
++def get_local_sbd_config(lib_env):
++    __ensure_not_cman(lib_env)
++    return environment_file_to_dict(sbd.get_local_sbd_config())
++
++
+ def _get_cluster_nodes(lib_env):
+     return lib_env.get_corosync_conf().get_nodes()
+ 
+ 
+ def __ensure_not_cman(lib_env):
+     if lib_env.is_cman_cluster:
+         raise LibraryError(reports.cman_unsupported_command())
+diff --git a/pcs/stonith.py b/pcs/stonith.py
+index 4b44f49ca..ab9e92640 100644
+--- a/pcs/stonith.py
++++ b/pcs/stonith.py
+@@ -443,30 +443,32 @@ def get_fence_agent_info(argv):
+ 
+ 
+ def sbd_cmd(lib, argv, modifiers):
+     if len(argv) == 0:
+         raise CmdLineInputError()
+     cmd = argv.pop(0)
+     try:
+         if cmd == "enable":
+             sbd_enable(lib, argv, modifiers)
+         elif cmd == "disable":
+             sbd_disable(lib, argv, modifiers)
+         elif cmd == "status":
+             sbd_status(lib, argv, modifiers)
+         elif cmd == "config":
+             sbd_config(lib, argv, modifiers)
++        elif cmd == "local_config_in_json":
++            local_sbd_config(lib, argv, modifiers)
+         else:
+             raise CmdLineInputError()
+     except CmdLineInputError as e:
+         utils.exit_on_cmdline_input_errror(
+             e, "stonith", "sbd {0}".format(cmd)
+         )
+ 
+ 
+ def sbd_enable(lib, argv, modifiers):
+     sbd_cfg = parse_args.prepare_options(argv)
+     default_watchdog, watchdog_dict = _sbd_parse_watchdogs(
+         modifiers["watchdog"]
+     )
+     lib.sbd.enable_sbd(
+         default_watchdog,
+@@ -546,15 +548,19 @@ def sbd_config(lib, argv, modifiers):
+     for key, val in config.items():
+         if key in filtered_options:
+             continue
+         print("{key}={val}".format(key=key, val=val))
+ 
+     print()
+     print("Watchdogs:")
+     for config in config_list:
+         watchdog = "<unknown>"
+         if config["config"] is not None:
+             watchdog = config["config"].get("SBD_WATCHDOG_DEV", "<unknown>")
+         print("  {node}: {watchdog}".format(
+             node=config["node"].label,
+             watchdog=watchdog
+         ))
++
++
++def local_sbd_config(lib, argv, modifiers):
++    print(json.dumps(lib.sbd.get_local_sbd_config()))
+diff --git a/pcs/test/test_lib_commands_sbd.py b/pcs/test/test_lib_commands_sbd.py
+index 410caa580..576684867 100644
+--- a/pcs/test/test_lib_commands_sbd.py
++++ b/pcs/test/test_lib_commands_sbd.py
+@@ -5,31 +5,35 @@ from __future__ import (
+     unicode_literals,
+ )
+ 
+ import logging
+ 
+ from unittest import TestCase
+ 
+ from pcs.test.tools.pcs_mock import mock
+ from pcs.test.tools.assertions import (
+     assert_raise_library_error,
+     assert_report_item_list_equal,
+ )
+ from pcs.test.tools.custom_mock import MockLibraryReportProcessor
+ 
+ from pcs.common import report_codes
+-from pcs.lib.errors import ReportItemSeverity as Severities
++from pcs.lib.errors import (
++    ReportItemSeverity as Severities,
++    LibraryError,
++    ReportItem,
++)
+ from pcs.lib.env import LibraryEnvironment
+ from pcs.lib.node import (
+     NodeAddresses,
+     NodeAddressesList,
+ )
+ from pcs.lib.external import (
+     NodeCommunicator,
+     NodeConnectionException,
+     CommandRunner,
+ )
+ import pcs.lib.commands.sbd as cmd_sbd
+ 
+ 
+ class CommandSbdTest(TestCase):
+     def setUp(self):
+@@ -598,15 +602,83 @@ invalid value
+                 {"node": "node2"}
+             )]
+         )
+ 
+ 
+     def test_cman_cluster(self, mock_sbd_cfg, mock_get_nodes):
+         self.mock_env.is_cman_cluster = True
+         assert_raise_library_error(
+             lambda: cmd_sbd.get_cluster_sbd_config(self.mock_env),
+             (
+                 Severities.ERROR,
+                 report_codes.CMAN_UNSUPPORTED_COMMAND,
+                 {}
+             )
+         )
++
++
++@mock.patch("pcs.lib.sbd.get_local_sbd_config")
++class GetLocalSbdConfigTest(TestCase):
++    def setUp(self):
++        self.mock_env = mock.MagicMock(spec_set=LibraryEnvironment)
++
++    def test_success(self, mock_config):
++        self.mock_env.is_cman_cluster = False
++        mock_config.return_value = """
++# This file has been generated by pcs.
++SBD_OPTS="-n node1"
++SBD_WATCHDOG_DEV=/dev/watchdog
++SBD_WATCHDOG_TIMEOUT=0
++"""
++
++        self.assertEqual(
++            {
++                "SBD_OPTS": '"-n node1"',
++                "SBD_WATCHDOG_DEV": "/dev/watchdog",
++                "SBD_WATCHDOG_TIMEOUT": "0"
++            },
++            cmd_sbd.get_local_sbd_config(self.mock_env)
++        )
++        self.assertEqual(1, mock_config.call_count)
++
++    def test_cman_cluster(self, mock_config):
++        self.mock_env.is_cman_cluster = True
++        assert_raise_library_error(
++            lambda: cmd_sbd.get_local_sbd_config(self.mock_env),
++            (
++                Severities.ERROR,
++                report_codes.CMAN_UNSUPPORTED_COMMAND,
++                {}
++            )
++        )
++        self.assertEqual(0, mock_config.call_count)
++
++    def test_file_error(self, mock_config):
++        self.mock_env.is_cman_cluster = False
++        mock_config.side_effect = LibraryError(ReportItem.error(
++            report_codes.UNABLE_TO_GET_SBD_CONFIG,
++            "message"
++        ))
++        assert_raise_library_error(
++            lambda: cmd_sbd.get_local_sbd_config(self.mock_env),
++            (
++                Severities.ERROR,
++                report_codes.UNABLE_TO_GET_SBD_CONFIG,
++                {}
++            )
++        )
++
++    def test_parse_error(self, mock_config):
++        self.mock_env.is_cman_cluster = False
++        mock_config.return_value = """
++# This file has been generated by pcs.
++invalid_file
++"""
++        assert_raise_library_error(
++            lambda: cmd_sbd.get_local_sbd_config(self.mock_env),
++            (
++                Severities.ERROR,
++                report_codes.PARSE_ERROR_SBD_CONFIG,
++                {}
++            )
++        )
++
+diff --git a/pcsd/cluster_entity.rb b/pcsd/cluster_entity.rb
+index 1da29e201..c28b3382e 100644
+--- a/pcsd/cluster_entity.rb
++++ b/pcsd/cluster_entity.rb
+@@ -988,64 +988,91 @@ module ClusterEntity
+         while elem
+           if elem.name == 'node_state'
+             @on_node = elem.attributes['uname']
+             break
+           end
+           elem = elem.parent
+         end
+       end
+     end
+   end
+ 
+ 
+   class Node < JSONable
+     attr_accessor :id, :error_list, :warning_list, :status, :quorum, :uptime,
+                   :name, :corosync, :pacemaker, :cman, :corosync_enabled,
+-                  :pacemaker_enabled, :pcsd_enabled
++                  :pacemaker_enabled, :pcsd_enabled, :services, :sbd_config
+ 
+     def initialize
+       @id = nil
+       @error_list = []
+       @warning_list = []
+       @status = 'unknown'
+       @quorum = nil
+       @uptime = 'unknown'
+       @name = nil
++      @services = {
++        :pacemaker => {
++          :running => nil,
++          :enabled => nil
++        },
++        :corosync => {
++          :running => nil,
++          :enabled => nil
++        },
++        :pcsd => {
++          :running => nil,
++          :enabled => nil
++        },
++        :sbd => {
++          :installed => nil,
++          :running => nil,
++          :enabled => nil
++        }
++      }
+       @corosync = false
+       @pacemaker = false
+       @cman = false
+       @corosync_enabled = false
+       @pacemaker_enabled = false
+       @pcsd_enabled = false
++      @sbd_config = nil
+     end
+ 
+     def self.load_current_node(crm_dom=nil)
+       node = ClusterEntity::Node.new
+-      node.corosync = corosync_running?
+-      node.corosync_enabled = corosync_enabled?
+-      node.pacemaker = pacemaker_running?
+-      node.pacemaker_enabled = pacemaker_enabled?
+-      node.cman = cman_running?
+-      node.pcsd_enabled = pcsd_enabled?
++      node.services.each do |service, info|
++        info[:running] = is_service_running?(service.to_s)
++        info[:enabled] = is_service_enabled?(service.to_s)
++      end
++      if ISSYSTEMCTL
++        node.services[:sbd][:installed] = is_service_installed?('sbd')
++      end
++      node.corosync = node.services[:corosync][:running]
++      node.corosync_enabled = node.services[:corosync][:enabled]
++      node.pacemaker = node.services[:pacemaker][:running]
++      node.pacemaker_enabled = node.services[:pacemaker][:enabled]
++      node.cman = is_service_running?('cman')
++      node.pcsd_enabled = node.services[:pcsd][:enabled]
+ 
+       node_online = (node.corosync and node.pacemaker)
+       node.status =  node_online ? 'online' : 'offline'
+ 
+       node.uptime = get_node_uptime
+       node.id = get_local_node_id
+ 
+       if node_online and crm_dom
+         node_el = crm_dom.elements["//node[@id='#{node.id}']"]
+         if node_el and node_el.attributes['standby'] == 'true'
+           node.status = 'standby'
+         else
+           node.status = 'online'
+         end
+         node.quorum = !!crm_dom.elements['//current_dc[@with_quorum="true"]']
+       else
+         node.status = 'offline'
+       end
+-
++      node.sbd_config = get_parsed_local_sbd_config()
+       return node
+     end
+   end
+ end
+diff --git a/pcsd/pcs.rb b/pcsd/pcs.rb
+index b487b7b22..14cfcecc4 100644
+--- a/pcsd/pcs.rb
++++ b/pcsd/pcs.rb
+@@ -396,33 +396,36 @@ def send_request(auth_user, node, request, post=false, data={}, remote=true, raw
+     # ipv6 addresses being used here at all.
+     myhttp = Net::HTTP.new(node, uri.port)
+     myhttp.use_ssl = true
+     myhttp.verify_mode = OpenSSL::SSL::VERIFY_NONE
+     res = myhttp.start do |http|
+       http.read_timeout = timeout
+       http.request(req)
+     end
+     return res.code.to_i, res.body
+   rescue Exception => e
+     $logger.info "No response from: #{node} request: #{request}, exception: #{e}"
+     return 400,'{"noresponse":true}'
+   end
+ end
+ 
+-def add_node(auth_user, new_nodename, all=false, auto_start=true)
++def add_node(auth_user, new_nodename, all=false, auto_start=true, watchdog=nil)
+   if all
+     command = [PCS, "cluster", "node", "add", new_nodename]
++    if watchdog and not watchdog.strip.empty?
++      command << "--watchdog=#{watchdog.strip}"
++    end
+     if auto_start
+       command << '--start'
+       command << '--enable'
+     end
+     out, stderror, retval = run_cmd(auth_user, *command)
+   else
+     out, stderror, retval = run_cmd(
+       auth_user, PCS, "cluster", "localnode", "add", new_nodename
+     )
+   end
+   $logger.info("Adding #{new_nodename} to pcs_settings.conf")
+   corosync_nodes = get_corosync_nodes()
+   pcs_config = PCSConfig.new(Cfgsync::PcsdSettings.from_file().text())
+   pcs_config.update_cluster($cluster_name, corosync_nodes)
+   sync_config = Cfgsync::PcsdSettings.from_text(pcs_config.text())
+@@ -809,84 +812,68 @@ def get_acls(auth_user, cib_dom=nil)
+   return acls
+ end
+ 
+ def enable_cluster(auth_user)
+   stdout, stderror, retval = run_cmd(auth_user, PCS, "cluster", "enable")
+   return false if retval != 0
+   return true
+ end
+ 
+ def disable_cluster(auth_user)
+   stdout, stderror, retval = run_cmd(auth_user, PCS, "cluster", "disable")
+   return false if retval != 0
+   return true
+ end
+ 
+-def corosync_running?()
+-  is_service_running?('corosync')
+-end
+-
+-def corosync_enabled?()
+-  is_service_enabled?('corosync')
+-end
+-
+ def get_corosync_version()
+   begin
+     stdout, stderror, retval = run_cmd(
+       PCSAuth.getSuperuserAuth(), COROSYNC, "-v"
+     )
+   rescue
+     stdout = []
+   end
+   if retval == 0
+     match = /version\D+(\d+)\.(\d+)\.(\d+)/.match(stdout.join())
+     if match
+       return match[1..3].collect { | x | x.to_i }
+     end
+   end
+   return nil
+ end
+ 
+ def pacemaker_running?()
+   is_service_running?('pacemaker')
+ end
+ 
+-def pacemaker_enabled?()
+-  is_service_enabled?('pacemaker')
+-end
+-
+ def get_pacemaker_version()
+   begin
+     stdout, stderror, retval = run_cmd(
+       PCSAuth.getSuperuserAuth(), PACEMAKERD, "-$"
+     )
+   rescue
+     stdout = []
+   end
+   if retval == 0
+     match = /(\d+)\.(\d+)\.(\d+)/.match(stdout.join())
+     if match
+       return match[1..3].collect { | x | x.to_i }
+     end
+   end
+   return nil
+ end
+ 
+-def cman_running?()
+-  is_service_running?('cman')
+-end
+-
+ def get_cman_version()
+   begin
+     stdout, stderror, retval = run_cmd(
+       PCSAuth.getSuperuserAuth(), CMAN_TOOL, "-V"
+     )
+   rescue
+     stdout = []
+   end
+   if retval == 0
+     match = /(\d+)\.(\d+)\.(\d+)/.match(stdout.join())
+     if match
+       return match[1..3].collect { | x | x.to_i }
+     end
+   end
+   return nil
+@@ -902,34 +889,30 @@ def get_rhel_version()
+   end
+   return nil
+ end
+ 
+ def pcsd_restart()
+   fork {
+     sleep(10)
+     if ISSYSTEMCTL
+       `systemctl restart pcsd`
+     else
+       `service pcsd restart`
+     end
+   }
+ end
+ 
+-def pcsd_enabled?()
+-  is_service_enabled?('pcsd')
+-end
+-
+ def get_pcsd_version()
+   return PCS_VERSION.split(".").collect { | x | x.to_i }
+ end
+ 
+ def run_cmd(auth_user, *args)
+   options = {}
+   return run_cmd_options(auth_user, options, *args)
+ end
+ 
+ def run_cmd_options(auth_user, options, *args)
+   $logger.info("Running: " + args.join(" "))
+   start = Time.now
+   out = ""
+   errout = ""
+ 
+@@ -1386,58 +1369,60 @@ def verify_cookie_secret(secret)
+   end
+   return []
+ end
+ 
+ def cluster_status_from_nodes(auth_user, cluster_nodes, cluster_name)
+   node_map = {}
+   forbidden_nodes = {}
+   overview = {
+     :cluster_name => cluster_name,
+     :error_list => [],
+     :warning_list => [],
+     :quorate => nil,
+     :status => 'unknown',
+     :node_list => [],
+     :resource_list => [],
++    :available_features => [],
+   }
+ 
+   threads = []
+   cluster_nodes.uniq.each { |node|
+     threads << Thread.new {
+       code, response = send_request_with_token(
+         auth_user,
+         node,
+         'status',
+         false,
+         {:version=>'2', :operations=>'1'},
+         true,
+         nil,
+         15
+       )
+       node_map[node] = {}
+       node_map[node].update(overview)
+       if 403 == code
+         forbidden_nodes[node] = true
+       end
+       node_status_unknown = {
+         :name => node,
+         :status => 'unknown',
+         :warning_list => [],
+         :error_list => []
+       }
+       begin
+         parsed_response = JSON.parse(response, {:symbolize_names => true})
++        parsed_response[:available_features] ||= []
+         if parsed_response[:noresponse]
+           node_map[node][:node] = {}
+           node_map[node][:node].update(node_status_unknown)
+         elsif parsed_response[:notoken] or parsed_response[:notauthorized]
+           node_map[node][:node] = {}
+           node_map[node][:node].update(node_status_unknown)
+           node_map[node][:node][:notauthorized] = true
+         else
+           if parsed_response[:node]
+             parsed_response[:status_version] = '2'
+             parsed_response[:node][:status_version] = '2'
+           else
+             parsed_response = status_v1_to_v2(parsed_response)
+           end
+           node_map[node] = parsed_response
+@@ -1498,50 +1483,82 @@ def cluster_status_from_nodes(auth_user, cluster_nodes, cluster_name)
+     status[:node_list] = node_status_list
+   # old pcsd doesn't provide info about quorum, use data from any node
+   else
+     status = overview
+     status[:quorate] = nil
+     status[:node_list] = node_status_list
+     cluster_nodes_map.each { |_, node|
+       if node[:status_version] and node[:status_version] == '1' and
+           !node[:cluster_settings][:error]
+         status = overview.update(node)
+         break
+       end
+     }
+   end
+   status.delete(:node)
++  sbd_enabled = []
++  sbd_running = []
++  node_map.each { |_, cluster_status|
++    # create set of available features on all nodes
++    # it is intersection of available features from all nodes
++    if cluster_status[:node][:status] != 'unknown'
++      status[:available_features] &= cluster_status[:available_features]
++    end
++    if (
++      cluster_status[:node][:services] and
++      cluster_status[:node][:services][:sbd]
++    )
++      if cluster_status[:node][:services][:sbd][:enabled]
++        sbd_enabled << cluster_status[:node][:name]
++      end
++      if cluster_status[:node][:services][:sbd][:running]
++        sbd_running << cluster_status[:node][:name]
++      end
++    end
++  }
+ 
+   if status[:quorate]
+     fence_count = 0
+     status[:resource_list].each { |r|
+       if r[:stonith]
+         fence_count += 1
+       end
+     }
+-    if fence_count == 0
++    if fence_count == 0 and sbd_enabled.empty?
+       status[:warning_list] << {
+-        :message => 'No fence devices configured in the cluster',
++        :message => 'No fencing configured in the cluster',
+       }
+     end
+ 
+     if status[:cluster_settings]['stonith-enabled'.to_sym] and
+         not is_cib_true(status[:cluster_settings]['stonith-enabled'.to_sym])
+       status[:warning_list] << {
+         :message => 'Stonith is not enabled',
+       }
+     end
++    if sbd_enabled.length == node_map.length and sbd_running.empty?
++      status[:warning_list] << {
++        :message => 'SBD is enabled but not running. Restart of cluster is' +
++          ' required.'
++      }
++    end
++    if sbd_running.length == node_map.length and sbd_enabled.empty?
++      status[:warning_list] << {
++        :message => 'SBD is disabled but it is still running. Restart of' +
++          ' cluster is required.'
++      }
++    end
+   end
+ 
+   if not_authorized_nodes.length > 0
+     status[:warning_list] << {
+       :message => 'Not authorized against node(s) '\
+         + not_authorized_nodes.join(', '),
+       :type => 'nodes_not_authorized',
+       :node_list => not_authorized_nodes,
+     }
+   end
+ 
+   if status[:quorate].nil?
+     if old_status
+       status[:warning_list] << {
+         :message => 'Cluster is running an old version of pcs/pcsd which '\
+@@ -1600,31 +1617,32 @@ def get_node_status(auth_user, cib_dom)
+       :cluster_name => $cluster_name,
+       :groups => [],
+       :constraints => {
+           # :rsc_location => [],
+           # :rcs_colocation => [],
+           # :rcs_order => []
+       },
+       :cluster_settings => {},
+       :need_ring1_address => need_ring1_address?,
+       :is_cman_with_udpu_transport => is_cman_with_udpu_transport?,
+       :acls => get_acls(auth_user, cib_dom),
+       :username => auth_user[:username],
+       :fence_levels => get_fence_levels(auth_user, cib_dom),
+       :node_attr => node_attrs_to_v2(get_node_attributes(auth_user, cib_dom)),
+       :nodes_utilization => get_nodes_utilization(cib_dom),
+-      :known_nodes => []
++      :known_nodes => [],
++      :available_features => ['sbd']
+   }
+ 
+   nodes = get_nodes_status()
+ 
+   known_nodes = []
+   nodes.each { |_, node_list|
+     known_nodes.concat node_list
+   }
+   node_status[:known_nodes] = known_nodes.uniq
+ 
+   nodes.each do |k,v|
+     node_status[k.to_sym] = v
+   end
+ 
+   if cib_dom
+@@ -1878,15 +1896,28 @@ def disable_service(service)
+   end
+   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)
+   return (retcode == 0)
+ end
+ 
+ def set_cluster_prop_force(auth_user, prop, val)
+   cmd = [PCS, 'property', 'set', "#{prop}=#{val}", '--force']
+   if pacemaker_running?
+     _, _, retcode = run_cmd(auth_user, *cmd)
+   else
+     cmd += ['-f', CIB_PATH]
+     _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)
+   end
+   return (retcode == 0)
+ end
++
++def get_parsed_local_sbd_config()
++  cmd = [PCS, 'stonith', 'sbd', 'local_config_in_json']
++  out, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)
++  if retcode != 0
++    return nil
++  end
++  begin
++    return JSON.parse(out.join(' '))
++  rescue JSON::ParserError
++    return nil
++  end
++end
+diff --git a/pcsd/public/css/style.css b/pcsd/public/css/style.css
+index 95535f0ce..6ae37b5ec 100644
+--- a/pcsd/public/css/style.css
++++ b/pcsd/public/css/style.css
+@@ -536,30 +536,76 @@ input[type=text], input[type=submit], input[type=password] {
+ .datatable td {
+   background: #ffffff;
+   border: 0px;
+ }
+ 
+ table.datatable td, table.datatable a {
+   color: #2b85db;
+ }
+ 
+ table.datatable {
+   border-width: 1px 1px 1px 1px;
+   border-color: #b8b8b8;
+   border-style: solid;
+ }
+ 
++/* dark data table*/
++
++.darkdatatable {
++  border-spacing: 0px;
++}
++
++.darkdatatable td, .darkdatatable th {
++  font-family: "Liberation";
++  font-size: 11px;
++  padding: 5px;
++}
++
++.darkdatatable td, .darkdatatable th{
++  text-align: left;
++  padding-left: 10;
++}
++
++.darkdatatable th {
++  font-weight: bold;
++  color: #ffffff;
++  border-bottom: 1px solid #898989;
++  background: #232323;
++}
++
++.darkdatatable td {
++  background: #191919;
++  border: 0px;
++}
++
++table.darkdatatable td, table.darkdatatable a {
++  color: #ffffff;
++}
++
++table.darkdatatable {
++  border-width: 1px 1px 1px 1px;
++  border-color: #898989;
++  border-style: solid;
++}
++
++.darkdatatable_header {
++  padding-left: 3px;
++  font-family: "Overpass";
++  font-size: 14px;
++  color: #c9c9c9;
++}
++
+ .link {
+   cursor:pointer;
+   font-family: "Liberation";
+   font-size: 12px;
+   color: #2b85db;
+   font-weight: normal;
+ }
+ 
+ #copyright {
+   color: #666764;
+   float: left;
+ }
+ 
+ #footer {
+   font-family: "Overpass";
+@@ -606,51 +652,59 @@ tr td a.remove {
+ }
+ 
+ .datatable_header span {
+   margin-top: 4px;
+ }
+ 
+ .sprites {
+   background-image: url("../images/action-icons.png");
+   background-color     : transparent; 
+   background-repeat    : no-repeat; 
+   float: left;
+   height: 16px;
+   width: 16px;
+ }
+ 
++.inverted {
++  filter: invert(100%);
++  -webkit-filter: invert(100%);
++}
++
+ .x { background-position: -32px -1px; }
+ .xdark { background-position: -32px -17px; }
+ .plus { background-position: -48px -1px; }
+ .check { background-position: -448px -1px; }
+ .warning { background-position: -432px -1px; }
+ .warningdark { background-position: -432px -17px; }
+ .error { background-position: -384px -1px; }
+ .errordark { background-position: -384px -17px; }
+ .checkdark { background-position: -448px -17px; }
+ .restart { background-position: -272px -17px; }
+ .standby { background-position: -352px -16px; }
+ .unstandby { background-position: -368px -16px; }
+ .cancel { background-position: -160px -17px; }
+ .configure { background-position: -64px -16px; }
++.configurelight { background-position: -64px 0px; }
+ .arrow { background-position: -544px -16px; }
+ .move { background-position: -16px -17px; }
+ .history { background-position: -256px -17px; }
+ .previewmap { background-position: -400px -1px; }
+ .downarrow { background-position: -528px -1px; }
+ .rightarrow { background-position: -544px -1px; }
+ .infoicon {background-position: -256px -1px; }
++.Xdark { background-position: -160px -16px; }
++.questionmarkdark { background-position: -336px -16px; }
+ 
+ .menuheader { position: relative; }
+ .menuheader .label {
+   font-family: "Overpass";
+   font-size: 11px;
+   font-weight: bold;
+   text-align: left;
+   color: #888888;
+ }
+ 
+ .menuheader .menu {
+   font-family: "Overpass";
+   font-size: 11px;
+   font-weight: bold;
+   text-align: left;
+diff --git a/pcsd/public/js/nodes-ember.js b/pcsd/public/js/nodes-ember.js
+index 4ff4ebca8..165f1c5db 100644
+--- a/pcsd/public/js/nodes-ember.js
++++ b/pcsd/public/js/nodes-ember.js
+@@ -26,30 +26,54 @@ Pcs = Ember.Application.createWithMixins({
+     if (this.cur_page == "acls") return "display: table-row;";
+     else return "display: none;";
+   }.property("cur_page"),
+   manage_page: function() {
+     if (this.cur_page == "manage") return "display: table-row;";
+     else return "display: none;";
+   }.property("cur_page"),
+   permissions_page: function() {
+     if (this.cur_page == "permissions") return "display: table-row;";
+     else return "display: none;";
+   }.property("cur_page"),
+   wizards_page: function() {
+     if (this.cur_page == "wizards") return "display: table-row;";
+     else return "display: none;";
+   }.property("cur_page"),
++  available_features: [],
++  is_sbd_supported: function() {
++    return (this.get("available_features").indexOf("sbd") != -1);
++  }.property("available_features"),
++  is_sbd_running: false,
++  is_sbd_enabled: false,
++  is_sbd_enabled_or_running: function() {
++    return (this.get("is_sbd_enabled") || this.get("is_sbd_running"));
++  }.property("is_sbd_enabled", "is_sbd_running"),
++  sbd_config: null,
++  sbd_config_table: function() {
++    if (!this.get("sbd_config")) {
++      return "no configuration obtained";
++    }
++    var out =
++      '<table class="darkdatatable"><tr><th>OPTION</th><th>VALUE</th></tr>\n';
++    var banned_options = ["SBD_OPTS", "SBD_WATCHDOG_DEV", "SBD_PACEMAKER"];
++    $.each(this.get("sbd_config"), function(opt, val) {
++      if (banned_options.indexOf(opt) == -1) {
++        out += '<tr><td>' + opt + '</td><td>' + val + '</td></tr>\n';
++      }
++    });
++    return out + '</table>';
++  }.property("sbd_config"),
+ 
+   getResourcesFromID: function(resources) {
+     var retArray = [];
+     var resource_map = Pcs.resourcesContainer.get('resource_map');
+     $.each(resources, function(_, resource_id) {
+       if (resource_id in resource_map && !resource_map[resource_id].get('stonith')) {
+         retArray.pushObject(resource_map[resource_id]);
+       }
+     });
+     return retArray;
+   },
+   updater: null,
+ 
+   update: function() {
+     Pcs.get('updater').update();
+@@ -100,30 +124,34 @@ Pcs = Ember.Application.createWithMixins({
+           Pcs.get('updater').update_finished();
+         }
+       });
+       return;
+     }
+     ajax_wrapper({
+       url: "cluster_status",
+       dataType: "json",
+       success: function(data) {
+         Pcs.resourcesContainer.update(data);
+         Pcs.nodesController.update(data);
+         Pcs.aclsController.update(data);
+         Pcs.set("cluster_settings",data.cluster_settings);
+         Pcs.set('need_ring1_address', false);
+         Pcs.set('is_cman_with_udpu_transport', false);
++        Pcs.set(
++          'available_features',
++          data['available_features'] ? data['available_features'] : []
++        );
+         if (data['need_ring1_address']) {
+           Pcs.set('need_ring1_address', true);
+         }
+         if (data['is_cman_with_udpu_transport']) {
+           Pcs.set('is_cman_with_udpu_transport', true);
+         }
+         var fence_change = false;
+         var resource_change = false;
+         Ember.run.next(function () {
+           var self = Pcs.resourcesContainer;
+           var cur_fence = self.get('cur_fence');
+           var cur_resource = self.get('cur_resource');
+           var resource_map = self.get('resource_map');
+           if (first_run) {
+             refresh_cluster_properties();
+@@ -1460,30 +1488,78 @@ Pcs.Clusternode = Ember.Object.extend({
+   is_in_maintenance: function() {
+     var self = this;
+     var result = false;
+     $.each(self.get('node_attrs'), function(_, attr) {
+       if (attr["name"] == "maintenance") {
+         result = is_cib_true(attr["value"]);
+         return false; // break foreach loop
+       }
+     });
+     return result;
+   }.property('node_attrs'),
+   fence_levels: [],
+   pcsd: null,
+   corosync_daemon: null,
+   pacemaker_daemon: null,
++  services: [],
++  sbd_config: null,
++  sbd_status: function() {
++    if (this.get("services") && this.get("services")["sbd"]) {
++      return this.get("services")["sbd"];
++    } else {
++      return {
++        installed: null,
++        enabled: null,
++        running: null
++      };
++    }
++  }.property("services"),
++  is_sbd_enabled: function() {
++    return this.get("sbd_status").enabled;
++  }.property("sbd_status"),
++  is_sbd_running: function() {
++    return this.get("sbd_status").running;
++  }.property("sbd_status"),
++  is_sbd_installed: function() {
++    return this.get("sbd_status").installed;
++  }.property("sbd_status"),
++  sbd_status_str: function() {
++    var running = 'Stopped';
++    var status_class = 'status-offline';
++    if (this.get("is_sbd_running") == null) {
++      running = 'Unknown';
++      status_class = 'status-unknown';
++    } else if (this.get("is_sbd_running")) {
++      status_class = 'status';
++      running = 'Running';
++    }
++    var starting = 'Disabled';
++    if (this.get("is_sbd_enabled") == null) {
++      starting = 'Unknown';
++    } else if (this.get("is_sbd_enabled")) {
++      starting = 'Enabled';
++    }
++    return '<span id="sbd_status" style="float:left" class="' + status_class
++      + '">' + running + ' (' + starting + ')</span>';
++  }.property("is_sbd_enabled", "is_sbd_enabled"),
++  sbd_watchdog: function() {
++    if (this.get("sbd_config") && this.get("sbd_config")["SBD_WATCHDOG_DEV"]) {
++      return this.get("sbd_config")["SBD_WATCHDOG_DEV"];
++    } else {
++      return "<unkown>";
++    }
++  }.property("sbd_config")
+ });
+ 
+ Pcs.Aclrole = Ember.Object.extend({
+   name: null,
+   cur_role: false,
+   checked: false,
+   description: "",
+   user_list: null,
+   group_list: null,
+   trclass: function() {
+     return this.cur_role ? "node_selected" : "";
+   }.property("cur_role"),
+   onmouseover: function() {
+     return this.cur_role ? "" : "hover_over(this);"
+   }.property("cur_role"),
+@@ -2018,30 +2094,38 @@ Pcs.nodesController = Ember.ArrayController.createWithMixins({
+         return false;
+       }
+     });
+     return ret_val;
+   }.property("cur_node", "content.@each.fence_levels"),
+   init: function(){
+     this._super();
+   },
+ 
+   load_node: function(node_row, dont_update_hash){
+     load_row(node_row, this, 'cur_node', '#node_info_div');
+     if (!dont_update_hash)
+       window.location.hash = "/nodes/" + $(node_row).attr("nodeID");
+   },
+ 
++  get_node_name_list: function() {
++    var node_list = [];
++    $.each(this.content, function(_, node) {
++      node_list.push(node.name);
++    });
++    return node_list;
++  },
++
+   update: function(data){
+     var self = this;
+     var nodes = [];
+     var corosync_nodes_online = data["corosync_online"];
+     var pacemaker_nodes_online = data["pacemaker_online"];
+     var pacemaker_nodes_standby = data["pacemaker_standby"];
+ 
+     var resources_on_nodes = {};
+     var lc_on_nodes = {};
+     $.each(data['node_list'], function(index, node) {
+       nodes.push(node.name);
+ 
+       resources_on_nodes[node.name] = [];
+       $.each(Pcs.resourcesContainer.get('resource_map'), function(resource_id, resource_obj) {
+         var nodes_running_on = resource_obj.get('nodes_running_on');
+@@ -2066,31 +2150,45 @@ Pcs.nodesController = Ember.ArrayController.createWithMixins({
+     var nodes_checked = {};
+     var cur_node_holder = "";
+     if (self.cur_node)
+       cur_node_holder = self.cur_node.name;
+     $.each(self.content, function (key, value) {
+       if (value.checked)
+         nodes_checked[value.name] = true;
+     });
+ 
+     if (data["nodes_utilization"]) {
+       self.set("utilization_support", true);
+     } else {
+       self.set("utilization_support", false);
+     }
+ 
++    var is_sbd_enabled = false;
++    var is_sbd_running = false;
++    var sbd = null;
++    Pcs.set("sbd_config", null);
+     $.each(data['node_list'], function(_, node_obj) {
++      if (node_obj["services"] && node_obj["services"]["sbd"]) {
++        sbd = node_obj["services"]["sbd"];
++        is_sbd_enabled = (is_sbd_enabled || sbd.enabled);
++        is_sbd_running = (is_sbd_running || sbd.running);
++      }
++
++      if (node_obj["sbd_config"]) {
++        Pcs.set("sbd_config", node_obj["sbd_config"]);
++      }
++
+       var node_id = node_obj.name;
+       if ($.inArray(node_id, corosync_nodes_online) > -1) {
+         corosync_online = true;
+       } else {
+         corosync_online = false;
+       }
+ 
+       if ($.inArray(node_id, pacemaker_nodes_online) > -1) {
+         pacemaker_online = true;
+       } else {
+         pacemaker_online = false;
+       }
+ 
+       if ($.inArray(node_id, pacemaker_nodes_standby) > -1) {
+         pacemaker_standby = true;
+@@ -2141,81 +2239,88 @@ Pcs.nodesController = Ember.ArrayController.createWithMixins({
+           node.set("pacemaker_daemon", node_obj["pacemaker"]);
+           node.set("pacemaker_enabled", node_obj["pacemaker_enabled"]);
+           node.set("pcsd_enabled", node_obj["pcsd_enabled"]);
+           node.set("corosync", corosync_online);
+           node.set("pacemaker", pacemaker_online);
+           node.set("pacemaker_standby", pacemaker_standby);
+           node.set("cur_node",false);
+           node.set("running_resources", Pcs.getResourcesFromID($.unique(resources_on_nodes[node_id].sort().reverse())));
+           node.set("location_constraints", lc_on_nodes[node_id].sort());
+           node.set("uptime", node_obj["uptime"]);
+           node.set("node_id", node_obj["id"]);
+           node.set("node_attrs", node_attr);
+           node.set("fence_levels", data["fence_levels"]);
+           node.set("status", node_obj["status"]);
+           node.set("utilization", utilization);
++          node.set("services", node_obj["services"]);
++          node.set("sbd_config", node_obj["sbd_config"]);
+         }
+       });
+ 
+       if (found == false) {
+         var node = Pcs.Clusternode.create({
+           name: node_id,
+           authorized:  authorized,
+           up: up_status,
+           pcsd: pcsd_daemon && authorized,
+           corosync_daemon: node_obj["corosync"],
+           corosync_enabled: node_obj["corosync_enabled"],
+           pacemaker_daemon: node_obj["pacemaker"],
+           pacemaker_enabled: node_obj["pacemaker_enabled"],
+           pcsd_enabled: node_obj["pcsd_enabled"],
+           corosync: corosync_online,
+           pacemaker: pacemaker_online,
+           pacemaker_standby: pacemaker_standby,
+           cur_node: false,
+           running_resources: Pcs.getResourcesFromID($.unique(resources_on_nodes[node_id].sort().reverse())),
+           location_constraints: lc_on_nodes[node_id].sort(),
+           uptime: node_obj["uptime"],
+           node_id: node_obj["id"],
+           node_attrs: node_attr,
+           fence_levels: data["fence_levels"],
+           status: node_obj["status"],
+-          utilization: utilization
++          utilization: utilization,
++          services: node_obj["services"],
++          sbd_config: node_obj["sbd_config"]
+         });
+       }
+       var pathname = window.location.pathname.split('/');
+ 
+       if (cur_node_holder == "") {
+         cur_node_name = Pcs.opening_node;
+       } else {
+         cur_node_name = cur_node_holder;
+       }
+       if (node.name == cur_node_name) {
+         node.set("cur_node",true);
+         self.set("cur_node", node);
+       }
+ 
+       if (nodes_checked[node.name])
+         node.set("checked",true);
+ 
+       if (found == false)
+         self.pushObject(node);
+     });
+     if (self.content && self.content.length > 0 && self.cur_node == null) {
+       self.set("cur_node", self.content[0]);
+       self.content[0].set("cur_node",true);
+     }
+ 
++    Pcs.set("is_sbd_enabled", is_sbd_enabled);
++    Pcs.set("is_sbd_running", is_sbd_running);
++
+     nodesToRemove = [];
+     $.each(self.content, function (key, node) {
+       found = false;
+       $.each(nodes, function (k,v) {
+         if (v == node.name)
+           found = true;
+       });
+       if (!found) {
+         nodesToRemove.push(node);
+       }
+     });
+ 
+     $.each(nodesToRemove, function(k,v) {
+       self.content.removeObject(v);
+     });
+diff --git a/pcsd/public/js/pcsd.js b/pcsd/public/js/pcsd.js
+index 254f39018..dd35ad7a6 100644
+--- a/pcsd/public/js/pcsd.js
++++ b/pcsd/public/js/pcsd.js
+@@ -2710,18 +2710,200 @@ Ember.Handlebars.helper('selector-helper', function (content, value, place_holde
+   var line;
+   if (place_holder) {
+     out += '<option value="">' + place_holder + '</option>'; 
+   }
+   $.each(content, function(_, opt){
+     line = '<option value="' + opt["value"] + '"';
+     if (value == opt["value"]) {
+       line += ' selected="selected"'
+     }
+     line += ">" + Handlebars.Utils.escapeExpression(opt["name"]) + "</option>";
+     out += line + "\n";
+   });
+   return new Handlebars.SafeString(out);
+ });
+ 
++Ember.Handlebars.helper('bool-to-icon', function(value, options) {
++  var out = '<span class="sprites inverted ';
++  if (typeof(value) == 'undefined' || value == null) {
++    out += "questionmarkdark";
++  } else if (value) {
++    out += "checkdark"
++  } else {
++    out += "Xdark"
++  }
++  return new Handlebars.SafeString(out + '">&nbsp;</span>');
++});
++
+ function nl2br(text) {
+   return text.replace(/(?:\r\n|\r|\n)/g, '<br />');
+ }
++
++function enable_sbd(dialog) {
++  ajax_wrapper({
++    type: 'POST',
++    url: get_cluster_remote_url() + "remote_enable_sbd",
++    data: dialog.find("#enable_sbd_form").serialize(),
++    timeout: pcs_timeout,
++    success: function() {
++      dialog.parent().find("#enable_sbd_btn").button(
++        "option", "disabled", false
++      );
++      dialog.dialog("close");
++      alert(
++        'SBD enabled! You have to restart cluster in order to apply changes.'
++      );
++      Pcs.update();
++    },
++    error: function (xhr, status, error) {
++      dialog.parent().find("#enable_sbd_btn").button(
++        "option", "disabled", false
++      );
++      xhr.responseText = xhr.responseText.replace(
++        "--skip-offline", "option 'ignore offline nodes'"
++      );
++      alert(
++        ajax_simple_error(xhr, status, error)
++      );
++    }
++  });
++}
++
++function enable_sbd_dialog(node_list) {
++  var buttonsOpts = [
++    {
++      text: "Enable SBD",
++      id: "enable_sbd_btn",
++      click: function() {
++        var dialog = $(this);
++        dialog.parent().find("#enable_sbd_btn").button(
++          "option", "disabled", true
++        );
++        enable_sbd(dialog);
++      }
++    },
++    {
++      text:"Cancel",
++      click: function () {
++        $(this).dialog("close");
++      }
++    }
++  ];
++
++  var dialog_obj = $("#enable_sbd_dialog").dialog({title: 'Enable SBD',
++    modal: true, resizable: false,
++    width: 'auto',
++    buttons: buttonsOpts
++  });
++
++  dialog_obj.keypress(function(e) {
++    if (
++      e.keyCode == $.ui.keyCode.ENTER &&
++      !dialog_obj.parent().find("#enable_sbd_btn").button("option", "disabled")
++    ) {
++      dialog_obj.parent().find("#enable_sbd_btn").trigger("click");
++      return false;
++    }
++  });
++  dialog_obj.find('#watchdog_table').empty();
++  $.each(node_list, function(_, node) {
++    dialog_obj.find("#watchdog_table").append(
++      '<tr>' +
++        '<td>' +
++          node + ':' +
++        '</td>' +
++        '<td>' +
++          '<input ' +
++            'type="text" ' +
++            'placeholder="/dev/watchdog" ' +
++            'name="watchdog[' + node + ']" ' +
++          '/>' +
++        '</td>' +
++      '</tr>'
++    )
++  });
++}
++
++function disable_sbd(dialog) {
++  ajax_wrapper({
++    type: 'POST',
++    url: get_cluster_remote_url() + "remote_disable_sbd",
++    data: dialog.find("#disable_sbd_form").serialize(),
++    timeout: pcs_timeout,
++    success: function() {
++      dialog.parent().find("#disable_sbd_btn").button(
++        "option", "disabled", false
++      );
++      dialog.dialog("close");
++      alert(
++        'SBD disabled! You have to restart cluster in order to apply changes.'
++      );
++      Pcs.update();
++    },
++    error: function (xhr, status, error) {
++      dialog.parent().find("#disable_sbd_btn").button(
++        "option", "disabled", false
++      );
++      xhr.responseText = xhr.responseText.replace(
++        "--skip-offline", "option 'ignore offline nodes'"
++      );
++      alert(ajax_simple_error(xhr, status, error));
++    }
++  });
++}
++
++function disable_sbd_dialog() {
++  var buttonsOpts = [
++    {
++      text: "Disable SBD",
++      id: "disable_sbd_btn",
++      click: function() {
++        var dialog = $(this);
++        dialog.parent().find("#disable_sbd_btn").button(
++          "option", "disabled", true
++        );
++        disable_sbd(dialog);
++      }
++    },
++    {
++      text:"Cancel",
++      click: function () {
++        $(this).dialog("close");
++      }
++    }
++  ];
++
++  $("#disable_sbd_dialog").dialog({
++    title: 'Disable SBD',
++    modal: true, resizable: false,
++    width: 'auto',
++    buttons: buttonsOpts
++  });
++}
++
++function sbd_status_dialog() {
++  var buttonsOpts = [
++    {
++      text: "Enable SBD",
++      click: function() {
++        enable_sbd_dialog(Pcs.nodesController.get_node_name_list());
++      }
++    },
++    {
++      text: "Disable SBD",
++      click: disable_sbd_dialog
++    },
++    {
++      text:"Close",
++      click: function () {
++        $(this).dialog("close");
++      }
++    }
++  ];
++
++  $("#sbd_status_dialog").dialog({
++    title: 'SBD',
++    modal: true, resizable: false,
++    width: 'auto',
++    buttons: buttonsOpts
++  });
++}
+diff --git a/pcsd/remote.rb b/pcsd/remote.rb
+index 2c9369f01..73edefee8 100644
+--- a/pcsd/remote.rb
++++ b/pcsd/remote.rb
+@@ -57,31 +57,33 @@ def remote(params, request, auth_user)
+       :remove_nodes => method(:remote_remove_nodes),
+       :remove_node => method(:remote_remove_node),
+       :cluster_destroy => method(:cluster_destroy),
+       :get_wizard => method(:get_wizard),
+       :wizard_submit => method(:wizard_submit),
+       :get_tokens => method(:get_tokens),
+       :get_cluster_tokens => method(:get_cluster_tokens),
+       :save_tokens => method(:save_tokens),
+       :get_cluster_properties_definition => method(:get_cluster_properties_definition),
+       :check_sbd => method(:check_sbd),
+       :set_sbd_config => method(:set_sbd_config),
+       :get_sbd_config => method(:get_sbd_config),
+       :sbd_disable => method(:sbd_disable),
+       :sbd_enable => method(:sbd_enable),
+       :remove_stonith_watchdog_timeout=> method(:remove_stonith_watchdog_timeout),
+-      :set_stonith_watchdog_timeout_to_zero => method(:set_stonith_watchdog_timeout_to_zero)
++      :set_stonith_watchdog_timeout_to_zero => method(:set_stonith_watchdog_timeout_to_zero),
++      :remote_enable_sbd => method(:remote_enable_sbd),
++      :remote_disable_sbd => method(:remote_disable_sbd)
+   }
+   remote_cmd_with_pacemaker = {
+       :pacemaker_node_status => method(:remote_pacemaker_node_status),
+       :resource_start => method(:resource_start),
+       :resource_stop => method(:resource_stop),
+       :resource_cleanup => method(:resource_cleanup),
+       :update_resource => method(:update_resource),
+       :update_fence_device => method(:update_fence_device),
+       :get_avail_resource_agents => method(:get_avail_resource_agents),
+       :get_avail_fence_agents => method(:get_avail_fence_agents),
+       :remove_resource => method(:remove_resource),
+       :add_constraint_remote => method(:add_constraint_remote),
+       :add_constraint_rule_remote => method(:add_constraint_rule_remote),
+       :add_constraint_set_remote => method(:add_constraint_set_remote),
+       :remove_constraint_remote => method(:remove_constraint_remote),
+@@ -764,31 +766,33 @@ end
+ 
+ def remote_add_node(params, request, auth_user, all=false)
+   if not allowed_for_local_cluster(auth_user, Permissions::FULL)
+     return 403, 'Permission denied'
+   end
+   auto_start = false
+   if params[:auto_start] and params[:auto_start] == "1"
+     auto_start = true
+   end
+ 
+   if params[:new_nodename] != nil
+     node = params[:new_nodename]
+     if params[:new_ring1addr] != nil
+       node += ',' + params[:new_ring1addr]
+     end
+-    retval, output = add_node(auth_user, node, all, auto_start)
++    retval, output = add_node(
++      auth_user, node, all, auto_start, params[:watchdog]
++    )
+   end
+ 
+   if retval == 0
+     return [200, JSON.generate([retval, get_corosync_conf()])]
+   end
+ 
+   return [400,output]
+ end
+ 
+ def remote_remove_nodes(params, request, auth_user)
+   if not allowed_for_local_cluster(auth_user, Permissions::FULL)
+     return 403, 'Permission denied'
+   end
+   count = 0
+   out = ""
+@@ -2287,15 +2291,71 @@ end
+ 
+ def set_stonith_watchdog_timeout_to_zero(param, request, auth_user)
+   unless allowed_for_local_cluster(auth_user, Permissions::WRITE)
+     return 403, 'Permission denied'
+   end
+   if set_cluster_prop_force(auth_user, 'stonith-watchdog-timeout', '0')
+     $logger.info('Cluster property "stonith-watchdog-timeout" set to "0"')
+     return [200, 'OK']
+   else
+     $logger.info(
+       'Failed to set cluster property "stonith-watchdog-timeout"to 0'
+     )
+     return [400, 'ERROR']
+   end
+ end
++
++def remote_enable_sbd(params, request, auth_user)
++  unless allowed_for_local_cluster(auth_user, Permissions::WRITE)
++    return 403, 'Permission denied'
++  end
++
++  arg_list = []
++
++  if ['true', '1', 'on'].include?(params[:ignore_offline_nodes])
++    arg_list << '--skip-offline'
++  end
++
++  params[:watchdog].each do |node, watchdog|
++    unless watchdog.strip.empty?
++      arg_list << "--watchdog=#{watchdog.strip}@#{node}"
++    end
++  end
++
++  params[:config].each do |option, value|
++    unless value.empty?
++      arg_list << "#{option}=#{value}"
++    end
++  end
++
++  _, stderr, retcode = run_cmd(
++    auth_user, PCS, 'stonith', 'sbd', 'enable', *arg_list
++  )
++
++  if retcode != 0
++    return [400, "Unable to enable sbd in cluster: #{stderr.join('')}"]
++  end
++
++  return [200, 'Sbd has been enabled.']
++end
++
++def remote_disable_sbd(params, request, auth_user)
++  unless allowed_for_local_cluster(auth_user, Permissions::WRITE)
++    return 403, 'Permission denied'
++  end
++
++  arg_list = []
++
++  if ['true', '1', 'on'].include?(params[:ignore_offline_nodes])
++    arg_list << '--skip-offline'
++  end
++
++  _, stderr, retcode = run_cmd(
++    auth_user, PCS, 'stonith', 'sbd', 'disable', *arg_list
++  )
++
++  if retcode != 0
++    return [400, "Unable to disable sbd in cluster: #{stderr.join('')}"]
++  end
++
++  return [200, 'Sbd has been disabled.']
++end
+diff --git a/pcsd/views/_dialogs.erb b/pcsd/views/_dialogs.erb
+index 8bfa5c697..46e7fdb29 100644
+--- a/pcsd/views/_dialogs.erb
++++ b/pcsd/views/_dialogs.erb
+@@ -43,15 +43,175 @@
+     <p style="color: orange">This is a CMAN cluster with UDPU transport, cluster restart is required to apply node removal.</p>
+   {{/if}}
+ </div>
+ 
+ <div id="dialog_verify_remove_resources" style="display: none;">
+   <p style="font-size:12px;">Are you sure you want to remove the following resource(s)?</p>
+   <span class="name_list"></span>
+   <input type="checkbox" name="force">
+   Enforce removal (Remove the resources without stopping them first.)
+ </div>
+ 
+ <div id="dialog_verify_remove_acl_roles" style="display:none;">
+   <p style="font-size:12px;">Are you sure you want to remove the following ACL role(s)?</p>
+   <span class="name_list"></span>
+ </div>
++
++<div id="enable_sbd_dialog" style="display:none;">
++  <form id="enable_sbd_form">
++    <table>
++      <tr>
++        <td class="darkdatatable_header">
++          Specify watchdog devices for nodes:
++        </td>
++      </tr>
++      <tr>
++        <td>
++          <table id="watchdog_table">
++          </table>
++        </td>
++      </tr>
++    </table>
++    <table style="margin-top: 20px;">
++      <tr>
++        <td class="darkdatatable_header">
++          SBD options:
++        </td>
++      </tr>
++      <tr>
++        <td>
++          <table id="sbd_options">
++            <tr>
++              <td>SBD_DELAY_START</td>
++              <td>
++                <select name="config[SBD_DELAY_START]">
++                  <option value="" selected>(default)</option>
++                  <option value="yes">yes</option>
++                  <option value="no">no</option>
++                </select>
++              </td>
++            </tr>
++            <tr>
++              <td>SBD_STARTMODE</td>
++              <td>
++                <select name="config[SBD_STARTMODE]">
++                  <option value="" selected>(default)</option>
++                  <option value="clean">clean</option>
++                  <option value="always">always</option>
++                </select>
++              </td>
++            </tr>
++            <tr>
++              <td>SBD_WATCHDOG_TIMEOUT</td>
++              <td>
++                <input
++                    type="text"
++                    name="config[SBD_WATCHDOG_TIMEOUT]"
++                    placeholder="5"
++                />
++              </td>
++            </tr>
++          </table>
++        </td>
++      </tr>
++    </table>
++    <table>
++      <tr>
++        <td>
++          <label for="ignore_offline_nodes_enable_sbd">
++            ignore offline nodes
++          </label>
++        </td>
++        <td>
++          <input
++              id="ignore_offline_nodes_enable_sbd"
++              type="checkbox"
++              name="ignore_offline_nodes"
++          />
++        </td>
++      </tr>
++    </table>
++  </form>
++</div>
++
++<div id="disable_sbd_dialog" style="display:none;">
++  <form id="disable_sbd_form">
++    Are you sure you want to disable SBD?
++    <table>
++      <tr>
++        <td>
++          <label for="ignore_offline_nodes_disable_sbd">
++            ignore offline nodes
++          </label>
++        </td>
++        <td>
++          <input
++              id="ignore_offline_nodes_disable_sbd"
++              type="checkbox"
++              name="ignore_offline_nodes"
++          />
++        </td>
++      </tr>
++    </table>
++  </form>
++</div>
++
++<div id="sbd_status_dialog" style="display:none;">
++  <table>
++    <tr>
++      <td class="darkdatatable_header">SBD service status</td>
++    </tr>
++    <tr>
++      <td>
++        <table class="darkdatatable">
++          <tr>
++            <th>NODE</th>
++            <th>INSTALLED</th>
++            <th>ENABLED</th>
++            <th>RUNNING</th>
++          </tr>
++          {{#each node in Pcs.nodesController}}
++          <tr>
++            <td>{{node.name}}</td>
++            <td>{{bool-to-icon node.is_sbd_installed}}</td>
++            <td>{{bool-to-icon node.is_sbd_enabled}}</td>
++            <td>{{bool-to-icon node.is_sbd_running}}</td>
++          </tr>
++          {{/each}}
++        </table>
++      </td>
++    </tr>
++  </table>
++  {{#if Pcs.is_sbd_enabled_or_running}}
++  <table style="margin-top: 20px;">
++    <tr>
++      <td class="darkdatatable_header">SBD configuration</td>
++    </tr>
++    <tr>
++      <td>
++        {{{Pcs.sbd_config_table}}}
++      </td>
++    </tr>
++  </table>
++  <table style="margin-top: 20px;">
++    <tr>
++      <td class="darkdatatable_header">SBD watchdogs</td>
++    </tr>
++    <tr>
++      <td>
++        <table class="darkdatatable">
++          <tr>
++            <th>NODE</th>
++            <th>WATCHDOG</th>
++          </tr>
++          {{#each node in Pcs.nodesController}}
++          <tr>
++            <td>{{node.name}}</td>
++            <td>{{node.sbd_watchdog}}</td>
++          </tr>
++          {{/each}}
++        </table>
++      </td>
++    </tr>
++  </table>
++  {{/if}}
++</div>
+diff --git a/pcsd/views/_resource.erb b/pcsd/views/_resource.erb
+index 4e2311c2b..36fa8a7cd 100644
+--- a/pcsd/views/_resource.erb
++++ b/pcsd/views/_resource.erb
+@@ -9,30 +9,38 @@
+ 	<% if @myView == "resource" %>
+ 	  <a href="#" onclick='verify_remove_resources(); return false;'>
+ 	<% else %>
+ 	  <a href="#" onclick='verify_remove_fence_devices(); return false;'>
+ 	<% end %>
+       Remove</a>&nbsp;&nbsp;&nbsp;&nbsp;</div>
+   <div class="plus sprites"></div><div class="link">&nbsp;
+     <% if @myView == "resource" %>
+       <a href="#" onclick="$('#add_resource').dialog({title: 'Add Resource', modal:true, width: 'auto'});return false;">
+     <% else %>
+       <a href="#" onclick="$('#add_stonith').dialog({title: 'Add Fence Device', modal:true, width: 'auto'});return false;">
+     <% end %>
+   Add</a>&nbsp;&nbsp;&nbsp;&nbsp;</div>
+     <% if @myView == "resource" %>
+       <div class="plus sprites"></div><div class="link">&nbsp;<a href="#" onclick="create_group();return false;">Create Group</a></div>
++    <% else %>
++        {{#if Pcs.is_sbd_supported}}
++        <div class="configurelight sprites"></div>
++        <div class="link">
++          &nbsp;
++          <a href="#" onclick="sbd_status_dialog();return false;">SBD</a>
++        </div>
++        {{/if}}
+     <% end %>
+     </td>
+     <td class="borderbottom">&nbsp;</td>
+     <td id="tab_name" width="125">
+       <div style="float: left">&nbsp;Edit <%= @pageName%>&nbsp;</div><div class="check sprites"></div>
+     </td>
+   </tr>
+   <tr id="<%=@myView%>_list_row" {{bind-attr style="Pcs.<%=@myView%>_page"}}>
+     <td id="<%=@myView%>_list" class="node_list">
+       <%= erb :_resource_list %>
+     </td>
+   <td id="node_info" colspan=2>
+     <div id="<%=@myView%>_info_div">
+     <% if @myView == "resource" %>
+       {{resource-edit resource=Pcs.resourcesContainer.cur_resource page_name="Resource" old_pcsd=Pcs.resourcesContainer.is_version_1 utilization_support=Pcs.nodesController.utilization_support}}
+diff --git a/pcsd/views/nodes.erb b/pcsd/views/nodes.erb
+index a554bc820..478e0f68e 100644
+--- a/pcsd/views/nodes.erb
++++ b/pcsd/views/nodes.erb
+@@ -173,30 +173,35 @@
+                       <span id="pacemaker_status" style="float:left" class="status-unknown">Unknown ({{Pcs.nodesController.cur_node.pacemaker_startup}})</span>
+                       {{/if}}
+                       {{/if}}
+                     </td></tr>
+                     <tr><td>corosync</td><td><div style="float:left;margin-right:6px;" class="check sprites"></div>
+                       {{#if Pcs.nodesController.cur_node.corosync_daemon}}
+                       <span id="corosync_status" style="float:left" class="status">Running ({{Pcs.nodesController.cur_node.corosync_startup}})</span>
+                       {{else}}
+                       {{#if Pcs.nodesController.cur_node.pcsd}}
+                       <span id="corosync_status" style="float:left" class="status-offline">Stopped ({{Pcs.nodesController.cur_node.corosync_startup}})</span>
+                       {{else}}
+                       <span id="corosync_status" style="float:left" class="status-unknown">Unknown ({{Pcs.nodesController.cur_node.corosync_startup}})</span>
+                       {{/if}}
+                       {{/if}}
+                     </td></tr>
++                    {{#if Pcs.is_sbd_enabled_or_running }}
++                    <tr><td>sbd</td><td><div style="float:left;margin-right:6px;" class="check sprites"></div>
++                      {{{Pcs.nodesController.cur_node.sbd_status_str}}}
++                    </td></tr>
++                    {{/if}}
+                     <tr><td>pcsd</td><td><div style="float:left;margin-right:6px;" class="check sprites"></div>
+                       {{#if Pcs.nodesController.cur_node.pcsd}}
+                       <span id="pcsd_status" style="float:left" class="status">Running ({{Pcs.nodesController.cur_node.pcsd_startup}})</span>
+                       {{else}}
+                       {{#if Pcs.nodesController.cur_node.authorized}}
+                       <span id="pcsd_status" style="float:left" class="status-offline">Stopped ({{Pcs.nodesController.cur_node.pcsd_startup}})</span>
+                       {{else}}
+                       <span id="pcsd_status" style="float:left" class="status-offline">Running (not Authorized) ({{Pcs.nodesController.cur_node.pcsd_startup}})</span>
+                       {{/if}}
+                       {{/if}}
+                     </td></tr>
+                   </table>
+                 </div>
+               </td>
+               </tr>
+@@ -323,23 +328,31 @@
+     <table id="add_node_selector">
+       <tr>
+         <td>Node Name:</td>
+         <td><input type=text name=new_nodename></td>
+       </tr>
+       {{#if Pcs.need_ring1_address}}
+       <tr>
+         <td>Ring1 address:</td>
+         <td><input type=text name=new_ring1addr></td>
+       </tr>
+       {{/if}}
+       <tr>
+         <td>Auto Start/Enable:</td>
+         <td><input type="checkbox" name="auto_start" value="1" checked></td>
+       </tr>
++      {{#if Pcs.is_sbd_enabled}}
++      <tr>
++        <td>SBD watchdog:</td>
++        <td>
++          <input type="text" name="watchdog" placeholder="/dev/watchdog" />
++        </td>
++      </tr>
++      {{/if}}
+       {{#if Pcs.is_cman_with_udpu_transport}}
+       <tr>
+         <td colspan="2" style="color: orange">This is a CMAN cluster with UDPU transport,<br>cluster restart is required to apply node addition.</td>
+       </tr>
+       {{/if}}
+     </table>
+   </form>
+ </div>

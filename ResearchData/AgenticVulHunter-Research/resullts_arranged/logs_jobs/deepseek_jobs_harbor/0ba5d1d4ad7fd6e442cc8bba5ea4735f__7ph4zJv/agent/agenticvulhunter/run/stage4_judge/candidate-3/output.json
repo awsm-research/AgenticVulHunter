@@ -1,0 +1,316 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "anymail/webhooks/mandrill.py",
+  "changed_line": 49,
+  "statement": "url = self.webhook_url or get_request_uri(request)",
+  "change_type": "A",
+  "function_name": "validate_request",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "request -> get_request_uri (includes basic auth) -> used in signature verification",
+  "security_relevance_score": 0.7,
+  "code_context": "1: import json\n2: from datetime import datetime\n3: \n4: import hashlib\n5: import hmac\n6: from base64 import b64encode\n7: from django.utils.crypto import constant_time_compare\n8: from django.utils.timezone import utc\n9: \n10: from .base import AnymailBaseWebhookView\n11: from ..exceptions import AnymailWebhookValidationFailure, AnymailConfigurationError\n12: from ..signals import tracking, AnymailTrackingEvent, EventType\n13: from ..utils import get_anymail_setting, getfirst, get_request_uri\n14: \n15: \n16: class MandrillSignatureMixin(object):\n17:     \"\"\"Validates Mandrill webhook signature\"\"\"\n18: \n19:     # These can be set from kwargs in View.as_view, or pulled from settings in init:\n20:     webhook_key = None  # required\n21:     webhook_url = None  # optional; defaults to actual url used\n22: \n23:     def __init__(self, **kwargs):\n24:         # noinspection PyUnresolvedReferences\n25:         esp_name = self.esp_name\n26:         # webhook_key is required for POST, but not for HEAD when Mandrill validates webhook url.\n27:         # Defer \"missing setting\" error until we actually try to use it in the POST...\n28:         webhook_key = get_anymail_setting('webhook_key', esp_name=esp_name, default=None,\n29:                                           kwargs=kwargs, allow_bare=True)\n30:         if webhook_key is not None:\n31:             self.webhook_key = webhook_key.encode('ascii')  # hmac.new requires bytes key in python 3\n32:         self.webhook_url = get_anymail_setting('webhook_url', esp_name=esp_name, default=None,\n33:                                                kwargs=kwargs, allow_bare=True)\n34:         # noinspection PyArgumentList\n35:         super(MandrillSignatureMixin, self).__init__(**kwargs)\n36: \n37:     def validate_request(self, request):\n38:         if self.webhook_key is None:\n39:             # issue deferred \"missing setting\" error (re-call get-setting without a default)\n40:             # noinspection PyUnresolvedReferences\n41:             get_anymail_setting('webhook_key', esp_name=self.esp_name, allow_bare=True)\n42: \n43:         try:\n44:             signature = request.META[\"HTTP_X_MANDRILL_SIGNATURE\"]\n45:         except KeyError:\n46:             raise AnymailWebhookValidationFailure(\"X-Mandrill-Signature header missing from webhook POST\")\n47: \n48:         # Mandrill signs the exact URL (including basic auth, if used) plus the sorted POST params:\n49:         url = self.webhook_url or get_request_uri(request)\n50:         params = request.POST.dict()\n51:         signed_data = url\n52:         for key in sorted(params.keys()):\n53:             signed_data += key + params[key]\n54: \n55:         expected_signature = b64encode(hmac.new(key=self.webhook_key, msg=signed_data.encode('utf-8'),\n56:                                                 digestmod=hashlib.sha1).digest())\n57:         if not constant_time_compare(signature, expected_signature):\n58:             raise AnymailWebhookValidationFailure(\n59:                 \"Mandrill webhook called with incorrect signature (for url %r)\" % url)\n60: \n61: \n62: class MandrillBaseWebhookView(MandrillSignatureMixin, AnymailBaseWebhookView):\n63:     \"\"\"Base view class for Mandrill webhooks\"\"\"\n64: \n65:     warn_if_no_basic_auth = False  # because we validate against signature\n66: \n67:     def parse_events(self, request):\n68:         esp_events = json.loads(request.POST['mandrill_events'])\n69:         return [self.esp_to_anymail_event(esp_event) for esp_event in esp_events]\n70: \n71:     def esp_to_anymail_event(self, esp_event):\n72:         raise NotImplementedError()\n73: \n74: \n75: class MandrillTrackingWebhookView(MandrillBaseWebhookView):\n76: \n77:     signal = tracking\n78: \n79:     event_types = {\n80:         # Message events:\n81:         'send': EventType.SENT,\n82:         'deferral': EventType.DEFERRED,\n83:         'hard_bounce': EventType.BOUNCED,\n84:         'soft_bounce': EventType.DEFERRED,\n85:         'open': EventType.OPENED,\n86:         'click': EventType.CLICKED,\n87:         'spam': EventType.COMPLAINED,\n88:         'unsub': EventType.UNSUBSCRIBED,\n89:         'reject': EventType.REJECTED,\n90:         # Sync events (we don't really normalize these well):\n91:         'whitelist': EventType.UNKNOWN,\n92:         'blacklist': EventType.UNKNOWN,\n93:         # Inbound events:\n94:         'inbound': EventType.INBOUND,\n95:     }\n96: \n97:     def esp_to_anymail_event(self, esp_event):\n98:         esp_type = getfirst(esp_event, ['event', 'type'], None)\n99:         event_type = self.event_types.get(esp_type, EventType.UNKNOWN)\n100:         if event_type == EventType.INBOUND:\n101:             raise AnymailConfigurationError(\n102:                 \"You seem to have set Mandrill's *inbound* webhook URL \"\n103:                 \"to Anymail's Mandrill *tracking* webhook URL.\")\n104: \n105:         try:\n106:             timestamp = datetime.fromtimestamp(esp_event['ts'], tz=utc)\n107:         except (KeyError, ValueError):\n108:             timestamp = None\n109: \n110:         try:\n111:             recipient = esp_event['msg']['email']\n112:         except KeyError:\n113:             try:\n114:                 recipient = esp_event['reject']['email']  # sync events\n115:             except KeyError:\n116:                 recipient = None\n117: \n118:         try:\n119:             mta_response = esp_event['msg']['diag']\n120:         except KeyError:\n121:             mta_response = None\n122: \n123:         try:\n124:             description = getfirst(esp_event['reject'], ['detail', 'reason'])\n125:         except KeyError:\n126:             description = None\n127: \n128:         try:\n129:             metadata = esp_event['msg']['metadata']\n130:         except KeyError:\n131:             metadata = None\n132: \n133:         try:\n134:             tags = esp_event['msg']['tags']\n135:         except KeyError:\n136:             tags = None\n137: \n138:         return AnymailTrackingEvent(\n139:             click_url=esp_event.get('url', None),\n140:             description=description,\n141:             esp_event=esp_event,\n142:             event_type=event_type,\n143:             message_id=esp_event.get('_id', None),\n144:             metadata=metadata,\n145:             mta_response=mta_response,\n146:             recipient=recipient,\n147:             reject_reason=None,  # probably map esp_event['msg']['bounce_description'], but insufficient docs\n148:             tags=tags,\n149:             timestamp=timestamp,\n150:             user_agent=esp_event.get('user_agent', None),\n151:         )",
+  "source_summary": "URL source is either configured webhook_url setting or dynamically constructed from request using get_request_uri(), which includes HTTP basic auth credentials if present",
+  "sink_summary": "URL is used as part of signed_data for HMAC-SHA1 signature verification against X-Mandrill-Signature header",
+  "guard_summary": "Signature verification using constant_time_compare protects against timing attacks; webhook_key required for POST requests",
+  "risk_pattern": "Basic auth credentials included in signature calculation may expose credentials if signature verification fails and error message leaks URL",
+  "used_variable_sources": [
+    "self.webhook_url (configured setting)",
+    "request (HTTP request object)",
+    "get_request_uri() (constructs URL with basic auth)"
+  ],
+  "called_function_context": [
+    "get_request_uri",
+    "get_request_basic_auth",
+    "request.build_absolute_uri",
+    "base64.b64decode",
+    "urlsplit",
+    "urlunsplit"
+  ],
+  "enclosing_conditions": [
+    "if self.webhook_key is None: (deferred error)",
+    "try/except for HTTP_X_MANDRILL_SIGNATURE header"
+  ],
+  "context_summary": "Line 49 constructs URL for Mandrill webhook signature verification. When webhook_url is not configured, get_request_uri() builds URL including basic auth credentials from HTTP_AUTHORIZATION header, which becomes part of HMAC-signed data.",
+  "unresolved_facts": [
+    "Whether error messages containing URL with basic auth are logged or exposed to attackers",
+    "Whether basic auth credentials in error messages could be exploited in practice"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-497",
+      "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+      "fit_reason": "Error message includes URL with basic auth credentials in signature verification failure, potentially exposing authentication credentials",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-200",
+      "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+      "fit_reason": "Basic auth credentials from URL construction are included in error messages, leading to information disclosure",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-208",
+      "cwe_name": "Observable Timing Discrepancy",
+      "fit_reason": "Signature verification uses constant_time_compare but initial retrieval focused on timing attacks",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-347",
+      "cwe_name": "Improper Verification of Cryptographic Signature",
+      "fit_reason": "Signature verification mechanism includes potentially sensitive data (basic auth) in signed payload",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1236",
+    "CWE-1275",
+    "CWE-20",
+    "CWE-200",
+    "CWE-208",
+    "CWE-22",
+    "CWE-347",
+    "CWE-425",
+    "CWE-497",
+    "CWE-502",
+    "CWE-697",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "cwe_id": "CWE-497",
+      "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "CWE-497 requires exposure of system-level information to unauthorized actors. The code constructs a URL that may include basic auth credentials, but the exact mechanism of exposure (error message leakage) is not directly demonstrated in the evidence."
+        },
+        "connection": {
+          "score": 0.45,
+          "evidence": "The URL constructed at line 49 is used in the error message at line 59 when signature verification fails. The connection from request data to error message output is established."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this line were reverted, the URL construction would change, potentially affecting whether basic auth credentials are included in error messages. The line determines which URL (configured vs. dynamic) is used for signature verification."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "The code uses constant_time_compare for signature verification but lacks proper sanitization of sensitive data in error messages.",
+          "required_control": "Error message sanitization to prevent leakage of sensitive authentication credentials",
+          "control_requirement_evidence": "CWE-497 requires preventing exposure of sensitive system information, including authentication credentials that may be included in URLs",
+          "existing_controls_checked": [
+            "constant_time_compare for signature verification timing attacks",
+            "webhook_key validation for authentication"
+          ],
+          "deficiency_evidence": "Error messages include the full URL without sanitizing basic auth credentials when signature verification fails"
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "The evidence shows the URL is included in error messages, but does not demonstrate that these error messages are actually exposed to unauthorized actors or that basic auth credentials are present and exploitable."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the URL construction would default to using only the configured webhook_url setting, potentially avoiding the inclusion of basic auth credentials from the request in error messages.",
+      "supporting_evidence": [
+        "Line 59 shows the URL is included in error messages: 'Mandrill webhook called with incorrect signature (for url %r)' % url",
+        "get_request_uri() function includes basic auth credentials from HTTP_AUTHORIZATION header when constructing URLs",
+        "The URL is constructed from either configured webhook_url or dynamically from the request"
+      ],
+      "contradicting_evidence": [
+        "The code uses constant_time_compare for secure signature verification",
+        "Basic auth warning is disabled (line 65) suggesting signature verification is the primary protection"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether error messages containing URLs with basic auth are actually logged or exposed to external attackers",
+        "Whether basic auth credentials are present in typical deployments",
+        "Whether the error handling mechanism exposes these messages to unauthorized parties"
+      ],
+      "review_comment": "The signature verification error message includes the full URL, which may contain basic auth credentials when webhook_url is not configured. While signature verification provides authentication, error messages should sanitize sensitive information like authentication credentials. Consider modifying the error message to exclude or redact authentication credentials from the displayed URL.",
+      "change_type": "A",
+      "raw_score": 0.41,
+      "score": 0.41
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "cwe_id": "CWE-200",
+      "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The code constructs a URL that may include basic auth credentials and includes it in error messages. CWE-200 requires exposure of sensitive information to unauthorized actors, which is partially demonstrated through potential credential leakage in error handling."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The URL constructed at line 49 is directly used in the error message at line 59 when signature verification fails. get_request_uri() includes HTTP basic auth credentials if present in the request."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The added line introduces dynamic URL construction that includes basic auth credentials. If reverted, the code would either use a static webhook_url or fail, preventing the potential credential exposure path."
+        },
+        "security_control": {
+          "score": 0.35,
+          "evidence": "The error handling control that prevents sensitive data exposure is weak. The error message includes the full URL with credentials when signature verification fails.",
+          "required_control": "Error handling that sanitizes or excludes sensitive information from error messages",
+          "control_requirement_evidence": "CWE-200 requires preventing exposure of sensitive information, including credentials, to unauthorized actors through error messages",
+          "existing_controls_checked": [
+            "constant_time_compare for signature verification",
+            "webhook_key validation"
+          ],
+          "deficiency_evidence": "The error message at line 59 directly includes the URL containing basic auth credentials without sanitization when signature verification fails"
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Impact depends on whether error messages are logged or exposed to attackers. The evidence shows the mechanism but not the actual exposure path or exploitation."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would either use a pre-configured webhook_url (if set) or fail to construct a URL, preventing the dynamic inclusion of basic auth credentials in error messages.",
+      "supporting_evidence": [
+        "Line 49: url = self.webhook_url or get_request_uri(request) - constructs URL including basic auth",
+        "Line 59: error message includes URL in 'Mandrill webhook called with incorrect signature (for url %r)'",
+        "get_request_uri() function includes HTTP basic auth credentials from request"
+      ],
+      "contradicting_evidence": [
+        "Line 65: warn_if_no_basic_auth = False indicates awareness of basic auth handling",
+        "Signature verification using constant_time_compare provides some protection"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether error messages containing URLs with basic auth are actually logged or exposed to external actors",
+        "Whether basic auth credentials in error messages could be practically exploited",
+        "The actual deployment context and error handling pipeline"
+      ],
+      "review_comment": "The code constructs URLs that may include basic auth credentials and includes them in error messages when signature verification fails. While signature verification provides authentication, error messages should not expose sensitive credentials. Sanitize the URL in error messages to remove or mask basic auth credentials before inclusion in logs or responses.",
+      "change_type": "A",
+      "raw_score": 0.42000000000000004,
+      "score": 0.42000000000000004
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "cwe_id": "CWE-208",
+      "cwe_name": "Observable Timing Discrepancy",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "The code uses constant_time_compare for signature verification, which specifically prevents timing attacks. This contradicts the CWE-208 mechanism of observable timing discrepancies."
+        },
+        "connection": {
+          "score": 0.15,
+          "evidence": "The URL construction feeds into signature verification, but the verification uses timing-safe comparison. No timing discrepancy mechanism is demonstrated."
+        },
+        "diff_causality": {
+          "score": 0.2,
+          "evidence": "The line constructs a URL for signature verification, but the verification itself uses constant_time_compare. The change doesn't create timing vulnerabilities."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "The code demonstrates proper timing-safe comparison implementation, not a deficiency.",
+          "required_control": "timing-safe comparison for cryptographic operations",
+          "control_requirement_evidence": "CWE-208 requires timing discrepancies in security-sensitive operations",
+          "existing_controls_checked": [
+            "constant_time_compare from django.utils.crypto for signature verification"
+          ],
+          "deficiency_evidence": "No deficiency demonstrated; the code correctly implements timing-safe comparison"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No timing-based information leakage is possible due to constant_time_compare usage."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the signature verification would still use constant_time_compare, maintaining timing safety.",
+      "supporting_evidence": [
+        "Signature verification uses constant_time_compare from django.utils.crypto"
+      ],
+      "contradicting_evidence": [
+        "constant_time_compare implementation prevents timing attacks",
+        "The code explicitly uses timing-safe comparison for signature verification"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether error messages containing URLs with basic auth are exposed",
+        "Whether basic auth credentials in error messages could be exploited"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.13,
+      "score": 0.13
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "anymail/webhooks/mandrill.py",
+      "changed_line": 49,
+      "statement": "url = self.webhook_url or get_request_uri(request)",
+      "cwe_id": "CWE-347",
+      "cwe_name": "Improper Verification of Cryptographic Signature",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.25,
+          "evidence": "The code performs cryptographic signature verification using HMAC-SHA1 with constant_time_compare, which is proper verification. The candidate line determines what data is included in the signature calculation, not whether verification occurs."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "The URL constructed at line 49 is directly connected to the signature verification at lines 55-57 as part of 'signed_data'. When webhook_url is not configured, get_request_uri(request) includes basic auth credentials in the URL, making them part of the signed payload."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this candidate line were reverted, the signature verification would need to use a different URL source. The line determines whether to use a configured webhook_url or dynamically construct the URL from the request (including basic auth)."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "The signature verification itself is a security control. The candidate line affects what data is included in that control.",
+          "required_control": "Proper verification of cryptographic signatures",
+          "control_requirement_evidence": "CWE-347 requires that cryptographic signatures are properly verified. The demonstrated mechanism shows signature verification occurs.",
+          "existing_controls_checked": [
+            "HMAC-SHA1 signature verification with constant_time_compare",
+            "webhook_key validation",
+            "X-Mandrill-Signature header presence check"
+          ],
+          "deficiency_evidence": "No deficiency in the verification mechanism itself is demonstrated. The candidate line determines data inclusion in the signature, not verification correctness."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No concrete security impact is demonstrated. The signature verification still occurs regardless of URL source. Basic auth inclusion in signed data doesn't bypass verification."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the signature verification would need an alternative method to obtain the URL for signing. The current implementation provides a fallback from configured webhook_url to dynamically constructed request URI.",
+      "supporting_evidence": [
+        "Line 49 constructs URL used in HMAC-SHA1 signature verification at lines 55-57",
+        "get_request_uri() includes basic auth credentials when present in request",
+        "URL becomes part of 'signed_data' used for signature calculation"
+      ],
+      "contradicting_evidence": [
+        "Signature verification still occurs with constant_time_compare regardless of URL source",
+        "The verification mechanism itself appears cryptographically sound",
+        "No evidence shows the signature is improperly verified"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether basic auth in URL affects signature verification correctness",
+        "Whether error message exposure of URL with basic auth constitutes a separate vulnerability",
+        "Whether Mandrill's signature specification requires basic auth exclusion"
+      ],
+      "review_comment": "The signature verification uses HMAC-SHA1 with constant-time comparison, which is proper. When webhook_url is not configured, get_request_uri() includes basic auth credentials in the signed data payload. While this doesn't affect verification correctness, consider whether basic auth should be excluded from the signed URL to avoid potential credential exposure in error messages. Use request.build_absolute_uri() without basic auth or configure webhook_url explicitly.",
+      "change_type": "A",
+      "raw_score": 0.35,
+      "score": 0.35
+    }
+  ],
+  "stage4_status": "completed"
+}

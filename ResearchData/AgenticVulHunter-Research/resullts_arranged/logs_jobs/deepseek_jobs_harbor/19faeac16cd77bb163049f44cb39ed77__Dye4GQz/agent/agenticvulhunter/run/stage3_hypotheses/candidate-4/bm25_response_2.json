@@ -1,0 +1,270 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "lib/expression/node/AssignmentNode.js",
+      "changed_line": 123,
+      "statement": "return 'setSafeProperty(scope, ' + jsName + ', ' + value + ')';",
+      "change_type": "A",
+      "function_name": "compileAssignmentNode",
+      "operation_type": "assignment_with_user_input",
+      "selection_reason": "user-controlled variable name -> embedded in assignment code -> potential scope pollution if not properly escaped",
+      "security_relevance_score": 0.7,
+      "code_context": "1: 'use strict';\n2: \n3: var latex = require('../../utils/latex');\n4: var stringify = require('../../utils/string').stringify;\n5: var getSafeProperty = require('../../utils/customs').getSafeProperty;\n6: var setSafeProperty = require('../../utils/customs').setSafeProperty;\n7: \n8: function factory (type, config, load, typed) {\n9:   var register = load(require('./compile')).register;\n10:   var compile = load(require('./compile')).compile;\n11:   var Node = load(require('./Node'));\n12:   var ArrayNode = load(require('./ArrayNode'));\n13:   var matrix = load(require('../../type/matrix/function/matrix'));\n14:   var assign = load(require('./utils/assign'));\n15:   var access = load(require('./utils/access'));\n16: \n17:   var keywords = require('../keywords');\n18:   var operators = require('../operators');\n19: \n20:   /**\n21:    * @constructor AssignmentNode\n22:    * @extends {Node}\n23:    *\n24:    * Define a symbol, like `a=3.2`, update a property like `a.b=3.2`, or\n25:    * replace a subset of a matrix like `A[2,2]=42`.\n26:    *\n27:    * Syntax:\n28:    *\n29:    *     new AssignmentNode(symbol, value)\n30:    *     new AssignmentNode(object, index, value)\n31:    *\n32:    * Usage:\n33:    *\n34:    *    new AssignmentNode(new SymbolNode('a'), new ConstantNode(2));                      // a=2\n35:    *    new AssignmentNode(new SymbolNode('a'), new IndexNode('b'), new ConstantNode(2))   // a.b=2\n36:    *    new AssignmentNode(new SymbolNode('a'), new IndexNode(1, 2), new ConstantNode(3))  // a[1,2]=3\n37:    *\n38:    * @param {SymbolNode | AccessorNode} object  Object on which to assign a value\n39:    * @param {IndexNode} [index=null]            Index, property name or matrix\n40:    *                                            index. Optional. If not provided\n41:    *                                            and `object` is a SymbolNode,\n42:    *                                            the property is assigned to the\n43:    *                                            global scope.\n44:    * @param {Node} value                        The value to be assigned\n45:    */\n46:   function AssignmentNode(object, index, value) {\n47:     if (!(this instanceof AssignmentNode)) {\n48:       throw new SyntaxError('Constructor must be called with the new operator');\n49:     }\n50: \n51:     this.object = object;\n52:     this.index = value ? index : null;\n53:     this.value = value ? value : index;\n54: \n55:     // validate input\n56:     if (!object || !(object.isSymbolNode || object.isAccessorNode)) {\n57:       throw new TypeError('SymbolNode or AccessorNode expected as \"object\"');\n58:     }\n59:     if (object && object.isSymbolNode && object.name === 'end') {\n60:       throw new Error('Cannot assign to symbol \"end\"');\n61:     }\n62:     if (this.index && !this.index.isIndexNode) {\n63:       throw new TypeError('IndexNode expected as \"index\"');\n64:     }\n65:     if (!this.value || !this.value.isNode) {\n66:       throw new TypeError('Node expected as \"value\"');\n67:     }\n68: \n69:     // readonly property name\n70:     Object.defineProperty(this, 'name', {\n71:       get: function () {\n72:         if (this.index) {\n73:           return (this.index.isObjectProperty())\n74:               ? this.index.getObjectProperty()\n75:               : '';\n76:         }\n77:         else {\n78:           return this.object.name || '';\n79:         }\n80:       }.bind(this),\n81:       set: function () {\n82:         throw new Error('Cannot assign a new name, name is read-only');\n83:       }\n84:     });\n85:   }\n86: \n87:   AssignmentNode.prototype = new Node();\n88: \n89:   AssignmentNode.prototype.type = 'AssignmentNode';\n90: \n91:   AssignmentNode.prototype.isAssignmentNode = true;\n92: \n93:   /**\n94:    * Compile the node to javascript code\n95:    * @param {AssignmentNode} node The node to be compiled\n96:    * @param {Object} defs     Object which can be used to define functions\n97:    *                          or constants globally available for the compiled\n98:    *                          expression\n99:    * @param {Object} args     Object with local function arguments, the key is\n100:    *                          the name of the argument, and the value is `true`.\n101:    *                          The object may not be mutated, but must be\n102:    *                          extended instead.\n103:    * @private\n104:    */\n105:   function compileAssignmentNode (node, defs, args) {\n106:     defs.assign = assign;\n107:     defs.access = access;\n108:     defs.getSafeProperty = getSafeProperty;\n109:     defs.setSafeProperty = setSafeProperty;\n110: \n111:     var size;\n112:     var object = compile(node.object, defs, args);\n113:     var index = node.index ? compile(node.index, defs, args) : null;\n114:     var value = compile(node.value, defs, args);\n115:     var jsName = stringify(node.object.name);\n116: \n117:     if (!node.index) {\n118:       // apply a variable to the scope, for example `a=2`\n119:       if (!node.object.isSymbolNode) {\n120:         throw new TypeError('SymbolNode expected as object');\n121:       }\n122: \n123:       return 'setSafeProperty(scope, ' + jsName + ', ' + value + ')';\n124:     }\n125:     else if (node.index.isObjectProperty()) {\n126:       // apply an object property for example `a.b=2`\n127:       var jsProp = stringify(node.index.getObjectProperty());\n128:       return 'setSafeProperty(' + object + ', ' + jsProp + ', ' + value + ')';\n129:     }\n130:     else if (node.object.isSymbolNode) {\n131:       // update a matrix subset, for example `a[2]=3`\n132:       size = node.index.needsSize() ? 'var size = math.size(object).valueOf();' : '';\n133: \n134:       // apply updated object to scope\n135:       return '(function () {' +\n136:           '  var object = ' + object + ';' +\n137:           '  var value = ' + value + ';' +\n138:           '  ' + size +\n139:           '  setSafeProperty(scope, ' + jsName + ', assign(object, ' + index + ', value));' +\n140:           '  return value;' +\n141:           '})()';\n142:     }\n143:     else { // node.object.isAccessorNode === true\n144:       // update a matrix subset, for example `a.b[2]=3`\n145:       size = node.index.needsSize() ? 'var size = math.size(object).valueOf();' : '';\n146: \n147:       // we will not use the compile function of the AccessorNode, but compile it\n148:       // ourselves here as we need the parent object of the AccessorNode:\n149:       // wee need to apply the updated object to parent object\n150:       var parentObject = compile(node.object.object, defs, args);\n151: \n152:       if (node.object.index.isObjectProperty()) {\n153:         var jsParentProperty = stringify(node.object.index.getObjectProperty());\n154:         return '(function () {' +\n155:             '  var parent = ' + parentObject + ';' +\n156:             '  var object = getSafeProperty(parent, ' + jsParentProperty + ');' + // parentIndex is a property\n157:             '  var value = ' + value + ';' +\n158:             size +\n159:             '  setSafeProperty(parent, ' + jsParentProperty + ', assign(object, ' + index + ', value));' +\n160:             '  return value;' +\n161:             '})()';\n162:       }\n163:       else {\n164:         // if some parameters use the 'end' parameter, we need to calculate the size\n165:         var parentSize = node.object.index.needsSize() ? 'var size = math.size(parent).valueOf();' : '';\n166:         var parentIndex = compile(node.object.index, defs, args);\n167: \n168:         return '(function () {' +\n169:             '  var parent = ' + parentObject + ';' +\n170:             '  ' + parentSize +\n171:             '  var parentIndex = ' + parentIndex + ';' +\n172:             '  var object = access(parent, parentIndex);' +\n173:             '  var value = ' + value + ';' +\n174:             '  ' + size +\n175:             '  assign(parent, parentIndex, assign(object, ' + index + ', value));' +\n176:             '  return value;' +\n177:             '})()';\n178:       }\n179:     }\n180:   }\n181: \n182:   // register the compile function\n183:   register(AssignmentNode.prototype.type, compileAssignmentNode);\n184: \n185:   /**\n186:    * Execute a callback for each of the child nodes of this node\n187:    * @param {function(child: Node, path: string, parent: Node)} callback\n188:    */\n189:   AssignmentNode.prototype.forEach = function (callback) {\n190:     callback(this.object, 'object', this);\n191:     if (this.index) {\n192:       callback(this.index, 'index', this);\n193:     }\n194:     callback(this.value, 'value', this);\n195:   };\n196: \n197:   /**\n198:    * Create a new AssignmentNode having it's childs be the results of calling\n199:    * the provided callback function for each of the childs of the original node.\n200:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n201:    * @returns {AssignmentNode} Returns a transformed copy of the node\n202:    */\n203:   AssignmentNode.prototype.map = function (callback) {\n204:     var object = this._ifNode(callback(this.object, 'object', this));\n205:     var index = this.index\n206:         ? this._ifNode(callback(this.index, 'index', this))\n207:         : null;\n208:     var value = this._ifNode(callback(this.value, 'value', this));\n209: \n210:     return new AssignmentNode(object, index, value);\n211:   };\n212: \n213:   /**\n214:    * Create a clone of this node, a shallow copy\n215:    * @return {AssignmentNode}\n216:    */\n217:   AssignmentNode.prototype.clone = function() {\n218:     return new AssignmentNode(this.object, this.index, this.value);\n219:   };\n220: \n221:   /*\n222:    * Is parenthesis needed?\n223:    * @param {node} node\n224:    * @param {string} [parenthesis='keep']\n225:    * @private\n226:    */\n227:   function needParenthesis(node, parenthesis) {\n228:     if (!parenthesis) {\n229:       parenthesis = 'keep';\n230:     }\n231: \n232:     var precedence = operators.getPrecedence(node, parenthesis);\n233:     var exprPrecedence = operators.getPrecedence(node.value, parenthesis);\n234:     return (parenthesis === 'all')\n235:       || ((exprPrecedence !== null) && (exprPrecedence <= precedence));\n236:   }\n237: \n238:   /**\n239:    * Get string representation\n240:    * @param {Object} options\n241:    * @return {string}\n242:    */\n243:   AssignmentNode.prototype._toString = function(options) {\n244:     var object = this.object.toString(options);\n245:     var index = this.index ? this.index.toString(options) : '';\n246:     var value = this.value.toString(options);\n247:     if (needParenthesis(this, options && options.parenthesis)) {\n248:       value = '(' + value + ')';\n249:     }\n250: \n251:     return object + index + ' = ' + value;\n252:   };\n253: \n254:   /**\n255:    * Get LaTeX representation\n256:    * @param {Object} options\n257:    * @return {string}\n258:    */\n259:   AssignmentNode.prototype._toTex = function(options) {\n260:     var object = this.object.toTex(options);\n261:     var index = this.index ? this.index.toTex(options) : '';\n262:     var value = this.value.toTex(options);\n263:     if (needParenthesis(this, options && options.parenthesis)) {\n264:       value = '\\\\left(' + value + '\\\\right)';\n265:     }\n266: \n267:     return object + index + ':=' + value;\n268:   };\n269: \n270:   return AssignmentNode;\n271: }\n272: ",
+      "source_summary": "node.object.name comes from SymbolNode constructor which accepts a string parameter. This name is parsed from user input expressions like 'a=2' where 'a' becomes the symbol name.",
+      "sink_summary": "setSafeProperty(scope, jsName, value) assigns a value to a property on the scope object using the symbol name as the property key.",
+      "guard_summary": "setSafeProperty validates that the target object is a plain object and prevents overriding inherited properties like constructor/toString. The stringify function escapes double quotes in the property name. SymbolNode validates that the name is a string.",
+      "risk_pattern": "User-controlled symbol names from parsed expressions are used as property keys in scope assignments. While stringify escapes quotes and setSafeProperty has some validation, the property name itself is not validated against a whitelist of safe property names.",
+      "used_variable_sources": [
+        "node.object.name (from SymbolNode constructor, derived from parsed user input)"
+      ],
+      "called_function_context": [
+        "stringify (escapes double quotes)",
+        "setSafeProperty (validates plain object and prevents overriding inherited properties)"
+      ],
+      "enclosing_conditions": [
+        "if (!node.index) - only for direct variable assignments like 'a=2'",
+        "if (!node.object.isSymbolNode) - validates object type"
+      ],
+      "context_summary": "The code compiles assignment expressions to JavaScript. For direct variable assignments (no index), it uses setSafeProperty to assign values to the scope object using the symbol name as the property key.",
+      "unresolved_facts": [
+        "Whether there are additional validation layers in the expression parsing that restrict symbol names",
+        "Whether the scope object has any additional security controls beyond setSafeProperty validation",
+        "Whether there are any known dangerous property names that could be exploited despite the existing controls"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "user-controlled property name used in object assignment to scope, potential prototype pollution or property injection",
+        "source": "user input symbol name from parsed expression",
+        "sensitive_operation": "setSafeProperty assignment to scope object",
+        "missing_control": "lack of validation for dangerous property names like __proto__",
+        "impact": "prototype pollution, property injection, code execution"
+      },
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-1321-improperly-controlled-modification-of-object-prototype-attributes-prototype-poll",
+          "cwe_id": "CWE-1321",
+          "cwe_name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 64.7504,
+          "raw_bm25_score": 64.7504,
+          "description": "Attacker-controlled object keys modify Object prototype attributes.",
+          "pattern": "cwe-1321 prototype-pollution __proto__ constructor prototype object-key property-key merge assign recursive-merge",
+          "remediation": "Reject prototype keys and use schema-constrained object updates.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-1321"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/overwritten-property",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 43.2784,
+          "raw_bm25_score": 43.2784,
+          "description": "If an object literal has two properties with the same name, the second property overwrites the first one, which makes the code hard to understand and error-prone.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/double-escaping",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 36.8172,
+          "raw_bm25_score": 36.8172,
+          "description": "When escaping special characters using a meta-character like backslash or ampersand, the meta-character has to be escaped first to avoid double-escaping, and conversely it has to be unescaped last to avoid double-unescaping.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output operations. Implement proper escaping for HTML, JavaScript, CSS, and URL contexts.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-116",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/eval-call",
+          "cwe_id": "CWE-676",
+          "cwe_name": "Use of Potentially Dangerous Function",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 34.8054,
+          "raw_bm25_score": 34.8054,
+          "description": "The 'eval' function and the 'Function' constructor execute strings as code. This is dangerous and impedes program analysis and understanding. Consequently, these two functions should not be used.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-676. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-676"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/useless-type-test",
+          "cwe_id": "CWE-571",
+          "cwe_name": "Expression is Always True",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 34.4883,
+          "raw_bm25_score": 34.4883,
+          "description": "Comparing the result of a typeof test against a string other than 'undefined', 'boolean', 'number', 'string', 'object', 'function' or 'symbol' is useless, since this comparison can never succeed.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-571. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "language-features",
+            "external/cwe/cwe-570"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/property-assignment-on-primitive",
+          "cwe_id": "CWE-704",
+          "cwe_name": "Incorrect Type Conversion or Cast",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.2487,
+          "raw_bm25_score": 29.2487,
+          "description": "Assigning to a property of a primitive value has no effect and may trigger a runtime error.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-704. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "language-features",
+            "external/cwe/cwe-704"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/prototype-polluting-assignment",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.4062,
+          "raw_bm25_score": 28.4062,
+          "description": "Modifying an object obtained via a user-controlled property name may lead to accidental mutation of the built-in Object prototype, and possibly escalate to remote code execution or cross-site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-079",
+            "external/cwe/cwe-094",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/template-object-injection",
+          "cwe_id": "CWE-94",
+          "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.8825,
+          "raw_bm25_score": 26.8825,
+          "description": "Instantiating a template using a user-controlled object is vulnerable to local file read and potential remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-073",
+            "external/cwe/cwe-094"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/redundant-assignment",
+          "cwe_id": "CWE-561",
+          "cwe_name": "Dead Code",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.3803,
+          "raw_bm25_score": 26.3803,
+          "description": "Assigning a variable to itself has no effect.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove dead code through static analysis. Use code coverage tools to identify unreachable code. Implement regular code reviews to eliminate unused functionality.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-480",
+            "external/cwe/cwe-561"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/conflicting-html-attribute",
+          "cwe_id": "CWE-758",
+          "cwe_name": "Reliance on Undefined, Unspecified, or Implementation-Defined Behavior",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.7004,
+          "raw_bm25_score": 22.7004,
+          "description": "If an HTML element has two attributes with the same name but different values, its behavior may be browser-dependent.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-758. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "maintainability",
+            "correctness",
+            "external/cwe/cwe-758"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

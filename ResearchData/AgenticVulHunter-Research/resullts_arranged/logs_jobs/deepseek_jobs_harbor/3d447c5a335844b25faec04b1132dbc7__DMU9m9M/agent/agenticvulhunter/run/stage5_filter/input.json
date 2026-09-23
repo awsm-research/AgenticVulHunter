@@ -1,0 +1,303 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "lib/ejs.js",
+    "changed_line": 276,
+    "statement": "if (p == 'root') {",
+    "change_type": "A",
+    "function_name": "cpOptsInData",
+    "operation_type": "security_control_validation",
+    "selection_reason": "User-controlled data object -> checks if option is 'root' -> prevents include directory manipulation that could lead to RCE",
+    "security_relevance_score": 0.9,
+    "code_context": "127:  * Get the template from a string or a file, either compiled on-the-fly or\n128:  * read from cache (if enabled), and cache the template if needed.\n129:  *\n130:  * If `template` is not set, the file specified in `options.filename` will be\n131:  * read.\n132:  *\n133:  * If `options.cache` is true, this function reads the file from\n134:  * `options.filename` so it must be set prior to calling this function.\n135:  *\n136:  * @memberof module:ejs-internal\n137:  * @param {Options} options   compilation options\n138:  * @param {String} [template] template source\n139:  * @return {(TemplateFunction|ClientFunction)}\n140:  * Depending on the value of `options.client`, either type might be returned.\n141:  * @static\n142:  */\n143: \n144: function handleCache(options, template) {\n145:   var func;\n146:   var filename = options.filename;\n147:   var hasTemplate = arguments.length > 1;\n148: \n149:   if (options.cache) {\n150:     if (!filename) {\n151:       throw new Error('cache option requires a filename');\n152:     }\n153:     func = exports.cache.get(filename);\n154:     if (func) {\n155:       return func;\n156:     }\n157:     if (!hasTemplate) {\n158:       template = fs.readFileSync(filename).toString().replace(_BOM, '');\n159:     }\n160:   }\n161:   else if (!hasTemplate) {\n162:     // istanbul ignore if: should not happen at all\n163:     if (!filename) {\n164:       throw new Error('Internal EJS error: no file name or template '\n165:                     + 'provided');\n166:     }\n167:     template = fs.readFileSync(filename).toString().replace(_BOM, '');\n168:   }\n169:   func = exports.compile(template, options);\n170:   if (options.cache) {\n171:     exports.cache.set(filename, func);\n172:   }\n173:   return func;\n174: }\n175: \n176: /**\n177:  * Get the template function.\n178:  *\n179:  * If `options.cache` is `true`, then the template is cached.\n180:  *\n181:  * @memberof module:ejs-internal\n182:  * @param {String}  path    path for the specified file\n183:  * @param {Options} options compilation options\n184:  * @return {(TemplateFunction|ClientFunction)}\n185:  * Depending on the value of `options.client`, either type might be returned\n186:  * @static\n187:  */\n188: \n189: function includeFile(path, options) {\n190:   var opts = utils.shallowCopy({}, options);\n191:   opts.filename = getIncludePath(path, opts);\n192:   return handleCache(opts);\n193: }\n194: \n195: /**\n196:  * Get the JavaScript source of an included file.\n197:  *\n198:  * @memberof module:ejs-internal\n199:  * @param {String}  path    path for the specified file\n200:  * @param {Options} options compilation options\n201:  * @return {Object}\n202:  * @static\n203:  */\n204: \n205: function includeSource(path, options) {\n206:   var opts = utils.shallowCopy({}, options);\n207:   var includePath;\n208:   var template;\n209:   includePath = getIncludePath(path,opts);\n210:   template = fs.readFileSync(includePath).toString().replace(_BOM, '');\n211:   opts.filename = includePath;\n212:   var templ = new Template(template, opts);\n213:   templ.generateSource();\n214:   return {\n215:     source: templ.source,\n216:     filename: includePath,\n217:     template: template\n218:   };\n219: }\n220: \n221: /**\n222:  * Re-throw the given `err` in context to the `str` of ejs, `filename`, and\n223:  * `lineno`.\n224:  *\n225:  * @implements RethrowCallback\n226:  * @memberof module:ejs-internal\n227:  * @param {Error}  err      Error object\n228:  * @param {String} str      EJS source\n229:  * @param {String} filename file name of the EJS file\n230:  * @param {String} lineno   line number of the error\n231:  * @static\n232:  */\n233: \n234: function rethrow(err, str, filename, lineno){\n235:   var lines = str.split('\\n');\n236:   var start = Math.max(lineno - 3, 0);\n237:   var end = Math.min(lines.length, lineno + 3);\n238:   // Error context\n239:   var context = lines.slice(start, end).map(function (line, i){\n240:     var curr = i + start + 1;\n241:     return (curr == lineno ? ' >> ' : '    ')\n242:       + curr\n243:       + '| '\n244:       + line;\n245:   }).join('\\n');\n246: \n247:   // Alter exception message\n248:   err.path = filename;\n249:   err.message = (filename || 'ejs') + ':'\n250:     + lineno + '\\n'\n251:     + context + '\\n\\n'\n252:     + err.message;\n253: \n254:   throw err;\n255: }\n256: \n257: /**\n258:  * Copy properties in data object that are recognized as options to an\n259:  * options object.\n260:  *\n261:  * This is used for compatibility with earlier versions of EJS and Express.js.\n262:  *\n263:  * @memberof module:ejs-internal\n264:  * @param {Object}  data data object\n265:  * @param {Options} opts options object\n266:  * @static\n267:  */\n268: \n269: function cpOptsInData(data, opts) {\n270:   _OPTS.forEach(function (p) {\n271:     if (typeof data[p] != 'undefined') {\n272:       // Disallow setting the root opt for includes via a passed data obj\n273:       // Unsanitized, parameterized use of `render` could allow the\n274:       // include directory to be reset, opening up the possibility of\n275:       // remote code execution\n276:       if (p == 'root') {\n277:         return;\n278:       }\n279:       opts[p] = data[p];\n280:     }\n281:   });\n282: }\n283: \n284: /**\n285:  * Compile the given `str` of ejs into a template function.\n286:  *\n287:  * @param {String}  template EJS template\n288:  *\n289:  * @param {Options} opts     compilation options\n290:  *\n291:  * @return {(TemplateFunction|ClientFunction)}\n292:  * Depending on the value of `opts.client`, either type might be returned.\n293:  * @public\n294:  */\n295: \n296: exports.compile = function compile(template, opts) {\n297:   var templ;\n298: \n299:   // v1 compat\n300:   // 'scope' is 'context'\n301:   // FIXME: Remove this in a future version\n302:   if (opts && opts.scope) {\n303:     if (!scopeOptionWarned){\n304:       console.warn('`scope` option is deprecated and will be removed in EJS 3');\n305:       scopeOptionWarned = true;\n306:     }\n307:     if (!opts.context) {\n308:       opts.context = opts.scope;\n309:     }\n310:     delete opts.scope;\n311:   }\n312:   templ = new Template(template, opts);\n313:   return templ.compile();\n314: };\n315: \n316: /**\n317:  * Render the given `template` of ejs.\n318:  *\n319:  * If you would like to include options but not data, you need to explicitly\n320:  * call this function with `data` being an empty object or `null`.\n321:  *\n322:  * @param {String}   template EJS template\n323:  * @param {Object}  [data={}] template data\n324:  * @param {Options} [opts={}] compilation and rendering options\n325:  * @return {String}\n326:  * @public\n327:  */\n328: \n329: exports.render = function (template, d, o) {\n330:   var data = d || {};\n331:   var opts = o || {};\n332: \n333:   // No options object -- if there are optiony names\n334:   // in the data, copy them to options\n335:   if (arguments.length == 2) {\n336:     cpOptsInData(data, opts);\n337:   }\n338: \n339:   return handleCache(opts, template)(data);\n340: };\n341: \n342: /**\n343:  * Render an EJS file at the given `path` and callback `cb(err, str)`.\n344:  *\n345:  * If you would like to include options but not data, you need to explicitly\n346:  * call this function with `data` being an empty object or `null`.\n347:  *\n348:  * @param {String}             path     path to the EJS file\n349:  * @param {Object}            [data={}] template data\n350:  * @param {Options}           [opts={}] compilation and rendering options\n351:  * @param {RenderFileCallback} cb callback\n352:  * @public\n353:  */\n354: \n355: exports.renderFile = function () {\n356:   var args = Array.prototype.slice.call(arguments);\n357:   var filename = args.shift();\n358:   var cb = args.pop();\n359:   var data = args.shift() || {};\n360:   var opts = args.pop() || {};\n361:   var result;\n362: \n363:   // Don't pollute passed in opts obj with new vals\n364:   opts = utils.shallowCopy({}, opts);\n365: \n366:   // No options object -- if there are optiony names\n367:   // in the data, copy them to options\n368:   if (arguments.length == 3) {\n369:     // Express 4\n370:     if (data.settings && data.settings['view options']) {\n371:       cpOptsInData(data.settings['view options'], opts);\n372:     }\n373:     // Express 3 and lower\n374:     else {\n375:       cpOptsInData(data, opts);\n376:     }\n377:   }\n378:   opts.filename = filename;\n379: \n380:   try {\n381:     result = handleCache(opts)(data);\n382:   }\n383:   catch(err) {\n384:     return cb(err);\n385:   }\n386:   return cb(null, result);\n387: };\n388: \n389: /**\n390:  * Clear intermediate JavaScript cache. Calls {@link Cache#reset}.\n391:  * @public\n392:  */\n393: \n394: exports.clearCache = function () {\n395:   exports.cache.reset();\n396: };\n397: \n398: function Template(text, opts) {\n399:   opts = opts || {};\n400:   var options = {};\n401:   this.templateText = text;\n402:   this.mode = null;\n403:   this.truncate = false;\n404:   this.currentLine = 1;\n405:   this.source = '';\n406:   this.dependencies = [];\n407:   options.client = opts.client || false;\n408:   options.escapeFunction = opts.escape || utils.escapeXML;\n409:   options.compileDebug = opts.compileDebug !== false;\n410:   options.debug = !!opts.debug;\n411:   options.filename = opts.filename;\n412:   options.delimiter = opts.delimiter || exports.delimiter || _DEFAULT_DELIMITER;\n413:   options.strict = opts.strict || false;\n414:   options.context = opts.context;\n415:   options.cache = opts.cache || false;\n416:   options.rmWhitespace = opts.rmWhitespace;\n417:   options.root = opts.root;\n418:   options.localsName = opts.localsName || exports.localsName || _DEFAULT_LOCALS_NAME;\n419: \n420:   if (options.strict) {\n421:     options._with = false;\n422:   }\n423:   else {\n424:     options._with = typeof opts._with != 'undefined' ? opts._with : true;\n425:   }",
+    "source_summary": "User-provided data object passed to render/renderFile functions, which may contain option properties including 'root'",
+    "sink_summary": "File system operations via getIncludePath -> resolveInclude -> path.resolve, used for EJS template includes",
+    "guard_summary": "New guard prevents 'root' option from being copied from user data to internal options, blocking path traversal via root manipulation",
+    "risk_pattern": "User-controlled root option could enable directory traversal in EJS include resolution, allowing arbitrary file inclusion",
+    "used_variable_sources": [
+      "data parameter (user-provided template data)",
+      "_OPTS array (includes 'root' and other options)"
+    ],
+    "called_function_context": [
+      "getIncludePath",
+      "resolveInclude",
+      "path.resolve"
+    ],
+    "enclosing_conditions": [
+      "typeof data[p] != 'undefined'",
+      "p in _OPTS array"
+    ],
+    "context_summary": "The cpOptsInData function copies option properties from user data to internal options for compatibility. The 'root' option controls the base directory for EJS include resolution. Without the guard, user-controlled root could enable path traversal attacks.",
+    "unresolved_facts": [
+      "Specific attack vectors that could exploit root manipulation",
+      "Whether other options in _OPTS could also be security-sensitive"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "Stage-2 evidence shows user-controlled root option could enable path traversal in EJS include resolution via getIncludePath/path.resolve. The guard prevents root manipulation that would allow arbitrary file inclusion.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "fit_reason": "Template engine injection via user-controlled options object; root manipulation could lead to arbitrary template file inclusion and potential code execution through EJS compilation.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "Missing validation of root option from untrusted data object before use in file system operations; the guard adds validation by rejecting root property from user data.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-830",
+        "cwe_name": "Inclusion of Web Functionality from an Untrusted Source",
+        "fit_reason": "User-controlled root could cause inclusion of arbitrary template files from untrusted directories, leading to functionality injection.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-20",
+      "CWE-22",
+      "CWE-378",
+      "CWE-400",
+      "CWE-502",
+      "CWE-563",
+      "CWE-571",
+      "CWE-598",
+      "CWE-79",
+      "CWE-829",
+      "CWE-830",
+      "CWE-912",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/ejs.js",
+        "changed_line": 276,
+        "statement": "if (p == 'root') {",
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.4,
+            "evidence": "The candidate prevents the 'root' option from being set via user data. The 'root' option is used as a base directory for include resolution (getIncludePath -> resolveInclude -> path.resolve). Preventing its user control is a defense against path traversal, but the exact CWE-22 mechanism (constructing a pathname with special elements that escape a restricted directory) is not demonstrated in the diff. The patch adds a control; it does not show an exploitable traversal."
+          },
+          "connection": {
+            "score": 0.5,
+            "evidence": "User-provided `data` object is passed to `cpOptsInData` from `render`/`renderFile`. If `data` contains a 'root' property, it would be copied to internal `opts`. The `opts.root` is used by `getIncludePath` to resolve include paths via `path.resolve`. The connection from user input to the path resolution sink is established via the option copying flow."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If the candidate line were reverted, the `if (p == 'root') { return; }` guard would be removed. This would allow a user-provided `data` object containing a 'root' property to set `opts.root`. The change materially creates a security control that prevents user manipulation of the root directory for includes."
+          },
+          "security_control": {
+            "score": 0.7,
+            "evidence": "The required control for CWE-22 is proper limitation of pathnames to a restricted directory, typically via validation/sanitization of user input used in path construction. The patch adds a control that blocks a specific user-controlled input ('root') from affecting the base directory. The deficiency before the patch was that user data could arbitrarily set the root directory, bypassing any intended restriction.",
+            "required_control": "Restriction of the base directory ('root') used for include path resolution to prevent user-controlled path traversal.",
+            "control_requirement_evidence": "CWE-22 occurs when external input can influence a pathname to escape a restricted directory. The 'root' option directly sets the base directory for includes; user control over it could allow traversal outside intended directories.",
+            "existing_controls_checked": [
+              "The `getIncludePath` function uses `path.resolve` with `opts.root`. No evidence of other validation or sanitization of `root` within the provided code context."
+            ],
+            "deficiency_evidence": "Before the patch, `cpOptsInData` copied any property from `data` that matched `_OPTS` (including 'root') to `opts`. This allowed user data to set the root directory, removing the restriction. The patch demonstrates the deficiency by adding the guard."
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "The concrete impact (arbitrary file inclusion/read leading to RCE or data exposure) is speculative. The evidence shows a control addition that prevents root manipulation, but does not demonstrate an actual path traversal exploit, attacker-controlled file inclusion, or resulting security consequence. Impact is inferred from the comment about 'remote code execution' but not evidenced."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the guard preventing the 'root' option from being copied from user data to internal options would be removed. User-provided template data containing a 'root' property would then set the base directory for EJS include resolution, potentially allowing path traversal outside the intended directory.",
+        "supporting_evidence": [
+          "The `cpOptsInData` function copies properties from user `data` to internal `opts` for compatibility. The `_OPTS` array includes 'root'.",
+          "The `root` option is used by `getIncludePath` (called from `includeFile`/`includeSource`) to resolve include paths via `path.resolve`.",
+          "The added guard specifically blocks copying the 'root' property from user data, with a comment stating it prevents include directory reset that could lead to remote code execution."
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the 'root' option, if set by user, would be used without further validation or canonicalization in `getIncludePath`/`resolveInclude`.",
+          "Whether other path traversal vectors exist (e.g., via the include path itself).",
+          "Whether downstream validation or access controls would prevent actual file inclusion outside intended directories.",
+          "Concrete attack scenario demonstrating file inclusion leading to RCE or data exposure."
+        ],
+        "review_comment": "The patch adds a guard to prevent user-controlled template data from setting the 'root' option, which is used as the base directory for EJS include resolution. This blocks a potential path traversal vector where an attacker could manipulate the root directory to include arbitrary files. Ensure the 'root' option can only be set via trusted options passed directly to the render functions, not via user data.",
+        "change_type": "A",
+        "raw_score": 0.5599999999999999,
+        "score": 0.5599999999999999
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/ejs.js",
+        "changed_line": 276,
+        "statement": "if (p == 'root') {",
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.3,
+            "evidence": "The patch prevents a user-controlled 'root' option from being copied to internal options. This could influence the path resolution for included template files. However, CWE-94 requires the generation of a code segment (e.g., dynamic code, script, query) using externally-influenced input. The demonstrated mechanism influences file path selection, not the direct construction of a code segment. The included template file's content is read and compiled, which is a step removed from the direct code generation described by CWE-94."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "The `data` parameter to `render`/`renderFile` is user-controlled. The `cpOptsInData` function iterates over `_OPTS` (which includes 'root') and copies properties from `data` to the internal `opts` object if defined. The `root` option is used by `getIncludePath` and `resolveInclude` to set the base directory for resolving relative paths in `<%- include(...) %>` statements. The patch breaks this connection by preventing the 'root' property from being copied."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If the candidate line (`if (p == 'root') { return; }`) were reverted, the `cpOptsInData` function would copy a user-provided `data.root` value into the internal `opts.root`. This would allow an attacker to manipulate the base directory for template includes, potentially enabling path traversal to include arbitrary files. The patch directly adds this security control."
+          },
+          "security_control": {
+            "score": 0.85,
+            "evidence": "The patch adds a validation/sanitization control by disallowing the 'root' option from being set via user data. This is a direct allowlist-style restriction on a security-sensitive option.",
+            "required_control": "Input validation to prevent user control over security-sensitive compilation/rendering options, specifically the 'root' directory path.",
+            "control_requirement_evidence": "For the demonstrated path (user data -> root option -> include path resolution), the CWE-94 mechanism (influencing code generation) requires that the user cannot arbitrarily set the base directory from which template files are included, as this could lead to inclusion and compilation of malicious template files.",
+            "existing_controls_checked": [
+              "The `cpOptsInData` function previously copied all properties in `_OPTS` from user data without restriction. The `getIncludePath` and `resolveInclude` functions use `opts.root` if provided, with no other validation on its source."
+            ],
+            "deficiency_evidence": "Prior to the patch, the required control (restricting user setting of 'root') was absent. The patch demonstrably adds this control by explicitly skipping the 'root' property during the copy operation."
+          },
+          "concrete_impact": {
+            "score": 0.5,
+            "evidence": "The concrete consequence is the ability to control the base directory for EJS template includes. This could lead to Local File Inclusion (LFI), potentially allowing the reading of sensitive files. For a true 'Code Injection' (CWE-94) impact, the included file would need to be a malicious EJS template that, when compiled and executed, results in arbitrary code execution. This secondary step (malicious template content leading to code execution) is plausible but not directly demonstrated by the evidence. The immediate, demonstrated impact is path traversal and arbitrary file inclusion."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the `cpOptsInData` function would copy a user-provided `data.root` value into the internal `opts` object, allowing an attacker to manipulate the base directory used to resolve relative paths in EJS include statements, potentially leading to arbitrary file inclusion.",
+        "supporting_evidence": [
+          "The `cpOptsInData` function copies properties from user-provided `data` object to internal `opts`. The `_OPTS` array includes 'root'.",
+          "The `root` option is used by `getIncludePath` and `resolveInclude` to determine the base directory for resolving `include` statements.",
+          "Code comment on lines 272-275 explicitly states the security risk: 'Disallow setting the root opt for includes via a passed data obj. Unsanitized, parameterized use of `render` could allow the include directory to be reset, opening up the possibility of remote code execution.'"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether a malicious EJS template file, once included, could lead to arbitrary code execution upon compilation/rendering (necessary for full CWE-94 impact).",
+          "The specific attack vectors or proof-of-concept demonstrating the exploit chain from root manipulation to code execution."
+        ],
+        "review_comment": "The patch adds a critical security control by preventing user-controlled data from setting the 'root' option, which defines the base directory for EJS template includes. Without this guard, an attacker could perform path traversal to include and execute arbitrary template files. To fully remediate, ensure all security-sensitive options in `_OPTS` (e.g., 'filename', 'client') are similarly validated or restricted from user data.",
+        "change_type": "A",
+        "raw_score": 0.65,
+        "score": 0.65
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/ejs.js",
+        "changed_line": 276,
+        "statement": "if (p == 'root') {",
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The patch adds a guard that prevents the 'root' option from being copied from user-provided data to internal options. This is a direct input validation mechanism: it validates that a specific property ('root') from untrusted input should not be accepted."
+          },
+          "connection": {
+            "score": 0.75,
+            "evidence": "User-provided data object is passed to render/renderFile functions. The cpOptsInData function iterates over _OPTS array (which includes 'root') and copies properties from data to opts if defined. The 'root' option controls the base directory for EJS include resolution via getIncludePath -> resolveInclude -> path.resolve."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If the candidate line were reverted, the guard would be removed, allowing the 'root' property from user data to be copied to internal options. This would materially expose the include directory to manipulation via untrusted input."
+          },
+          "security_control": {
+            "score": 0.8,
+            "evidence": "The patch adds a whitelist-style validation that rejects a specific dangerous property from untrusted input.",
+            "required_control": "Validation/sanitization of user-provided option properties before they influence file system operations.",
+            "control_requirement_evidence": "CWE-20 requires validating inputs that affect security-sensitive operations. The 'root' option directly controls file system path resolution for includes, making validation essential to prevent directory traversal.",
+            "existing_controls_checked": [
+              "No prior validation of 'root' property in cpOptsInData; other properties are copied without restriction."
+            ],
+            "deficiency_evidence": "Before the patch, the 'root' property from user data was copied without validation, allowing untrusted control over the include base directory. The patch demonstrates the deficiency by adding the missing validation."
+          },
+          "concrete_impact": {
+            "score": 0.7,
+            "evidence": "If 'root' is controllable, an attacker could set it to an arbitrary directory, potentially leading to arbitrary file inclusion during EJS template rendering. This could enable reading sensitive files or, if combined with other vulnerabilities, remote code execution."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the guard preventing 'root' from being copied from user data to internal options would be removed. This would allow user-controlled data to set the 'root' option, potentially enabling directory traversal in EJS include resolution.",
+        "supporting_evidence": [
+          "The cpOptsInData function copies properties from user data to options for compatibility.",
+          "The 'root' option is included in the _OPTS array and influences getIncludePath -> resolveInclude -> path.resolve.",
+          "The added guard specifically blocks the 'root' property with a comment explaining the security risk: 'Disallow setting the root opt for includes via a passed data obj'."
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Specific attack vectors that could exploit root manipulation to achieve RCE (beyond file inclusion).",
+          "Whether other options in _OPTS could also be security-sensitive and require similar validation."
+        ],
+        "review_comment": "The patch adds a guard to prevent the 'root' option from being copied from user-provided data to internal options, addressing a missing input validation. User-controlled 'root' could manipulate the include directory base path, enabling directory traversal during EJS template rendering. To remediate, maintain this guard and consider validating other security-sensitive options in _OPTS that influence file system or code generation behavior.",
+        "change_type": "A",
+        "raw_score": 0.8,
+        "score": 0.8
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "lib/ejs.js",
+        "changed_line": 276,
+        "statement": "if (p == 'root') {",
+        "cwe_id": "CWE-830",
+        "cwe_name": "Inclusion of Web Functionality from an Untrusted Source",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.1,
+            "evidence": "CWE-830 specifically addresses inclusion of web functionality/widgets from untrusted external domains (e.g., third-party JavaScript). The demonstrated mechanism involves file system path resolution for template includes, not web functionality inclusion from external domains."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "User-provided data object is passed to cpOptsInData. When 'root' property exists in data, it would be copied to internal options (without the guard). The 'root' option is used by getIncludePath → resolveInclude → path.resolve to determine base directory for EJS template includes."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If the candidate line were absent, user-controlled 'root' option would be copied from data to opts. With the guard, the 'root' property is explicitly blocked from being copied from user data, preventing user manipulation of the include directory."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "",
+            "required_control": "Validation/sanitization of user-controlled path/directory options",
+            "control_requirement_evidence": "For path traversal or arbitrary file inclusion vulnerabilities, user-controlled directory/path options must be validated or restricted to prevent access outside intended directories.",
+            "existing_controls_checked": [
+              "The guard prevents 'root' from being copied from user data; downstream path resolution uses path.resolve but without validation of the 'root' value itself"
+            ],
+            "deficiency_evidence": "The patch adds a control that blocks user manipulation of 'root', but the evidence doesn't demonstrate that downstream path resolution lacks validation or that attacker-controlled 'root' would lead to actual traversal. The control deficiency is speculative rather than demonstrated."
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "The comment suggests 'remote code execution' possibility, but no concrete impact is demonstrated. Arbitrary file inclusion could lead to information disclosure or template injection, but the exact security consequence is not evidenced."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, user-provided data containing a 'root' property would have that value copied to the internal options object, allowing user control over the base directory used for EJS include resolution.",
+        "supporting_evidence": [
+          "cpOptsInData copies properties from user data to options for compatibility",
+          "The 'root' option controls base directory for template includes via getIncludePath → resolveInclude → path.resolve",
+          "Comment states: 'Unsanitized, parameterized use of `render` could allow the include directory to be reset, opening up the possibility of remote code execution'"
+        ],
+        "contradicting_evidence": [
+          "CWE-830 specifically addresses inclusion of web functionality from untrusted external domains (third-party widgets, scripts), not file system path resolution for template includes",
+          "The mechanism involves local file system operations, not inclusion of external web functionality"
+        ],
+        "contradiction_severity": "material",
+        "unresolved_facts": [
+          "Whether attacker-controlled 'root' would actually enable path traversal (depends on path.resolve behavior and existing directory restrictions)",
+          "Whether other path traversal protections exist in resolveInclude or getIncludePath",
+          "Concrete attack vector demonstrating RCE or other impact"
+        ],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.45999999999999996,
+        "score": 0.45999999999999996
+      }
+    ],
+    "stage4_status": "completed"
+  }
+]

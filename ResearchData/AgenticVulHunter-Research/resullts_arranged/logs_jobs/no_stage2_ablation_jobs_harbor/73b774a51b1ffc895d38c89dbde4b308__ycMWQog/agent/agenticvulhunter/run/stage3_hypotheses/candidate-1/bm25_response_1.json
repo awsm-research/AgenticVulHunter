@@ -1,0 +1,235 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "lib/expression/node/OperatorNode.js",
+      "changed_line": 72,
+      "statement": "if (typeof node.fn !== 'string' || !isSafeMethod(defs.math, node.fn)) {",
+      "change_type": "A",
+      "function_name": "",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+      "security_relevance_score": 0.9,
+      "code_context": "1: 'use strict';\n2: \n3: var latex = require('../../utils/latex');\n4: var map = require('../../utils/array').map;\n5: var join = require('../../utils/array').join;\n6: var stringify = require('../../utils/string').stringify;\n7: var isSafeMethod = require('../../utils/customs').isSafeMethod;\n8: var operators = require('../operators');\n9: \n10: function factory (type, config, load, typed, math) {\n11:   var register = load(require('./compile')).register;\n12:   var compile = load(require('./compile')).compile;\n13:   var Node         = load(require('./Node'));\n14:   var ConstantNode = load(require('./ConstantNode'));\n15:   var SymbolNode   = load(require('./SymbolNode'));\n16:   var FunctionNode = load(require('./FunctionNode'));\n17: \n18:   /**\n19:    * @constructor OperatorNode\n20:    * @extends {Node}\n21:    * An operator with two arguments, like 2+3\n22:    *\n23:    * @param {string} op           Operator name, for example '+'\n24:    * @param {string} fn           Function name, for example 'add'\n25:    * @param {Node[]} args         Operator arguments\n26:    * @param {boolean} [implicit]  Is this an implicit multiplication?\n27:    */\n28:   function OperatorNode(op, fn, args, implicit) {\n29:     if (!(this instanceof OperatorNode)) {\n30:       throw new SyntaxError('Constructor must be called with the new operator');\n31:     }\n32: \n33:     //validate input\n34:     if (typeof op !== 'string') {\n35:       throw new TypeError('string expected for parameter \"op\"');\n36:     }\n37:     if (typeof fn !== 'string') {\n38:       throw new TypeError('string expected for parameter \"fn\"');\n39:     }\n40:     if (!Array.isArray(args)\n41:         || !args.every(function (node) {return node && node.isNode;})) {\n42:       throw new TypeError('Array containing Nodes expected for parameter \"args\"');\n43:     }\n44: \n45:     this.implicit = (implicit === true);\n46:     this.op = op;\n47:     this.fn = fn;\n48:     this.args = args || [];\n49:   }\n50: \n51:   OperatorNode.prototype = new Node();\n52: \n53:   OperatorNode.prototype.type = 'OperatorNode';\n54: \n55:   OperatorNode.prototype.isOperatorNode = true;\n56: \n57:   /**\n58:    * Compile the node to javascript code\n59:    * @param {OperatorNode} node The node to be compiled\n60:    * @param {Object} defs     Object which can be used to define functions\n61:    *                          or constants globally available for the compiled\n62:    *                          expression\n63:    * @param {Object} args     Object with local function arguments, the key is\n64:    *                          the name of the argument, and the value is `true`.\n65:    *                          The object may not be mutated, but must be\n66:    *                          extended instead.\n67:    * @return {string} js\n68:    * @private\n69:    */\n70:   function compileOperatorNode(node, defs, args) {\n71:     // validate fn\n72:     if (typeof node.fn !== 'string' || !isSafeMethod(defs.math, node.fn)) {\n73:       if (!defs.math[node.fn]) {\n74:         throw new Error('Function ' + node.fn + ' missing in provided namespace \"math\"');\n75:       }\n76:       else {\n77:         throw new Error('No access to function \"' + node.fn + '\"');\n78:       }\n79:     }\n80: \n81:     var jsArgs = map(node.args, function (arg) {\n82:       return compile(arg, defs, args);\n83:     });\n84: \n85:     return 'math[' + stringify(node.fn) + '](' + join(jsArgs, ', ') + ')';\n86:   }\n87: \n88:   // register the compile function\n89:   register(OperatorNode.prototype.type, compileOperatorNode);\n90: \n91:   /**\n92:    * Execute a callback for each of the child nodes of this node\n93:    * @param {function(child: Node, path: string, parent: Node)} callback\n94:    */\n95:   OperatorNode.prototype.forEach = function (callback) {\n96:     for (var i = 0; i < this.args.length; i++) {\n97:       callback(this.args[i], 'args[' + i + ']', this);\n98:     }\n99:   };\n100: \n101:   /**\n102:    * Create a new OperatorNode having it's childs be the results of calling\n103:    * the provided callback function for each of the childs of the original node.\n104:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n105:    * @returns {OperatorNode} Returns a transformed copy of the node\n106:    */\n107:   OperatorNode.prototype.map = function (callback) {\n108:     var args = [];\n109:     for (var i = 0; i < this.args.length; i++) {\n110:       args[i] = this._ifNode(callback(this.args[i], 'args[' + i + ']', this));\n111:     }\n112:     return new OperatorNode(this.op, this.fn, args);\n113:   };\n114: \n115:   /**\n116:    * Create a clone of this node, a shallow copy\n117:    * @return {OperatorNode}\n118:    */\n119:   OperatorNode.prototype.clone = function () {\n120:     return new OperatorNode(this.op, this.fn, this.args.slice(0), this.implicit);\n121:   };\n122: \n123:   /**\n124:    * Calculate which parentheses are necessary. Gets an OperatorNode\n125:    * (which is the root of the tree) and an Array of Nodes\n126:    * (this.args) and returns an array where 'true' means that an argument\n127:    * has to be enclosed in parentheses whereas 'false' means the opposite.\n128:    *\n129:    * @param {OperatorNode} root\n130:    * @param {string} parenthesis\n131:    * @param {Node[]} args\n132:    * @param {boolean} latex\n133:    * @return {boolean[]}\n134:    * @private\n135:    */\n136:   function calculateNecessaryParentheses(root, parenthesis, args, latex) {\n137:     //precedence of the root OperatorNode\n138:     var precedence = operators.getPrecedence(root, parenthesis);\n139:     var associativity = operators.getAssociativity(root, parenthesis);\n140: \n141:     if ((parenthesis === 'all') || ((args.length > 2) && (root.getIdentifier() !== 'OperatorNode:add') && (root.getIdentifier() !== 'OperatorNode:multiply'))) {\n142:       var parens = args.map(function (arg) {\n143:         switch (arg.getContent().type) { //Nodes that don't need extra parentheses\n144:           case 'ArrayNode':\n145:           case 'ConstantNode':\n146:           case 'SymbolNode':\n147:           case 'ParenthesisNode':\n148:             return false;\n149:             break;\n150:           default:\n151:             return true;\n152:         }\n153:       });\n154:       return parens;\n155:     }\n156: \n157:     if (args.length === 0) {\n158:       return [];\n159:     } else if (args.length === 1) { //unary operators\n160:       //precedence of the operand\n161:       var operandPrecedence = operators.getPrecedence(args[0], parenthesis);\n162: \n163:       //handle special cases for LaTeX, where some of the parentheses aren't needed\n164:       if (latex && (operandPrecedence !== null)) {\n165:         var operandIdentifier;\n166:         var rootIdentifier;\n167:         if (parenthesis === 'keep') {\n168:           operandIdentifier = args[0].getIdentifier();\n169:           rootIdentifier = root.getIdentifier();\n170:         }\n171:         else {\n172:           //Ignore Parenthesis Nodes when not in 'keep' mode\n173:           operandIdentifier = args[0].getContent().getIdentifier();\n174:           rootIdentifier = root.getContent().getIdentifier();\n175:         }\n176:         if (operators.properties[precedence][rootIdentifier].latexLeftParens === false) {\n177:           return [false];\n178:         }\n179: \n180:         if (operators.properties[operandPrecedence][operandIdentifier].latexParens === false) {\n181:           return [false];\n182:         }\n183:       }\n184: \n185:       if (operandPrecedence === null) {\n186:         //if the operand has no defined precedence, no parens are needed\n187:         return [false];\n188:       }\n189: \n190:       if (operandPrecedence <= precedence) {\n191:         //if the operands precedence is lower, parens are needed\n192:         return [true];\n193:       }\n194: \n195:       //otherwise, no parens needed\n196:       return [false];\n197:     } else if (args.length === 2) { //binary operators\n198:       var lhsParens; //left hand side needs parenthesis?\n199:       //precedence of the left hand side\n200:       var lhsPrecedence = operators.getPrecedence(args[0], parenthesis);\n201:       //is the root node associative with the left hand side\n202:       var assocWithLhs = operators.isAssociativeWith(root, args[0], parenthesis);\n203: \n204:       if (lhsPrecedence === null) {\n205:         //if the left hand side has no defined precedence, no parens are needed\n206:         //FunctionNode for example\n207:         lhsParens = false;\n208:       }\n209:       else if ((lhsPrecedence === precedence) && (associativity === 'right') && !assocWithLhs) {\n210:         //In case of equal precedence, if the root node is left associative\n211:         // parens are **never** necessary for the left hand side.\n212:         //If it is right associative however, parens are necessary\n213:         //if the root node isn't associative with the left hand side\n214:         lhsParens = true;\n215:       }\n216:       else if (lhsPrecedence < precedence) {\n217:         lhsParens = true;\n218:       }\n219:       else {\n220:         lhsParens = false;\n221:       }",
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "js/useless-type-test",
+          "cwe_id": "CWE-571",
+          "cwe_name": "Expression is Always True",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 12.1502,
+          "raw_bm25_score": 12.1502,
+          "description": "Comparing the result of a typeof test against a string other than 'undefined', 'boolean', 'number', 'string', 'object', 'function' or 'symbol' is useless, since this comparison can never succeed.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-571. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "language-features",
+            "external/cwe/cwe-570"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/useless-regexp-character-escape",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 10.0098,
+          "raw_bm25_score": 10.0098,
+          "description": "Prepending a backslash to an ordinary character in a string does not have any effect, and may make regular expressions constructed from this string behave unexpectedly.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/regex/unmatchable-dollar",
+          "cwe_id": "CWE-561",
+          "cwe_name": "Dead Code",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 8.0744,
+          "raw_bm25_score": 8.0744,
+          "description": "If a dollar assertion '$' appears in a regular expression before another term that cannot match the empty string, then this assertion can never match, so the entire regular expression cannot match any string.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove dead code through static analysis. Use code coverage tools to identify unreachable code. Implement regular code reviews to eliminate unused functionality.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "regular-expressions",
+            "external/cwe/cwe-561"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/unvalidated-dynamic-method-call",
+          "cwe_id": "CWE-754",
+          "cwe_name": "Improper Check for Unusual or Exceptional Conditions",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 6.8008,
+          "raw_bm25_score": 6.8008,
+          "description": "Calling a method with a user-controlled name may dispatch to an unexpected target, which could cause an exception.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-754"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/enabling-electron-renderer-node-integration",
+          "cwe_id": "CWE-94",
+          "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 6.6691,
+          "raw_bm25_score": 6.6691,
+          "description": "Enabling `nodeIntegration` or `nodeIntegrationInWorker` can expose the application to remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "frameworks/electron",
+            "external/cwe/cwe-094"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/file-system-race",
+          "cwe_id": "CWE-367",
+          "cwe_name": "Time-of-check Time-of-use (TOCTOU) Race Condition",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 6.1238,
+          "raw_bm25_score": 6.1238,
+          "description": "Separately checking the state of a file before operating on it may allow an attacker to modify the file between the two operations.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-367"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/index-out-of-bounds",
+          "cwe_id": "CWE-193",
+          "cwe_name": "Off-by-one Error",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 5.8758,
+          "raw_bm25_score": 5.8758,
+          "description": "An array index is compared to be less than or equal to the 'length' property, and then used in an indexing operation that could be out of bounds.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-193. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "logic",
+            "language-features"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/sensitive-get-query",
+          "cwe_id": "CWE-598",
+          "cwe_name": "Use of GET Request Method With Sensitive Query Strings",
+          "language": "javascript",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 5.7766,
+          "raw_bm25_score": 5.7766,
+          "description": "Placing sensitive data in a GET request increases the risk of the data being exposed to an attacker.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-598"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/tainted-format-string",
+          "cwe_id": "CWE-134",
+          "cwe_name": "Use of Externally-Controlled Format String",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 5.5804,
+          "raw_bm25_score": 5.5804,
+          "description": "Using external input in format strings can lead to garbled output.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-134"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/node/assignment-to-exports-variable",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 5.444,
+          "raw_bm25_score": 5.444,
+          "description": "Assigning to the special 'exports' variable only overwrites its value and does not export anything. Such an assignment is hence most likely unintentional.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "frameworks/node.js",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

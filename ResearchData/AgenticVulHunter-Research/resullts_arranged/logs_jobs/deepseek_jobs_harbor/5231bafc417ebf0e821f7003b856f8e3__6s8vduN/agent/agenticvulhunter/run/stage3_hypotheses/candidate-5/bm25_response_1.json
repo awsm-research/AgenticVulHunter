@@ -1,0 +1,250 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "tests/tests.py",
+      "changed_line": 53,
+      "statement": "request.session = SessionStore('Python/2.7', '127.0.0.1')",
+      "change_type": "A",
+      "function_name": "Client.login",
+      "operation_type": "session_store_initialization",
+      "selection_reason": "Initializes a session store with hardcoded user-agent and IP -> could mask real client attributes in tests, affecting security validation.",
+      "security_relevance_score": 0.2,
+      "code_context": "1: from datetime import timedelta\n2: import sys\n3: try:\n4:     from urllib.parse import urlencode\n5: except ImportError:\n6:     from urllib import urlencode\n7: \n8: from django.conf import settings\n9: from django.contrib.auth import SESSION_KEY, authenticate, login\n10: from django.contrib.auth.models import User\n11: from django.contrib.sessions.backends.base import CreateError\n12: from django.core.urlresolvers import reverse\n13: from django.db import IntegrityError\n14: from django.http import HttpRequest\n15: from django.test import TestCase, Client as BaseClient\n16: from django.test.utils import override_settings\n17: from django.utils.timezone import now\n18: \n19: from user_sessions.backends.db import SessionStore\n20: from user_sessions.models import Session\n21: from user_sessions.templatetags.user_sessions import location, device\n22: \n23: if sys.version_info[:2] < (2, 7):\n24:     from django.utils.unittest.case import skipUnless\n25: else:\n26:     from unittest import skipUnless\n27: \n28: try:\n29:     from django.contrib.gis.geoip import GeoIP\n30:     geoip = GeoIP()\n31:     geoip_msg = None\n32: except Exception as e:\n33:     geoip = None\n34:     geoip_msg = str(e)\n35: \n36: \n37: class Client(BaseClient):\n38:     def login(self, **credentials):\n39:         \"\"\"\n40:         Sets the Factory to appear as if it has successfully logged into a site.\n41: \n42:         Returns True if login is possible; False if the provided credentials\n43:         are incorrect, or the user is inactive, or if the sessions framework is\n44:         not available.\n45:         \"\"\"\n46:         user = authenticate(**credentials)\n47:         if user and user.is_active:\n48:             # Create a fake request to store login details.\n49:             request = HttpRequest()\n50:             if self.session:\n51:                 request.session = self.session\n52:             else:\n53:                 request.session = SessionStore('Python/2.7', '127.0.0.1')\n54:             login(request, user)\n55: \n56:             # Save the session values.\n57:             request.session.save()\n58: \n59:             # Set the cookie to represent the session.\n60:             session_cookie = settings.SESSION_COOKIE_NAME\n61:             self.cookies[session_cookie] = request.session.session_key\n62:             cookie_data = {\n63:                 'max-age': None,\n64:                 'path': '/',\n65:                 'domain': settings.SESSION_COOKIE_DOMAIN,\n66:                 'secure': settings.SESSION_COOKIE_SECURE or None,\n67:                 'expires': None,\n68:             }\n69:             self.cookies[session_cookie].update(cookie_data)\n70: \n71:             return True\n72:         else:\n73:             return False\n74: \n75: \n76: class MiddlewareTest(TestCase):\n77:     def test_unmodified_session(self):\n78:         self.client.get('/', HTTP_USER_AGENT='Python/2.7')\n79:         self.assertNotIn(settings.SESSION_COOKIE_NAME, self.client.cookies)\n80: \n81:     def test_modify_session(self):\n82:         self.client.get('/modify_session/', HTTP_USER_AGENT='Python/2.7')\n83:         self.assertIn(settings.SESSION_COOKIE_NAME, self.client.cookies)\n84:         session = Session.objects.get(\n85:             pk=self.client.cookies[settings.SESSION_COOKIE_NAME].value\n86:         )\n87:         self.assertEqual(session.user_agent, 'Python/2.7')\n88:         self.assertEqual(session.ip, '127.0.0.1')\n89: \n90:     def test_login(self):\n91:         user = User.objects.create_superuser('bouke', '', 'secret')\n92:         response = self.client.post('/admin/',\n93:                                     data={\n94:                                         'username': 'bouke',\n95:                                         'password': 'secret',\n96:                                         'this_is_the_login_form': '1',\n97:                                         'next': '/admin/'},\n98:                                     HTTP_USER_AGENT='Python/2.7')\n99:         self.assertRedirects(response, '/admin/')\n100:         session = Session.objects.get(\n101:             pk=self.client.cookies[settings.SESSION_COOKIE_NAME].value\n102:         )\n103:         self.assertEqual(user, session.user)\n104: \n105:     def test_long_ua(self):\n106:         self.client.get('/modify_session/',\n107:                         HTTP_USER_AGENT=''.join('a' for _ in range(400)))\n108: \n109: \n110: class ViewsTest(TestCase):\n111:     client_class = Client\n112: \n113:     def setUp(self):\n114:         User.objects.create_user('bouke', '', 'secret')\n115:         assert self.client.login(username='bouke', password='secret')\n116: \n117:     def test_list(self):\n118:         response = self.client.get(reverse('user_sessions:session_list'))\n119:         self.assertContains(response, 'Active Sessions')\n120:         self.assertContains(response, 'End Session', 2)\n121: \n122:     def test_delete(self):\n123:         session_key = self.client.cookies[settings.SESSION_COOKIE_NAME].value\n124:         response = self.client.post(reverse('user_sessions:session_delete',\n125:                                             args=[session_key]))\n126:         self.assertRedirects(response, reverse('user_sessions:session_list'))\n127: \n128: \n129: class SessionStoreTest(TestCase):\n130:     def setUp(self):\n131:         self.store = SessionStore('Python/2.7', '127.0.0.1', None)\n132: \n133:     def test_untouched_init(self):\n134:         self.assertFalse(self.store.modified)\n135:         self.assertFalse(self.store.accessed)\n136: \n137:     def test_auth_session_key(self):\n138:         self.assertFalse(SESSION_KEY in self.store)\n139:         self.assertFalse(self.store.modified)\n140:         self.assertTrue(self.store.accessed)\n141: \n142:         self.store.get(SESSION_KEY)\n143:         self.assertFalse(self.store.modified)\n144: \n145:         self.store[SESSION_KEY] = 1\n146:         self.assertTrue(self.store.modified)\n147: \n148:     def test_save(self):\n149:         self.store[SESSION_KEY] = 1\n150:         self.store.save()\n151: \n152:         session = Session.objects.get(pk=self.store.session_key)\n153:         self.assertEqual(session.user_agent, 'Python/2.7')\n154:         self.assertEqual(session.ip, '127.0.0.1')\n155:         self.assertEqual(session.user_id, 1)\n156:         self.assertAlmostEqual(now(), session.last_activity,\n157:                                delta=timedelta(seconds=5))\n158: \n159:     def test_load_unmodified(self):\n160:         self.store[SESSION_KEY] = 1\n161:         self.store.save()\n162:         store2 = SessionStore('Python/2.7', '127.0.0.1',\n163:                               self.store.session_key)\n164:         store2.load()\n165:         self.assertEqual(store2.user_agent, 'Python/2.7')\n166:         self.assertEqual(store2.ip, '127.0.0.1')\n167:         self.assertEqual(store2.user_id, 1)\n168:         self.assertEqual(store2.modified, False)\n169: \n170:     def test_load_modified(self):\n171:         self.store[SESSION_KEY] = 1\n172:         self.store.save()\n173:         store2 = SessionStore('Python/3.3', '8.8.8.8', self.store.session_key)\n174:         store2.load()\n175:         self.assertEqual(store2.user_agent, 'Python/3.3')\n176:         self.assertEqual(store2.ip, '8.8.8.8')\n177:         self.assertEqual(store2.user_id, 1)\n178:         self.assertEqual(store2.modified, True)\n179: \n180: \n181: @skipUnless(geoip, geoip_msg)\n182: class LocationTemplateFilterTest(TestCase):\n183:     def test_no_location(self):\n184:         self.assertEqual(location('127.0.0.1'), '<i>unknown</i>')\n185: \n186:     def test_google(self):\n187:         self.assertEqual(location('8.8.8.8'), 'United States')\n188: \n189: \n190: class DeviceTemplateFilterTest(TestCase):\n191:     def test_ie(self):\n192:         self.assertEqual(\n193:             'Internet Explorer on Windows XP',\n194:             device('Mozilla/4.0 (Windows; MSIE 6.0; Windows NT 5.1; SV1; '\n195:                    '.NET CLR 2.0.50727)')\n196:         )\n197:         self.assertEqual(\n198:             'Internet Explorer on Windows Vista',\n199:             device('Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.0; '\n200:                    'Trident/4.0; SLCC1; .NET CLR 2.0.50727; .NET CLR 1.1.4322;'\n201:                    ' InfoPath.2; .NET CLR 3.5.21022; .NET CLR 3.5.30729; '\n202:                    'MS-RTC LM 8; OfficeLiveConnector.1.4; OfficeLivePatch.1.3;'",
+      "source_summary": "Hardcoded values 'Python/2.7' (user_agent) and '127.0.0.1' (IP address) provided directly to SessionStore constructor",
+      "sink_summary": "Session data including user_agent and IP are stored in database via request.session.save() and used for session management and security controls",
+      "guard_summary": "No validation of user_agent/IP parameters; hardcoded values bypass real client attributes; SessionStore.load() compares stored vs current user_agent/IP to detect modifications",
+      "risk_pattern": "Test code initializes session with hardcoded client attributes, potentially masking real client characteristics and bypassing security controls that rely on accurate user_agent/IP tracking",
+      "used_variable_sources": [
+        "hardcoded_string_literal"
+      ],
+      "called_function_context": [
+        "SessionStore.__init__",
+        "login",
+        "request.session.save"
+      ],
+      "enclosing_conditions": [
+        "if user and user.is_active",
+        "if self.session (false branch)"
+      ],
+      "context_summary": "In test Client.login method, creates fake session with hardcoded user_agent/IP when no existing session exists, then authenticates user and saves session to database",
+      "unresolved_facts": [
+        "Whether real client attributes (HTTP_USER_AGENT, REMOTE_ADDR) are properly captured in production vs test environments",
+        "Security implications of mismatched user_agent/IP between session creation and subsequent requests"
+      ],
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/untrusted-data-to-external-api",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.928,
+          "raw_bm25_score": 16.928,
+          "description": "Data provided remotely is used in this external API without sanitization, which could be a security risk.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/unicode-dos",
+          "cwe_id": "CWE-770",
+          "cwe_name": "Allocation of Resources Without Limits or Throttling",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.27,
+          "raw_bm25_score": 16.27,
+          "description": "A remote user-controlled data can reach a costly Unicode normalization with either form NFKC or NFKD. On Windows OS, with an attack such as the One Million Unicode Characters, this could lead to a denial of service. And, with the use of special Unicode characters, like U+2100 (℀) or U+2105 (℅), the payload size could be tripled.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-770"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/ip-address-spoofing",
+          "cwe_id": "CWE-348",
+          "cwe_name": "Use of Less Trusted Source",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.1848,
+          "raw_bm25_score": 15.1848,
+          "description": "A remote endpoint identifier is read from an HTTP header. Attackers can modify the value of the identifier to forge the client ip.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-348"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "fallback/cwe-1321-improperly-controlled-modification-of-object-prototype-attributes-prototype-poll",
+          "cwe_id": "CWE-1321",
+          "cwe_name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 15.0289,
+          "raw_bm25_score": 15.0289,
+          "description": "Attacker-controlled object keys modify Object prototype attributes.",
+          "pattern": "cwe-1321 prototype-pollution __proto__ constructor prototype object-key property-key merge assign recursive-merge",
+          "remediation": "Reject prototype keys and use schema-constrained object updates.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-1321"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/paramiko-command-injection",
+          "cwe_id": "CWE-74",
+          "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 14.3586,
+          "raw_bm25_score": 14.3586,
+          "description": "user provided command can lead to execute code on a external server that can be belong to other users or admins",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized APIs and separate data from control instructions. Validate input format and escape special characters.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-074"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/timing-attack-against-hash",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 13.0209,
+          "raw_bm25_score": 13.0209,
+          "description": "When checking a Hash over a message, a constant-time algorithm should be used. Otherwise, an attacker may be able to forge a valid Hash for an arbitrary message by running a timing attack if they can send to the validation procedure. A successful attack can result in authentication bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/bind-socket-all-network-interfaces",
+          "cwe_id": "CWE-200",
+          "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 12.4397,
+          "raw_bm25_score": 12.4397,
+          "description": "Binding a socket to all interfaces opens it up to traffic from any IPv4 address and is therefore associated with security risks.",
+          "pattern": "Find code that may expose sensitive information in error messages, logs, or responses",
+          "remediation": "Implement proper access controls. Use generic error messages for users. Avoid exposing sensitive information in error responses, debugging output, or log files.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-200"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/unsafe-deserialization",
+          "cwe_id": "CWE-502",
+          "cwe_name": "Deserialization of Untrusted Data",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 12.2647,
+          "raw_bm25_score": 12.2647,
+          "description": "Deserializing user-controlled data may allow attackers to execute arbitrary code.",
+          "pattern": "Identify deserialization operations on untrusted data without proper validation",
+          "remediation": "Use safe serialization formats like JSON. If complex deserialization is needed, implement strict validation and type checking.",
+          "tags": [
+            "external/cwe/cwe-502",
+            "security",
+            "serialization"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 12.1849,
+          "raw_bm25_score": 12.1849,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "fallback/cwe-863-incorrect-authorization",
+          "cwe_id": "CWE-863",
+          "cwe_name": "Incorrect Authorization",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 11.8889,
+          "raw_bm25_score": 11.8889,
+          "description": "An authorization check exists but evaluates access incorrectly.",
+          "pattern": "cwe-863 incorrect-authorization authorization-check permission-check role-check ownership-check acl-check access-decision bypass",
+          "remediation": "Evaluate authorization from trusted server-side identity and policy state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-863"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

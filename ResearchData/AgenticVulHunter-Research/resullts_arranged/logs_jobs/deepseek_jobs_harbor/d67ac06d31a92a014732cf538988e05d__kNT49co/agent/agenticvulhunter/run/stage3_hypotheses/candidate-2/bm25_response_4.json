@@ -1,0 +1,370 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "src/lxml/html/clean.py",
+      "changed_line": 429,
+      "statement": "style = self._substitute_comments('', style)",
+      "change_type": "A",
+      "function_name": "_has_sneaky_javascript",
+      "operation_type": "style_sanitization",
+      "selection_reason": "untrusted style input -> comment removal -> sneaky JavaScript detection",
+      "security_relevance_score": 0.8,
+      "code_context": "280:             # FIXME: is <layer> really embedded?\n281:             # We should get rid of any <param> tags not inside <applet>;\n282:             # These are not really valid anyway.\n283:             for el in list(doc.iter('param')):\n284:                 found_parent = False\n285:                 parent = el.getparent()\n286:                 while parent is not None and parent.tag not in ('applet', 'object'):\n287:                     parent = parent.getparent()\n288:                 if parent is None:\n289:                     el.drop_tree()\n290:             kill_tags.update(('applet',))\n291:             # The alternate contents that are in an iframe are a good fallback:\n292:             remove_tags.update(('iframe', 'embed', 'layer', 'object', 'param'))\n293:         if self.frames:\n294:             # FIXME: ideally we should look at the frame links, but\n295:             # generally frames don't mix properly with an HTML\n296:             # fragment anyway.\n297:             kill_tags.update(defs.frame_tags)\n298:         if self.forms:\n299:             remove_tags.add('form')\n300:             kill_tags.update(('button', 'input', 'select', 'textarea'))\n301:         if self.annoying_tags:\n302:             remove_tags.update(('blink', 'marque'))\n303: \n304:         _remove = []\n305:         _kill = []\n306:         for el in doc.iter():\n307:             if el.tag in kill_tags:\n308:                 if self.allow_element(el):\n309:                     continue\n310:                 _kill.append(el)\n311:             elif el.tag in remove_tags:\n312:                 if self.allow_element(el):\n313:                     continue\n314:                 _remove.append(el)\n315: \n316:         if _remove and _remove[0] == doc:\n317:             # We have to drop the parent-most tag, which we can't\n318:             # do.  Instead we'll rewrite it:\n319:             el = _remove.pop(0)\n320:             el.tag = 'div'\n321:             el.attrib.clear()\n322:         elif _kill and _kill[0] == doc:\n323:             # We have to drop the parent-most element, which we can't\n324:             # do.  Instead we'll clear it:\n325:             el = _kill.pop(0)\n326:             if el.tag != 'html':\n327:                 el.tag = 'div'\n328:             el.clear()\n329: \n330:         for el in _kill:\n331:             el.drop_tree()\n332:         for el in _remove:\n333:             el.drop_tag()\n334: \n335:         allow_tags = self.allow_tags\n336:         if self.remove_unknown_tags:\n337:             if allow_tags:\n338:                 raise ValueError(\n339:                     \"It does not make sense to pass in both allow_tags and remove_unknown_tags\")\n340:             allow_tags = set(defs.tags)\n341:         if allow_tags:\n342:             bad = []\n343:             for el in doc.iter():\n344:                 if el.tag not in allow_tags:\n345:                     bad.append(el)\n346:             for el in bad:\n347:                 el.drop_tag()\n348:         if self.add_nofollow:\n349:             for el in _find_external_links(doc):\n350:                 if not self.allow_follow(el):\n351:                     el.set('rel', 'nofollow')\n352: \n353:     def allow_follow(self, anchor):\n354:         \"\"\"\n355:         Override to suppress rel=\"nofollow\" on some anchors.\n356:         \"\"\"\n357:         return False\n358: \n359:     def allow_element(self, el):\n360:         if el.tag not in self._tag_link_attrs:\n361:             return False\n362:         attr = self._tag_link_attrs[el.tag]\n363:         if isinstance(attr, (list, tuple)):\n364:             for one_attr in attr:\n365:                 url = el.get(one_attr)\n366:                 if not url:\n367:                     return False\n368:                 if not self.allow_embedded_url(el, url):\n369:                     return False\n370:             return True\n371:         else:\n372:             url = el.get(attr)\n373:             if not url:\n374:                 return False\n375:             return self.allow_embedded_url(el, url)\n376: \n377:     def allow_embedded_url(self, el, url):\n378:         if (self.whitelist_tags is not None\n379:             and el.tag not in self.whitelist_tags):\n380:             return False\n381:         scheme, netloc, path, query, fragment = urlparse.urlsplit(url)\n382:         netloc = netloc.lower().split(':', 1)[0]\n383:         if scheme not in ('http', 'https'):\n384:             return False\n385:         if netloc in self.host_whitelist:\n386:             return True\n387:         return False\n388: \n389:     def kill_conditional_comments(self, doc):\n390:         \"\"\"\n391:         IE conditional comments basically embed HTML that the parser\n392:         doesn't normally see.  We can't allow anything like that, so\n393:         we'll kill any comments that could be conditional.\n394:         \"\"\"\n395:         bad = []\n396:         self._kill_elements(\n397:             doc, lambda el: _conditional_comment_re.search(el.text),\n398:             etree.Comment)                \n399: \n400:     def _kill_elements(self, doc, condition, iterate=None):\n401:         bad = []\n402:         for el in doc.iter(iterate):\n403:             if condition(el):\n404:                 bad.append(el)\n405:         for el in bad:\n406:             el.drop_tree()\n407: \n408:     def _remove_javascript_link(self, link):\n409:         # links like \"j a v a s c r i p t:\" might be interpreted in IE\n410:         new = _substitute_whitespace('', link)\n411:         if _javascript_scheme_re.search(new):\n412:             # FIXME: should this be None to delete?\n413:             return ''\n414:         return link\n415: \n416:     _substitute_comments = re.compile(r'/\\*.*?\\*/', re.S).sub\n417: \n418:     def _has_sneaky_javascript(self, style):\n419:         \"\"\"\n420:         Depending on the browser, stuff like ``e x p r e s s i o n(...)``\n421:         can get interpreted, or ``expre/* stuff */ssion(...)``.  This\n422:         checks for attempt to do stuff like this.\n423: \n424:         Typically the response will be to kill the entire style; if you\n425:         have just a bit of Javascript in the style another rule will catch\n426:         that and remove only the Javascript from the style; this catches\n427:         more sneaky attempts.\n428:         \"\"\"\n429:         style = self._substitute_comments('', style)\n430:         style = style.replace('\\\\', '')\n431:         style = _substitute_whitespace('', style)\n432:         style = style.lower()\n433:         if 'javascript:' in style:\n434:             return True\n435:         if 'expression(' in style:\n436:             return True\n437:         return False\n438: \n439:     def clean_html(self, html):\n440:         if isinstance(html, basestring):\n441:             return_string = True\n442:             doc = fromstring(html)\n443:         else:\n444:             return_string = False\n445:             doc = copy.deepcopy(html)\n446:         self(doc)\n447:         if return_string:\n448:             return tostring(doc)\n449:         else:\n450:             return doc\n451: \n452: clean = Cleaner()\n453: clean_html = clean.clean_html\n454: \n455: ############################################################\n456: ## Autolinking\n457: ############################################################\n458: \n459: _link_regexes = [\n460:     re.compile(r'(?P<body>https?://(?P<host>[a-z0-9._-]+)(?:/[/\\-_.,a-z0-9%&?;=~]*)?)', re.I),\n461:     # This is conservative, but autolinking can be a bit conservative:\n462:     re.compile(r'mailto:(?P<body>[a-z0-9._-]+@(?P<host>[a-z0-9_._]+[a-z]))', re.I),\n463:     ]\n464: \n465: _avoid_elements = ['textarea', 'pre', 'code', 'head', 'select', 'a']\n466: \n467: _avoid_hosts = [\n468:     re.compile(r'^localhost', re.I),\n469:     re.compile(r'\\bexample\\.(?:com|org|net)$', re.I),\n470:     re.compile(r'^127\\.0\\.0\\.1$'),\n471:     ]\n472: \n473: _avoid_classes = ['nolink']\n474: \n475: def autolink(el, link_regexes=_link_regexes,\n476:              avoid_elements=_avoid_elements,\n477:              avoid_hosts=_avoid_hosts,\n478:              avoid_classes=_avoid_classes):\n479:     \"\"\"\n480:     Turn any URLs into links.\n481: \n482:     It will search for links identified by the given regular\n483:     expressions (by default mailto and http(s) links).\n484: \n485:     It won't link text in an element in avoid_elements, or an element\n486:     with a class in avoid_classes.  It won't link to anything with a\n487:     host that matches one of the regular expressions in avoid_hosts\n488:     (default localhost and 127.0.0.1).\n489: \n490:     If you pass in an element, the elements tail will not be\n491:     substituted, only the contents of the element.\n492:     \"\"\"\n493:     if el.tag in avoid_elements:\n494:         return\n495:     class_name = el.get('class')\n496:     if class_name:\n497:         class_name = class_name.split()\n498:         for match_class in avoid_classes:\n499:             if match_class in class_name:\n500:                 return\n501:     for child in list(el):\n502:         autolink(child, link_regexes=link_regexes,\n503:                  avoid_elements=avoid_elements,\n504:                  avoid_hosts=avoid_hosts,\n505:                  avoid_classes=avoid_classes)\n506:         if child.tail:\n507:             text, tail_children = _link_text(\n508:                 child.tail, link_regexes, avoid_hosts, factory=el.makeelement)\n509:             if tail_children:\n510:                 child.tail = text\n511:                 index = el.index(child)\n512:                 el[index+1:index+1] = tail_children\n513:     if el.text:\n514:         text, pre_children = _link_text(\n515:             el.text, link_regexes, avoid_hosts, factory=el.makeelement)\n516:         if pre_children:\n517:             el.text = text\n518:             el[:0] = pre_children\n519: \n520: def _link_text(text, link_regexes, avoid_hosts, factory):\n521:     leading_text = ''\n522:     links = []\n523:     last_pos = 0\n524:     while 1:\n525:         best_match, best_pos = None, None\n526:         for regex in link_regexes:\n527:             regex_pos = last_pos\n528:             while 1:\n529:                 match = regex.search(text, pos=regex_pos)\n530:                 if match is None:\n531:                     break\n532:                 host = match.group('host')\n533:                 for host_regex in avoid_hosts:\n534:                     if host_regex.search(host):\n535:                         regex_pos = match.end()\n536:                         break\n537:                 else:\n538:                     break\n539:             if match is None:\n540:                 continue\n541:             if best_pos is None or match.start() < best_pos:\n542:                 best_match = match\n543:                 best_pos = match.start()\n544:         if best_match is None:\n545:             # No more matches\n546:             if links:\n547:                 assert not links[-1].tail\n548:                 links[-1].tail = text\n549:             else:\n550:                 assert not leading_text\n551:                 leading_text = text\n552:             break\n553:         link = best_match.group(0)\n554:         end = best_match.end()\n555:         if link.endswith('.') or link.endswith(','):\n556:             # These punctuation marks shouldn't end a link\n557:             end -= 1\n558:             link = link[:-1]\n559:         prev_text = text[:best_match.start()]\n560:         if links:\n561:             assert not links[-1].tail\n562:             links[-1].tail = prev_text\n563:         else:\n564:             assert not leading_text\n565:             leading_text = prev_text\n566:         anchor = factory('a')\n567:         anchor.set('href', link)\n568:         body = best_match.group('body')\n569:         if not body:\n570:             body = link\n571:         if body.endswith('.') or body.endswith(','):\n572:             body = body[:-1]\n573:         anchor.text = body\n574:         links.append(anchor)\n575:         text = text[end:]\n576:     return leading_text, links\n577:                 \n578: def autolink_html(html, *args, **kw):",
+      "source_summary": "HTML element style attributes and <style> tag content from untrusted HTML input",
+      "sink_summary": "Browser CSS interpretation that may execute JavaScript via expressions or javascript: URLs",
+      "guard_summary": "CSS regex filtering (_css_javascript_re, _css_import_re) removes obvious JavaScript patterns before sneaky detection; style deletion on detection",
+      "risk_pattern": "Untrusted CSS content with comment-obfuscated JavaScript bypasses initial regex filters but is caught by comment removal and whitespace normalization before final checks",
+      "used_variable_sources": [
+        "el.get('style')",
+        "el.text (style tag content)"
+      ],
+      "called_function_context": [
+        "_css_javascript_re.sub()",
+        "_css_import_re.sub()",
+        "_substitute_whitespace()"
+      ],
+      "enclosing_conditions": [
+        "if self.javascript and not self.style",
+        "for el in _find_styled_elements(doc)",
+        "for el in list(doc.iter('style'))"
+      ],
+      "context_summary": "Method detects obfuscated JavaScript in CSS after basic filtering by removing comments, backslashes, and whitespace, then checking for 'javascript:' and 'expression(' patterns",
+      "unresolved_facts": [
+        "Specific browser interpretation behaviors for comment-obfuscated CSS expressions",
+        "Effectiveness against all possible obfuscation techniques"
+      ],
+      "retrieval_query": {
+        "mechanism_summary": "CSS sanitization bypass through comment removal and obfuscation detection",
+        "source": "untrusted style attributes and style tag content",
+        "sensitive_operation": "browser CSS interpretation with JavaScript execution capabilities",
+        "missing_control": "complete neutralization of obfuscated JavaScript patterns in CSS after comment stripping",
+        "impact": "cross-site scripting via CSS injection",
+        "mechanism_keywords": [
+          "sanitization bypass",
+          "comment obfuscation",
+          "CSS expression",
+          "javascript: URL",
+          "style injection"
+        ]
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/template-injection",
+          "cwe_id": "CWE-74",
+          "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.5138,
+          "raw_bm25_score": 28.5138,
+          "description": "Using user-controlled data to create a template can lead to remote code execution or cross site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized APIs and separate data from control instructions. Validate input format and escape special characters.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-074"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/unicode-bypass-validation",
+          "cwe_id": "CWE-179",
+          "cwe_name": "Incorrect Behavior Order: Early Validation",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.5282,
+          "raw_bm25_score": 27.5282,
+          "description": "A Unicode transformation is using a remote user-controlled data. The transformation is a Unicode normalization using the algorithms \"NFC\" or \"NFKC\". In all cases, the security measures implemented or the logical validation performed to escape any injection characters, to validate using regex patterns or to perform string-based checks, before the Unicode transformation are **bypassable** by special Unicode characters.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement validation early in the processing pipeline. Ensure validation cannot be bypassed by alternate code paths. Use consistent validation across all entry points.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-176",
+            "external/cwe/cwe-179",
+            "external/cwe/cwe-180"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/jinja2/autoescape-false",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.7648,
+          "raw_bm25_score": 26.7648,
+          "description": "Using jinja2 templates with 'autoescape=False' can cause a cross-site scripting vulnerability.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-079"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/regex-injection",
+          "cwe_id": "CWE-730",
+          "cwe_name": "Security Issue (CWE-730)",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.9212,
+          "raw_bm25_score": 21.9212,
+          "description": "User input should not be used in regular expressions without first being escaped, otherwise a malicious user may be able to inject an expression that could require exponential time on certain inputs.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-730",
+            "external/cwe/cwe-400"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/csrf-protection-disabled",
+          "cwe_id": "CWE-352",
+          "cwe_name": "Cross-Site Request Forgery (CSRF)",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.0813,
+          "raw_bm25_score": 21.0813,
+          "description": "Disabling or weakening CSRF protection may make the application vulnerable to a Cross-Site Request Forgery (CSRF) attack.",
+          "pattern": "Find state-changing operations that lack CSRF protection mechanisms",
+          "remediation": "Implement CSRF tokens for all state-changing operations. Use SameSite cookie attributes and validate the Origin/Referer headers.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-352"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/unsafe-deserialization",
+          "cwe_id": "CWE-502",
+          "cwe_name": "Deserialization of Untrusted Data",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.4693,
+          "raw_bm25_score": 20.4693,
+          "description": "Deserializing user-controlled data may allow attackers to execute arbitrary code.",
+          "pattern": "Identify deserialization operations on untrusted data without proper validation",
+          "remediation": "Use safe serialization formats like JSON. If complex deserialization is needed, implement strict validation and type checking.",
+          "tags": [
+            "external/cwe/cwe-502",
+            "security",
+            "serialization"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/url-redirection",
+          "cwe_id": "CWE-601",
+          "cwe_name": "URL Redirection to Untrusted Site ('Open Redirect')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.3268,
+          "raw_bm25_score": 20.3268,
+          "description": "URL redirection based on unvalidated user input may cause redirection to malicious web sites.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Validate redirect URLs against allowlists. Use relative URLs where possible and avoid user-controlled redirects.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-601"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 19.0155,
+          "raw_bm25_score": 19.0155,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/bad-tag-filter",
+          "cwe_id": "CWE-116",
+          "cwe_name": "Improper Encoding or Escaping of Output",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 17.4549,
+          "raw_bm25_score": 17.4549,
+          "description": "Matching HTML tags using regular expressions is hard to do right, and can easily lead to security issues.",
+          "pattern": "Detect output operations that lack proper encoding for the target context",
+          "remediation": "Use context-appropriate encoding for all output operations. Implement proper escaping for HTML, JavaScript, CSS, and URL contexts.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-116",
+            "external/cwe/cwe-020",
+            "external/cwe/cwe-185"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/empty-except",
+          "cwe_id": "CWE-390",
+          "cwe_name": "Detection of Error Condition Without Action",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.4815,
+          "raw_bm25_score": 16.4815,
+          "description": "Except doesn't do anything and has no comment",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-390. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "error-handling",
+            "external/cwe/cwe-390"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 11,
+          "rule_id": "py/xpath-injection",
+          "cwe_id": "CWE-643",
+          "cwe_name": "Improper Neutralization of Data within XPath Expressions ('XPath Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.9906,
+          "raw_bm25_score": 15.9906,
+          "description": "Building a XPath query from user-controlled sources is vulnerable to insertion of malicious Xpath code by the user.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-643"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 12,
+          "rule_id": "py/ldap-injection",
+          "cwe_id": "CWE-90",
+          "cwe_name": "Improper Neutralization of Special Elements used in an LDAP Query ('LDAP Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 15.0091,
+          "raw_bm25_score": 15.0091,
+          "description": "Building an LDAP query from user-controlled sources is vulnerable to insertion of malicious LDAP code by the user.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized LDAP queries and escape special characters. Validate input format and use LDAP libraries with injection protection.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-090"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 13,
+          "rule_id": "py/bind-socket-all-network-interfaces",
+          "cwe_id": "CWE-200",
+          "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 14.9532,
+          "raw_bm25_score": 14.9532,
+          "description": "Binding a socket to all interfaces opens it up to traffic from any IPv4 address and is therefore associated with security risks.",
+          "pattern": "Find code that may expose sensitive information in error messages, logs, or responses",
+          "remediation": "Implement proper access controls. Use generic error messages for users. Avoid exposing sensitive information in error responses, debugging output, or log files.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-200"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 14,
+          "rule_id": "py/timing-attack-against-hash",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 14.9355,
+          "raw_bm25_score": 14.9355,
+          "description": "When checking a Hash over a message, a constant-time algorithm should be used. Otherwise, an attacker may be able to forge a valid Hash for an arbitrary message by running a timing attack if they can send to the validation procedure. A successful attack can result in authentication bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 15,
+          "rule_id": "py/incomplete-url-substring-sanitization",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 14.5281,
+          "raw_bm25_score": 14.5281,
+          "description": "Security checks on the substrings of an unparsed URL are often vulnerable to bypassing.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

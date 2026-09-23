@@ -1,0 +1,62 @@
+{
+  "candidate": {
+    "candidate_id": "candidate-7",
+    "filepath": "pcsd/pcs.rb",
+    "changed_line": 1914,
+    "statement": "out, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)",
+    "change_type": "A",
+    "function_name": "get_parsed_local_sbd_config",
+    "operation_type": "privileged_command_execution",
+    "selection_reason": "PCSAuth.getSuperuserAuth() -> run_cmd executes privileged command -> constructs command from external input (cmd array) -> potential command injection",
+    "security_relevance_score": 0.6,
+    "code_context": "1765:   }\n1766:   return all_nodes_attr\n1767: end\n1768: \n1769: def status_v1_to_v2(status)\n1770:   new_status = status.select { |k,_|\n1771:     [:cluster_name, :username, :is_cman_with_udpu_transport,\n1772:      :need_ring1_address, :cluster_settings, :constraints, :groups,\n1773:      :corosync_online, :corosync_offline, :pacemaker_online, :pacemaker_standby,\n1774:      :pacemaker_offline, :acls, :fence_levels\n1775:     ].include?(k)\n1776:   }\n1777:   new_status[:node_attr] = node_attrs_to_v2(status[:node_attr])\n1778: \n1779:   resources = ClusterEntity::make_resources_tree(\n1780:     ClusterEntity::get_primitives_from_status_v1(status[:resources])\n1781:   )\n1782:   resources_hash = []\n1783:   resources.each { |r|\n1784:     resources_hash << r.to_status('2')\n1785:   }\n1786:   new_status[:resource_list] = resources_hash\n1787:   new_status[:node] = status.select { |k,_|\n1788:     [:uptime, :corosync, :pacemaker, :cman, :corosync_enabled,\n1789:      :pacemaker_enabled, :pcsd_enabled\n1790:     ].include?(k)\n1791:   }\n1792: \n1793:   new_status[:node].update(\n1794:     {\n1795:       :id => status[:node_id],\n1796:       :quorum => nil,\n1797:       :warning_list => [],\n1798:       :error_list => [],\n1799:       :status => (new_status[:node][:corosync] and\n1800:         new_status[:node][:pacemaker]) ? \"online\" : \"offline\",\n1801:       :status_version => '1'\n1802:     }\n1803:   )\n1804:   new_status[:status_version] = '1'\n1805: \n1806:   return new_status\n1807: end\n1808: \n1809: def allowed_for_local_cluster(auth_user, action)\n1810:   pcs_config = PCSConfig.new(Cfgsync::PcsdSettings.from_file().text())\n1811:   return pcs_config.permissions_local.allows?(\n1812:     auth_user[:username], auth_user[:usergroups], action\n1813:   )\n1814: end\n1815: \n1816: def allowed_for_superuser(auth_user)\n1817:   $logger.debug(\n1818:     \"permission check superuser username=#{auth_user[:username]} groups=#{auth_user[:usergroups]}\"\n1819:   )\n1820:   if SUPERUSER != auth_user[:username]\n1821:     $logger.debug('permission denied')\n1822:     return false\n1823:   end\n1824:   $logger.debug('permission granted for superuser')\n1825:   return true\n1826: end\n1827: \n1828: def get_default_overview_node_list(clustername)\n1829:   nodes = get_cluster_nodes clustername\n1830:   node_list = []\n1831:   nodes.each { |node|\n1832:     node_list << {\n1833:       'error_list' => [],\n1834:       'warning_list' => [],\n1835:       'status' => 'unknown',\n1836:       'quorum' => false,\n1837:       'name' => node\n1838:     }\n1839:   }\n1840:   return node_list\n1841: end\n1842: \n1843: def is_service_enabled?(service)\n1844:   if ISSYSTEMCTL\n1845:     cmd = ['systemctl', 'is-enabled', \"#{service}.service\"]\n1846:   else\n1847:     cmd = ['chkconfig', service]\n1848:   end\n1849:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1850:   return (retcode == 0)\n1851: end\n1852: \n1853: def is_service_running?(service)\n1854:   if ISSYSTEMCTL\n1855:     cmd = ['systemctl', 'status', \"#{service}.service\"]\n1856:   else\n1857:     cmd = ['service', service, 'status']\n1858:   end\n1859:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1860:   return (retcode == 0)\n1861: end\n1862: \n1863: def is_service_installed?(service)\n1864:   unless ISSYSTEMCTL\n1865:     raise NotImplementedException.new('Not supported on non systemd systems.')\n1866:   end\n1867:   stdout, _, retcode = run_cmd(\n1868:     PCSAuth.getSuperuserAuth(), PCS, 'resource', 'list', 'systemd'\n1869:   )\n1870:   if retcode != 0\n1871:     return nil\n1872:   end\n1873:   stdout.each { |line|\n1874:     if line.strip() == \"systemd:#{service}\"\n1875:       return true\n1876:     end\n1877:   }\n1878:   return false\n1879: end\n1880: \n1881: def enable_service(service)\n1882:   if ISSYSTEMCTL\n1883:     cmd = ['systemctl', 'enable', \"#{service}.service\"]\n1884:   else\n1885:     cmd = ['chkconfig', service, 'on']\n1886:   end\n1887:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1888:   return (retcode == 0)\n1889: end\n1890: \n1891: def disable_service(service)\n1892:   if ISSYSTEMCTL\n1893:     cmd = ['systemctl', 'disable', \"#{service}.service\"]\n1894:   else\n1895:     cmd = ['chkconfig', service, 'off']\n1896:   end\n1897:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1898:   return (retcode == 0)\n1899: end\n1900: \n1901: def set_cluster_prop_force(auth_user, prop, val)\n1902:   cmd = [PCS, 'property', 'set', \"#{prop}=#{val}\", '--force']\n1903:   if pacemaker_running?\n1904:     _, _, retcode = run_cmd(auth_user, *cmd)\n1905:   else\n1906:     cmd += ['-f', CIB_PATH]\n1907:     _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1908:   end\n1909:   return (retcode == 0)\n1910: end\n1911: \n1912: def get_parsed_local_sbd_config()\n1913:   cmd = [PCS, 'stonith', 'sbd', 'local_config_in_json']\n1914:   out, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1915:   if retcode != 0\n1916:     return nil\n1917:   end\n1918:   begin\n1919:     return JSON.parse(out.join(' '))\n1920:   rescue JSON::ParserError\n1921:     return nil\n1922:   end\n1923: end",
+    "source_summary": "Command array 'cmd' is constructed from hardcoded literals: PCS constant, 'stonith', 'sbd', 'local_config_in_json'. No external input flows into command construction.",
+    "sink_summary": "run_cmd executes command via exec(*args) with superuser privileges (PCSAuth.getSuperuserAuth()). Command output is parsed as JSON.",
+    "guard_summary": "No validation or sanitization needed as command components are hardcoded. Authentication uses PCSAuth.getSuperuserAuth() which provides superuser context.",
+    "risk_pattern": "Privileged command execution with hardcoded arguments; no injection path exists as command components are literals.",
+    "used_variable_sources": [
+      "PCS constant (likely defined elsewhere)",
+      "String literals: 'stonith', 'sbd', 'local_config_in_json'"
+    ],
+    "called_function_context": [
+      "run_cmd -> run_cmd_options -> exec(*args)",
+      "PCSAuth.getSuperuserAuth() (provides superuser auth context)"
+    ],
+    "enclosing_conditions": [
+      "None - unconditional execution in get_parsed_local_sbd_config function"
+    ],
+    "context_summary": "Function get_parsed_local_sbd_config executes 'pcs stonith sbd local_config_in_json' with superuser privileges to retrieve SBD configuration in JSON format, parsing output.",
+    "unresolved_facts": [
+      "Exact definition of PCS constant",
+      "Full implementation of PCSAuth.getSuperuserAuth() method",
+      "Whether PCS constant could be manipulated elsewhere"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  "target_cwe": {
+    "cwe_id": "CWE-284",
+    "cwe_name": "Improper Access Control",
+    "description": "The product does not restrict or incorrectly restricts access to a resource from an unauthorized actor.",
+    "impact": "auth vulnerability impact",
+    "patterns": [
+      "authentication",
+      "authorization"
+    ],
+    "detection_indicators": [
+      "authentication",
+      "authorization"
+    ],
+    "remediation_steps": [
+      "Implement proper authentication and session management",
+      "Use multi-factor authentication where appropriate"
+    ],
+    "related_cwes": []
+  },
+  "stage3_hypothesis": {
+    "cwe_id": "CWE-284",
+    "cwe_name": "Improper Access Control",
+    "fit_reason": "Retrieved in search 2; relates to potential excessive privileges for read-only configuration command",
+    "proposal_source": "adaptive_bm25",
+    "retrieved_by_sast": true
+  }
+}

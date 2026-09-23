@@ -1,0 +1,247 @@
+diff --git a/etc/memcache.conf-sample b/etc/memcache.conf-sample
+new file mode 100644
+index 000000000..580d94aa9
+--- /dev/null
++++ b/etc/memcache.conf-sample
+@@ -0,0 +1,5 @@
++[memcache]
++# You can use this single conf file instead of having memcache_servers set in
++# several other conf files under [filter:cache] for example. You can specify
++# multiple servers separated with commas, as in: 10.1.2.3:11211,10.1.2.4:11211
++# memcache_servers = 127.0.0.1:11211
+diff --git a/etc/proxy-server.conf-sample b/etc/proxy-server.conf-sample
+index 1b21ff071..9110df8e0 100644
+--- a/etc/proxy-server.conf-sample
++++ b/etc/proxy-server.conf-sample
+@@ -92,32 +92,34 @@ user_test_tester3 = testing3
+ [filter:healthcheck]
+ use = egg:swift#healthcheck
+ # You can override the default log routing for this filter here:
+ # set log_name = healthcheck
+ # set log_facility = LOG_LOCAL0
+ # set log_level = INFO
+ # set log_headers = False
+ 
+ [filter:cache]
+ use = egg:swift#memcache
+ # You can override the default log routing for this filter here:
+ # set log_name = cache
+ # set log_facility = LOG_LOCAL0
+ # set log_level = INFO
+ # set log_headers = False
+-# Default for memcache_servers is below, but you can specify multiple servers
+-# with the format: 10.1.2.3:11211,10.1.2.4:11211
++# Default for memcache_servers is to try to read the property from
++# memcache.conf (see memcache.conf-sample) or lacking that file, it will
++# default to the value below. You can specify multiple servers separated with
++# commas, as in: 10.1.2.3:11211,10.1.2.4:11211
+ # memcache_servers = 127.0.0.1:11211
+ 
+ [filter:ratelimit]
+ use = egg:swift#ratelimit
+ # You can override the default log routing for this filter here:
+ # set log_name = ratelimit
+ # set log_facility = LOG_LOCAL0
+ # set log_level = INFO
+ # set log_headers = False
+ # clock_accuracy should represent how accurate the proxy servers' system clocks
+ # are with each other. 1000 means that all the proxies' clock are accurate to
+ # each other within 1 millisecond.  No ratelimit should be higher than the
+ # clock accuracy.
+ # clock_accuracy = 1000
+ # max_sleep_time_seconds = 60
+diff --git a/swift/common/middleware/memcache.py b/swift/common/middleware/memcache.py
+index e2eca36d6..ba829d1e6 100644
+--- a/swift/common/middleware/memcache.py
++++ b/swift/common/middleware/memcache.py
+@@ -1,42 +1,57 @@
+ # Copyright (c) 2010-2011 OpenStack, LLC.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+ # You may obtain a copy of the License at
+ #
+ #    http://www.apache.org/licenses/LICENSE-2.0
+ #
+ # Unless required by applicable law or agreed to in writing, software
+ # distributed under the License is distributed on an "AS IS" BASIS,
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ # implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import os
++from ConfigParser import ConfigParser, NoSectionError, NoOptionError
++
+ from swift.common.memcached import MemcacheRing
+ 
+ 
+ class MemcacheMiddleware(object):
+     """
+     Caching middleware that manages caching in swift.
+     """
+ 
+     def __init__(self, app, conf):
+         self.app = app
+-        self.memcache = MemcacheRing([s.strip() for s in
+-            conf.get('memcache_servers', '127.0.0.1:11211').split(',')
+-            if s.strip()])
++        self.memcache_servers = conf.get('memcache_servers')
++        if not self.memcache_servers:
++            path = os.path.join(conf.get('swift_dir', '/etc/swift'),
++                                'memcache.conf')
++            memcache_conf = ConfigParser()
++            if memcache_conf.read(path):
++                try:
++                    self.memcache_servers = \
++                        memcache_conf.get('memcache', 'memcache_servers')
++                except (NoSectionError, NoOptionError):
++                    pass
++        if not self.memcache_servers:
++            self.memcache_servers = '127.0.0.1:11211'
++        self.memcache = MemcacheRing(
++            [s.strip() for s in self.memcache_servers.split(',') if s.strip()])
+ 
+     def __call__(self, env, start_response):
+         env['swift.cache'] = self.memcache
+         return self.app(env, start_response)
+ 
+ 
+ def filter_factory(global_conf, **local_conf):
+     conf = global_conf.copy()
+     conf.update(local_conf)
+ 
+     def cache_filter(app):
+         return MemcacheMiddleware(app, conf)
+ 
+     return cache_filter
+diff --git a/test/unit/common/middleware/test_memcache.py b/test/unit/common/middleware/test_memcache.py
+index baf50c6f3..4610a779b 100644
+--- a/test/unit/common/middleware/test_memcache.py
++++ b/test/unit/common/middleware/test_memcache.py
+@@ -2,41 +2,125 @@
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+ # You may obtain a copy of the License at
+ #
+ #    http://www.apache.org/licenses/LICENSE-2.0
+ #
+ # Unless required by applicable law or agreed to in writing, software
+ # distributed under the License is distributed on an "AS IS" BASIS,
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ # implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ import unittest
++from ConfigParser import NoSectionError, NoOptionError
+ 
+ from webob import Request
+ 
+ from swift.common.middleware import memcache
+ from swift.common.memcached import MemcacheRing
+ 
+ class FakeApp(object):
+     def __call__(self, env, start_response):
+         return env
+ 
++
++class ExcConfigParser(object):
++
++    def read(self, path):
++        raise Exception('read called with %r' % path)
++
++
++class EmptyConfigParser(object):
++
++    def read(self, path):
++        return False
++
++
++class SetConfigParser(object):
++
++    def read(self, path):
++        return True
++
++    def get(self, section, option):
++        if section == 'memcache':
++            if option == 'memcache_servers':
++                return '1.2.3.4:5'
++            else:
++                raise NoOptionError(option)
++        else:
++            raise NoSectionError(option)
++
++
+ def start_response(*args):
+     pass
+ 
+ class TestCacheMiddleware(unittest.TestCase):
+ 
+     def setUp(self):
+         self.app = memcache.MemcacheMiddleware(FakeApp(), {})
+ 
+     def test_cache_middleware(self):
+         req = Request.blank('/something', environ={'REQUEST_METHOD': 'GET'})
+         resp = self.app(req.environ, start_response)
+         self.assertTrue('swift.cache' in resp)
+         self.assertTrue(isinstance(resp['swift.cache'], MemcacheRing))
+ 
++    def test_conf_default_read(self):
++        orig_parser = memcache.ConfigParser
++        memcache.ConfigParser = ExcConfigParser
++        exc = None
++        try:
++            app = memcache.MemcacheMiddleware(FakeApp(), {})
++        except Exception, err:
++            exc = err
++        finally:
++            memcache.ConfigParser = orig_parser
++        self.assertEquals(str(exc),
++            "read called with '/etc/swift/memcache.conf'")
++
++    def test_conf_set_no_read(self):
++        orig_parser = memcache.ConfigParser
++        memcache.ConfigParser = ExcConfigParser
++        exc = None
++        try:
++            app = memcache.MemcacheMiddleware(
++                    FakeApp(), {'memcache_servers': '1.2.3.4:5'})
++        except Exception, err:
++            exc = err
++        finally:
++            memcache.ConfigParser = orig_parser
++        self.assertEquals(exc, None)
++
++    def test_conf_default(self):
++        orig_parser = memcache.ConfigParser
++        memcache.ConfigParser = EmptyConfigParser
++        try:
++            app = memcache.MemcacheMiddleware(FakeApp(), {})
++        finally:
++            memcache.ConfigParser = orig_parser
++        self.assertEquals(app.memcache_servers, '127.0.0.1:11211')
++
++    def test_conf_from_extra_conf(self):
++        orig_parser = memcache.ConfigParser
++        memcache.ConfigParser = SetConfigParser
++        try:
++            app = memcache.MemcacheMiddleware(FakeApp(), {})
++        finally:
++            memcache.ConfigParser = orig_parser
++        self.assertEquals(app.memcache_servers, '1.2.3.4:5')
++
++    def test_conf_from_inline_conf(self):
++        orig_parser = memcache.ConfigParser
++        memcache.ConfigParser = SetConfigParser
++        try:
++            app = memcache.MemcacheMiddleware(
++                    FakeApp(), {'memcache_servers': '6.7.8.9:10'})
++        finally:
++            memcache.ConfigParser = orig_parser
++        self.assertEquals(app.memcache_servers, '6.7.8.9:10')
++
++
+ if __name__ == '__main__':
+     unittest.main()

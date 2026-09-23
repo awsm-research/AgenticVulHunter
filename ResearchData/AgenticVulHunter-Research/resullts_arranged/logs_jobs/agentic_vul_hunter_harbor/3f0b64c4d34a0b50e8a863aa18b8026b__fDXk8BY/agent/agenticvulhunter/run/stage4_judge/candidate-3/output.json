@@ -1,0 +1,238 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "index.js",
+  "changed_line": 158,
+  "statement": "const meta = new IntegrityMetadata(",
+  "change_type": "A",
+  "function_name": "fromStream",
+  "operation_type": "security_sensitive_decision",
+  "selection_reason": "observable input stream data -> digest calculation and metadata construction -> security-sensitive integrity generation",
+  "security_relevance_score": 0.8,
+  "code_context": "9: const SRI_REGEX = /^([^-]+)-([^?]+)([?\\S*]*)$/\n10: const STRICT_SRI_REGEX = /^([^-]+)-([A-Za-z0-9+/]+(?:=?=?))([?\\x21-\\x7E]*)$/\n11: const VCHAR_REGEX = /[\\x21-\\x7E]+/\n12: \n13: class IntegrityMetadata {\n14:   constructor (metadata, opts) {\n15:     const strict = !!(opts && opts.strict)\n16:     this.source = metadata.trim()\n17:     // 3.1. Integrity metadata\n18:     // https://w3c.github.io/webappsec-subresource-integrity/#integrity-metadata-description\n19:     const match = this.source.match(\n20:       strict\n21:       ? STRICT_SRI_REGEX\n22:       : SRI_REGEX\n23:     )\n24:     if (!match) { return }\n25:     if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }\n26:     this.algorithm = match[1]\n27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)\n194:     checker.on('error', reject)\n195:     checker.on('verified', algo => {\n196:       resolve(algo)\n197:     })\n198:   })\n199: }\n200: \n201: module.exports.createCheckerStream = createCheckerStream\n202: function createCheckerStream (sri, opts) {\n203:   opts = opts || {}\n204:   sri = parse(sri, opts)\n205:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n206:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n207:     return pickAlgorithm(acc, algo) || acc\n208:   })\n209:   const digests = sri[algorithm].map(m => m.digest)\n210:   const hash = crypto.createHash(algorithm)\n211:   const stream = new Transform({\n212:     transform: function (chunk, enc, cb) {\n213:       hash.update(chunk, enc)\n214:       cb(null, chunk, enc)\n215:     },\n216:     flush: function (cb) {\n217:       const digest = hash.digest('base64')\n218:       if (digests.some(d => d === digest)) {\n219:         stream.emit('verified', algorithm)\n220:         return cb()\n221:       } else {\n222:         const err = new Error(`${algorithm} integrity checksum failed`)\n223:         err.code = 'EBADCHECKSUM'\n224:         err.found = digest\n225:         err.expected = digests\n226:         err.algorithm = algorithm\n227:         return cb(err)\n228:       }\n229:     }\n230:   })\n231:   return stream\n232: }\n233: \n234: function getPrioritizedHash (algo1, algo2) {\n235:   return algo1\n236: }",
+  "source_summary": "The integrity metadata is constructed from a stream of data. The digest is calculated using crypto.createHash() and base64 encoding, with algorithm and options derived from the stream processing context.",
+  "sink_summary": "The constructed IntegrityMetadata object is used to build an integrity hash for security verification purposes in subresource integrity checks.",
+  "guard_summary": "Security controls include: 1) Algorithm validation against SPEC_ALGORITHMS ['sha256', 'sha384', 'sha512'] in strict mode, 2) Base64 format validation of digest using BASE64_REGEX, 3) Option syntax validation using VCHAR_REGEX, and 4) Input sanitization through regex matching during metadata parsing.",
+  "risk_pattern": "The code constructs integrity metadata from stream data. If the stream is attacker-controlled, it could potentially lead to malformed SRI strings that bypass validation if strict mode is not enforced.",
+  "used_variable_sources": [
+    "algo",
+    "digest",
+    "optString"
+  ],
+  "called_function_context": [
+    "crypto.createHash()",
+    "hash.digest('base64')",
+    "IntegrityMetadata.constructor()"
+  ],
+  "enclosing_conditions": [],
+  "context_summary": "In the fromStream function, a stream is processed to generate integrity metadata. The digest is calculated from the stream data using cryptographic hashing, and then passed to IntegrityMetadata constructor along with algorithm and options. The metadata construction occurs within a Promise that resolves after stream processing completes.",
+  "unresolved_facts": [
+    "Whether the 'opts' parameter passed to IntegrityMetadata constructor contains strict mode settings",
+    "Whether the stream input is attacker-controlled or if there are any validation checks on it before processing"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-807",
+      "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+      "fit_reason": "The fromStream function processes attacker-controlled stream data to generate integrity metadata. If strict mode is not enforced via opts parameter, the SRI parsing may be bypassed, allowing malformed inputs to pass validation.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "fit_reason": "The stream processing logic in fromStream involves complex data transformations that could lead to incorrect handling of integrity metadata if input validation is insufficient or bypassed.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-328",
+      "cwe_name": "Use of Weak Hash",
+      "fit_reason": "While the code uses sha512 by default, the vulnerability arises from potential bypass of strict mode validation that would otherwise enforce algorithm validation against SPEC_ALGORITHMS.",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-116",
+    "CWE-1321",
+    "CWE-134",
+    "CWE-19",
+    "CWE-327",
+    "CWE-328",
+    "CWE-400",
+    "CWE-561",
+    "CWE-676",
+    "CWE-807",
+    "CWE-835",
+    "CWE-94"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "index.js",
+      "changed_line": 158,
+      "statement": "const meta = new IntegrityMetadata(",
+      "cwe_id": "CWE-807",
+      "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The fromStream function processes untrusted stream data to generate integrity metadata. If the opts parameter does not enforce strict mode, the SRI parsing can be bypassed, allowing malformed inputs to pass validation, which directly aligns with CWE-807's mechanism of relying on untrusted inputs in security decisions."
+        },
+        "connection": {
+          "score": 0.65,
+          "evidence": "The stream data is an untrusted input that flows into the IntegrityMetadata constructor. The connection path is: stream -> crypto.createHash() -> digest -> IntegrityMetadata constructor -> SRI parsing. However, it's not explicitly confirmed whether the stream is attacker-controlled or if there are validation checks before processing."
+        },
+        "diff_causality": {
+          "score": 0.75,
+          "evidence": "If this line were reverted (i.e., the IntegrityMetadata construction was removed), no integrity metadata would be generated from the stream data, which would fundamentally alter the security decision process. The patch introduces the reliance on potentially untrusted input for integrity verification."
+        },
+        "security_control": {
+          "score": 0.55,
+          "evidence": "The code includes some validation controls such as algorithm validation against SPEC_ALGORITHMS in strict mode, base64 format validation of digest, and option syntax validation. However, these controls are only active when strict mode is enabled via opts parameter, which is not guaranteed to be set by default.",
+          "required_control": "Enforcement of strict mode for SRI parsing",
+          "control_requirement_evidence": "CWE-807 requires that security decisions not rely on untrusted inputs without proper validation. The system must ensure that SRI parsing is always strict when processing untrusted data to prevent bypassing of validation.",
+          "existing_controls_checked": [
+            "Algorithm validation against SPEC_ALGORITHMS in strict mode",
+            "Base64 format validation of digest using BASE64_REGEX",
+            "Option syntax validation using VCHAR_REGEX"
+          ],
+          "deficiency_evidence": "The system only enforces strict mode validation when explicitly enabled via opts.strict. If not set, the parsing allows potentially malformed inputs to pass through without sufficient validation, creating a reliance on untrusted inputs in security decisions."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "If stream data is attacker-controlled and strict mode is not enforced, an attacker could provide malformed SRI strings that bypass validation. This could lead to integrity checks being circumvented, allowing malicious content to pass security verification."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, no integrity metadata would be constructed from stream data, and thus no security decision based on stream-provided SRI values would occur.",
+      "supporting_evidence": [
+        "The fromStream function processes attacker-controlled stream data to generate integrity metadata",
+        "IntegrityMetadata constructor is called with stream-derived digest and algorithm",
+        "Strict mode validation is only applied when opts.strict is explicitly set"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the 'opts' parameter passed to IntegrityMetadata constructor contains strict mode settings",
+        "Whether the stream input is attacker-controlled or if there are any validation checks on it before processing"
+      ],
+      "review_comment": "The fromStream function processes untrusted stream data to generate integrity metadata. If strict mode is not enforced, SRI parsing can be bypassed allowing malformed inputs to pass validation. The system should enforce strict mode by default when processing untrusted inputs to prevent reliance on untrusted inputs in security decisions. Ensure opts.strict is enabled when processing external stream data.",
+      "change_type": "A",
+      "raw_score": 0.6799999999999999,
+      "score": 0.6799999999999999
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "index.js",
+      "changed_line": 158,
+      "statement": "const meta = new IntegrityMetadata(",
+      "cwe_id": "CWE-19",
+      "cwe_name": "Data Processing Errors",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "CWE-19 is a legacy category for data processing errors, not a specific vulnerability mechanism. The demonstrated behavior involves integrity metadata construction and validation, which does not directly map to the generic 'data processing errors' category."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "The stream input could potentially be attacker-controlled, and the digest calculation occurs on this data. However, there is no explicit evidence that the stream is externally controlled or that a specific data processing error occurs in the path from stream to metadata construction."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If line 158 were reverted (i.e., the IntegrityMetadata construction was removed), then no integrity metadata would be generated from the stream, which would materially change the behavior of the fromStream function. However, this doesn't demonstrate a specific vulnerability mechanism."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "There are validation checks in place including algorithm validation against SPEC_ALGORITHMS, base64 format validation of digest, and option syntax validation using VCHAR_REGEX. However, these controls do not prevent all potential data processing errors, particularly those related to malformed inputs or unexpected stream behavior.",
+          "required_control": "Input sanitization and validation of stream data before integrity metadata construction",
+          "control_requirement_evidence": "The function processes stream data to generate integrity metadata, so any malformed or malicious input could lead to incorrect metadata being generated if not properly validated.",
+          "existing_controls_checked": [
+            "Algorithm validation against SPEC_ALGORITHMS in strict mode",
+            "Base64 format validation of digest using BASE64_REGEX",
+            "Option syntax validation using VCHAR_REGEX"
+          ],
+          "deficiency_evidence": "The controls do not validate that the stream data itself is safe or well-formed before it's used to compute the digest. The stream input could contain unexpected data that leads to incorrect metadata generation."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "While there are validation checks, the potential for incorrect integrity metadata generation exists if stream data is malformed or malicious. However, no concrete security consequence is demonstrated in the provided evidence."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, then no IntegrityMetadata object would be constructed from the stream digest, and the fromStream function would not produce any integrity metadata for the processed stream data.",
+      "supporting_evidence": [
+        "The fromStream function processes a stream to generate integrity metadata",
+        "IntegrityMetadata constructor is called with algorithm, digest, and options derived from stream processing",
+        "Validation checks exist but do not cover stream input sanitization"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the 'opts' parameter passed to IntegrityMetadata constructor contains strict mode settings",
+        "Whether the stream input is attacker-controlled or if there are any validation checks on it before processing"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.36,
+      "score": 0.36
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "index.js",
+      "changed_line": 158,
+      "statement": "const meta = new IntegrityMetadata(",
+      "cwe_id": "CWE-328",
+      "cwe_name": "Use of Weak Hash",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.4,
+          "evidence": "The code uses sha512 as default algorithm, which is a strong hash function. However, the vulnerability potential lies in bypassing strict mode validation that enforces algorithm validation against SPEC_ALGORITHMS. The mechanism is partially demonstrated but not fully aligned with CWE-328's core requirement of using inherently weak hash functions."
+        },
+        "connection": {
+          "score": 0.6,
+          "evidence": "The stream data is processed to generate digest values that are used in integrity metadata construction. If the stream is attacker-controlled, it could potentially influence the algorithm or digest values passed to IntegrityMetadata constructor, creating a path from input to vulnerable operation."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "If this line were reverted, the IntegrityMetadata object would not be constructed with the digest calculated from stream data. The patch introduces the stream-based digest calculation and metadata construction, which is central to the potential vulnerability path."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "The code includes validation checks for strict mode (SPEC_ALGORITHMS), base64 format (BASE64_REGEX), and option syntax (VCHAR_REGEX). However, these controls are only effective when strict mode is enabled. The vulnerability arises if strict mode is not enforced by default or if the opts parameter does not contain strict mode settings.",
+          "required_control": "Enforcement of strict mode validation for algorithm selection",
+          "control_requirement_evidence": "CWE-328 requires that hash functions used be strong and secure. If the system allows weak algorithms to be selected, it constitutes a vulnerability. The control is needed to ensure only strong algorithms are accepted.",
+          "existing_controls_checked": [
+            "Algorithm validation against SPEC_ALGORITHMS in strict mode",
+            "Base64 format validation of digest using BASE64_REGEX",
+            "Option syntax validation using VCHAR_REGEX"
+          ],
+          "deficiency_evidence": "The code defaults to non-strict mode and does not enforce strict mode by default. The vulnerability arises from potential bypass of strict mode validation that would otherwise prevent weak algorithm selection."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "If an attacker can control the stream input and bypass strict mode validation, they could potentially inject a weak hash algorithm (like SHA-1) into the integrity metadata. This would allow for security bypass where the integrity check becomes ineffective against attacks that target weak hashes."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the IntegrityMetadata object would not be constructed with digest values calculated from stream data. The stream processing would not result in integrity metadata generation, removing the potential vulnerability path for weak hash usage.",
+      "supporting_evidence": [
+        "The code uses sha512 as default algorithm which is strong",
+        "IntegrityMetadata constructor accepts opts parameter that can enable strict mode validation",
+        "Stream data is processed to generate digest values used in integrity metadata"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether the 'opts' parameter passed to IntegrityMetadata constructor contains strict mode settings",
+        "Whether the stream input is attacker-controlled or if there are any validation checks on it before processing"
+      ],
+      "review_comment": "The fromStream function processes stream data to generate integrity metadata. If strict mode is not enforced by default, weak hash algorithms could be accepted. The patch introduces stream-based digest calculation but does not ensure strict mode validation is enabled. Enforce strict mode validation by default to prevent acceptance of weak hash algorithms.",
+      "change_type": "A",
+      "raw_score": 0.52,
+      "score": 0.52
+    }
+  ],
+  "stage4_status": "completed"
+}

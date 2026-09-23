@@ -1,0 +1,253 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "dbusmock/mockobject.py",
+      "changed_line": 320,
+      "statement": "module = load_module(template)",
+      "change_type": "A",
+      "function_name": "AddTemplate",
+      "operation_type": "code_execution",
+      "selection_reason": "observable input 'template' -> exact operation 'load_module(template)' -> security-sensitive effect of executing arbitrary Python code from a file path",
+      "security_relevance_score": 0.8,
+      "code_context": "171:                              interface,\n172:                              properties)\n173:         obj.AddMethods(interface, methods)\n174: \n175:         objects[path] = obj\n176: \n177:     @dbus.service.method(MOCK_IFACE,\n178:                          in_signature='s',\n179:                          out_signature='')\n180:     def RemoveObject(self, path):\n181:         '''Remove a D-Bus object from the mock'''\n182: \n183:         try:\n184:             del objects[path]\n185:         except KeyError:\n186:             raise dbus.exceptions.DBusException(\n187:                 'org.freedesktop.DBus.Mock.NameError',\n188:                 'object %s does not exist' % path)\n189: \n190:     @dbus.service.method(MOCK_IFACE,\n191:                          in_signature='sssss',\n192:                          out_signature='')\n193:     def AddMethod(self, interface, name, in_sig, out_sig, code):\n194:         '''Add a method to this object\n195: \n196:         interface: D-Bus interface to add this to. For convenience you can\n197:                    specify '' here to add the method to the object's main\n198:                    interface (as specified on construction).\n199:         name: Name of the method\n200:         in_sig: Signature of input arguments; for example \"ias\" for a method\n201:                 that takes an int32 and a string array as arguments; see\n202:                 http://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-signatures\n203:         out_sig: Signature of output arguments; for example \"s\" for a method\n204:                  that returns a string; use '' for methods that do not return\n205:                  anything.\n206:         code: Python 3 code to run in the method call; you have access to the\n207:               arguments through the \"args\" list, and can set the return value\n208:               by assigning a value to the \"ret\" variable. You can also read the\n209:               global \"objects\" variable, which is a dictionary mapping object\n210:               paths to DBusMockObject instances.\n211: \n212:               For keeping state across method calls, you are free to use normal\n213:               Python members of the \"self\" object, which will be persistant for\n214:               the whole mock's life time. E. g. you can have a method with\n215:               \"self.my_state = True\", and another method that returns it with\n216:               \"ret = self.my_state\".\n217: \n218:               When specifying '', the method will not do anything (except\n219:               logging) and return None.\n220:         '''\n221:         if not interface:\n222:             interface = self.interface\n223:         n_args = len(dbus.Signature(in_sig))\n224: \n225:         # we need to have separate methods for dbus-python, so clone\n226:         # mock_method(); using message_keyword with this dynamic approach fails\n227:         # because inspect cannot handle those, so pass on interface and method\n228:         # name as first positional arguments\n229:         method = lambda self, *args, **kwargs: DBusMockObject.mock_method(\n230:             self, interface, name, in_sig, *args, **kwargs)\n231: \n232:         # we cannot specify in_signature here, as that trips over a consistency\n233:         # check in dbus-python; we need to set it manually instead\n234:         dbus_method = dbus.service.method(interface,\n235:                                           out_signature=out_sig)(method)\n236:         dbus_method.__name__ = str(name)\n237:         dbus_method._dbus_in_signature = in_sig\n238:         dbus_method._dbus_args = ['arg%i' % i for i in range(1, n_args + 1)]\n239: \n240:         setattr(self.__class__, name, dbus_method)\n241: \n242:         self.methods.setdefault(interface, {})[str(name)] = (in_sig, out_sig, code, dbus_method)\n243: \n244:     @dbus.service.method(MOCK_IFACE,\n245:                          in_signature='sa(ssss)',\n246:                          out_signature='')\n247:     def AddMethods(self, interface, methods):\n248:         '''Add several methods to this object\n249: \n250:         interface: D-Bus interface to add this to. For convenience you can\n251:                    specify '' here to add the method to the object's main\n252:                    interface (as specified on construction).\n253:         methods: list of 4-tuples (name, in_sig, out_sig, code) describing one\n254:                  method each. See AddMethod() for details of the tuple values.\n255:         '''\n256:         for method in methods:\n257:             self.AddMethod(interface, *method)\n258: \n259:     @dbus.service.method(MOCK_IFACE,\n260:                          in_signature='ssv',\n261:                          out_signature='')\n262:     def AddProperty(self, interface, name, value):\n263:         '''Add property to this object\n264: \n265:         interface: D-Bus interface to add this to. For convenience you can\n266:                    specify '' here to add the property to the object's main\n267:                    interface (as specified on construction).\n268:         name: Property name.\n269:         value: Property value.\n270:         '''\n271:         if not interface:\n272:             interface = self.interface\n273:         try:\n274:             self.props[interface][name]\n275:             raise dbus.exceptions.DBusException(\n276:                 self.interface + '.PropertyExists',\n277:                 'property %s already exists' % name)\n278:         except KeyError:\n279:             # this is what we expect\n280:             pass\n281:         self.props.setdefault(interface, {})[name] = value\n282: \n283:     @dbus.service.method(MOCK_IFACE,\n284:                          in_signature='sa{sv}',\n285:                          out_signature='')\n286:     def AddProperties(self, interface, properties):\n287:         '''Add several properties to this object\n288: \n289:         interface: D-Bus interface to add this to. For convenience you can\n290:                    specify '' here to add the property to the object's main\n291:                    interface (as specified on construction).\n292:         properties: A property_name (string) → value map\n293:         '''\n294:         for k, v in properties.items():\n295:             self.AddProperty(interface, k, v)\n296: \n297:     @dbus.service.method(MOCK_IFACE,\n298:                          in_signature='sa{sv}',\n299:                          out_signature='')\n300:     def AddTemplate(self, template, parameters):\n301:         '''Load a template into the mock.\n302: \n303:         python-dbusmock ships a set of standard mocks for common system\n304:         services such as UPower and NetworkManager. With these the actual tests\n305:         become a lot simpler, as they only have to set up the particular\n306:         properties for the tests, and not the skeleton of common properties,\n307:         interfaces, and methods.\n308: \n309:         template: Name of the template to load or the full path to a *.py file\n310:                   for custom templates. See \"pydoc dbusmock.templates\" for a\n311:                   list of available templates from python-dbusmock package, and\n312:                   \"pydoc dbusmock.templates.NAME\" for documentation about\n313:                   template NAME.\n314:         parameters: A parameter (string) → value (variant) map, for\n315:                     parameterizing templates. Each template can define their\n316:                     own, see documentation of that particular template for\n317:                     details.\n318:         '''\n319:         try:\n320:             module = load_module(template)\n321:         except ImportError as e:\n322:             raise dbus.exceptions.DBusException('Cannot add template %s: %s' % (template, str(e)))\n323: \n324:         # pick out all D-BUS service methods and add them to our interface\n325:         for symbol in dir(module):\n326:             fn = getattr(module, symbol)\n327:             if '_dbus_interface' in dir(fn):\n328:                 setattr(self.__class__, symbol, fn)\n329: \n330:         if parameters is None:\n331:             parameters = {}\n332: \n333:         module.load(self, parameters)\n334: \n335:     @dbus.service.method(MOCK_IFACE,\n336:                          in_signature='sssav',\n337:                          out_signature='')\n338:     def EmitSignal(self, interface, name, signature, args):\n339:         '''Emit a signal from the object.\n340: \n341:         interface: D-Bus interface to send the signal from. For convenience you\n342:                    can specify '' here to add the method to the object's main\n343:                    interface (as specified on construction).\n344:         name: Name of the signal\n345:         signature: Signature of input arguments; for example \"ias\" for a signal\n346:                 that takes an int32 and a string array as arguments; see\n347:                 http://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-signatures\n348:         args: variant array with signal arguments; must match order and type in\n349:               \"signature\"\n350:         '''\n351:         if not interface:\n352:             interface = self.interface\n353: \n354:         # convert types of arguments according to signature, using\n355:         # MethodCallMessage.append(); this will also provide type/length\n356:         # checks, except for the case of an empty signature\n357:         if signature == '' and len(args) > 0:\n358:             raise TypeError('Fewer items found in D-Bus signature than in Python arguments')\n359:         m = dbus.connection.MethodCallMessage('a.b', '/a', 'a.b', 'a')\n360:         m.append(signature=signature, *args)\n361:         args = m.get_args_list()\n362: \n363:         fn = lambda self, *args: self.log('emit %s.%s%s' % (interface, name, self.format_args(args)))\n364:         fn.__name__ = str(name)\n365:         dbus_fn = dbus.service.signal(interface)(fn)\n366:         dbus_fn._dbus_signature = signature\n367:         dbus_fn._dbus_args = ['arg%i' % i for i in range(1, len(args) + 1)]\n368: \n369:         dbus_fn(self, *args)\n370: \n371:     @dbus.service.method(MOCK_IFACE,\n372:                          in_signature='',\n373:                          out_signature='a(tsav)')\n374:     def GetCalls(self):\n375:         '''List all the logged calls since the last call to ClearCalls().\n376: \n377:         Return a list of (timestamp, method_name, args_list) tuples.\n378:         '''\n379:         return self.call_log\n380: \n381:     @dbus.service.method(MOCK_IFACE,\n382:                          in_signature='s',\n383:                          out_signature='a(tav)')\n384:     def GetMethodCalls(self, method):\n385:         '''List all the logged calls of a particular method.\n386: \n387:         Return a list of (timestamp, args_list) tuples.\n388:         '''\n389:         return [(row[0], row[2]) for row in self.call_log if row[1] == method]\n390: \n391:     @dbus.service.method(MOCK_IFACE,\n392:                          in_signature='',\n393:                          out_signature='')\n394:     def ClearCalls(self):\n395:         '''Empty the log of mock call signatures.'''\n396: \n397:         self.call_log = []\n398: \n399:     @dbus.service.signal(MOCK_IFACE, signature='sav')\n400:     def MethodCalled(self, name, args):\n401:         pass\n402: \n403:     def mock_method(self, interface, dbus_method, in_signature, *args, **kwargs):\n404:         '''Master mock method.\n405: \n406:         This gets \"instantiated\" in AddMethod(). Execute the code snippet of\n407:         the method and return the \"ret\" variable if it was set.\n408:         '''\n409:         #print('mock_method', dbus_method, self, in_signature, args, kwargs, file=sys.stderr)\n410: \n411:         # convert types of arguments according to signature, using\n412:         # MethodCallMessage.append(); this will also provide type/length\n413:         # checks, except for the case of an empty signature\n414:         if in_signature == '' and len(args) > 0:\n415:             raise TypeError('Fewer items found in D-Bus signature than in Python arguments')\n416:         m = dbus.connection.MethodCallMessage('a.b', '/a', 'a.b', 'a')\n417:         m.append(signature=in_signature, *args)\n418:         args = m.get_args_list()\n419: \n420:         self.log(dbus_method + self.format_args(args))\n421:         self.call_log.append((int(time.time()), str(dbus_method), args))\n422:         self.MethodCalled(dbus_method, args)\n423: \n424:         code = self.methods[interface][dbus_method][2]\n425:         if code:\n426:             loc = locals().copy()\n427:             exec(code, globals(), loc)\n428:             if 'ret' in loc:\n429:                 return loc['ret']\n430: \n431:     def format_args(self, args):\n432:         '''Format a D-BUS argument tuple into an appropriate logging string.'''\n433: \n434:         def format_arg(a):\n435:             if isinstance(a, dbus.Boolean):\n436:                 return str(bool(a))\n437:             if isinstance(a, dbus.Byte):\n438:                 return str(int(a))\n439:             if isinstance(a, int) or isinstance(a, long):\n440:                 return str(a)\n441:             if isinstance(a, str) or isinstance(a, unicode):\n442:                 return '\"' + str(a) + '\"'\n443:             if isinstance(a, list):\n444:                 return '[' + ', '.join([format_arg(x) for x in a]) + ']'\n445:             if isinstance(a, dict):\n446:                 fmta = '{'\n447:                 first = True\n448:                 for k, v in a.items():\n449:                     if first:\n450:                         first = False\n451:                     else:\n452:                         fmta += ', '\n453:                     fmta += format_arg(k) + ': ' + format_arg(v)\n454:                 return fmta + '}'\n455: \n456:             # fallback\n457:             return repr(a)\n458: \n459:         s = ''\n460:         for a in args:\n461:             if s:\n462:                 s += ' '\n463:             s += format_arg(a)\n464:         if s:\n465:             s = ' ' + s\n466:         return s\n467: \n468:     def log(self, msg):\n469:         '''Log a message, prefixed with a timestamp.",
+      "source_summary": "The 'template' parameter comes from D-Bus method call input, specifically from the AddTemplate D-Bus method which is exposed to external callers. The parameter can be either a name of a standard template or a full path to a *.py file for custom templates.",
+      "sink_summary": "The loaded module's code is executed via 'module.load(self, parameters)' on line 333, and D-Bus methods from the module are added to the mock object interface. This allows arbitrary code execution in the context of the running dbusmock process.",
+      "guard_summary": "There are no validation or sanitization checks on the template parameter before it's passed to load_module. The function directly passes the user-provided template name/path to importlib.import_module without any filtering or path validation, making it vulnerable to path traversal and code injection attacks.",
+      "risk_pattern": "Direct execution of user-controlled module names/paths through importlib.import_module, allowing arbitrary code execution in the context of the dbusmock process",
+      "used_variable_sources": [
+        "template"
+      ],
+      "called_function_context": [
+        "load_module(template)"
+      ],
+      "enclosing_conditions": [],
+      "context_summary": "The AddTemplate method accepts a template parameter that can be either a standard template name or a file path. The load_module function processes this input by either treating it as a file path (if it's an existing .py file) or as a module name to import from dbusmock.templates. In both cases, the user input directly influences which Python module gets loaded and executed.",
+      "unresolved_facts": [],
+      "retrieval_query": {
+        "source": "template parameter from D-Bus method AddTemplate",
+        "sensitive_operation": "load_module() called with user-controlled input",
+        "missing_control": "no validation of template path/module name before import",
+        "mechanism_keywords": [
+          "importlib.import_module",
+          "arbitrary code execution",
+          "module loading"
+        ]
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 35.4064,
+          "raw_bm25_score": 35.4064,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/call/wrong-named-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 32.6852,
+          "raw_bm25_score": 32.6852,
+          "description": "Using a named argument whose name does not correspond to a parameter of the called function or method, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.4237,
+          "raw_bm25_score": 28.4237,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/template-injection",
+          "cwe_id": "CWE-74",
+          "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.3138,
+          "raw_bm25_score": 26.3138,
+          "description": "Using user-controlled data to create a template can lead to remote code execution or cross site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized APIs and separate data from control instructions. Validate input format and escape special characters.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-074"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/unicode-bypass-validation",
+          "cwe_id": "CWE-179",
+          "cwe_name": "Incorrect Behavior Order: Early Validation",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.1235,
+          "raw_bm25_score": 26.1235,
+          "description": "A Unicode transformation is using a remote user-controlled data. The transformation is a Unicode normalization using the algorithms \"NFC\" or \"NFKC\". In all cases, the security measures implemented or the logical validation performed to escape any injection characters, to validate using regex patterns or to perform string-based checks, before the Unicode transformation are **bypassable** by special Unicode characters.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement validation early in the processing pipeline. Ensure validation cannot be bypassed by alternate code paths. Use consistent validation across all entry points.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-176",
+            "external/cwe/cwe-179",
+            "external/cwe/cwe-180"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/unicode-dos",
+          "cwe_id": "CWE-770",
+          "cwe_name": "Allocation of Resources Without Limits or Throttling",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.6184,
+          "raw_bm25_score": 25.6184,
+          "description": "A remote user-controlled data can reach a costly Unicode normalization with either form NFKC or NFKD. On Windows OS, with an attack such as the One Million Unicode Characters, this could lead to a denial of service. And, with the use of special Unicode characters, like U+2100 (℀) or U+2105 (℅), the payload size could be tripled.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement resource consumption limits, rate limiting, and proper cleanup mechanisms for all operations.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-770"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/count-untrusted-data-external-api",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.5211,
+          "raw_bm25_score": 25.5211,
+          "description": "This reports the external APIs that are used with untrusted data, along with how frequently the API is called, and how many unique sources of untrusted data flow to it.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/client-exposed-cookie",
+          "cwe_id": "CWE-1004",
+          "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.2777,
+          "raw_bm25_score": 24.2777,
+          "description": "Cookies without the `HttpOnly` attribute set can be accessed by JS scripts, making them more vulnerable to XSS attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Set HttpOnly flag on session cookies to prevent JavaScript access. Also use Secure and SameSite attributes.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1004"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/full-ssrf",
+          "cwe_id": "CWE-918",
+          "cwe_name": "Server-Side Request Forgery (SSRF)",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.0196,
+          "raw_bm25_score": 24.0196,
+          "description": "Making a network request to a URL that is fully user-controlled allows for request forgery attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement URL validation with allowlists of permitted destinations. Use network segmentation and validate all outbound requests.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-918"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/timing-attack-against-hash",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.8737,
+          "raw_bm25_score": 23.8737,
+          "description": "When checking a Hash over a message, a constant-time algorithm should be used. Otherwise, an attacker may be able to forge a valid Hash for an arbitrary message by running a timing attack if they can send to the validation procedure. A successful attack can result in authentication bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

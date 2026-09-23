@@ -1,0 +1,262 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "dbusmock/mockobject.py",
+      "changed_line": 37,
+      "statement": "def load_module(name):",
+      "change_type": "A",
+      "function_name": "load_module",
+      "operation_type": "code_execution",
+      "selection_reason": "observable input 'name' -> exact operation 'importlib.import_module(m)' -> security-sensitive effect of executing arbitrary Python code from a file path",
+      "security_relevance_score": 0.9,
+      "code_context": "1: # coding: UTF-8\n2: '''Mock D-BUS objects for test suites.'''\n3: \n4: # This program is free software; you can redistribute it and/or modify it under\n5: # the terms of the GNU Lesser General Public License as published by the Free\n6: # Software Foundation; either version 3 of the License, or (at your option) any\n7: # later version.  See http://www.gnu.org/copyleft/lgpl.html for the full text\n8: # of the license.\n9: \n10: __author__ = 'Martin Pitt'\n11: __email__ = 'martin.pitt@ubuntu.com'\n12: __copyright__ = '(c) 2012 Canonical Ltd.'\n13: __license__ = 'LGPL 3+'\n14: \n15: import time\n16: import sys\n17: import importlib\n18: \n19: # we do not use this ourselves, but mock methods often want to use this\n20: import os\n21: os  # pyflakes\n22: \n23: import dbus\n24: import dbus.service\n25: \n26: # global path -> DBusMockObject mapping\n27: objects = {}\n28: \n29: MOCK_IFACE = 'org.freedesktop.DBus.Mock'\n30: \n31: # stubs to keep code compatible with Python 2 and 3\n32: if sys.version_info[0] >= 3:\n33:     long = int\n34:     unicode = str\n35: \n36: \n37: def load_module(name):\n38:     if os.path.exists(name) and os.path.splitext(name)[1] == '.py':\n39:         sys.path.insert(0, os.path.dirname(os.path.abspath(name)))\n40:         try:\n41:             m = os.path.splitext(os.path.basename(name))[0]\n42:             module = importlib.import_module(m)\n43:         finally:\n44:             sys.path.pop(0)\n45: \n46:         return module\n47: \n48:     return importlib.import_module('dbusmock.templates.' + name)\n49: \n50: \n51: class DBusMockObject(dbus.service.Object):\n52:     '''Mock D-Bus object\n53: \n54:     This can be configured to have arbitrary methods (including code execution)\n55:     and properties via methods on the org.freedesktop.DBus.Mock interface, so\n56:     that you can control the mock from any programming language.\n57:     '''\n58: \n59:     def __init__(self, bus_name, path, interface, props, logfile=None):\n60:         '''Create a new DBusMockObject\n61: \n62:         bus_name: A dbus.service.BusName instance where the object will be put on\n63:         path: D-Bus object path\n64:         interface: Primary D-Bus interface name of this object (where\n65:                    properties and methods will be put on)\n66:         props: A property_name (string) → property (Variant) map with initial\n67:                properties on \"interface\"\n68:         logfile: When given, method calls will be logged into that file name;\n69:                  if None, logging will be written to stdout. Note that you can\n70:                  also query the called methods over D-BUS with GetCalls() and\n71:                  GetMethodCalls().\n72:         '''\n73:         super(self.__class__, self).__init__(bus_name, path)\n74: \n75:         self.bus_name = bus_name\n76:         self.interface = interface\n77:         # interface -> name -> value\n78:         self.props = {}\n79:         self.props[interface] = props\n80: \n81:         # interface -> name -> (in_signature, out_signature, code, dbus_wrapper_fn)\n82:         self.methods = {interface: {}}\n83: \n84:         if logfile:\n85:             self.logfile = open(logfile, 'w')\n86:         else:\n87:             self.logfile = None\n88:         self.call_log = []\n89: \n90:     def __del__(self):\n91:         if self.logfile:\n92:             self.logfile.close()\n93: \n94:     @dbus.service.method(dbus.PROPERTIES_IFACE,\n95:                          in_signature='ss', out_signature='v')\n96:     def Get(self, interface_name, property_name):\n97:         '''Standard D-Bus API for getting a property value'''\n98: \n99:         try:\n100:             return self.GetAll(interface_name)[property_name]\n101:         except KeyError:\n102:             raise dbus.exceptions.DBusException(\n103:                 self.interface + '.UnknownProperty',\n104:                 'no such property ' + property_name)\n105: \n106:     @dbus.service.method(dbus.PROPERTIES_IFACE,\n107:                          in_signature='s', out_signature='a{sv}')\n108:     def GetAll(self, interface_name, *args, **kwargs):\n109:         '''Standard D-Bus API for getting all property values'''\n110: \n111:         try:\n112:             return self.props[interface_name]\n113:         except KeyError:\n114:             raise dbus.exceptions.DBusException(\n115:                 self.interface + '.UnknownInterface',\n116:                 'no such interface ' + interface_name)\n117: \n118:     @dbus.service.method(dbus.PROPERTIES_IFACE,\n119:                          in_signature='ssv', out_signature='')\n120:     def Set(self, interface_name, property_name, value, *args, **kwargs):\n121:         '''Standard D-Bus API for setting a property value'''\n122: \n123:         try:\n124:             iface_props = self.props[interface_name]\n125:         except KeyError:\n126:             raise dbus.exceptions.DBusException(\n127:                 self.interface + '.UnknownInterface',\n128:                 'no such interface ' + interface_name)\n129: \n130:         if property_name not in iface_props:\n131:             raise dbus.exceptions.DBusException(\n132:                 self.interface + '.UnknownProperty',\n133:                 'no such property ' + property_name)\n134: \n135:         iface_props[property_name] = value\n136: \n137:     @dbus.service.method(MOCK_IFACE,\n138:                          in_signature='ssa{sv}a(ssss)',\n139:                          out_signature='')\n140:     def AddObject(self, path, interface, properties, methods):\n141:         '''Add a new D-Bus object to the mock\n142: \n143:         path: D-Bus object path\n144:         interface: Primary D-Bus interface name of this object (where\n145:                    properties and methods will be put on)\n146:         properties: A property_name (string) → value map with initial\n147:                     properties on \"interface\"\n148:         methods: An array of 4-tuples (name, in_sig, out_sig, code) describing\n149:                  methods to add to \"interface\"; see AddMethod() for details of\n150:                  the tuple values\n151: \n152:         Example:\n153:         dbus_proxy.AddObject('/com/example/Foo/Manager',\n154:                              'com.example.Foo.Control',\n155:                              {\n156:                                  'state': dbus.String('online', variant_level=1),\n157:                              },\n158:                              [\n159:                                  ('Start', '', '', ''),\n160:                                  ('EchoInt', 'i', 'i', 'ret = args[0]'),\n161:                                  ('GetClients', '', 'ao', 'ret = [\"/com/example/Foo/Client1\"]'),\n162:                              ])\n163:         '''\n164:         if path in objects:\n165:             raise dbus.exceptions.DBusException(\n166:                 'org.freedesktop.DBus.Mock.NameError',\n167:                 'object %s already exists' % path)\n168: \n169:         obj = DBusMockObject(self.bus_name,\n170:                              path,\n171:                              interface,\n172:                              properties)\n173:         obj.AddMethods(interface, methods)\n174: \n175:         objects[path] = obj\n176: \n177:     @dbus.service.method(MOCK_IFACE,\n178:                          in_signature='s',\n179:                          out_signature='')\n180:     def RemoveObject(self, path):\n181:         '''Remove a D-Bus object from the mock'''\n182: \n183:         try:\n184:             del objects[path]\n185:         except KeyError:\n186:             raise dbus.exceptions.DBusException(",
+      "source_summary": "The 'name' parameter originates from the 'template' argument passed to AddTemplate method, which can be set via command-line argument '--template' when running the dbusmock main script. This means an attacker who can control the command-line arguments can influence the value of 'name'.",
+      "sink_summary": "The function executes arbitrary Python code by importing a module using importlib.import_module(). When the path points to a .py file, it modifies sys.path to include the directory containing the file, imports the module, and returns it. This allows execution of arbitrary Python code from files specified by the 'name' parameter.",
+      "guard_summary": "There are no validation or sanitization checks on the 'name' parameter before it's used in path operations or module import. The function only checks if the file exists and has a .py extension, but does not validate that the path is safe or restricted.",
+      "risk_pattern": "An attacker can provide a malicious Python file path through the command-line template argument, which gets imported and executed by the load_module function. This allows arbitrary code execution based on user-controllable input.",
+      "used_variable_sources": [
+        "template"
+      ],
+      "called_function_context": [
+        "importlib.import_module(m)"
+      ],
+      "enclosing_conditions": [
+        "os.path.exists(name) and os.path.splitext(name)[1] == '.py'"
+      ],
+      "context_summary": "The load_module function is called from AddTemplate method which is exposed via D-Bus interface. The template parameter can be set through command-line arguments, making it potentially attacker-controlled. When a .py file path is provided, the function modifies sys.path and imports that module, leading to arbitrary code execution.",
+      "unresolved_facts": [
+        "Whether the command-line argument parsing validates or sanitizes the template argument",
+        "The exact security controls in place for D-Bus method calls that invoke AddTemplate"
+      ],
+      "retrieval_query": {
+        "mechanism_keywords": [
+          "path traversal",
+          "module import",
+          "sys.path manipulation",
+          "arbitrary code execution",
+          "file path validation"
+        ],
+        "sensitive_operation": "importlib.import_module with user-controllable path",
+        "missing_control": "No sanitization of file paths before module loading"
+      },
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/call/wrong-named-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 52.6758,
+          "raw_bm25_score": 52.6758,
+          "description": "Using a named argument whose name does not correspond to a parameter of the called function or method, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 48.7136,
+          "raw_bm25_score": 48.7136,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/timing-attack-against-hash",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 32.5038,
+          "raw_bm25_score": 32.5038,
+          "description": "When checking a Hash over a message, a constant-time algorithm should be used. Otherwise, an attacker may be able to forge a valid Hash for an arbitrary message by running a timing attack if they can send to the validation procedure. A successful attack can result in authentication bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/shell-command-constructed-from-input",
+          "cwe_id": "CWE-78",
+          "cwe_name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.0112,
+          "raw_bm25_score": 29.0112,
+          "description": "Using externally controlled strings in a command line may allow a malicious user to change the meaning of the command.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use safe command execution APIs with parameter arrays. Validate and sanitize command arguments against strict allowlists.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-088",
+            "external/cwe/cwe-073"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/client-exposed-cookie",
+          "cwe_id": "CWE-1004",
+          "cwe_name": "Sensitive Cookie Without 'HttpOnly' Flag",
+          "language": "python",
+          "severity": "medium",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.7369,
+          "raw_bm25_score": 28.7369,
+          "description": "Cookies without the `HttpOnly` attribute set can be accessed by JS scripts, making them more vulnerable to XSS attacks.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Set HttpOnly flag on session cookies to prevent JavaScript access. Also use Secure and SameSite attributes.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-1004"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/count-untrusted-data-external-api",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 27.2373,
+          "raw_bm25_score": 27.2373,
+          "description": "This reports the external APIs that are used with untrusted data, along with how frequently the API is called, and how many unique sources of untrusted data flow to it.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/paramiko-command-injection",
+          "cwe_id": "CWE-74",
+          "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.8395,
+          "raw_bm25_score": 26.8395,
+          "description": "user provided command can lead to execute code on a external server that can be belong to other users or admins",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized APIs and separate data from control instructions. Validate input format and escape special characters.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-074"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/percent-format/wrong-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.4174,
+          "raw_bm25_score": 26.4174,
+          "description": "A string formatting operation, such as '\"%s: %s, %s\" % (a,b)', where the number of conversion specifiers in the format string differs from the number of values to be formatted will raise a TypeError.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/csv-injection",
+          "cwe_id": "CWE-1236",
+          "cwe_name": "Improper Neutralization of Formula Elements in a CSV File",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.1094,
+          "raw_bm25_score": 26.1094,
+          "description": "From user-controlled data saved in CSV files, it is easy to attempt information disclosure or other malicious activities when automated by spreadsheet software",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-1236"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/command-line-injection",
+          "cwe_id": "CWE-88",
+          "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.0643,
+          "raw_bm25_score": 25.0643,
+          "description": "Using externally controlled strings in a command line may allow a malicious user to change the meaning of the command.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-088. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-078",
+            "external/cwe/cwe-088"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

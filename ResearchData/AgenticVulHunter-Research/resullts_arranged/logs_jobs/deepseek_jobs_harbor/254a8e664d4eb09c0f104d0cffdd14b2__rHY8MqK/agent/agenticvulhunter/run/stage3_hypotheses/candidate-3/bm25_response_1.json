@@ -1,0 +1,258 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "glance/api/v1/images.py",
+      "changed_line": 832,
+      "statement": "status = 'pending_delete'",
+      "change_type": "A",
+      "function_name": "delete",
+      "operation_type": "state_assignment",
+      "selection_reason": "Configuration-controlled condition -> sets status to pending_delete -> affects deletion workflow and timing",
+      "security_relevance_score": 0.6,
+      "code_context": "683: \n684:         image_meta = self._reserve(req, image_meta)\n685:         id = image_meta['id']\n686: \n687:         image_meta = self._handle_source(req, id, image_meta, image_data)\n688: \n689:         location_uri = image_meta.get('location')\n690:         if location_uri:\n691:             self.update_store_acls(req, id, location_uri, public=is_public)\n692: \n693:         # Prevent client from learning the location, as it\n694:         # could contain security credentials\n695:         image_meta.pop('location', None)\n696: \n697:         return {'image_meta': image_meta}\n698: \n699:     @utils.mutating\n700:     def update(self, req, id, image_meta, image_data):\n701:         \"\"\"\n702:         Updates an existing image with the registry.\n703: \n704:         :param request: The WSGI/Webob Request object\n705:         :param id: The opaque image identifier\n706: \n707:         :retval Returns the updated image information as a mapping\n708:         \"\"\"\n709:         self._enforce(req, 'modify_image')\n710:         is_public = image_meta.get('is_public')\n711:         if is_public:\n712:             self._enforce(req, 'publicize_image')\n713: \n714:         orig_image_meta = self.get_image_meta_or_404(req, id)\n715:         orig_status = orig_image_meta['status']\n716: \n717:         # The default behaviour for a PUT /images/<IMAGE_ID> is to\n718:         # override any properties that were previously set. This, however,\n719:         # leads to a number of issues for the common use case where a caller\n720:         # registers an image with some properties and then almost immediately\n721:         # uploads an image file along with some more properties. Here, we\n722:         # check for a special header value to be false in order to force\n723:         # properties NOT to be purged. However we also disable purging of\n724:         # properties if an image file is being uploaded...\n725:         purge_props = req.headers.get('x-glance-registry-purge-props', True)\n726:         purge_props = (utils.bool_from_string(purge_props) and\n727:                        image_data is None)\n728: \n729:         if image_data is not None and orig_status != 'queued':\n730:             raise HTTPConflict(_(\"Cannot upload to an unqueued image\"))\n731: \n732:         # Only allow the Location|Copy-From fields to be modified if the\n733:         # image is in queued status, which indicates that the user called\n734:         # POST /images but originally supply neither a Location|Copy-From\n735:         # field NOR image data\n736:         location = self._external_source(image_meta, req)\n737:         reactivating = orig_status != 'queued' and location\n738:         activating = orig_status == 'queued' and (location or image_data)\n739: \n740:         # Make image public in the backend store (if implemented)\n741:         orig_or_updated_loc = location or orig_image_meta.get('location', None)\n742:         if orig_or_updated_loc:\n743:             self.update_store_acls(req, id, orig_or_updated_loc,\n744:                                    public=is_public)\n745: \n746:         if reactivating:\n747:             msg = _(\"Attempted to update Location field for an image \"\n748:                     \"not in queued status.\")\n749:             raise HTTPBadRequest(explanation=msg,\n750:                                  request=req,\n751:                                  content_type=\"text/plain\")\n752: \n753:         try:\n754:             if location:\n755:                 image_meta['size'] = self._get_size(req.context, image_meta,\n756:                                                     location)\n757: \n758:             image_meta = registry.update_image_metadata(req.context,\n759:                                                         id,\n760:                                                         image_meta,\n761:                                                         purge_props)\n762: \n763:             if activating:\n764:                 image_meta = self._handle_source(req, id, image_meta,\n765:                                                  image_data)\n766: \n767:         except exception.Invalid, e:\n768:             msg = (_(\"Failed to update image metadata. Got error: %(e)s\")\n769:                    % locals())\n770:             for line in msg.split('\\n'):\n771:                 LOG.error(line)\n772:             self.notifier.error('image.update', msg)\n773:             raise HTTPBadRequest(explanation=msg,\n774:                                  request=req,\n775:                                  content_type=\"text/plain\")\n776:         except exception.NotFound, e:\n777:             msg = (\"Failed to find image to update: %(e)s\" % locals())\n778:             for line in msg.split('\\n'):\n779:                 LOG.info(line)\n780:             self.notifier.info('image.update', msg)\n781:             raise HTTPNotFound(explanation=msg,\n782:                                request=req,\n783:                                content_type=\"text/plain\")\n784:         except exception.Forbidden, e:\n785:             msg = (\"Forbidden to update image: %(e)s\" % locals())\n786:             for line in msg.split('\\n'):\n787:                 LOG.info(line)\n788:             self.notifier.info('image.update', msg)\n789:             raise HTTPForbidden(explanation=msg,\n790:                                 request=req,\n791:                                 content_type=\"text/plain\")\n792:         else:\n793:             self.notifier.info('image.update', image_meta)\n794: \n795:         # Prevent client from learning the location, as it\n796:         # could contain security credentials\n797:         image_meta.pop('location', None)\n798: \n799:         return {'image_meta': image_meta}\n800: \n801:     @utils.mutating\n802:     def delete(self, req, id):\n803:         \"\"\"\n804:         Deletes the image and all its chunks from the Glance\n805: \n806:         :param req: The WSGI/Webob Request object\n807:         :param id: The opaque image identifier\n808: \n809:         :raises HttpBadRequest if image registry is invalid\n810:         :raises HttpNotFound if image or any chunk is not available\n811:         :raises HttpUnauthorized if image or any chunk is not\n812:                 deleteable by the requesting user\n813:         \"\"\"\n814:         self._enforce(req, 'delete_image')\n815: \n816:         image = self.get_image_meta_or_404(req, id)\n817:         if image['protected']:\n818:             msg = _(\"Image is protected\")\n819:             LOG.debug(msg)\n820:             raise HTTPForbidden(explanation=msg,\n821:                                 request=req,\n822:                                 content_type=\"text/plain\")\n823: \n824:         status = 'deleted'\n825:         try:\n826:             # The image's location field may be None in the case\n827:             # of a saving or queued image, therefore don't ask a backend\n828:             # to delete the image if the backend doesn't yet store it.\n829:             # See https://bugs.launchpad.net/glance/+bug/747799\n830:             if image['location']:\n831:                 if CONF.delayed_delete:\n832:                     status = 'pending_delete'\n833:                     schedule_delayed_delete_from_backend(image['location'], id)\n834:                 else:\n835:                     safe_delete_from_backend(image['location'],\n836:                                              req.context, id)\n837: \n838:             registry.update_image_metadata(req.context, id, {'status': status})\n839:             registry.delete_image_metadata(req.context, id)\n840:         except exception.NotFound, e:\n841:             msg = (\"Failed to find image to delete: %(e)s\" % locals())\n842:             for line in msg.split('\\n'):\n843:                 LOG.info(line)\n844:             self.notifier.info('image.delete', msg)\n845:             raise HTTPNotFound(explanation=msg,\n846:                                request=req,\n847:                                content_type=\"text/plain\")\n848:         except exception.Forbidden, e:\n849:             msg = (\"Forbidden to delete image: %(e)s\" % locals())\n850:             for line in msg.split('\\n'):\n851:                 LOG.info(line)\n852:             self.notifier.info('image.delete', msg)\n853:             raise HTTPForbidden(explanation=msg,\n854:                                 request=req,\n855:                                 content_type=\"text/plain\")\n856:         else:\n857:             self.notifier.info('image.delete', image)\n858: \n859:     def get_store_or_400(self, request, scheme):\n860:         \"\"\"\n861:         Grabs the storage backend for the supplied store name\n862:         or raises an HTTPBadRequest (400) response\n863: \n864:         :param request: The WSGI/Webob Request object\n865:         :param scheme: The backend store scheme\n866: \n867:         :raises HTTPNotFound if store does not exist\n868:         \"\"\"\n869:         try:\n870:             return get_store_from_scheme(request.context, scheme)\n871:         except exception.UnknownScheme:\n872:             msg = _(\"Store for scheme %s not found\")\n873:             LOG.error(msg % scheme)\n874:             raise HTTPBadRequest(explanation=msg,\n875:                                  request=request,\n876:                                  content_type='text/plain')\n877: \n878:     def verify_scheme_or_exit(self, scheme):\n879:         \"\"\"\n880:         Verifies availability of the storage backend for the\n881:         given scheme or exits\n882: \n883:         :param scheme: The backend store scheme\n884:         \"\"\"\n885:         try:\n886:             get_store_from_scheme(context.RequestContext(), scheme)\n887:         except exception.UnknownScheme:\n888:             msg = _(\"Store for scheme %s not found\")\n889:             LOG.error(msg % scheme)\n890:             # message on stderr will only be visible if started directly via\n891:             # bin/glance-api, as opposed to being daemonized by glance-control\n892:             sys.stderr.write(msg % scheme)\n893:             sys.exit(255)\n894: \n895: \n896: class ImageDeserializer(wsgi.JSONRequestDeserializer):\n897:     \"\"\"Handles deserialization of specific controller method requests.\"\"\"\n898: \n899:     def _deserialize(self, request):\n900:         result = {}\n901:         try:\n902:             result['image_meta'] = utils.get_image_meta_from_headers(request)\n903:         except exception.Invalid:\n904:             image_size_str = request.headers['x-image-meta-size']\n905:             msg = _(\"Incoming image size of %s was not convertible to \"\n906:                     \"an integer.\") % image_size_str\n907:             raise HTTPBadRequest(explanation=msg, request=request)\n908: \n909:         image_meta = result['image_meta']\n910:         image_meta = validate_image_meta(request, image_meta)\n911:         if request.content_length:\n912:             image_size = request.content_length\n913:         elif 'size' in image_meta:\n914:             image_size = image_meta['size']\n915:         else:\n916:             image_size = None\n917: \n918:         data = request.body_file if self.has_body(request) else None\n919: \n920:         if image_size is None and data is not None:\n921:             data = utils.LimitingReader(data, CONF.image_size_cap)\n922: \n923:             #NOTE(bcwaldon): this is a hack to make sure the downstream code\n924:             # gets the correct image data\n925:             request.body_file = data\n926: \n927:         elif image_size > CONF.image_size_cap:\n928:             max_image_size = CONF.image_size_cap\n929:             msg = _(\"Denying attempt to upload image larger than %d bytes.\")\n930:             LOG.warn(msg % max_image_size)\n931:             raise HTTPBadRequest(explanation=msg % max_image_size,\n932:                                  request=request)\n933: \n934:         result['image_data'] = data\n935:         return result\n936: \n937:     def create(self, request):\n938:         return self._deserialize(request)\n939: \n940:     def update(self, request):\n941:         return self._deserialize(request)\n942: \n943: \n944: class ImageSerializer(wsgi.JSONResponseSerializer):\n945:     \"\"\"Handles serialization of specific controller method responses.\"\"\"\n946: \n947:     def __init__(self):\n948:         self.notifier = notifier.Notifier()\n949: \n950:     def _inject_location_header(self, response, image_meta):\n951:         location = self._get_image_location(image_meta)\n952:         response.headers['Location'] = location.encode('utf-8')\n953: \n954:     def _inject_checksum_header(self, response, image_meta):\n955:         if image_meta['checksum'] is not None:\n956:             response.headers['ETag'] = image_meta['checksum'].encode('utf-8')\n957: \n958:     def _inject_image_meta_headers(self, response, image_meta):\n959:         \"\"\"\n960:         Given a response and mapping of image metadata, injects\n961:         the Response with a set of HTTP headers for the image\n962:         metadata. Each main image metadata field is injected\n963:         as a HTTP header with key 'x-image-meta-<FIELD>' except\n964:         for the properties field, which is further broken out\n965:         into a set of 'x-image-meta-property-<KEY>' headers\n966: \n967:         :param response: The Webob Response object\n968:         :param image_meta: Mapping of image metadata\n969:         \"\"\"\n970:         headers = utils.image_meta_to_http_headers(image_meta)\n971: \n972:         for k, v in headers.items():\n973:             response.headers[k.encode('utf-8')] = v.encode('utf-8')\n974: \n975:     def _get_image_location(self, image_meta):\n976:         \"\"\"Build a relative url to reach the image defined by image_meta.\"\"\"\n977:         return \"/v1/images/%s\" % image_meta['id']\n978: \n979:     def meta(self, response, result):\n980:         image_meta = result['image_meta']\n981:         self._inject_image_meta_headers(response, image_meta)",
+      "source_summary": "image['location'] comes from image metadata retrieved via get_image_meta_or_404(req, id). CONF.delayed_delete is a boolean configuration setting.",
+      "sink_summary": "When delayed_delete=True: schedule_delayed_delete_from_backend writes URI and timestamp to file. When delayed_delete=False: safe_delete_from_backend calls delete_from_backend which calls store.delete(loc) on the storage backend.",
+      "guard_summary": "Authentication: self._enforce(req, 'delete_image') at line 814. Authorization: protected image check at lines 817-822 prevents deletion of protected images. Location validation: Only attempts deletion if image['location'] exists (line 830).",
+      "risk_pattern": "Configuration-controlled deletion timing: delayed_delete setting determines whether image deletion is immediate or scheduled for later execution via file-based queue.",
+      "used_variable_sources": [
+        "image['location'] from get_image_meta_or_404",
+        "CONF.delayed_delete from configuration"
+      ],
+      "called_function_context": [
+        "get_image_meta_or_404",
+        "schedule_delayed_delete_from_backend",
+        "safe_delete_from_backend",
+        "delete_from_backend",
+        "registry.update_image_metadata",
+        "registry.delete_image_metadata"
+      ],
+      "enclosing_conditions": [
+        "if image['location']:",
+        "if CONF.delayed_delete:"
+      ],
+      "context_summary": "The candidate statement is in the delete() method, which handles image deletion. When delayed_delete is enabled, it sets status to 'pending_delete' and schedules deletion via file-based queue instead of immediate deletion.",
+      "unresolved_facts": [
+        "Specific store backend implementations and their security characteristics",
+        "Scrubber process implementation that handles scheduled deletions",
+        "Exact file permissions and security of scrubber_datadir"
+      ],
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/timing-attack-against-hash",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.3535,
+          "raw_bm25_score": 21.3535,
+          "description": "When checking a Hash over a message, a constant-time algorithm should be used. Otherwise, an attacker may be able to forge a valid Hash for an arbitrary message by running a timing attack if they can send to the validation procedure. A successful attack can result in authentication bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "fallback/cwe-863-incorrect-authorization",
+          "cwe_id": "CWE-863",
+          "cwe_name": "Incorrect Authorization",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 20.73,
+          "raw_bm25_score": 20.73,
+          "description": "An authorization check exists but evaluates access incorrectly.",
+          "pattern": "cwe-863 incorrect-authorization authorization-check permission-check role-check ownership-check acl-check access-decision bypass",
+          "remediation": "Evaluate authorization from trusted server-side identity and policy state.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-863"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 20.6048,
+          "raw_bm25_score": 20.6048,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/csv-injection",
+          "cwe_id": "CWE-1236",
+          "cwe_name": "Improper Neutralization of Formula Elements in a CSV File",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 16.9408,
+          "raw_bm25_score": 16.9408,
+          "description": "From user-controlled data saved in CSV files, it is easy to attempt information disclosure or other malicious activities when automated by spreadsheet software",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-1236"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "fallback/cwe-425-direct-request-forced-browsing",
+          "cwe_id": "CWE-425",
+          "cwe_name": "Direct Request ('Forced Browsing')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 14.674,
+          "raw_bm25_score": 14.674,
+          "description": "A restricted route, URL, script, or file can be requested directly without required authorization.",
+          "pattern": "cwe-425 forced-browsing direct-request restricted-url protected-route protected-file missing-authorization route endpoint hidden-link",
+          "remediation": "Authorize every protected route and resource on direct access.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-425"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/comparison-missing-self",
+          "cwe_id": "CWE-571",
+          "cwe_name": "Expression is Always True",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 13.5709,
+          "raw_bm25_score": 13.5709,
+          "description": "Comparison of identical values, the intent of which is unclear.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-571. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-570",
+            "external/cwe/cwe-571"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/url-redirection",
+          "cwe_id": "CWE-601",
+          "cwe_name": "URL Redirection to Untrusted Site ('Open Redirect')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 12.9909,
+          "raw_bm25_score": 12.9909,
+          "description": "URL redirection based on unvalidated user input may cause redirection to malicious web sites.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Validate redirect URLs against allowlists. Use relative URLs where possible and avoid user-controlled redirects.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-601"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "fallback/cwe-284-improper-access-control",
+          "cwe_id": "CWE-284",
+          "cwe_name": "Improper Access Control",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 11.6484,
+          "raw_bm25_score": 11.6484,
+          "description": "An access-control policy is missing or incorrectly enforced for a protected resource.",
+          "pattern": "cwe-284 access-control authorization permission acl role owner ownership privilege protected-resource protected-endpoint allow deny",
+          "remediation": "Require explicit server-side authorization before protected operations.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-284"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/constant-conditional-expression",
+          "cwe_id": "CWE-570",
+          "cwe_name": "Expression is Always False",
+          "language": "python",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 10.8628,
+          "raw_bm25_score": 10.8628,
+          "description": "The conditional is always true or always false",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-570. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "useless-code",
+            "external/cwe/cwe-561",
+            "external/cwe/cwe-570"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/insecure-temporary-file",
+          "cwe_id": "CWE-377",
+          "cwe_name": "Insecure Temporary File",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 10.4818,
+          "raw_bm25_score": 10.4818,
+          "description": "Creating a temporary file using this method may be insecure.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "external/cwe/cwe-377",
+            "security"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

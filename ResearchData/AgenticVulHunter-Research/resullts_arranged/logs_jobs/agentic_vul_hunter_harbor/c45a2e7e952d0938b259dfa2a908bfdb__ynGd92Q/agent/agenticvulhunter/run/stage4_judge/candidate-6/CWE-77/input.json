@@ -1,0 +1,57 @@
+{
+  "candidate": {
+    "candidate_id": "candidate-6",
+    "filepath": "pcsd/pcs.rb",
+    "changed_line": 1912,
+    "statement": "def get_parsed_local_sbd_config()",
+    "change_type": "A",
+    "function_name": "get_parsed_local_sbd_config",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.6,
+    "code_context": "1763:       }\n1764:     }\n1765:   }\n1766:   return all_nodes_attr\n1767: end\n1768: \n1769: def status_v1_to_v2(status)\n1770:   new_status = status.select { |k,_|\n1771:     [:cluster_name, :username, :is_cman_with_udpu_transport,\n1772:      :need_ring1_address, :cluster_settings, :constraints, :groups,\n1773:      :corosync_online, :corosync_offline, :pacemaker_online, :pacemaker_standby,\n1774:      :pacemaker_offline, :acls, :fence_levels\n1775:     ].include?(k)\n1776:   }\n1777:   new_status[:node_attr] = node_attrs_to_v2(status[:node_attr])\n1778: \n1779:   resources = ClusterEntity::make_resources_tree(\n1780:     ClusterEntity::get_primitives_from_status_v1(status[:resources])\n1781:   )\n1782:   resources_hash = []\n1783:   resources.each { |r|\n1784:     resources_hash << r.to_status('2')\n1785:   }\n1786:   new_status[:resource_list] = resources_hash\n1787:   new_status[:node] = status.select { |k,_|\n1788:     [:uptime, :corosync, :pacemaker, :cman, :corosync_enabled,\n1789:      :pacemaker_enabled, :pcsd_enabled\n1790:     ].include?(k)\n1791:   }\n1792: \n1793:   new_status[:node].update(\n1794:     {\n1795:       :id => status[:node_id],\n1796:       :quorum => nil,\n1797:       :warning_list => [],\n1798:       :error_list => [],\n1799:       :status => (new_status[:node][:corosync] and\n1800:         new_status[:node][:pacemaker]) ? \"online\" : \"offline\",\n1801:       :status_version => '1'\n1802:     }\n1803:   )\n1804:   new_status[:status_version] = '1'\n1805: \n1806:   return new_status\n1807: end\n1808: \n1809: def allowed_for_local_cluster(auth_user, action)\n1810:   pcs_config = PCSConfig.new(Cfgsync::PcsdSettings.from_file().text())\n1811:   return pcs_config.permissions_local.allows?(\n1812:     auth_user[:username], auth_user[:usergroups], action\n1813:   )\n1814: end\n1815: \n1816: def allowed_for_superuser(auth_user)\n1817:   $logger.debug(\n1818:     \"permission check superuser username=#{auth_user[:username]} groups=#{auth_user[:usergroups]}\"\n1819:   )\n1820:   if SUPERUSER != auth_user[:username]\n1821:     $logger.debug('permission denied')\n1822:     return false\n1823:   end\n1824:   $logger.debug('permission granted for superuser')\n1825:   return true\n1826: end\n1827: \n1828: def get_default_overview_node_list(clustername)\n1829:   nodes = get_cluster_nodes clustername\n1830:   node_list = []\n1831:   nodes.each { |node|\n1832:     node_list << {\n1833:       'error_list' => [],\n1834:       'warning_list' => [],\n1835:       'status' => 'unknown',\n1836:       'quorum' => false,\n1837:       'name' => node\n1838:     }\n1839:   }\n1840:   return node_list\n1841: end\n1842: \n1843: def is_service_enabled?(service)\n1844:   if ISSYSTEMCTL\n1845:     cmd = ['systemctl', 'is-enabled', \"#{service}.service\"]\n1846:   else\n1847:     cmd = ['chkconfig', service]\n1848:   end\n1849:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1850:   return (retcode == 0)\n1851: end\n1852: \n1853: def is_service_running?(service)\n1854:   if ISSYSTEMCTL\n1855:     cmd = ['systemctl', 'status', \"#{service}.service\"]\n1856:   else\n1857:     cmd = ['service', service, 'status']\n1858:   end\n1859:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1860:   return (retcode == 0)\n1861: end\n1862: \n1863: def is_service_installed?(service)\n1864:   unless ISSYSTEMCTL\n1865:     raise NotImplementedException.new('Not supported on non systemd systems.')\n1866:   end\n1867:   stdout, _, retcode = run_cmd(\n1868:     PCSAuth.getSuperuserAuth(), PCS, 'resource', 'list', 'systemd'\n1869:   )\n1870:   if retcode != 0\n1871:     return nil\n1872:   end\n1873:   stdout.each { |line|\n1874:     if line.strip() == \"systemd:#{service}\"\n1875:       return true\n1876:     end\n1877:   }\n1878:   return false\n1879: end\n1880: \n1881: def enable_service(service)\n1882:   if ISSYSTEMCTL\n1883:     cmd = ['systemctl', 'enable', \"#{service}.service\"]\n1884:   else\n1885:     cmd = ['chkconfig', service, 'on']\n1886:   end\n1887:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1888:   return (retcode == 0)\n1889: end\n1890: \n1891: def disable_service(service)\n1892:   if ISSYSTEMCTL\n1893:     cmd = ['systemctl', 'disable', \"#{service}.service\"]\n1894:   else\n1895:     cmd = ['chkconfig', service, 'off']\n1896:   end\n1897:   _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1898:   return (retcode == 0)\n1899: end\n1900: \n1901: def set_cluster_prop_force(auth_user, prop, val)\n1902:   cmd = [PCS, 'property', 'set', \"#{prop}=#{val}\", '--force']\n1903:   if pacemaker_running?\n1904:     _, _, retcode = run_cmd(auth_user, *cmd)\n1905:   else\n1906:     cmd += ['-f', CIB_PATH]\n1907:     _, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1908:   end\n1909:   return (retcode == 0)\n1910: end\n1911: \n1912: def get_parsed_local_sbd_config()\n1913:   cmd = [PCS, 'stonith', 'sbd', 'local_config_in_json']\n1914:   out, _, retcode = run_cmd(PCSAuth.getSuperuserAuth(), *cmd)\n1915:   if retcode != 0\n1916:     return nil\n1917:   end\n1918:   begin\n1919:     return JSON.parse(out.join(' '))\n1920:   rescue JSON::ParserError\n1921:     return nil\n1922:   end\n1923: end",
+    "source_summary": "The function constructs a command using the PCS constant, which is defined as '/usr/sbin/pcs' in bootstrap.rb. The command executes 'pcs stonith sbd local_config_in_json' with superuser privileges via run_cmd function.",
+    "sink_summary": "The output of the command is parsed as JSON and returned. If the command fails or JSON parsing fails, nil is returned.",
+    "guard_summary": "The function does not perform any input validation or sanitization on the command output before parsing it as JSON. It relies on the security of the underlying 'pcs' command execution and its output format.",
+    "risk_pattern": "The function executes a system command with superuser privileges that is constructed using a hardcoded binary path. If an attacker could influence the environment or the pcs command behavior, it might lead to unauthorized access or information disclosure through the JSON parsing of command output.",
+    "used_variable_sources": [
+      "PCS"
+    ],
+    "called_function_context": [
+      "run_cmd(PCSAuth.getSuperuserAuth(), *cmd)"
+    ],
+    "enclosing_conditions": [],
+    "context_summary": "The function get_parsed_local_sbd_config executes a system command to retrieve SBD configuration in JSON format. It uses the PCS constant (defined as '/usr/sbin/pcs') to construct the command, runs it with superuser privileges, and attempts to parse the output as JSON.",
+    "unresolved_facts": [
+      "The exact security controls around the 'pcs stonith sbd local_config_in_json' command execution are not fully detailed in the provided context.",
+      "Whether the output of the 'pcs' command is subject to any sanitization or validation before being passed to JSON.parse."
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  "target_cwe": {
+    "cwe_id": "CWE-77",
+    "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+    "description": "The product constructs all or part of a command using externally-influenced input from an upstream component, but it does not neutralize or incorrectly neutralizes special elements that could modify the intended command when it is sent to a downstream component. Many protocols and products have their own custom command language. While OS or shell command strings are frequently discovered and ta...",
+    "impact": "code execution",
+    "patterns": [
+      "input_validation"
+    ],
+    "detection_indicators": [
+      "input_validation"
+    ],
+    "remediation_steps": [
+      "Use parameterized queries and prepared statements",
+      "Implement strict input validation with whitelisting"
+    ],
+    "related_cwes": [
+      "CWE-74"
+    ]
+  },
+  "stage3_hypothesis": {
+    "cwe_id": "CWE-77",
+    "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+    "fit_reason": "The function constructs a command using a hardcoded binary path '/usr/sbin/pcs' and executes it with superuser privileges. If an attacker could influence the environment or the pcs command behavior, it might lead to command injection.",
+    "proposal_source": "adaptive_bm25",
+    "retrieved_by_sast": true
+  }
+}

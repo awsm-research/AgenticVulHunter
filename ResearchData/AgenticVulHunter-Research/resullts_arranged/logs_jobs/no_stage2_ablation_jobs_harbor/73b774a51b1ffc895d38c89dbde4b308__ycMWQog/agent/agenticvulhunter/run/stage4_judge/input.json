@@ -1,0 +1,559 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "lib/expression/node/OperatorNode.js",
+    "changed_line": 72,
+    "statement": "if (typeof node.fn !== 'string' || !isSafeMethod(defs.math, node.fn)) {",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.9,
+    "code_context": "1: 'use strict';\n2: \n3: var latex = require('../../utils/latex');\n4: var map = require('../../utils/array').map;\n5: var join = require('../../utils/array').join;\n6: var stringify = require('../../utils/string').stringify;\n7: var isSafeMethod = require('../../utils/customs').isSafeMethod;\n8: var operators = require('../operators');\n9: \n10: function factory (type, config, load, typed, math) {\n11:   var register = load(require('./compile')).register;\n12:   var compile = load(require('./compile')).compile;\n13:   var Node         = load(require('./Node'));\n14:   var ConstantNode = load(require('./ConstantNode'));\n15:   var SymbolNode   = load(require('./SymbolNode'));\n16:   var FunctionNode = load(require('./FunctionNode'));\n17: \n18:   /**\n19:    * @constructor OperatorNode\n20:    * @extends {Node}\n21:    * An operator with two arguments, like 2+3\n22:    *\n23:    * @param {string} op           Operator name, for example '+'\n24:    * @param {string} fn           Function name, for example 'add'\n25:    * @param {Node[]} args         Operator arguments\n26:    * @param {boolean} [implicit]  Is this an implicit multiplication?\n27:    */\n28:   function OperatorNode(op, fn, args, implicit) {\n29:     if (!(this instanceof OperatorNode)) {\n30:       throw new SyntaxError('Constructor must be called with the new operator');\n31:     }\n32: \n33:     //validate input\n34:     if (typeof op !== 'string') {\n35:       throw new TypeError('string expected for parameter \"op\"');\n36:     }\n37:     if (typeof fn !== 'string') {\n38:       throw new TypeError('string expected for parameter \"fn\"');\n39:     }\n40:     if (!Array.isArray(args)\n41:         || !args.every(function (node) {return node && node.isNode;})) {\n42:       throw new TypeError('Array containing Nodes expected for parameter \"args\"');\n43:     }\n44: \n45:     this.implicit = (implicit === true);\n46:     this.op = op;\n47:     this.fn = fn;\n48:     this.args = args || [];\n49:   }\n50: \n51:   OperatorNode.prototype = new Node();\n52: \n53:   OperatorNode.prototype.type = 'OperatorNode';\n54: \n55:   OperatorNode.prototype.isOperatorNode = true;\n56: \n57:   /**\n58:    * Compile the node to javascript code\n59:    * @param {OperatorNode} node The node to be compiled\n60:    * @param {Object} defs     Object which can be used to define functions\n61:    *                          or constants globally available for the compiled\n62:    *                          expression\n63:    * @param {Object} args     Object with local function arguments, the key is\n64:    *                          the name of the argument, and the value is `true`.\n65:    *                          The object may not be mutated, but must be\n66:    *                          extended instead.\n67:    * @return {string} js\n68:    * @private\n69:    */\n70:   function compileOperatorNode(node, defs, args) {\n71:     // validate fn\n72:     if (typeof node.fn !== 'string' || !isSafeMethod(defs.math, node.fn)) {\n73:       if (!defs.math[node.fn]) {\n74:         throw new Error('Function ' + node.fn + ' missing in provided namespace \"math\"');\n75:       }\n76:       else {\n77:         throw new Error('No access to function \"' + node.fn + '\"');\n78:       }\n79:     }\n80: \n81:     var jsArgs = map(node.args, function (arg) {\n82:       return compile(arg, defs, args);\n83:     });\n84: \n85:     return 'math[' + stringify(node.fn) + '](' + join(jsArgs, ', ') + ')';\n86:   }\n87: \n88:   // register the compile function\n89:   register(OperatorNode.prototype.type, compileOperatorNode);\n90: \n91:   /**\n92:    * Execute a callback for each of the child nodes of this node\n93:    * @param {function(child: Node, path: string, parent: Node)} callback\n94:    */\n95:   OperatorNode.prototype.forEach = function (callback) {\n96:     for (var i = 0; i < this.args.length; i++) {\n97:       callback(this.args[i], 'args[' + i + ']', this);\n98:     }\n99:   };\n100: \n101:   /**\n102:    * Create a new OperatorNode having it's childs be the results of calling\n103:    * the provided callback function for each of the childs of the original node.\n104:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n105:    * @returns {OperatorNode} Returns a transformed copy of the node\n106:    */\n107:   OperatorNode.prototype.map = function (callback) {\n108:     var args = [];\n109:     for (var i = 0; i < this.args.length; i++) {\n110:       args[i] = this._ifNode(callback(this.args[i], 'args[' + i + ']', this));\n111:     }\n112:     return new OperatorNode(this.op, this.fn, args);\n113:   };\n114: \n115:   /**\n116:    * Create a clone of this node, a shallow copy\n117:    * @return {OperatorNode}\n118:    */\n119:   OperatorNode.prototype.clone = function () {\n120:     return new OperatorNode(this.op, this.fn, this.args.slice(0), this.implicit);\n121:   };\n122: \n123:   /**\n124:    * Calculate which parentheses are necessary. Gets an OperatorNode\n125:    * (which is the root of the tree) and an Array of Nodes\n126:    * (this.args) and returns an array where 'true' means that an argument\n127:    * has to be enclosed in parentheses whereas 'false' means the opposite.\n128:    *\n129:    * @param {OperatorNode} root\n130:    * @param {string} parenthesis\n131:    * @param {Node[]} args\n132:    * @param {boolean} latex\n133:    * @return {boolean[]}\n134:    * @private\n135:    */\n136:   function calculateNecessaryParentheses(root, parenthesis, args, latex) {\n137:     //precedence of the root OperatorNode\n138:     var precedence = operators.getPrecedence(root, parenthesis);\n139:     var associativity = operators.getAssociativity(root, parenthesis);\n140: \n141:     if ((parenthesis === 'all') || ((args.length > 2) && (root.getIdentifier() !== 'OperatorNode:add') && (root.getIdentifier() !== 'OperatorNode:multiply'))) {\n142:       var parens = args.map(function (arg) {\n143:         switch (arg.getContent().type) { //Nodes that don't need extra parentheses\n144:           case 'ArrayNode':\n145:           case 'ConstantNode':\n146:           case 'SymbolNode':\n147:           case 'ParenthesisNode':\n148:             return false;\n149:             break;\n150:           default:\n151:             return true;\n152:         }\n153:       });\n154:       return parens;\n155:     }\n156: \n157:     if (args.length === 0) {\n158:       return [];\n159:     } else if (args.length === 1) { //unary operators\n160:       //precedence of the operand\n161:       var operandPrecedence = operators.getPrecedence(args[0], parenthesis);\n162: \n163:       //handle special cases for LaTeX, where some of the parentheses aren't needed\n164:       if (latex && (operandPrecedence !== null)) {\n165:         var operandIdentifier;\n166:         var rootIdentifier;\n167:         if (parenthesis === 'keep') {\n168:           operandIdentifier = args[0].getIdentifier();\n169:           rootIdentifier = root.getIdentifier();\n170:         }\n171:         else {\n172:           //Ignore Parenthesis Nodes when not in 'keep' mode\n173:           operandIdentifier = args[0].getContent().getIdentifier();\n174:           rootIdentifier = root.getContent().getIdentifier();\n175:         }\n176:         if (operators.properties[precedence][rootIdentifier].latexLeftParens === false) {\n177:           return [false];\n178:         }\n179: \n180:         if (operators.properties[operandPrecedence][operandIdentifier].latexParens === false) {\n181:           return [false];\n182:         }\n183:       }\n184: \n185:       if (operandPrecedence === null) {\n186:         //if the operand has no defined precedence, no parens are needed\n187:         return [false];\n188:       }\n189: \n190:       if (operandPrecedence <= precedence) {\n191:         //if the operands precedence is lower, parens are needed\n192:         return [true];\n193:       }\n194: \n195:       //otherwise, no parens needed\n196:       return [false];\n197:     } else if (args.length === 2) { //binary operators\n198:       var lhsParens; //left hand side needs parenthesis?\n199:       //precedence of the left hand side\n200:       var lhsPrecedence = operators.getPrecedence(args[0], parenthesis);\n201:       //is the root node associative with the left hand side\n202:       var assocWithLhs = operators.isAssociativeWith(root, args[0], parenthesis);\n203: \n204:       if (lhsPrecedence === null) {\n205:         //if the left hand side has no defined precedence, no parens are needed\n206:         //FunctionNode for example\n207:         lhsParens = false;\n208:       }\n209:       else if ((lhsPrecedence === precedence) && (associativity === 'right') && !assocWithLhs) {\n210:         //In case of equal precedence, if the root node is left associative\n211:         // parens are **never** necessary for the left hand side.\n212:         //If it is right associative however, parens are necessary\n213:         //if the root node isn't associative with the left hand side\n214:         lhsParens = true;\n215:       }\n216:       else if (lhsPrecedence < precedence) {\n217:         lhsParens = true;\n218:       }\n219:       else {\n220:         lhsParens = false;\n221:       }",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "fit_reason": "The code performs a dynamic method call with user-controlled function name (node.fn) in a math expression context, which can lead to remote code execution if the validation is bypassed.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-754",
+        "cwe_name": "Improper Check for Unusual or Exceptional Conditions",
+        "fit_reason": "The code calls a method with a user-controlled name without proper validation, which may dispatch to an unexpected target and cause an exception.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-571",
+        "cwe_name": "Expression is Always True",
+        "fit_reason": "The code contains a typeof test against a string that will never succeed, making the condition always true and potentially leading to incorrect behavior.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-134",
+      "CWE-193",
+      "CWE-20",
+      "CWE-352",
+      "CWE-367",
+      "CWE-476",
+      "CWE-561",
+      "CWE-563",
+      "CWE-571",
+      "CWE-598",
+      "CWE-676",
+      "CWE-685",
+      "CWE-754",
+      "CWE-758",
+      "CWE-79",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "lib/expression/node/OperatorNode.js",
+    "changed_line": 85,
+    "statement": "return 'math[' + stringify(node.fn) + '](' + join(jsArgs, ', ') + ')';",
+    "change_type": "A",
+    "function_name": "compileOperatorNode",
+    "operation_type": "code_generation",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.9,
+    "code_context": "1: 'use strict';\n2: \n3: var latex = require('../../utils/latex');\n4: var map = require('../../utils/array').map;\n5: var join = require('../../utils/array').join;\n6: var stringify = require('../../utils/string').stringify;\n7: var isSafeMethod = require('../../utils/customs').isSafeMethod;\n8: var operators = require('../operators');\n9: \n10: function factory (type, config, load, typed, math) {\n11:   var register = load(require('./compile')).register;\n12:   var compile = load(require('./compile')).compile;\n13:   var Node         = load(require('./Node'));\n14:   var ConstantNode = load(require('./ConstantNode'));\n15:   var SymbolNode   = load(require('./SymbolNode'));\n16:   var FunctionNode = load(require('./FunctionNode'));\n17: \n18:   /**\n19:    * @constructor OperatorNode\n20:    * @extends {Node}\n21:    * An operator with two arguments, like 2+3\n22:    *\n23:    * @param {string} op           Operator name, for example '+'\n24:    * @param {string} fn           Function name, for example 'add'\n25:    * @param {Node[]} args         Operator arguments\n26:    * @param {boolean} [implicit]  Is this an implicit multiplication?\n27:    */\n28:   function OperatorNode(op, fn, args, implicit) {\n29:     if (!(this instanceof OperatorNode)) {\n30:       throw new SyntaxError('Constructor must be called with the new operator');\n31:     }\n32: \n33:     //validate input\n34:     if (typeof op !== 'string') {\n35:       throw new TypeError('string expected for parameter \"op\"');\n36:     }\n37:     if (typeof fn !== 'string') {\n38:       throw new TypeError('string expected for parameter \"fn\"');\n39:     }\n40:     if (!Array.isArray(args)\n41:         || !args.every(function (node) {return node && node.isNode;})) {\n42:       throw new TypeError('Array containing Nodes expected for parameter \"args\"');\n43:     }\n44: \n45:     this.implicit = (implicit === true);\n46:     this.op = op;\n47:     this.fn = fn;\n48:     this.args = args || [];\n49:   }\n50: \n51:   OperatorNode.prototype = new Node();\n52: \n53:   OperatorNode.prototype.type = 'OperatorNode';\n54: \n55:   OperatorNode.prototype.isOperatorNode = true;\n56: \n57:   /**\n58:    * Compile the node to javascript code\n59:    * @param {OperatorNode} node The node to be compiled\n60:    * @param {Object} defs     Object which can be used to define functions\n61:    *                          or constants globally available for the compiled\n62:    *                          expression\n63:    * @param {Object} args     Object with local function arguments, the key is\n64:    *                          the name of the argument, and the value is `true`.\n65:    *                          The object may not be mutated, but must be\n66:    *                          extended instead.\n67:    * @return {string} js\n68:    * @private\n69:    */\n70:   function compileOperatorNode(node, defs, args) {\n71:     // validate fn\n72:     if (typeof node.fn !== 'string' || !isSafeMethod(defs.math, node.fn)) {\n73:       if (!defs.math[node.fn]) {\n74:         throw new Error('Function ' + node.fn + ' missing in provided namespace \"math\"');\n75:       }\n76:       else {\n77:         throw new Error('No access to function \"' + node.fn + '\"');\n78:       }\n79:     }\n80: \n81:     var jsArgs = map(node.args, function (arg) {\n82:       return compile(arg, defs, args);\n83:     });\n84: \n85:     return 'math[' + stringify(node.fn) + '](' + join(jsArgs, ', ') + ')';\n86:   }\n87: \n88:   // register the compile function\n89:   register(OperatorNode.prototype.type, compileOperatorNode);\n90: \n91:   /**\n92:    * Execute a callback for each of the child nodes of this node\n93:    * @param {function(child: Node, path: string, parent: Node)} callback\n94:    */\n95:   OperatorNode.prototype.forEach = function (callback) {\n96:     for (var i = 0; i < this.args.length; i++) {\n97:       callback(this.args[i], 'args[' + i + ']', this);\n98:     }\n99:   };\n100: \n101:   /**\n102:    * Create a new OperatorNode having it's childs be the results of calling\n103:    * the provided callback function for each of the childs of the original node.\n104:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n105:    * @returns {OperatorNode} Returns a transformed copy of the node\n106:    */\n107:   OperatorNode.prototype.map = function (callback) {\n108:     var args = [];\n109:     for (var i = 0; i < this.args.length; i++) {\n110:       args[i] = this._ifNode(callback(this.args[i], 'args[' + i + ']', this));\n111:     }\n112:     return new OperatorNode(this.op, this.fn, args);\n113:   };\n114: \n115:   /**\n116:    * Create a clone of this node, a shallow copy\n117:    * @return {OperatorNode}\n118:    */\n119:   OperatorNode.prototype.clone = function () {\n120:     return new OperatorNode(this.op, this.fn, this.args.slice(0), this.implicit);\n121:   };\n122: \n123:   /**\n124:    * Calculate which parentheses are necessary. Gets an OperatorNode\n125:    * (which is the root of the tree) and an Array of Nodes\n126:    * (this.args) and returns an array where 'true' means that an argument\n127:    * has to be enclosed in parentheses whereas 'false' means the opposite.\n128:    *\n129:    * @param {OperatorNode} root\n130:    * @param {string} parenthesis\n131:    * @param {Node[]} args\n132:    * @param {boolean} latex\n133:    * @return {boolean[]}\n134:    * @private\n135:    */\n136:   function calculateNecessaryParentheses(root, parenthesis, args, latex) {\n137:     //precedence of the root OperatorNode\n138:     var precedence = operators.getPrecedence(root, parenthesis);\n139:     var associativity = operators.getAssociativity(root, parenthesis);\n140: \n141:     if ((parenthesis === 'all') || ((args.length > 2) && (root.getIdentifier() !== 'OperatorNode:add') && (root.getIdentifier() !== 'OperatorNode:multiply'))) {\n142:       var parens = args.map(function (arg) {\n143:         switch (arg.getContent().type) { //Nodes that don't need extra parentheses\n144:           case 'ArrayNode':\n145:           case 'ConstantNode':\n146:           case 'SymbolNode':\n147:           case 'ParenthesisNode':\n148:             return false;\n149:             break;\n150:           default:\n151:             return true;\n152:         }\n153:       });\n154:       return parens;\n155:     }\n156: \n157:     if (args.length === 0) {\n158:       return [];\n159:     } else if (args.length === 1) { //unary operators\n160:       //precedence of the operand\n161:       var operandPrecedence = operators.getPrecedence(args[0], parenthesis);\n162: \n163:       //handle special cases for LaTeX, where some of the parentheses aren't needed\n164:       if (latex && (operandPrecedence !== null)) {\n165:         var operandIdentifier;\n166:         var rootIdentifier;\n167:         if (parenthesis === 'keep') {\n168:           operandIdentifier = args[0].getIdentifier();\n169:           rootIdentifier = root.getIdentifier();\n170:         }\n171:         else {\n172:           //Ignore Parenthesis Nodes when not in 'keep' mode\n173:           operandIdentifier = args[0].getContent().getIdentifier();\n174:           rootIdentifier = root.getContent().getIdentifier();\n175:         }\n176:         if (operators.properties[precedence][rootIdentifier].latexLeftParens === false) {\n177:           return [false];\n178:         }\n179: \n180:         if (operators.properties[operandPrecedence][operandIdentifier].latexParens === false) {\n181:           return [false];\n182:         }\n183:       }\n184: \n185:       if (operandPrecedence === null) {\n186:         //if the operand has no defined precedence, no parens are needed\n187:         return [false];\n188:       }\n189: \n190:       if (operandPrecedence <= precedence) {\n191:         //if the operands precedence is lower, parens are needed\n192:         return [true];\n193:       }\n194: \n195:       //otherwise, no parens needed\n196:       return [false];\n197:     } else if (args.length === 2) { //binary operators\n198:       var lhsParens; //left hand side needs parenthesis?\n199:       //precedence of the left hand side\n200:       var lhsPrecedence = operators.getPrecedence(args[0], parenthesis);\n201:       //is the root node associative with the left hand side\n202:       var assocWithLhs = operators.isAssociativeWith(root, args[0], parenthesis);\n203: \n204:       if (lhsPrecedence === null) {\n205:         //if the left hand side has no defined precedence, no parens are needed\n206:         //FunctionNode for example\n207:         lhsParens = false;\n208:       }\n209:       else if ((lhsPrecedence === precedence) && (associativity === 'right') && !assocWithLhs) {\n210:         //In case of equal precedence, if the root node is left associative\n211:         // parens are **never** necessary for the left hand side.\n212:         //If it is right associative however, parens are necessary\n213:         //if the root node isn't associative with the left hand side\n214:         lhsParens = true;\n215:       }\n216:       else if (lhsPrecedence < precedence) {\n217:         lhsParens = true;\n218:       }\n219:       else {\n220:         lhsParens = false;\n221:       }\n222: \n223:       var rhsParens; //right hand side needs parenthesis?\n224:       //precedence of the right hand side\n225:       var rhsPrecedence = operators.getPrecedence(args[1], parenthesis);\n226:       //is the root node associative with the right hand side?\n227:       var assocWithRhs = operators.isAssociativeWith(root, args[1], parenthesis);\n228: \n229:       if (rhsPrecedence === null) {\n230:         //if the right hand side has no defined precedence, no parens are needed\n231:         //FunctionNode for example\n232:         rhsParens = false;\n233:       }\n234:       else if ((rhsPrecedence === precedence) && (associativity === 'left') && !assocWithRhs) {",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "fit_reason": "The code generates javascript code dynamically using 'math[' + stringify(node.fn) + ']' which allows for code injection if node.fn is not properly validated.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-754",
+        "cwe_name": "Improper Check for Unusual or Exceptional Conditions",
+        "fit_reason": "The code performs a dynamic method call with 'math[node.fn]' without sufficient validation of the function name, which could lead to unexpected behavior or exceptions.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-676",
+        "cwe_name": "Use of Potentially Dangerous Function",
+        "fit_reason": "The code uses a mechanism that effectively executes strings as code through dynamic function invocation, similar to eval, which is dangerous.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-193",
+      "CWE-219",
+      "CWE-352",
+      "CWE-367",
+      "CWE-561",
+      "CWE-563",
+      "CWE-584",
+      "CWE-676",
+      "CWE-685",
+      "CWE-704",
+      "CWE-754",
+      "CWE-79",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "lib/expression/node/ObjectNode.js",
+    "changed_line": 57,
+    "statement": "if (!isSafeProperty(key)) {",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.8,
+    "code_context": "1: 'use strict';\n2: \n3: var stringify = require('../../utils/string').stringify;\n4: var isSafeProperty = require('../../utils/customs').isSafeProperty;\n5: var hasOwnProperty = require('../../utils/object').hasOwnProperty;\n6: \n7: function factory (type, config, load, typed) {\n8:   var register = load(require('./compile')).register;\n9:   var compile = load(require('./compile')).compile;\n10:   var Node = load(require('./Node'));\n11: \n12:   /**\n13:    * @constructor ObjectNode\n14:    * @extends {Node}\n15:    * Holds an object with keys/values\n16:    * @param {Object.<string, Node>} [properties]   array with key/value pairs\n17:    */\n18:   function ObjectNode(properties) {\n19:     if (!(this instanceof ObjectNode)) {\n20:       throw new SyntaxError('Constructor must be called with the new operator');\n21:     }\n22: \n23:     this.properties = properties || {};\n24: \n25:     // validate input\n26:     if (properties) {\n27:       if (!(typeof properties === 'object') || Object.keys(properties).some(function (key) {\n28:             return !properties[key] || !properties[key].isNode;\n29:           })) {\n30:         throw new TypeError('Object containing Nodes expected');\n31:       }\n32:     }\n33:   }\n34: \n35:   ObjectNode.prototype = new Node();\n36: \n37:   ObjectNode.prototype.type = 'ObjectNode';\n38: \n39:   ObjectNode.prototype.isObjectNode = true;\n40: \n41:   /**\n42:    * Compile the node to javascript code\n43:    * @param {ObjectNode} node The node to be compiled\n44:    * @param {Object} defs     Object which can be used to define functions\n45:    *                          or constants globally available for the compiled\n46:    *                          expression\n47:    * @param {Object} args     Object with local function arguments, the key is\n48:    *                          the name of the argument, and the value is `true`.\n49:    *                          The object may not be mutated, but must be\n50:    *                          extended instead.\n51:    * @return {string} code\n52:    * @private\n53:    */\n54:   function compileObjectNode(node, defs, args) {\n55:     var entries = [];\n56:     for (var key in node.properties) {\n57:       if (!isSafeProperty(key)) {\n58:         throw new Error('No access to property \"' + key + '\"');\n59:       }\n60: \n61:       if (hasOwnProperty(node.properties, key)) {\n62:         entries.push(stringify(key) + ': ' + compile(node.properties[key], defs, args));\n63:       }\n64:     }\n65:     return '{' + entries.join(', ') + '}';\n66:   }\n67: \n68:   // register the compile function\n69:   register(ObjectNode.prototype.type, compileObjectNode);\n70: \n71:   /**\n72:    * Execute a callback for each of the child nodes of this node\n73:    * @param {function(child: Node, path: string, parent: Node)} callback\n74:    */\n75:   ObjectNode.prototype.forEach = function (callback) {\n76:     for (var key in this.properties) {\n77:       if (this.properties.hasOwnProperty(key)) {\n78:         callback(this.properties[key], 'properties[' + stringify(key) + ']', this);\n79:       }\n80:     }\n81:   };\n82: \n83:   /**\n84:    * Create a new ObjectNode having it's childs be the results of calling\n85:    * the provided callback function for each of the childs of the original node.\n86:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n87:    * @returns {ObjectNode} Returns a transformed copy of the node\n88:    */\n89:   ObjectNode.prototype.map = function (callback) {\n90:     var properties = {};\n91:     for (var key in this.properties) {\n92:       if (this.properties.hasOwnProperty(key)) {\n93:         properties[key] = this._ifNode(callback(this.properties[key],\n94:             'properties[' + stringify(key) + ']', this));\n95:       }\n96:     }\n97:     return new ObjectNode(properties);\n98:   };\n99: \n100:   /**\n101:    * Create a clone of this node, a shallow copy\n102:    * @return {ObjectNode}\n103:    */\n104:   ObjectNode.prototype.clone = function() {\n105:     var properties = {};\n106:     for (var key in this.properties) {\n107:       if (this.properties.hasOwnProperty(key)) {\n108:         properties[key] = this.properties[key];\n109:       }\n110:     }\n111:     return new ObjectNode(properties);\n112:   };\n113: \n114:   /**\n115:    * Get string representation\n116:    * @param {Object} options\n117:    * @return {string} str\n118:    * @override\n119:    */\n120:   ObjectNode.prototype._toString = function(options) {\n121:     var entries = [];\n122:     for (var key in this.properties) {\n123:       if (this.properties.hasOwnProperty(key)) {\n124:         entries.push(stringify(key) + ': ' + this.properties[key].toString(options));\n125:       }\n126:     }\n127:     return '{' + entries.join(', ') + '}';\n128:   };\n129: \n130:   /**\n131:    * Get LaTeX representation\n132:    * @param {Object} options\n133:    * @return {string} str\n134:    */\n135:   ObjectNode.prototype._toTex = function(options) {\n136:     var entries = [];\n137:     for (var key in this.properties) {\n138:       if (this.properties.hasOwnProperty(key)) {\n139:         entries.push(\"\\\\mathbf{\" + key + ':} & ' + this.properties[key].toTex(options) + \"\\\\\\\\\");\n140:       }\n141:     }\n142:     return '\\\\left\\\\{\\\\begin{array}{ll}' + entries.join('\\n') + '\\\\end{array}\\\\right\\\\}';\n143:   };\n144: \n145:   return ObjectNode;\n146: }\n147: \n148: exports.name = 'ObjectNode';\n149: exports.path = 'expression.node';\n150: exports.factory = factory;",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-807",
+        "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+        "fit_reason": "The code makes a security-sensitive decision based on user-controlled object property keys without proper validation, matching the mechanism of relying on untrusted inputs for security decisions.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-1321",
+        "cwe_name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+        "fit_reason": "While the code does not directly modify prototypes, the use of user-controlled keys in object property access could potentially lead to prototype pollution if not properly sanitized, and this CWE is strongly supported by the evidence.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-79",
+        "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+        "fit_reason": "If user-controlled keys are used in a context where they might be rendered in HTML, this could lead to XSS vulnerabilities, though less directly than the other mechanisms.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-1321",
+      "CWE-193",
+      "CWE-310",
+      "CWE-326",
+      "CWE-352",
+      "CWE-367",
+      "CWE-400",
+      "CWE-476",
+      "CWE-561",
+      "CWE-563",
+      "CWE-639",
+      "CWE-704",
+      "CWE-79",
+      "CWE-807",
+      "CWE-834",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-4",
+    "filepath": "lib/expression/node/compile.js",
+    "changed_line": 41,
+    "statement": "if (hasOwnProperty(compileFunctions, node.type)) {",
+    "change_type": "A",
+    "function_name": "compile",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.8,
+    "code_context": "1: // the compile functions which compile a Node into JavaScript are not\n2: // exposed as class methods for security reasons to prevent being able to\n3: // override them or create fake Nodes. Instead, only compile functions of\n4: // registered nodes can be executed\n5: \n6: var hasOwnProperty = require('../../utils/object').hasOwnProperty;\n7: \n8: function factory () {\n9:   // map with node type as key and compile functions as value\n10:   var compileFunctions = {}\n11: \n12:   /**\n13:    * Register a compile function for a node\n14:    * @param {string} type\n15:    * @param {function} compileFunction\n16:    *                      The compile function, invoked as\n17:    *                      compileFunction(node, defs, args)\n18:    */\n19:   function register(type, compileFunction) {\n20:     if (compileFunctions[type] === undefined) {\n21:       compileFunctions[type] = compileFunction;\n22:     }\n23:     else {\n24:       throw new Error('Cannot register type \"' + type + '\": already exists');\n25:     }\n26:   }\n27: \n28:   /**\n29:    * Compile a Node into JavaScript\n30:    * @param {Node} node\n31:    * @param {Object} defs     Object which can be used to define functions\n32:    *                          or constants globally available for the compiled\n33:    *                          expression\n34:    * @param {Object} args     Object with local function arguments, the key is\n35:    *                          the name of the argument, and the value is `true`.\n36:    *                          The object may not be mutated, but must be\n37:    *                          extended instead.\n38:    * @return {string} Returns JavaScript code\n39:    */\n40:   function compile (node, defs, args) {\n41:     if (hasOwnProperty(compileFunctions, node.type)) {\n42:       var compileFunction = compileFunctions[node.type];\n43:       return compileFunction(node, defs, args);\n44:     }\n45:     else if (typeof node._compile === 'function' &&\n46:         !hasOwnProperty(node, '_compile')) {\n47:       // Compatibility for CustomNodes\n48:       // TODO: this is a security risk, change it such that you have to register CustomNodes separately in math.js, like math.expression.node.register(MyCustomNode)\n49:       return node._compile(defs, args);\n50:     }\n51:     else {\n52:       throw new Error('Cannot compile node: unknown type \"' + node.type + '\"');\n53:     }\n54:   }\n55: \n56:   return {\n57:     register: register,\n58:     compile: compile\n59:   }\n60: }\n61: \n62: exports.factory = factory;",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "fit_reason": "The code allows execution of compile functions based on node.type, which can lead to arbitrary code execution if node.type is controlled by an attacker.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "The code uses hasOwnProperty check but does not properly validate or restrict the node.type, allowing unauthorized access to compile functions.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-502",
+        "cwe_name": "Deserialization of Untrusted Data",
+        "fit_reason": "If node objects are deserialized from untrusted input, they could contain malicious node.types that lead to code execution.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-830",
+        "cwe_name": "Inclusion of Web Functionality from an Untrusted Source",
+        "fit_reason": "The code includes functionality (compile functions) from potentially untrusted sources via node.type, which can lead to arbitrary code execution.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-79",
+        "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+        "fit_reason": "If the compiled JavaScript is used in a web context and node.type controls script generation, it could lead to XSS if not properly sanitized.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-193",
+      "CWE-367",
+      "CWE-502",
+      "CWE-561",
+      "CWE-563",
+      "CWE-601",
+      "CWE-704",
+      "CWE-758",
+      "CWE-79",
+      "CWE-807",
+      "CWE-829",
+      "CWE-830",
+      "CWE-843",
+      "CWE-863",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-5",
+    "filepath": "lib/expression/node/FunctionNode.js",
+    "changed_line": 104,
+    "statement": "return jsFn + '(' + join(jsArgs, ', ') + ')';              // \"regular\" evaluation",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_execution",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.7,
+    "code_context": "1: 'use strict';\n2: \n3: var latex = require('../../utils/latex');\n4: var stringify = require('../../utils/string').stringify;\n5: var extend = require('../../utils/object').extend;\n6: var hasOwnProperty = require('../../utils/object').hasOwnProperty;\n7: var map = require('../../utils/array').map;\n8: var join = require('../../utils/array').join;\n9: var validateSafeMethod = require('../../utils/customs').validateSafeMethod;\n10: var getUniqueArgumentsName = require('./utils/getUniqueArgumentsName');\n11: \n12: function factory (type, config, load, typed, math) {\n13:   var register = load(require('./compile')).register;\n14:   var compile = load(require('./compile')).compile;\n15:   var Node = load(require('./Node'));\n16:   var SymbolNode = load(require('./SymbolNode'));\n17: \n18:   /**\n19:    * @constructor FunctionNode\n20:    * @extends {./Node}\n21:    * invoke a list with arguments on a node\n22:    * @param {./Node | string} fn Node resolving with a function on which to invoke\n23:    *                             the arguments, typically a SymboNode or AccessorNode\n24:    * @param {./Node[]} args\n25:    */\n26:   function FunctionNode(fn, args) {\n27:     if (!(this instanceof FunctionNode)) {\n28:       throw new SyntaxError('Constructor must be called with the new operator');\n29:     }\n30: \n31:     if (typeof fn === 'string') {\n32:       fn = new SymbolNode(fn);\n33:     }\n34: \n35:     // validate input\n36:     if (!fn || !fn.isNode) throw new TypeError('Node expected as parameter \"fn\"');\n37:     if (!Array.isArray(args)\n38:         || !args.every(function (arg) {return arg && arg.isNode;})) {\n39:       throw new TypeError('Array containing Nodes expected for parameter \"args\"');\n40:     }\n41: \n42:     this.fn = fn;\n43:     this.args = args || [];\n44: \n45:     // readonly property name\n46:     Object.defineProperty(this, 'name', {\n47:       get: function () {\n48:         return this.fn.name || '';\n49:       }.bind(this),\n50:       set: function () {\n51:         throw new Error('Cannot assign a new name, name is read-only');\n52:       }\n53:     });\n54: \n55:     // TODO: deprecated since v3, remove some day\n56:     var deprecated = function () {\n57:       throw new Error('Property `FunctionNode.object` is deprecated, use `FunctionNode.fn` instead');\n58:     };\n59:     Object.defineProperty(this, 'object', { get: deprecated, set: deprecated });\n60:   }\n61: \n62:   FunctionNode.prototype = new Node();\n63: \n64:   FunctionNode.prototype.type = 'FunctionNode';\n65: \n66:   FunctionNode.prototype.isFunctionNode = true;\n67: \n68:   /**\n69:    * Compile the node to javascript code\n70:    * @param {FunctionNode} node The node to be compiled\n71:    * @param {Object} defs     Object which can be used to define functions\n72:    *                          or constants globally available for the compiled\n73:    *                          expression\n74:    * @param {Object} args     Object with local function arguments, the key is\n75:    *                          the name of the argument, and the value is `true`.\n76:    *                          The object may not be mutated, but must be\n77:    *                          extended instead.\n78:    * @return {string} js\n79:    * @private\n80:    */\n81:   function compileFunctionNode(node, defs, args) {\n82:     // compile fn and arguments\n83:     var jsFn = compile(node.fn, defs, args);\n84:     var jsArgs = map(node.args, function (arg) {\n85:       return compile(arg, defs, args);\n86:     });\n87:     var jsScope = compileScope(defs, args);\n88:     var argsName;\n89: \n90:     if (node.fn.isSymbolNode) {\n91:       // we can statically determine whether the function has an rawArgs property\n92:       var name = node.fn.name;\n93:       var fn = defs.math[name];\n94:       var isRaw = (typeof fn === 'function') && (fn.rawArgs == true);\n95: \n96:       if (isRaw) {\n97:         // pass unevaluated parameters (nodes) to the function\n98:         argsName = getUniqueArgumentsName(defs);\n99:         defs[argsName] = node.args;\n100: \n101:         return jsFn + '(' + argsName + ', math, ' + jsScope + ')'; // \"raw\" evaluation\n102:       }\n103:       else {\n104:         return jsFn + '(' + join(jsArgs, ', ') + ')';              // \"regular\" evaluation\n105:       }\n106:     }\n107:     else if (node.fn.isAccessorNode && node.fn.index.isObjectProperty()) {\n108:       // execute the function with the right context: the object of the AccessorNode\n109:       argsName = getUniqueArgumentsName(defs);\n110:       defs[argsName] = node.args;\n111:       defs.validateSafeMethod = validateSafeMethod\n112: \n113:       var jsObject = compile(node.fn.object, defs, args);\n114:       var jsProp = stringify(node.fn.index.getObjectProperty());\n115: \n116:       return '(function () {' +\n117:           'var object = ' + jsObject + ';' +\n118:           'validateSafeMethod(object, ' + jsProp + ');' +\n119:           'return (object[' + jsProp + '] && object[' + jsProp + '].rawArgs) ' +\n120:           ' ? object[' + jsProp + '](' + argsName + ', math, ' + jsScope + ')' + // \"raw\" evaluation\n121:           ' : object[' + jsProp + '](' + join(jsArgs, ', ') + ')' +              // \"regular\" evaluation\n122:           '})()';\n123:     }\n124:     else { // node.fn.isAccessorNode && !node.fn.index.isObjectProperty()\n125:       // we have to dynamically determine whether the function has a rawArgs property\n126:       argsName = getUniqueArgumentsName(defs);\n127:       defs[argsName] = node.args;\n128: \n129:       return '(function () {' +\n130:           'var fn = ' + jsFn + ';' +\n131:           'return (fn && fn.rawArgs) ' +\n132:           ' ? fn(' + argsName + ', math, ' + jsScope + ')' +  // \"raw\" evaluation\n133:           ' : fn(' + join(jsArgs, ', ') + ')' +               // \"regular\" evaluation\n134:           '})()';\n135:     }\n136:   }\n137: \n138:   // register the compile function\n139:   register(FunctionNode.prototype.type, compileFunctionNode);\n140: \n141:   /**\n142:    * Merge function arguments into scope before passing to the actual function.\n143:    * This is needed when the function has `rawArgs=true`. In that case we have\n144:    * to pass the `scope` as third argument, including any variables of\n145:    * enclosing functions.\n146:    * @param {Object} defs     Object which can be used to define functions\n147:    *                          or constants globally available for the compiled\n148:    *                          expression\n149:    * @param {Object} args     Object with local function arguments, the key is\n150:    *                          the name of the argument, and the value is `true`.\n151:    *                          The object may not be mutated, but must be\n152:    *                          extended instead.\n153:    * @return {string} js\n154:    * @private\n155:    */\n156:   function compileScope (defs, args) {\n157:     var names = Object.keys(args);\n158:     if (names.length === 0) {\n159:       return 'scope';\n160:     }\n161:     else {\n162:       // merge arguments into scope\n163:       defs.extend = extend;\n164: \n165:       var jsArgs = map(names, function (arg) {\n166:           return stringify(arg) + ': ' + arg;\n167:         });\n168: \n169:       return 'extend(extend({}, scope), {' + join(jsArgs, ', ') + '})';\n170:     }\n171:   }\n172: \n173:   /**\n174:    * Execute a callback for each of the child nodes of this node\n175:    * @param {function(child: Node, path: string, parent: Node)} callback\n176:    */\n177:   FunctionNode.prototype.forEach = function (callback) {\n178:     for (var i = 0; i < this.args.length; i++) {\n179:       callback(this.args[i], 'args[' + i + ']', this);\n180:     }\n181:   };\n182: \n183:   /**\n184:    * Create a new FunctionNode having it's childs be the results of calling\n185:    * the provided callback function for each of the childs of the original node.\n186:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n187:    * @returns {FunctionNode} Returns a transformed copy of the node\n188:    */\n189:   FunctionNode.prototype.map = function (callback) {\n190:     var fn = this.fn.map(callback);\n191:     var args = [];\n192:     for (var i = 0; i < this.args.length; i++) {\n193:       args[i] = this._ifNode(callback(this.args[i], 'args[' + i + ']', this));\n194:     }\n195:     return new FunctionNode(fn, args);\n196:   };\n197: \n198:   /**\n199:    * Create a clone of this node, a shallow copy\n200:    * @return {FunctionNode}\n201:    */\n202:   FunctionNode.prototype.clone = function () {\n203:     return new FunctionNode(this.fn, this.args.slice(0));\n204:   };\n205: \n206:   //backup Node's toString function\n207:   //@private\n208:   var nodeToString = FunctionNode.prototype.toString;\n209: \n210:   /**\n211:    * Get string representation. (wrapper function)\n212:    * This overrides parts of Node's toString function.\n213:    * If callback is an object containing callbacks, it\n214:    * calls the correct callback for the current node,\n215:    * otherwise it falls back to calling Node's toString\n216:    * function.\n217:    *\n218:    * @param {Object} options\n219:    * @return {string} str\n220:    * @override\n221:    */\n222:   FunctionNode.prototype.toString = function (options) {\n223:     var customString;\n224:     var name = this.fn.toString(options);\n225:     if (options && (typeof options.handler === 'object') && hasOwnProperty(options.handler, name)) {\n226:       //callback is a map of callback functions\n227:       customString = options.handler[name](this, options);\n228:     }\n229: \n230:     if (typeof customString !== 'undefined') {\n231:       return customString;\n232:     }\n233: \n234:     //fall back to Node's toString\n235:     return nodeToString.call(this, options);\n236:   };\n237: \n238:   /**\n239:    * Get string representation\n240:    * @param {Object} options\n241:    * @return {string} str\n242:    */\n243:   FunctionNode.prototype._toString = function (options) {\n244:     var args = this.args.map(function (arg) {\n245:       return arg.toString(options);\n246:     });\n247: \n248:     // format the arguments like \"add(2, 4.2)\"\n249:     return this.fn.toString(options) + '(' + args.join(', ') + ')';\n250:   };\n251: \n252:   /*\n253:    * Expand a LaTeX template",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "fit_reason": "The code dynamically compiles and executes user-supplied functions (FunctionNode) with user-provided arguments, which directly matches the mechanism of code injection where untrusted input is used to generate executable code.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-754",
+        "cwe_name": "Improper Check for Unusual or Exceptional Conditions",
+        "fit_reason": "The code performs dynamic method calls with user-controlled names without proper validation, which could lead to unexpected behavior or exceptions when dispatching to unintended targets.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-685",
+        "cwe_name": "Function Call With Incorrect Number of Arguments",
+        "fit_reason": "The code handles function arguments dynamically and may pass incorrect number of arguments during compilation, especially in the 'raw' evaluation path where arguments are passed differently.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-193",
+      "CWE-20",
+      "CWE-352",
+      "CWE-367",
+      "CWE-400",
+      "CWE-561",
+      "CWE-563",
+      "CWE-584",
+      "CWE-676",
+      "CWE-685",
+      "CWE-704",
+      "CWE-754",
+      "CWE-807",
+      "CWE-88",
+      "CWE-93",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-6",
+    "filepath": "lib/expression/node/FunctionAssignmentNode.js",
+    "changed_line": 88,
+    "statement": "'      ' + stringify(join(node.types, ',')) + ': function (' + join(node.params, ',') + ') {' +",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_execution",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.7,
+    "code_context": "1: 'use strict';\n2: \n3: var keywords = require('../keywords');\n4: var stringify = require('../../utils/string').stringify;\n5: var forEach = require('../../utils/array').forEach;\n6: var join = require('../../utils/array').join;\n7: var latex = require('../../utils/latex');\n8: var operators = require('../operators');\n9: var setSafeProperty = require('../../utils/customs').setSafeProperty;\n10: \n11: function factory (type, config, load, typed) {\n12:   var register = load(require('./compile')).register;\n13:   var compile = load(require('./compile')).compile;\n14:   var Node = load(require('./Node'));\n15: \n16:   /**\n17:    * @constructor FunctionAssignmentNode\n18:    * @extends {Node}\n19:    * Function assignment\n20:    *\n21:    * @param {string} name           Function name\n22:    * @param {string[] | Array.<{name: string, type: string}>} params\n23:    *                                Array with function parameter names, or an\n24:    *                                array with objects containing the name\n25:    *                                and type of the parameter\n26:    * @param {Node} expr             The function expression\n27:    */\n28:   function FunctionAssignmentNode(name, params, expr) {\n29:     if (!(this instanceof FunctionAssignmentNode)) {\n30:       throw new SyntaxError('Constructor must be called with the new operator');\n31:     }\n32: \n33:     // validate input\n34:     if (typeof name !== 'string') throw new TypeError('String expected for parameter \"name\"');\n35:     if (!Array.isArray(params))  throw new TypeError('Array containing strings or objects expected for parameter \"params\"');\n36:     if (!(expr && expr.isNode)) throw new TypeError('Node expected for parameter \"expr\"');\n37:     if (name in keywords) throw new Error('Illegal function name, \"' + name + '\" is a reserved keyword');\n38: \n39:     this.name = name;\n40:     this.params = params.map(function (param) {\n41:       return param && param.name || param;\n42:     });\n43:     this.types = params.map(function (param) {\n44:       return param && param.type || 'any'\n45:     });\n46:     this.expr = expr;\n47:   }\n48: \n49:   FunctionAssignmentNode.prototype = new Node();\n50: \n51:   FunctionAssignmentNode.prototype.type = 'FunctionAssignmentNode';\n52: \n53:   FunctionAssignmentNode.prototype.isFunctionAssignmentNode = true;\n54: \n55:   /**\n56:    * Compile the node to javascript code\n57:    * @param {FunctionAssignmentNode} node The node to be compiled\n58:    * @param {Object} defs     Object which can be used to define functions\n59:    *                          or constants globally available for the compiled\n60:    *                          expression\n61:    * @param {Object} args     Object with local function arguments, the key is\n62:    *                          the name of the argument, and the value is `true`.\n63:    *                          The object may not be mutated, but must be\n64:    *                          extended instead.\n65:    * @return {string} js\n66:    * @private\n67:    */\n68:   function compileFunctionAssignmentNode(node, defs, args) {\n69:     defs.typed = typed;\n70:     defs.setSafeProperty = setSafeProperty;\n71: \n72:     // validate params\n73:     // FIXME: rename parameters to safe, internal names\n74: \n75:     // we extend the original args and add the args to the child object\n76:     var childArgs = Object.create(args);\n77:     forEach(node.params, function (variable) {\n78:       childArgs[variable] = true;\n79:     });\n80: \n81:     // compile the function expression with the child args\n82:     var jsExpr = compile(node.expr, defs, childArgs);\n83:     var jsName = stringify(node.name);\n84: \n85:     return 'setSafeProperty(scope, ' + jsName + ', ' +\n86:         '  (function () {' +\n87:         '    var fn = typed(' + jsName + ', {' +\n88:         '      ' + stringify(join(node.types, ',')) + ': function (' + join(node.params, ',') + ') {' +\n89:         '        return ' + jsExpr + '' +\n90:         '      }' +\n91:         '    });' +\n92:         '    fn.syntax = ' + stringify(node.name + '(' + join(node.params, ', ') + ')') + ';' +\n93:         '    return fn;' +\n94:         '  })())';\n95:   }\n96: \n97:   // register the compile function\n98:   register(FunctionAssignmentNode.prototype.type, compileFunctionAssignmentNode);\n99: \n100:   /**\n101:    * Execute a callback for each of the child nodes of this node\n102:    * @param {function(child: Node, path: string, parent: Node)} callback\n103:    */\n104:   FunctionAssignmentNode.prototype.forEach = function (callback) {\n105:     callback(this.expr, 'expr', this);\n106:   };\n107: \n108:   /**\n109:    * Create a new FunctionAssignmentNode having it's childs be the results of calling\n110:    * the provided callback function for each of the childs of the original node.\n111:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n112:    * @returns {FunctionAssignmentNode} Returns a transformed copy of the node\n113:    */\n114:   FunctionAssignmentNode.prototype.map = function (callback) {\n115:     var expr = this._ifNode(callback(this.expr, 'expr', this));\n116: \n117:     return new FunctionAssignmentNode(this.name, this.params.slice(0), expr);\n118:   };\n119: \n120:   /**\n121:    * Create a clone of this node, a shallow copy\n122:    * @return {FunctionAssignmentNode}\n123:    */\n124:   FunctionAssignmentNode.prototype.clone = function () {\n125:     return new FunctionAssignmentNode(this.name, this.params.slice(0), this.expr);\n126:   };\n127: \n128:   /**\n129:    * Is parenthesis needed?\n130:    * @param {Node} node\n131:    * @param {Object} parenthesis\n132:    * @private\n133:    */\n134:   function needParenthesis(node, parenthesis) {\n135:     var precedence = operators.getPrecedence(node, parenthesis);\n136:     var exprPrecedence = operators.getPrecedence(node.expr, parenthesis);\n137: \n138:     return (parenthesis === 'all')\n139:       || ((exprPrecedence !== null) && (exprPrecedence <= precedence));\n140:   }\n141: \n142:   /**\n143:    * get string representation\n144:    * @param {Object} options\n145:    * @return {string} str\n146:    */\n147:   FunctionAssignmentNode.prototype._toString = function (options) {\n148:     var parenthesis = (options && options.parenthesis) ? options.parenthesis : 'keep';\n149:     var expr = this.expr.toString(options);\n150:     if (needParenthesis(this, parenthesis)) {\n151:       expr = '(' + expr + ')';\n152:     }\n153:     return this.name + '(' + this.params.join(', ') + ') = ' + expr;\n154:   };\n155: \n156:   /**\n157:    * get LaTeX representation\n158:    * @param {Object} options\n159:    * @return {string} str\n160:    */\n161:   FunctionAssignmentNode.prototype._toTex = function (options) {\n162:     var parenthesis = (options && options.parenthesis) ? options.parenthesis : 'keep';\n163:     var expr = this.expr.toTex(options);\n164:     if (needParenthesis(this, parenthesis)) {\n165:       expr = '\\\\left(' + expr + '\\\\right)';\n166:     }\n167: \n168:     return '\\\\mathrm{' + this.name\n169:         + '}\\\\left(' + this.params.map(latex.toSymbol).join(',') + '\\\\right):=' + expr;\n170:   };\n171: \n172:   return FunctionAssignmentNode;\n173: }\n174: exports.name = 'FunctionAssignmentNode';\n175: exports.path = 'expression.node';\n176: exports.factory = factory;",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "fit_reason": "The code dynamically generates JavaScript functions using typed() with user-provided types and parameters, creating a potential code injection vector when these inputs are not properly validated.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-676",
+        "cwe_name": "Use of Potentially Dangerous Function",
+        "fit_reason": "The use of typed() function with user-provided input for function type definitions may lead to execution of untrusted code, as the typed() function can execute strings as code.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-79",
+        "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+        "fit_reason": "The dynamic generation of functions with user-provided parameters could potentially lead to prototype pollution, which might escalate to XSS or remote code execution.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-193",
+      "CWE-20",
+      "CWE-352",
+      "CWE-367",
+      "CWE-378",
+      "CWE-476",
+      "CWE-494",
+      "CWE-561",
+      "CWE-563",
+      "CWE-676",
+      "CWE-685",
+      "CWE-704",
+      "CWE-754",
+      "CWE-79",
+      "CWE-830",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-7",
+    "filepath": "lib/utils/customs.js",
+    "changed_line": 71,
+    "statement": "function isSafeProperty (prop) {",
+    "change_type": "A",
+    "function_name": "isSafeProperty",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.7,
+    "code_context": "1: 'use strict';\n2: \n3: /**\n4:  * Get a property of a plain object\n5:  * Throws an error in case the object is not a plain object or the\n6:  * property is not defined on the object itself\n7:  * @param {Object} object\n8:  * @param {string} prop\n9:  * @return {*} Returns the property value when safe\n10:  */\n11: function getSafeProperty (object, prop) {\n12:   // only allow getting properties of a plain object\n13:   if (isPlainObject(object)) {\n14:     // only allow getting properties defined on the object itself,\n15:     // not inherited from it's prototype.\n16:     if (Object.hasOwnProperty.call(object, prop)) {\n17:       return object[prop];\n18:     }\n19: \n20:     if (!(prop in object)) {\n21:       // this is a not existing property on a plain object\n22:       return undefined;\n23:     }\n24:   }\n25: \n26:   if (typeof object[prop] === 'function' && isSafeMethod(object, prop)) {\n27:     throw new Error('Cannot access method \"' + prop + '\" as a property');\n28:   }\n29: \n30:   throw new Error('No access to property \"' + prop + '\"');\n31: }\n32: \n33: /**\n34:  * Set a property on a plain object.\n35:  * Throws an error in case the object is not a plain object or the\n36:  * property would override an inherited property like .constructor or .toString\n37:  * @param {Object} object\n38:  * @param {string} prop\n39:  * @param {*} value\n40:  * @return {*} Returns the value\n41:  */\n42: // TODO: merge this function into access.js?\n43: function setSafeProperty (object, prop, value) {\n44:   // only allow setting properties of a plain object\n45:   if (isPlainObject(object)) {\n46:     // only allow setting properties defined on the object itself,\n47:     // not inherited from it's prototype.\n48:     if (prop in object) {\n49:       // property already exists\n50:       // override when the property is defined on the object itself.\n51:       // don't allow overriding inherited properties like .constructor or .toString\n52:       if (Object.hasOwnProperty.call(object, prop)) {\n53:         return object[prop] = value;\n54:       }\n55:     }\n56:     else {\n57:       // this is a new property, that's just ok\n58:       return object[prop] = value;\n59:     }\n60:   }\n61: \n62:   throw new Error('No access to property \"' + prop + '\"');\n63: }\n64: \n65: /**\n66:  * Test whether a property is safe to use for an object.\n67:  * For example .toString and .constructor are not safe\n68:  * @param {string} prop\n69:  * @return {boolean} Returns true when safe\n70:  */\n71: function isSafeProperty (prop) {\n72:   return !(prop in {});\n73: }\n74: \n75: /**\n76:  * Validate whether a method is safe.\n77:  * Throws an error when that's not the case.\n78:  * @param {Object} object\n79:  * @param {string} method\n80:  */\n81: // TODO: merge this function into assign.js?\n82: function validateSafeMethod (object, method) {\n83:   if (!isSafeMethod(object, method)) {\n84:     throw new Error('No access to method \"' + method + '\"');\n85:   }\n86: }\n87: \n88: function isSafeMethod (object, method) {\n89:   // TODO: remove this, replace with whitelist\n90:   if (method === 'constructor') {\n91:     return false;\n92:   }\n93: \n94:   // test for plain functions defined on the object (instead of a method)\n95:   if (Object.hasOwnProperty.call(object, method) && isPlainObject(object)) {\n96:     return true;\n97:   }\n98: \n99:   // only allow methods from the whitelist\n100:   // TODO: also check whether this method is supported on given object\n101:   return safeMethods[method];\n102: }\n103: \n104: function isPlainObject (object) {\n105:   // TODO: improve this function\n106:   return typeof object === 'object' && object && object.constructor === Object;\n107: }\n108: \n109: // whitelist of safe methods\n110: var safeMethods = {\n111:   abs: true,\n112:   absoluteValue: true,\n113:   acos: true,\n114:   acosh: true,\n115:   acot: true,\n116:   acoth: true,\n117:   acsc: true,\n118:   acsch: true,\n119:   add: true,\n120:   and: true,\n121:   arg: true,\n122:   asec: true,\n123:   asech: true,\n124:   asin: true,\n125:   asinh: true,\n126:   atan: true,\n127:   atan2: true,\n128:   atanh: true,\n129:   bellNumbers: true,\n130:   bignumber: true,\n131:   bitAnd: true,\n132:   bitNot: true,\n133:   bitOr: true,\n134:   bitXor: true,\n135:   boolean: true,\n136:   catalan: true,\n137:   cbrt: true,\n138:   ceil: true,\n139:   chain: true,\n140:   clone: true,\n141:   cloneDeep: true,\n142:   cmp: true,\n143:   combinations: true,\n144:   compare: true,\n145:   comparedTo: true,\n146:   compile: true,\n147:   complex: true,\n148:   composition: true,\n149:   concat: true,\n150:   config: true,\n151:   conj: true,\n152:   conjugate: true,\n153:   cos: true,\n154:   cosh: true,\n155:   cosine: true,\n156:   cot: true,\n157:   coth: true,\n158:   create: true,\n159:   createUnit: true,\n160:   cross: true,\n161:   csc: true,\n162:   csch: true,\n163:   cube: true,\n164:   cubeRoot: true,\n165:   decimalPlaces: true,\n166:   deepEqual: true,\n167:   derivative: true,\n168:   det: true,\n169:   diag: true,\n170:   diagonal: true,\n171:   distance: true,\n172:   div: true,\n173:   divToInt: true,\n174:   divide: true,\n175:   dividedBy: true,\n176:   dividedToIntegerBy: true,\n177:   done: true,\n178:   dot: true,\n179:   dotDivide: true,\n180:   dotMultiply: true,\n181:   dotPow: true,\n182:   dp: true,\n183:   emit: true,\n184:   eq: true,\n185:   equal: true,\n186:   equalBase: true,\n187:   equals: true,\n188:   erf: true,\n189:   eval: true,\n190:   exp: true,\n191:   eye: true,\n192:   factorial: true,\n193:   filter: true,\n194:   fix: true,\n195:   flatten: true,\n196:   floor: true,\n197:   forEach: true,\n198:   format: true,\n199:   formatUnits: true,\n200:   fraction: true,\n201:   gamma: true,\n202:   gcd: true,\n203:   greaterThan: true,\n204:   greaterThanOrEqualTo: true,\n205:   gt: true,\n206:   gte: true,\n207:   hasBase: true,\n208:   help: true,\n209:   hyperbolicCosine: true,\n210:   hyperbolicSine: true,\n211:   hyperbolicTangent: true,\n212:   hypot: true,\n213:   im: true,\n214:   import: true,\n215:   index: true,\n216:   intersect: true,\n217:   inv: true,\n218:   inverse: true,\n219:   inverseCosine: true,\n220:   inverseHyperbolicCosine: true,",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-1321",
+        "cwe_name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
+        "fit_reason": "The isSafeProperty function uses 'prop in {}' which can be exploited to pollute the Object prototype when prop is a user-controlled string that matches prototype properties like '__proto__' or 'constructor'",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-79",
+        "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+        "fit_reason": "If the property name is used in a context where it's rendered as HTML, prototype pollution could lead to XSS vulnerabilities",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-476",
+        "cwe_name": "NULL Pointer Dereference",
+        "fit_reason": "The function does not properly validate that 'prop' is a string before using it in property access operations, which could lead to dereferencing null/undefined",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-1321",
+      "CWE-193",
+      "CWE-352",
+      "CWE-367",
+      "CWE-476",
+      "CWE-480",
+      "CWE-563",
+      "CWE-571",
+      "CWE-676",
+      "CWE-685",
+      "CWE-704",
+      "CWE-79",
+      "CWE-807",
+      "CWE-834",
+      "CWE-863"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-8",
+    "filepath": "lib/expression/node/ArrayNode.js",
+    "changed_line": 63,
+    "statement": "join(items, ',') +",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_execution",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.6,
+    "code_context": "1: 'use strict';\n2: \n3: var map = require('../../utils/array').map;\n4: var join = require('../../utils/array').join;\n5: \n6: function factory (type, config, load, typed) {\n7:   var register = load(require('./compile')).register;\n8:   var compile = load(require('./compile')).compile;\n9:   var Node = load(require('./Node'));\n10: \n11:   /**\n12:    * @constructor ArrayNode\n13:    * @extends {Node}\n14:    * Holds an 1-dimensional array with items\n15:    * @param {Node[]} [items]   1 dimensional array with items\n16:    */\n17:   function ArrayNode(items) {\n18:     if (!(this instanceof ArrayNode)) {\n19:       throw new SyntaxError('Constructor must be called with the new operator');\n20:     }\n21: \n22:     this.items = items || [];\n23: \n24:     // validate input\n25:     if (!Array.isArray(this.items)\n26:         || !this.items.every(function (item) {return item && item.isNode;})) {\n27:       throw new TypeError('Array containing Nodes expected');\n28:     }\n29: \n30:     // TODO: deprecated since v3, remove some day\n31:     var deprecated = function () {\n32:       throw new Error('Property `ArrayNode.nodes` is deprecated, use `ArrayNode.items` instead');\n33:     };\n34:     Object.defineProperty(this, 'nodes', { get: deprecated, set: deprecated });\n35:   }\n36: \n37:   ArrayNode.prototype = new Node();\n38: \n39:   ArrayNode.prototype.type = 'ArrayNode';\n40: \n41:   ArrayNode.prototype.isArrayNode = true;\n42: \n43:   /**\n44:    * Compile the node to javascript code\n45:    * @param {ArrayNode} node  Node to be compiled\n46:    * @param {Object} defs     Object which can be used to define functions\n47:    *                          or constants globally available for the compiled\n48:    *                          expression\n49:    * @param {Object} args     Object with local function arguments, the key is\n50:    *                          the name of the argument, and the value is `true`.\n51:    *                          The object may not be mutated, but must be\n52:    *                          extended instead.\n53:    * @private\n54:    */\n55:   function compileArrayNode(node, defs, args) {\n56:     var asMatrix = (defs.math.config().matrix !== 'Array');\n57: \n58:     var items = map(node.items, function (item) {\n59:       return compile(item, defs, args);\n60:     });\n61: \n62:     return (asMatrix ? 'math.matrix([' : '[') +\n63:         join(items, ',') +\n64:         (asMatrix ? '])' : ']');\n65:   }\n66: \n67:   // register the compile function\n68:   register(ArrayNode.prototype.type, compileArrayNode);\n69: \n70:       /**\n71:    * Execute a callback for each of the child nodes of this node\n72:    * @param {function(child: Node, path: string, parent: Node)} callback\n73:    */\n74:   ArrayNode.prototype.forEach = function (callback) {\n75:     for (var i = 0; i < this.items.length; i++) {\n76:       var node = this.items[i];\n77:       callback(node, 'items[' + i + ']', this);\n78:     }\n79:   };\n80: \n81:   /**\n82:    * Create a new ArrayNode having it's childs be the results of calling\n83:    * the provided callback function for each of the childs of the original node.\n84:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n85:    * @returns {ArrayNode} Returns a transformed copy of the node\n86:    */\n87:   ArrayNode.prototype.map = function (callback) {\n88:     var items = [];\n89:     for (var i = 0; i < this.items.length; i++) {\n90:       items[i] = this._ifNode(callback(this.items[i], 'items[' + i + ']', this));\n91:     }\n92:     return new ArrayNode(items);\n93:   };\n94: \n95:   /**\n96:    * Create a clone of this node, a shallow copy\n97:    * @return {ArrayNode}\n98:    */\n99:   ArrayNode.prototype.clone = function() {\n100:     return new ArrayNode(this.items.slice(0));\n101:   };\n102: \n103:   /**\n104:    * Get string representation\n105:    * @param {Object} options\n106:    * @return {string} str\n107:    * @override\n108:    */\n109:   ArrayNode.prototype._toString = function(options) {\n110:     var items = this.items.map(function (node) {\n111:       return node.toString(options);\n112:     });\n113:     return '[' + items.join(', ') + ']';\n114:   };\n115: \n116:   /**\n117:    * Get LaTeX representation\n118:    * @param {Object} options\n119:    * @return {string} str\n120:    */\n121:   ArrayNode.prototype._toTex = function(options) {\n122:     var s = '\\\\begin{bmatrix}';\n123: \n124:     this.items.forEach(function(node) {\n125:       if (node.items) {\n126:         s += node.items.map(function(childNode) {\n127:           return childNode.toTex(options);\n128:         }).join('&');\n129:       }\n130:       else {\n131:         s += node.toTex(options);\n132:       }\n133: \n134:       // new line\n135:       s += '\\\\\\\\';\n136:     });\n137:     s += '\\\\end{bmatrix}';\n138:     return s;\n139:   };\n140: \n141:   return ArrayNode;\n142: }\n143: \n144: exports.name = 'ArrayNode';\n145: exports.path = 'expression.node';\n146: exports.factory = factory;",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "fit_reason": "The join operation on array items in a security-sensitive execution context could allow injection of malicious code if the items contain unescaped code fragments.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-88",
+        "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+        "fit_reason": "If the joined array items are used as command arguments, and the delimiter is not properly escaped, an attacker could inject additional arguments or commands.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-77",
+        "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+        "fit_reason": "The join operation on potentially untrusted array items may lead to command injection if the result is passed to a shell or command interpreter without proper sanitization.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-193",
+      "CWE-20",
+      "CWE-352",
+      "CWE-367",
+      "CWE-378",
+      "CWE-494",
+      "CWE-502",
+      "CWE-561",
+      "CWE-563",
+      "CWE-643",
+      "CWE-704",
+      "CWE-77",
+      "CWE-79",
+      "CWE-88",
+      "CWE-90",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-9",
+    "filepath": "lib/expression/node/BlockNode.js",
+    "changed_line": 75,
+    "statement": "join(blocks, '') +",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_execution",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.6,
+    "code_context": "1: 'use strict';\n2: \n3: var map = require('../../utils/array').map;\n4: var join = require('../../utils/array').join;\n5: \n6: function factory (type, config, load, typed) {\n7:   var register = load(require('./compile')).register;\n8:   var compile = load(require('./compile')).compile;\n9:   var Node = load(require('./Node'));\n10:   var ResultSet = load(require('../../type/resultset/ResultSet'));\n11: \n12:   /**\n13:    * @constructor BlockNode\n14:    * @extends {Node}\n15:    * Holds a set with blocks\n16:    * @param {Array.<{node: Node} | {node: Node, visible: boolean}>} blocks\n17:    *            An array with blocks, where a block is constructed as an Object\n18:    *            with properties block, which is a Node, and visible, which is\n19:    *            a boolean. The property visible is optional and is true by default\n20:    */\n21:   function BlockNode(blocks) {\n22:     if (!(this instanceof BlockNode)) {\n23:       throw new SyntaxError('Constructor must be called with the new operator');\n24:     }\n25: \n26:     // validate input, copy blocks\n27:     if (!Array.isArray(blocks)) throw new Error('Array expected');\n28:     this.blocks = blocks.map(function (block) {\n29:       var node = block && block.node;\n30:       var visible = block && block.visible !== undefined ? block.visible : true;\n31: \n32:       if (!(node && node.isNode))      throw new TypeError('Property \"node\" must be a Node');\n33:       if (typeof visible !== 'boolean') throw new TypeError('Property \"visible\" must be a boolean');\n34: \n35:       return {\n36:         node: node,\n37:         visible: visible\n38:       }\n39:     });\n40:   }\n41: \n42:   BlockNode.prototype = new Node();\n43: \n44:   BlockNode.prototype.type = 'BlockNode';\n45: \n46:   BlockNode.prototype.isBlockNode = true;\n47: \n48:   /**\n49:    * Compile the node to javascript code\n50:    * @param {BlockNode} node  The node to be compiled\n51:    * @param {Object} defs     Object which can be used to define functions\n52:    *                          or constants globally available for the compiled\n53:    *                          expression\n54:    * @param {Object} args     Object with local function arguments, the key is\n55:    *                          the name of the argument, and the value is `true`.\n56:    *                          The object may not be mutated, but must be\n57:    *                          extended instead.\n58:    * @return {string} js\n59:    * @private\n60:    */\n61:   function compileBlockNode (node, defs, args) {\n62:     defs.ResultSet = ResultSet;\n63:     var blocks = map(node.blocks, function (param) {\n64:       var js = compile(param.node, defs, args);\n65:       if (param.visible) {\n66:         return 'results.push(' + js + ');';\n67:       }\n68:       else {\n69:         return js + ';';\n70:       }\n71:     });\n72: \n73:     return '(function () {' +\n74:         'var results = [];' +\n75:         join(blocks, '') +\n76:         'return new ResultSet(results);' +\n77:         '})()';\n78:   }\n79: \n80:   // register the compile function\n81:   register(BlockNode.prototype.type, compileBlockNode);\n82: \n83:   /**\n84:    * Execute a callback for each of the child blocks of this node\n85:    * @param {function(child: Node, path: string, parent: Node)} callback\n86:    */\n87:   BlockNode.prototype.forEach = function (callback) {\n88:     for (var i = 0; i < this.blocks.length; i++) {\n89:       callback(this.blocks[i].node, 'blocks[' + i + '].node', this);\n90:     }\n91:   };\n92: \n93:   /**\n94:    * Create a new BlockNode having it's childs be the results of calling\n95:    * the provided callback function for each of the childs of the original node.\n96:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n97:    * @returns {BlockNode} Returns a transformed copy of the node\n98:    */\n99:   BlockNode.prototype.map = function (callback) {\n100:     var blocks = [];\n101:     for (var i = 0; i < this.blocks.length; i++) {\n102:       var block = this.blocks[i];\n103:       var node = this._ifNode(callback(block.node, 'blocks[' + i + '].node', this));\n104:       blocks[i] = {\n105:         node: node,\n106:         visible: block.visible\n107:       };\n108:     }\n109:     return new BlockNode(blocks);\n110:   };\n111: \n112:   /**\n113:    * Create a clone of this node, a shallow copy\n114:    * @return {BlockNode}\n115:    */\n116:   BlockNode.prototype.clone = function () {\n117:     var blocks = this.blocks.map(function (block) {\n118:       return {\n119:         node: block.node,\n120:         visible: block.visible\n121:       };\n122:     });\n123: \n124:     return new BlockNode(blocks);\n125:   };\n126: \n127:   /**\n128:    * Get string representation\n129:    * @param {Object} options\n130:    * @return {string} str\n131:    * @override\n132:    */\n133:   BlockNode.prototype._toString = function (options) {\n134:     return this.blocks.map(function (param) {\n135:       return param.node.toString(options) + (param.visible ? '' : ';');\n136:     }).join('\\n');\n137:   };\n138: \n139:   /**\n140:    * Get LaTeX representation\n141:    * @param {Object} options\n142:    * @return {string} str\n143:    */\n144:   BlockNode.prototype._toTex = function (options) {\n145:     return this.blocks.map(function (param) {\n146:       return param.node.toTex(options) + (param.visible ? '' : ';');\n147:     }).join('\\\\;\\\\;\\n');\n148:   };\n149: \n150:   return BlockNode;\n151: }\n152: \n153: exports.name = 'BlockNode';\n154: exports.path = 'expression.node';\n155: exports.factory = factory;",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "fit_reason": "The join operation on blocks containing user-controlled code elements can lead to code injection if the blocks are not properly sanitized",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-77",
+        "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+        "fit_reason": "If the blocks contain command-like elements, joining them without sanitization can result in command injection",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-88",
+        "cwe_name": "Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')",
+        "fit_reason": "The join operation may introduce argument delimiters that can be exploited for argument injection if the blocks contain command arguments",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-193",
+      "CWE-20",
+      "CWE-352",
+      "CWE-367",
+      "CWE-494",
+      "CWE-561",
+      "CWE-563",
+      "CWE-704",
+      "CWE-758",
+      "CWE-77",
+      "CWE-78",
+      "CWE-79",
+      "CWE-88",
+      "CWE-90",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-10",
+    "filepath": "lib/expression/node/IndexNode.js",
+    "changed_line": 138,
+    "statement": "return 'math.index(' + join(dimensions, ', ') + ')';",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_execution",
+    "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+    "security_relevance_score": 0.6,
+    "code_context": "1: 'use strict';\n2: \n3: var map = require('../../utils/array').map;\n4: var join = require('../../utils/array').join;\n5: \n6: function factory (type, config, load, typed) {\n7:   var register = load(require('./compile')).register;\n8:   var compile = load(require('./compile')).compile;\n9:   var Node = load(require('./Node'));\n10:   var RangeNode = load(require('./RangeNode'));\n11:   var SymbolNode = load(require('./SymbolNode'));\n12: \n13:   var Range = load(require('../../type/matrix/Range'));\n14: \n15:   var isArray = Array.isArray;\n16: \n17:   /**\n18:    * @constructor IndexNode\n19:    * @extends Node\n20:    *\n21:    * Describes a subset of a matrix or an object property.\n22:    * Cannot be used on its own, needs to be used within an AccessorNode or\n23:    * AssignmentNode.\n24:    *\n25:    * @param {Node[]} dimensions\n26:    * @param {boolean} [dotNotation=false]  Optional property describing whether\n27:    *                                       this index was written using dot\n28:    *                                       notation like `a.b`, or using bracket\n29:    *                                       notation like `a[\"b\"]` (default).\n30:    *                                       Used to stringify an IndexNode.\n31:    */\n32:   function IndexNode(dimensions, dotNotation) {\n33:     if (!(this instanceof IndexNode)) {\n34:       throw new SyntaxError('Constructor must be called with the new operator');\n35:     }\n36: \n37:     this.dimensions = dimensions;\n38:     this.dotNotation = dotNotation || false;\n39: \n40:     // validate input\n41:     if (!isArray(dimensions)\n42:         || !dimensions.every(function (range) {return range && range.isNode;})) {\n43:       throw new TypeError('Array containing Nodes expected for parameter \"dimensions\"');\n44:     }\n45:     if (this.dotNotation && !this.isObjectProperty()) {\n46:       throw new Error('dotNotation only applicable for object properties');\n47:     }\n48: \n49:     // TODO: deprecated since v3, remove some day\n50:     var deprecated = function () {\n51:       throw new Error('Property `IndexNode.object` is deprecated, use `IndexNode.fn` instead');\n52:     };\n53:     Object.defineProperty(this, 'object', { get: deprecated, set: deprecated });\n54:   }\n55: \n56:   IndexNode.prototype = new Node();\n57: \n58:   IndexNode.prototype.type = 'IndexNode';\n59: \n60:   IndexNode.prototype.isIndexNode = true;\n61: \n62:   /**\n63:    * Compile all range nodes\n64:    *\n65:    * When some of the dimensions has `end` defined, the IndexNode requires\n66:    * a variable `size` to be defined in the current closure, and must contain\n67:    * the size of the matrix that's being handled. To check whether the `size`\n68:    * variable is needed, call IndexNode.needsSize().\n69:    *\n70:    * @param {IndexNode} node        The node to be compiled\n71:    * @param {Object} defs           Object which can be used to define functions\n72:    *                                or constants globally available for the\n73:    *                                compiled expression\n74:    * @param {Object} args           Object with local function arguments, the key is\n75:    *                                the name of the argument, and the value is `true`.\n76:    *                                The object may not be mutated, but must be\n77:    *                                extended instead.\n78:    * @return {string} code\n79:    */\n80:   function compileIndexNode(node, defs, args) {\n81:     // args can be mutated by IndexNode, when dimensions use `end`\n82:     var childArgs = Object.create(args);\n83: \n84:     // helper function to create a Range from start, step and end\n85:     defs.range = function (start, end, step) {\n86:       return new Range(\n87:           (start && start.isBigNumber === true) ? start.toNumber() : start,\n88:           (end   && end.isBigNumber === true)   ? end.toNumber()   : end,\n89:           (step  && step.isBigNumber === true)  ? step.toNumber()  : step\n90:       );\n91:     };\n92: \n93:     // TODO: implement support for bignumber (currently bignumbers are silently\n94:     //       reduced to numbers when changing the value to zero-based)\n95: \n96:     // TODO: Optimization: when the range values are ConstantNodes,\n97:     //       we can beforehand resolve the zero-based value\n98: \n99:     // optimization for a simple object property\n100:     var dimensions = map(node.dimensions, function (range, i) {\n101:       if (range && range.isRangeNode) {\n102:         if (range.needsEnd()) {\n103:           childArgs.end = true;\n104: \n105:           // resolve end and create range\n106:           return '(function () {' +\n107:               'var end = size[' + i + ']; ' +\n108:               'return range(' +\n109:               compile(range.start, defs, childArgs) + ', ' +\n110:               compile(range.end, defs, childArgs) + ', ' +\n111:               (range.step ? compile(range.step, defs, childArgs) : '1') +\n112:               '); ' +\n113:               '})()';\n114:         }\n115:         else {\n116:           // create range\n117:           return 'range(' +\n118:               compile(range.start, defs, childArgs) + ', ' +\n119:               compile(range.end, defs, childArgs) + ', ' +\n120:               (range.step ? compile(range.step, defs, childArgs) : '1') +\n121:               ')';\n122:         }\n123:       }\n124:       if (range.isSymbolNode && range.name === 'end') {\n125:         childArgs.end = true;\n126: \n127:         // resolve the parameter 'end'\n128:         return '(function () {' +\n129:             'var end = size[' + i + ']; ' +\n130:             'return ' + compile(range, defs, childArgs) + '; ' +\n131:             '})()'\n132:       }\n133:       else { // ConstantNode\n134:         return compile(range, defs, childArgs);\n135:       }\n136:     });\n137: \n138:     return 'math.index(' + join(dimensions, ', ') + ')';\n139:   }\n140: \n141:   // register the compile function\n142:   register(IndexNode.prototype.type, compileIndexNode);\n143: \n144:   /**\n145:    * Execute a callback for each of the child nodes of this node\n146:    * @param {function(child: Node, path: string, parent: Node)} callback\n147:    */\n148:   IndexNode.prototype.forEach = function (callback) {\n149:     for (var i = 0; i < this.dimensions.length; i++) {\n150:       callback(this.dimensions[i], 'dimensions[' + i + ']', this);\n151:     }\n152:   };\n153: \n154:   /**\n155:    * Create a new IndexNode having it's childs be the results of calling\n156:    * the provided callback function for each of the childs of the original node.\n157:    * @param {function(child: Node, path: string, parent: Node): Node} callback\n158:    * @returns {IndexNode} Returns a transformed copy of the node\n159:    */\n160:   IndexNode.prototype.map = function (callback) {\n161:     var dimensions = [];\n162:     for (var i = 0; i < this.dimensions.length; i++) {\n163:       dimensions[i] = this._ifNode(callback(this.dimensions[i], 'dimensions[' + i + ']', this));\n164:     }\n165: \n166:     return new IndexNode(dimensions);\n167:   };\n168: \n169:   /**\n170:    * Create a clone of this node, a shallow copy\n171:    * @return {IndexNode}\n172:    */\n173:   IndexNode.prototype.clone = function () {\n174:     return new IndexNode(this.dimensions.slice(0));\n175:   };\n176: \n177:   /**\n178:    * Test whether this IndexNode contains a single property name\n179:    * @return {boolean}\n180:    */\n181:   IndexNode.prototype.isObjectProperty = function () {\n182:     return this.dimensions.length === 1 &&\n183:         this.dimensions[0].isConstantNode &&\n184:         this.dimensions[0].valueType === 'string';\n185:   };\n186: \n187:   /**\n188:    * Returns the property name if IndexNode contains a property.\n189:    * If not, returns null.\n190:    * @return {string | null}\n191:    */\n192:   IndexNode.prototype.getObjectProperty = function () {\n193:     return this.isObjectProperty() ? this.dimensions[0].value : null;\n194:   };\n195: \n196:   /**\n197:    * Get string representation\n198:    * @param {Object} options\n199:    * @return {string} str\n200:    */\n201:   IndexNode.prototype._toString = function (options) {\n202:     // format the parameters like \"[1, 0:5]\"\n203:     return this.dotNotation\n204:         ? ('.' + this.getObjectProperty())\n205:         : ('[' + this.dimensions.join(', ') + ']');\n206:   };\n207: \n208:   /**\n209:    * Get LaTeX representation\n210:    * @param {Object} options\n211:    * @return {string} str\n212:    */\n213:   IndexNode.prototype._toTex = function (options) {\n214:     var dimensions = this.dimensions.map(function (range) {\n215:       return range.toTex(options);\n216:     });\n217: \n218:     return this.dotNotation\n219:         ? ('.' + this.getObjectProperty() + '')\n220:         : ('_{' + dimensions.join(',') + '}');\n221:   };\n222: \n223:   /**\n224:    * Test whether this IndexNode needs the object size, size of the Matrix\n225:    * @return {boolean}\n226:    */\n227:   IndexNode.prototype.needsSize = function () {\n228:     return this.dimensions.some(function (range) {\n229:       return (range.isRangeNode && range.needsEnd()) ||\n230:           (range.isSymbolNode && range.name === 'end');\n231:     });\n232:   };\n233: \n234:   return IndexNode;\n235: }\n236: \n237: exports.name = 'IndexNode';\n238: exports.path = 'expression.node';\n239: exports.factory = factory;",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-193",
+        "cwe_name": "Off-by-one Error",
+        "fit_reason": "Stage-2 evidence shows IndexNode handles indexing operations where computed indices could be out of bounds, matching the mechanism of comparing index to length property and then using it in an indexing operation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-125",
+        "cwe_name": "Out-of-bounds Read",
+        "fit_reason": "Stage-2 evidence demonstrates IndexNode performs indexing operations that could access memory before or beyond valid buffer range when dimensions are computed at runtime",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-119",
+        "cwe_name": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
+        "fit_reason": "Stage-2 evidence shows IndexNode's handling of matrix or object property indexing could access memory outside intended buffer boundaries when dimensions are processed",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-119",
+      "CWE-125",
+      "CWE-178",
+      "CWE-193",
+      "CWE-352",
+      "CWE-367",
+      "CWE-400",
+      "CWE-476",
+      "CWE-561",
+      "CWE-563",
+      "CWE-584",
+      "CWE-704",
+      "CWE-79",
+      "CWE-834",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  }
+]

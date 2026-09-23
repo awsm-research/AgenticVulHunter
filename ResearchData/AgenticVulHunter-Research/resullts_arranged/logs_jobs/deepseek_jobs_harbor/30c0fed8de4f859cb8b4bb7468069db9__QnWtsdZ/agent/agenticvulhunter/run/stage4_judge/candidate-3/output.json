@@ -1,0 +1,318 @@
+{
+  "candidate_id": "candidate-3",
+  "filepath": "kdcproxy/__init__.py",
+  "changed_line": 141,
+  "statement": "length = -1",
+  "change_type": "A",
+  "function_name": "__call__",
+  "operation_type": "exception_handler_length_assignment",
+  "selection_reason": "Missing CONTENT_LENGTH -> sets length to -1 -> may cause read() to read entire stream",
+  "security_relevance_score": 0.4,
+  "code_context": "1: #!/usr/bin/python3\n2: \n3: # Copyright (C) 2013, Red Hat, Inc.\n4: # All rights reserved.\n5: #\n6: # Permission is hereby granted, free of charge, to any person obtaining a copy\n7: # of this software and associated documentation files (the \"Software\"), to deal\n8: # in the Software without restriction, including without limitation the rights\n9: # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell\n10: # copies of the Software, and to permit persons to whom the Software is\n11: # furnished to do so, subject to the following conditions:\n12: #\n13: # The above copyright notice and this permission notice shall be included in\n14: # all copies or substantial portions of the Software.\n15: #\n16: # THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\n17: # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\n18: # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\n19: # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\n20: # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\n21: # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN\n22: # THE SOFTWARE.\n23: \n24: from kdcproxy.config import MetaResolver\n25: import kdcproxy.codec as codec\n26: \n27: import select\n28: import socket\n29: import struct\n30: import sys\n31: import time\n32: import io\n33: \n34: try: # Python 3.x\n35:     import http.client as httplib\n36:     import urllib.parse as urlparse\n37: except ImportError: # Python 2.x\n38:     import httplib\n39:     import urlparse\n40: \n41: class HTTPException(Exception):\n42:     def __init__(self, code, msg, headers=[]):\n43:         headers = list(filter(lambda h: h[0] != 'Content-Length', headers))\n44:         headers.append(('Content-Length', str(len(msg))))\n45: \n46:         if 'Content-Type' not in dict(headers):\n47:             headers.append(('Content-Type', 'text/plain'))\n48: \n49:         if sys.version_info.major == 3 and isinstance(msg, str):\n50:             msg = bytes(msg, \"UTF8\")\n51: \n52:         super(HTTPException, self).__init__(code, msg, headers)\n53:         self.code = code\n54:         self.message = msg\n55:         self.headers = headers\n56: \n57:     def __str__(self):\n58:         return \"%d %s\" % (self.code, httplib.responses[self.code])\n59: \n60: class Application:\n61:     SOCKTYPES = {\n62:         \"tcp\": socket.SOCK_STREAM,\n63:         \"udp\": socket.SOCK_DGRAM,\n64:     }\n65: \n66:     def __init__(self):\n67:         self.__resolver = MetaResolver()\n68: \n69:     def __await_reply(self, pr, rsocks, wsocks, timeout):\n70:         extra = 0\n71:         while (timeout + extra) > time.time():\n72:             if not wsocks and not rsocks:\n73:                 break\n74: \n75:             r, w, x = select.select(rsocks, wsocks, rsocks + wsocks,\n76:                                     (timeout + extra) - time.time())\n77:             for sock in x:\n78:                 sock.close()\n79:                 try:\n80:                     rsocks.remove(sock)\n81:                 except ValueError:\n82:                     pass\n83:                 try:\n84:                     wsocks.remove(sock)\n85:                 except ValueError:\n86:                     pass\n87: \n88:             for sock in w:\n89:                 try:\n90:                     if sock.type & ~socket.SOCK_NONBLOCK == socket.SOCK_DGRAM:\n91:                         # If we proxy over UDP, remove the 4-byte length\n92:                         # prefix since it is TCP only.\n93:                         sock.sendall(pr.request[4:])\n94:                     else:\n95:                         sock.sendall(pr.request)\n96:                         extra = 10 # New connections get 10 extra seconds\n97:                 except:\n98:                     continue\n99:                 rsocks.append(sock)\n100:                 wsocks.remove(sock)\n101: \n102:             for sock in r:\n103:                 try:\n104:                     reply = sock.recv(1048576)\n105: \n106:                     # If we proxy over UDP, we will be missing the 4-byte\n107:                     # length prefix. So add it.\n108:                     if sock.type & ~socket.SOCK_NONBLOCK == socket.SOCK_DGRAM:\n109:                         reply = struct.pack(\"!I\", len(reply)) + reply\n110: \n111:                     return reply\n112:                 except:\n113:                     pass\n114: \n115:         return None\n116: \n117:     def __filter_addr(self, addr):\n118:         if addr[0] not in (socket.AF_INET, socket.AF_INET6):\n119:             return False\n120: \n121:         if addr[1] not in (socket.SOCK_STREAM, socket.SOCK_DGRAM):\n122:             return False\n123: \n124:         if addr[2] not in (socket.IPPROTO_TCP, socket.IPPROTO_UDP):\n125:             return False\n126: \n127:         return True\n128: \n129:     def __call__(self, env, start_response):\n130:         try:\n131:             # Validate the method\n132:             method = env[\"REQUEST_METHOD\"].upper()\n133:             if method != \"POST\":\n134:                 raise HTTPException(405, \"Method not allowed (%s).\" % method,\n135:                                     (\"Allow\", \"POST\"))\n136: \n137:             # Parse the request\n138:             try:\n139:                 length = int(env[\"CONTENT_LENGTH\"])\n140:             except AttributeError:\n141:                 length = -1\n142:             try:\n143:                 pr = codec.decode(env[\"wsgi.input\"].read(length))\n144:             except codec.ParsingError as e:\n145:                 raise HTTPException(400, e.message)\n146: \n147:             # Find the remote proxy\n148:             servers = self.__resolver.lookup(pr.realm,\n149:                                   isinstance(pr, codec.KPASSWDProxyRequest))\n150:             if not servers:\n151:                 raise HTTPException(503, \"Can't find remote (%s).\" % pr)\n152: \n153:             # Contact the remote server\n154:             reply = None\n155:             wsocks = []\n156:             rsocks = []\n157:             for server in map(urlparse.urlparse, servers):\n158:                 # Enforce valid, supported URIs\n159:                 scheme = server.scheme.lower().split(\"+\", 1)\n160:                 if scheme[0] not in (\"kerberos\", \"kpasswd\"):\n161:                     continue\n162:                 if len(scheme) > 1 and scheme[1] not in (\"tcp\", \"udp\"):\n163:                     continue\n164: \n165:                 # Do the DNS lookup\n166:                 try:\n167:                     port = server.port\n168:                     if port is None:\n169:                         port = scheme[0]\n170:                     addrs = socket.getaddrinfo(server.hostname, port)\n171:                 except socket.gaierror:\n172:                     continue\n173: \n174:                 # Sort addresses so that we get TCP first.\n175:                 #\n176:                 # Stick a None address on the end so we can get one\n177:                 # more attempt after all servers have been contacted.\n178:                 addrs = tuple(sorted(filter(self.__filter_addr, addrs)))\n179:                 for addr in addrs + (None,):\n180:                     if addr is not None:\n181:                         # Bypass unspecified socktypes\n182:                         if len(scheme) > 1 and addr[1] != self.SOCKTYPES[scheme[1]]:\n183:                             continue\n184: \n185:                         # Create the socket\n186:                         sock = socket.socket(*addr[:3])\n187:                         sock.setblocking(0)\n188: \n189:                         # Connect\n190:                         try:\n191:                             # In Python 2.x, non-blocking connect() throws\n192:                             # socket.error() with errno == EINPROGRESS. In\n193:                             # Python 3.x, it throws io.BlockingIOError().\n194:                             sock.connect(addr[4])\n195:                         except socket.error as e:\n196:                             if e.errno != 115: # errno != EINPROGRESS\n197:                                 sock.close()\n198:                                 continue\n199:                         except io.BlockingIOError:\n200:                             pass\n201:                         wsocks.append(sock)\n202: \n203:                     # Resend packets to UDP servers\n204:                     for sock in tuple(rsocks):\n205:                         if sock.type & ~socket.SOCK_NONBLOCK == socket.SOCK_DGRAM:\n206:                             wsocks.append(sock)\n207:                             rsocks.remove(sock)\n208: \n209:                     # Call select()\n210:                     timeout = time.time() + (15 if addr is None else 2)\n211:                     reply = self.__await_reply(pr, rsocks, wsocks, timeout)\n212:                     if reply is not None:\n213:                         break\n214: \n215:                 if reply is not None:\n216:                     break\n217: \n218:             for sock in rsocks + wsocks:\n219:                 sock.close()\n220: \n221:             if reply is None:\n222:                 raise HTTPException(503, \"Remote unavailable (%s).\" % pr)\n223: \n224:             # Return the result to the client\n225:             raise HTTPException(200, codec.encode(reply),\n226:                                 [(\"Content-Type\", \"application/kerberos\")])\n227:         except HTTPException as e:\n228:             start_response(str(e), e.headers)\n229:             return [e.message]\n230: \n231: application = Application()",
+  "source_summary": "CONTENT_LENGTH header from HTTP request environment. When AttributeError occurs (CONTENT_LENGTH missing), length defaults to -1.",
+  "sink_summary": "env['wsgi.input'].read(length) -> codec.decode() -> ASN.1 parsing of Kerberos protocol messages",
+  "guard_summary": "Only POST requests allowed; CONTENT_LENGTH parsing with try-except; ASN.1 parsing with length validation in ProxyRequest.parse(); no explicit validation for negative length input to read()",
+  "risk_pattern": "Missing CONTENT_LENGTH header causes read(-1) which reads entire input stream without size limits, potentially allowing oversized ASN.1 payloads to bypass length checks",
+  "used_variable_sources": [
+    "env[\"CONTENT_LENGTH\"]",
+    "env[\"wsgi.input\"]"
+  ],
+  "called_function_context": [
+    "codec.decode()",
+    "ProxyRequest.parse()",
+    "decoder.decode()"
+  ],
+  "enclosing_conditions": [
+    "method == \"POST\"",
+    "AttributeError on env[\"CONTENT_LENGTH\"] access"
+  ],
+  "context_summary": "WSGI application handler for Kerberos proxy; processes HTTP POST requests containing Kerberos protocol messages encoded in ASN.1 format",
+  "unresolved_facts": [
+    "Maximum buffer size limits in ASN.1 decoder",
+    "WSGI server's handling of read(-1) behavior",
+    "Potential memory exhaustion impact from unbounded reads"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-400",
+      "cwe_name": "Uncontrolled Resource Consumption",
+      "fit_reason": "Missing CONTENT_LENGTH header causes read(-1) which reads entire input stream without size limits, leading to potential memory exhaustion and denial of service",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-770",
+      "cwe_name": "Allocation of Resources Without Limits or Throttling",
+      "fit_reason": "No throttling or limits on input size when CONTENT_LENGTH is missing, allowing unbounded resource allocation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-125",
+      "cwe_name": "Out-of-bounds Read",
+      "fit_reason": "read(-1) may read beyond intended buffer boundaries when CONTENT_LENGTH is missing",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-119",
+      "cwe_name": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
+      "fit_reason": "Missing length validation allows read operation to access memory without proper bounds restriction",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1004",
+    "CWE-113",
+    "CWE-119",
+    "CWE-125",
+    "CWE-200",
+    "CWE-208",
+    "CWE-22",
+    "CWE-352",
+    "CWE-390",
+    "CWE-400",
+    "CWE-584",
+    "CWE-685",
+    "CWE-770"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "kdcproxy/__init__.py",
+      "changed_line": 141,
+      "statement": "length = -1",
+      "cwe_id": "CWE-400",
+      "cwe_name": "Uncontrolled Resource Consumption",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The code explicitly sets length = -1 when CONTENT_LENGTH is missing, causing read(-1) to read the entire input stream without size limits, directly enabling uncontrolled resource consumption"
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "HTTP request environment provides CONTENT_LENGTH header → exception handler sets length = -1 → env['wsgi.input'].read(length) reads entire stream → codec.decode() processes unbounded input"
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If the candidate line were removed, the AttributeError would propagate, preventing the vulnerable read(-1) operation and forcing explicit error handling"
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "",
+          "required_control": "Input size validation and limits for resource-bound operations",
+          "control_requirement_evidence": "CWE-400 requires controlling resource allocation; reading unbounded input streams can exhaust memory",
+          "existing_controls_checked": [
+            "POST method validation",
+            "ASN.1 parsing in codec.decode()",
+            "WSGI server input handling"
+          ],
+          "deficiency_evidence": "No size validation when CONTENT_LENGTH is missing; read(-1) bypasses any WSGI server limits; ASN.1 decoder may process oversized payloads"
+        },
+        "concrete_impact": {
+          "score": 0.65,
+          "evidence": "Memory exhaustion through unbounded read operations, potentially causing denial of service; impact depends on WSGI server behavior and available memory"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the AttributeError exception would propagate unhandled, preventing the vulnerable read(-1) operation and forcing the application to handle missing CONTENT_LENGTH explicitly.",
+      "supporting_evidence": [
+        "CONTENT_LENGTH header access with try-except block that catches AttributeError",
+        "env['wsgi.input'].read(length) called with potentially negative length value",
+        "codec.decode() processes the result of read() operation",
+        "No size validation or limits when CONTENT_LENGTH is missing"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "WSGI server's specific behavior for read(-1) calls",
+        "Maximum buffer size limits in the ASN.1 decoder implementation",
+        "Memory allocation patterns and limits in the deployment environment"
+      ],
+      "review_comment": "When CONTENT_LENGTH header is missing, the code sets length = -1 causing read() to consume the entire input stream without size limits. This change introduces a resource consumption vulnerability where malicious clients can send oversized payloads. Add explicit size validation by setting a reasonable default maximum length or rejecting requests with missing CONTENT_LENGTH.",
+      "change_type": "A",
+      "raw_score": 0.7500000000000001,
+      "score": 0.7500000000000001
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "kdcproxy/__init__.py",
+      "changed_line": 141,
+      "statement": "length = -1",
+      "cwe_id": "CWE-770",
+      "cwe_name": "Allocation of Resources Without Limits or Throttling",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code sets length=-1 when CONTENT_LENGTH is missing, causing read(-1) which reads the entire input stream without size limits. However, CWE-770 specifically addresses reusable resource allocation, while this appears to be a single read operation."
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "HTTP request environment provides CONTENT_LENGTH header → exception handler sets length=-1 → env['wsgi.input'].read(length) reads entire stream → codec.decode() processes unbounded input"
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If the candidate line were removed, the AttributeError would propagate, preventing the vulnerable read(-1) operation and forcing explicit error handling for missing CONTENT_LENGTH."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "The code lacks validation for the CONTENT_LENGTH header presence and proper error handling for missing headers.",
+          "required_control": "Input size validation and bounds checking for HTTP request body",
+          "control_requirement_evidence": "CWE-770 requires limits on resource allocation; missing CONTENT_LENGTH bypasses any potential size validation",
+          "existing_controls_checked": [
+            "POST method validation",
+            "ASN.1 parsing in codec.decode()"
+          ],
+          "deficiency_evidence": "No validation for missing CONTENT_LENGTH header; exception handler sets length=-1 without size constraints"
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Potential memory exhaustion from unbounded read, but the exact impact depends on WSGI server behavior and downstream ASN.1 decoder limits which are not demonstrated."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the AttributeError would not be caught, preventing the read(-1) operation and forcing the application to handle missing CONTENT_LENGTH explicitly, likely with an error response.",
+      "supporting_evidence": [
+        "CONTENT_LENGTH header access with try-except AttributeError handler",
+        "env['wsgi.input'].read(length) call with length=-1 parameter",
+        "No size validation or limits when CONTENT_LENGTH is missing"
+      ],
+      "contradicting_evidence": [
+        "CWE-770 specifically addresses reusable resource allocation patterns, while this appears to be a single read operation",
+        "The ASN.1 decoder may have internal size limits not visible in this code"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "WSGI server's actual behavior for read(-1) calls",
+        "Maximum buffer size and memory limits in the ASN.1 decoder",
+        "Whether this constitutes reusable resource allocation as defined by CWE-770"
+      ],
+      "review_comment": "When CONTENT_LENGTH header is missing, the exception handler sets length=-1, causing read() to consume the entire input stream without size limits. This bypasses potential size validation and could lead to resource exhaustion. Add explicit validation for CONTENT_LENGTH presence and reject requests with missing or invalid content length headers.",
+      "change_type": "A",
+      "raw_score": 0.55,
+      "score": 0.55
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "kdcproxy/__init__.py",
+      "changed_line": 141,
+      "statement": "length = -1",
+      "cwe_id": "CWE-125",
+      "cwe_name": "Out-of-bounds Read",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-125 is a memory-safety vulnerability where software reads data outside the bounds of an allocated buffer. The demonstrated behavior is a WSGI input stream read with a length of -1, which is a documented API behavior (read all data until EOF) not a buffer over-read. No buffer allocation or pointer arithmetic is shown."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "The `env[\"wsgi.input\"]` stream is connected to the HTTP request body. The `length` variable from line 141 is passed to `env[\"wsgi.input\"].read(length)` at line 143. When CONTENT_LENGTH is missing (AttributeError), length becomes -1, causing the read() call."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If the candidate line `length = -1` were reverted, the `except AttributeError` block would have no assignment, causing `length` to remain undefined and raising an UnboundLocalError when used at line 143. The patch materially creates the -1 value flow to the read() call."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "",
+          "required_control": "Input size validation before reading from stream",
+          "control_requirement_evidence": "For unbounded stream reads, a control is required to prevent resource exhaustion or oversized payload processing. The CWE-125 mechanism does not apply here; the relevant control would be for CWE-400/770.",
+          "existing_controls_checked": [
+            "POST method check (line 133-135)",
+            "CONTENT_LENGTH parsing try-except (lines 138-141)",
+            "ASN.1 parsing in codec.decode() (line 143)"
+          ],
+          "deficiency_evidence": "The control deficiency is that when CONTENT_LENGTH is missing, the code defaults to -1, which may cause unbounded reading. However, this is not a bounds-check deficiency for a fixed buffer; it's a missing size limit for a stream read. No evidence shows this leads to reading outside an allocated buffer's bounds."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No concrete security consequence is demonstrated. The read(-1) behavior is defined by WSGI specification (read until EOF). While potentially leading to resource exhaustion (CWE-400) or oversized ASN.1 payloads, no out-of-bounds read of a fixed buffer is shown."
+        }
+      },
+      "diff_counterfactual": "If the candidate line `length = -1` were reverted, the `except AttributeError` block would not assign to `length`, leaving it undefined. When `env[\"wsgi.input\"].read(length)` is called at line 143, Python would raise an UnboundLocalError, causing the request to fail with an internal server error rather than proceeding with a length of -1.",
+      "supporting_evidence": [
+        "Line 141: `length = -1` is assigned when `env[\"CONTENT_LENGTH\"]` raises AttributeError (missing header).",
+        "Line 143: `env[\"wsgi.input\"].read(length)` uses the -1 value directly.",
+        "Python documentation: `file.read(size)` with size=-1 reads until EOF."
+      ],
+      "contradicting_evidence": [
+        "CWE-125 requires reading outside the bounds of an allocated buffer. The code uses `read()` on a stream object, which reads bytes from an input source, not from a fixed-size buffer.",
+        "No buffer allocation, pointer arithmetic, or fixed-size array indexing is present in the demonstrated code path.",
+        "The WSGI `read()` method with size=-1 is defined behavior, not an unintended out-of-bounds access."
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether the WSGI server's implementation of `read(-1)` has internal buffer limits.",
+        "Whether the ASN.1 decoder in `codec.decode()` allocates fixed buffers based on the input size.",
+        "Whether reading the entire stream could cause memory exhaustion in practice."
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.36,
+      "score": 0.36
+    },
+    {
+      "candidate_id": "candidate-3",
+      "filepath": "kdcproxy/__init__.py",
+      "changed_line": 141,
+      "statement": "length = -1",
+      "cwe_id": "CWE-119",
+      "cwe_name": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code sets length=-1 when CONTENT_LENGTH is missing, which may cause read() to read the entire input stream without size limits. However, CWE-119 specifically requires memory buffer boundary violations, while this appears to be more about resource exhaustion or input validation."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "HTTP request environment provides CONTENT_LENGTH header, which when missing triggers the -1 assignment. This length value is directly passed to env['wsgi.input'].read(length) at line 143, connecting external input to the read operation."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "The added line 'length = -1' is the only change that enables the unbounded read behavior when CONTENT_LENGTH is missing. Without this line, the AttributeError would propagate and prevent the vulnerable code path."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "",
+          "required_control": "Bounds checking for input size limits",
+          "control_requirement_evidence": "CWE-119 requires proper bounds restriction on memory operations. Reading with length=-1 bypasses any size limitations.",
+          "existing_controls_checked": [
+            "POST method validation",
+            "ASN.1 parsing in codec.decode()",
+            "WSGI server's default read behavior"
+          ],
+          "deficiency_evidence": "The code lacks validation that prevents negative or unbounded length values from reaching the read() operation. The exception handler introduces the vulnerability by converting missing header to -1 instead of rejecting the request."
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "The evidence shows potential for unbounded memory consumption through read(-1), but does not demonstrate actual memory buffer boundary violations or memory corruption. The impact remains speculative regarding buffer overflow versus resource exhaustion."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, requests without CONTENT_LENGTH header would raise an AttributeError exception instead of proceeding with length=-1, preventing the unbounded read operation entirely.",
+      "supporting_evidence": [
+        "Line 141: 'length = -1' assignment when CONTENT_LENGTH header is missing",
+        "Line 143: 'env[\"wsgi.input\"].read(length)' uses the -1 value directly",
+        "Python documentation: read(-1) reads until EOF without size limits"
+      ],
+      "contradicting_evidence": [
+        "The code uses Python's memory-managed strings and file operations, which have built-in bounds protection",
+        "No evidence of fixed-size buffers or manual memory management that could lead to boundary violations"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether the WSGI server's input stream has practical size limits",
+        "Whether codec.decode() has internal size validation for ASN.1 parsing",
+        "Whether this leads to actual memory corruption versus resource exhaustion"
+      ],
+      "review_comment": "The exception handler sets length=-1 when CONTENT_LENGTH header is missing, allowing unbounded reads of the input stream. This bypasses size limitations and could lead to resource exhaustion. Fix by rejecting requests without CONTENT_LENGTH header or implementing a reasonable maximum size limit for the read operation.",
+      "change_type": "A",
+      "raw_score": 0.53,
+      "score": 0.53
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,157 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "sydent/http/servlets/store_invite_servlet.py",
+    "changed_line": 79,
+    "statement": "substitutions[key] = values[0]",
+    "change_type": "A",
+    "function_name": "StoreInviteServlet.render_POST",
+    "operation_type": "data_propagation",
+    "selection_reason": "observable input from request.args -> exact operation of direct assignment without sanitization -> security-sensitive effect of potentially injecting unescaped data into email templates",
+    "security_relevance_score": 0.85,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: import nacl.signing\n17: import random\n18: import string\n19: from email.header import Header\n20: \n21: from twisted.web.resource import Resource\n22: from unpaddedbase64 import encode_base64\n23: \n24: import json\n25: from sydent.db.invite_tokens import JoinTokenStore\n26: from sydent.db.threepid_associations import GlobalAssociationStore\n27: \n28: from sydent.http.servlets import require_args, send_cors\n29: from sydent.util.emailutils import sendEmail\n30: \n31: \n32: class StoreInviteServlet(Resource):\n33:     def __init__(self, syd):\n34:         self.sydent = syd\n35: \n36:     def render_POST(self, request):\n37:         send_cors(request)\n38:         err = require_args(request, (\"medium\", \"address\", \"room_id\", \"sender\",))\n39:         if err:\n40:             return json.dumps(err)\n41:         medium = request.args[\"medium\"][0]\n42:         address = request.args[\"address\"][0]\n43:         roomId = request.args[\"room_id\"][0]\n44:         sender = request.args[\"sender\"][0]\n45: \n46:         globalAssocStore = GlobalAssociationStore(self.sydent)\n47:         mxid = globalAssocStore.getMxid(medium, address)\n48:         if mxid:\n49:             request.setResponseCode(400)\n50:             return json.dumps({\n51:                 \"errcode\": \"THREEPID_IN_USE\",\n52:                 \"error\": \"Binding already known\",\n53:                 \"mxid\": mxid,\n54:             })\n55: \n56:         if medium != \"email\":\n57:             request.setResponseCode(400)\n58:             return json.dumps({\n59:                 \"errcode\": \"M_UNRECOGNIZED\",\n60:                 \"error\": \"Didn't understand medium '%s'\" % (medium,),\n61:             })\n62: \n63:         token = self._randomString(128)\n64: \n65:         tokenStore = JoinTokenStore(self.sydent)\n66: \n67:         ephemeralPrivateKey = nacl.signing.SigningKey.generate()\n68:         ephemeralPublicKey = ephemeralPrivateKey.verify_key\n69: \n70:         ephemeralPrivateKeyBase64 = encode_base64(ephemeralPrivateKey.encode(), True)\n71:         ephemeralPublicKeyBase64 = encode_base64(ephemeralPublicKey.encode(), True)\n72: \n73:         tokenStore.storeEphemeralPublicKey(ephemeralPublicKeyBase64)\n74:         tokenStore.storeToken(medium, address, roomId, sender, token)\n75: \n76:         substitutions = {}\n77:         for key, values in request.args.items():\n78:             if len(values) == 1 and type(values[0]) == str:\n79:                 substitutions[key] = values[0]\n80:         substitutions[\"token\"] = token\n81: \n82:         required = [\n83:             'sender_display_name',\n84:             'token',\n85:             'room_name',\n86:             'bracketed_room_name',\n87:             'room_avatar_url',\n88:             'sender_display_name',\n89:             'guest_user_id',\n90:             'guest_access_token',\n91:         ]\n92:         for k in required:\n93:             substitutions.setdefault(k, '')\n94: \n95:         substitutions[\"ephemeral_private_key\"] = ephemeralPrivateKeyBase64\n96:         if substitutions[\"room_name\"] != '':\n97:             substitutions[\"bracketed_room_name\"] = \"(%s)\" % substitutions[\"room_name\"]\n98: \n99:         subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')\n100:         substitutions[\"subject_header_value\"] = subject_header.encode()\n101: \n102:         sendEmail(self.sydent, \"email.invite_template\", address, substitutions)\n103: \n104:         pubKey = self.sydent.keyring.ed25519.verify_key\n105:         pubKeyBase64 = encode_base64(pubKey.encode())\n106: \n107:         baseUrl = \"%s/_matrix/identity/api/v1\" % (self.sydent.cfg.get('http', 'client_http_base'),)\n108: \n109:         keysToReturn = []\n110:         keysToReturn.append({\n111:             \"public_key\": pubKeyBase64,\n112:             \"key_validity_url\": baseUrl + \"/pubkey/isvalid\",\n113:         })\n114:         keysToReturn.append({\n115:             \"public_key\": ephemeralPublicKeyBase64,\n116:             \"key_validity_url\": baseUrl + \"/pubkey/ephemeral/isvalid\",\n117:         })\n118: \n119:         resp = {\n120:             \"token\": token,\n121:             \"public_key\": pubKeyBase64,\n122:             \"public_keys\": keysToReturn,\n123:             \"display_name\": self.redact(address),\n124:         }\n125: \n126:         return json.dumps(resp)\n127: \n128:     def redact(self, address):\n129:         return \"@\".join(map(self._redact, address.split(\"@\", 1)))\n130: \n131:     def _redact(self, s):\n132:         if len(s) > 5:\n133:             return s[:3] + \"...\"\n134:         elif len(s) > 1:\n135:             return s[0] + \"...\"\n136:         else:\n137:             return \"...\"\n138: \n139:     def _randomString(self, length):\n140:         return ''.join(random.choice(string.ascii_letters) for _ in xrange(length))",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-74",
+        "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+        "fit_reason": "Stage-2 evidence shows user input from request.args is directly assigned to template substitutions without sanitization, creating potential for injection into email templates",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-79",
+        "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+        "fit_reason": "Stage-2 evidence shows user input is used in email template rendering, and the code uses Header.encode() which may not fully neutralize XSS payloads in email contexts",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-116",
+        "cwe_name": "Improper Encoding or Escaping of Output",
+        "fit_reason": "Stage-2 evidence shows direct assignment of request.args to template variables without proper escaping, potentially allowing malicious input to be rendered in email output",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-117",
+      "CWE-20",
+      "CWE-22",
+      "CWE-340",
+      "CWE-352",
+      "CWE-409",
+      "CWE-425",
+      "CWE-561",
+      "CWE-563",
+      "CWE-581",
+      "CWE-643",
+      "CWE-685",
+      "CWE-74",
+      "CWE-79",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "sydent/util/emailutils.py",
+    "changed_line": 53,
+    "statement": "allSubstitutions[k+\"_forhtml\"] = cgi.escape(v.decode('utf8'))",
+    "change_type": "A",
+    "function_name": "sendEmail",
+    "operation_type": "data_transformation",
+    "selection_reason": "observable input from substitutions -> exact operation of html escaping -> security-sensitive effect of preventing XSS in email templates",
+    "security_relevance_score": 0.75,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2014-2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: \n17: import logging\n18: import os\n19: import random\n20: import smtplib\n21: import email.utils\n22: import string\n23: import twisted.python.log\n24: import cgi\n25: import urllib\n26: \n27: import email.utils\n28: \n29: from sydent.util import time_msec\n30: \n31: logger = logging.getLogger(__name__)\n32: \n33: \n34: def sendEmail(sydent, templateName, mailTo, substitutions):\n35:         mailFrom = sydent.cfg.get('email', 'email.from')\n36:         mailTemplateFile = sydent.cfg.get('email', templateName)\n37: \n38:         myHostname = os.uname()[1]\n39:         midRandom = \"\".join([random.choice(string.ascii_letters) for _ in range(16)])\n40:         messageid = \"<%d%s@%s>\" % (time_msec(), midRandom, myHostname)\n41: \n42:         allSubstitutions = {}\n43:         allSubstitutions.update(substitutions)\n44:         allSubstitutions.update({\n45:             'messageid': messageid,\n46:             'date': email.utils.formatdate(localtime=False),\n47:             'to': mailTo,\n48:             'from': mailFrom,\n49:         })\n50: \n51:         for k,v in allSubstitutions.items():\n52:             allSubstitutions[k] = v.decode('utf8')\n53:             allSubstitutions[k+\"_forhtml\"] = cgi.escape(v.decode('utf8'))\n54:             allSubstitutions[k+\"_forurl\"] = urllib.quote(v)\n55: \n56:         mailString = open(mailTemplateFile).read() % allSubstitutions\n57:         rawFrom = email.utils.parseaddr(mailFrom)[1]\n58:         rawTo = email.utils.parseaddr(mailTo)[1]\n59:         if rawFrom == '' or rawTo == '':\n60:             logger.info(\"Couldn't parse from / to address %s / %s\", mailFrom, mailTo)\n61:             raise EmailAddressException()\n62:         mailServer = sydent.cfg.get('email', 'email.smtphost')\n63:         logger.info(\"Sending mail to %s with mail server: %s\" % (mailTo, mailServer,))\n64:         try:\n65:             smtp = smtplib.SMTP(mailServer)\n66:             smtp.sendmail(rawFrom, rawTo, mailString.encode('utf-8'))\n67:             smtp.quit()\n68:         except Exception as origException:\n69:             twisted.python.log.err()\n70:             ese = EmailSendException()\n71:             ese.cause = origException\n72:             raise ese\n73: \n74: \n75: class EmailAddressException(Exception):\n76:     pass\n77: \n78: \n79: class EmailSendException(Exception):\n80:     pass",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-116",
+        "cwe_name": "Improper Encoding or Escaping of Output",
+        "fit_reason": "The code performs HTML escaping of user input in email templates, which is a form of output encoding that could be insufficient to prevent XSS vulnerabilities",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-79",
+        "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+        "fit_reason": "The code uses cgi.escape() for HTML escaping in email templates, which is intended to prevent XSS but may not be sufficient or correctly applied",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-179",
+        "cwe_name": "Incorrect Behavior Order: Early Validation",
+        "fit_reason": "The code performs Unicode decoding before HTML escaping, which could lead to validation order issues in handling user input",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-125",
+      "CWE-179",
+      "CWE-19",
+      "CWE-200",
+      "CWE-340",
+      "CWE-561",
+      "CWE-581",
+      "CWE-685",
+      "CWE-74",
+      "CWE-79"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "sydent/util/emailutils.py",
+    "changed_line": 54,
+    "statement": "allSubstitutions[k+\"_forurl\"] = urllib.quote(v)",
+    "change_type": "A",
+    "function_name": "sendEmail",
+    "operation_type": "data_transformation",
+    "selection_reason": "observable input from substitutions -> exact operation of URL encoding -> security-sensitive effect of preventing URL injection in email templates",
+    "security_relevance_score": 0.7,
+    "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2014-2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: \n17: import logging\n18: import os\n19: import random\n20: import smtplib\n21: import email.utils\n22: import string\n23: import twisted.python.log\n24: import cgi\n25: import urllib\n26: \n27: import email.utils\n28: \n29: from sydent.util import time_msec\n30: \n31: logger = logging.getLogger(__name__)\n32: \n33: \n34: def sendEmail(sydent, templateName, mailTo, substitutions):\n35:         mailFrom = sydent.cfg.get('email', 'email.from')\n36:         mailTemplateFile = sydent.cfg.get('email', templateName)\n37: \n38:         myHostname = os.uname()[1]\n39:         midRandom = \"\".join([random.choice(string.ascii_letters) for _ in range(16)])\n40:         messageid = \"<%d%s@%s>\" % (time_msec(), midRandom, myHostname)\n41: \n42:         allSubstitutions = {}\n43:         allSubstitutions.update(substitutions)\n44:         allSubstitutions.update({\n45:             'messageid': messageid,\n46:             'date': email.utils.formatdate(localtime=False),\n47:             'to': mailTo,\n48:             'from': mailFrom,\n49:         })\n50: \n51:         for k,v in allSubstitutions.items():\n52:             allSubstitutions[k] = v.decode('utf8')\n53:             allSubstitutions[k+\"_forhtml\"] = cgi.escape(v.decode('utf8'))\n54:             allSubstitutions[k+\"_forurl\"] = urllib.quote(v)\n55: \n56:         mailString = open(mailTemplateFile).read() % allSubstitutions\n57:         rawFrom = email.utils.parseaddr(mailFrom)[1]\n58:         rawTo = email.utils.parseaddr(mailTo)[1]\n59:         if rawFrom == '' or rawTo == '':\n60:             logger.info(\"Couldn't parse from / to address %s / %s\", mailFrom, mailTo)\n61:             raise EmailAddressException()\n62:         mailServer = sydent.cfg.get('email', 'email.smtphost')\n63:         logger.info(\"Sending mail to %s with mail server: %s\" % (mailTo, mailServer,))\n64:         try:\n65:             smtp = smtplib.SMTP(mailServer)\n66:             smtp.sendmail(rawFrom, rawTo, mailString.encode('utf-8'))\n67:             smtp.quit()\n68:         except Exception as origException:\n69:             twisted.python.log.err()\n70:             ese = EmailSendException()\n71:             ese.cause = origException\n72:             raise ese\n73: \n74: \n75: class EmailAddressException(Exception):\n76:     pass\n77: \n78: \n79: class EmailSendException(Exception):\n80:     pass",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-74",
+        "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+        "fit_reason": "User input is used directly in email template construction and URL encoding without proper sanitization, enabling potential injection attacks",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-116",
+        "cwe_name": "Improper Encoding or Escaping of Output",
+        "fit_reason": "User input is URL encoded but not properly escaped for email template context, potentially allowing malicious URLs in generated emails",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-601",
+        "cwe_name": "URL Redirection to Untrusted Site ('Open Redirect')",
+        "fit_reason": "URL encoding of user input could enable open redirect vulnerabilities if the encoded values are used in redirect contexts within email templates",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-117",
+      "CWE-1236",
+      "CWE-179",
+      "CWE-19",
+      "CWE-200",
+      "CWE-561",
+      "CWE-601",
+      "CWE-643",
+      "CWE-685",
+      "CWE-74",
+      "CWE-79",
+      "CWE-93",
+      "CWE-943"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  }
+]

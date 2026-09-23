@@ -1,0 +1,246 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "jinja2/bccache.py",
+      "changed_line": 67,
+      "statement": "self.code = marshal.load_bytecode(f)",
+      "change_type": "A",
+      "function_name": "load_bytecode",
+      "operation_type": "security_sensitive_decision",
+      "selection_reason": "observable input from file -> exact operation load bytecode with marshal -> security-sensitive effect of potentially executing arbitrary code through bytecode execution",
+      "security_relevance_score": 0.8,
+      "code_context": "1: # -*- coding: utf-8 -*-\n2: \"\"\"\n3:     jinja2.bccache\n4:     ~~~~~~~~~~~~~~\n5: \n6:     This module implements the bytecode cache system Jinja is optionally\n7:     using.  This is useful if you have very complex template situations and\n8:     the compiliation of all those templates slow down your application too\n9:     much.\n10: \n11:     Situations where this is useful are often forking web applications that\n12:     are initialized on the first request.\n13: \n14:     :copyright: Copyright 2008 by Armin Ronacher.\n15:     :license: BSD.\n16: \"\"\"\n17: from os import path, listdir, remove\n18: import marshal\n19: import tempfile\n20: import cPickle as pickle\n21: import fnmatch\n22: from cStringIO import StringIO\n23: try:\n24:     from hashlib import sha1\n25: except ImportError:\n26:     from sha import new as sha1\n27: \n28: \n29: bc_version = 1\n30: bc_magic = 'j2' + pickle.dumps(bc_version, 2)\n31: \n32: \n33: class Bucket(object):\n34:     \"\"\"Buckets are used to store the bytecode for one template.  It's created\n35:     and initialized by the bytecode cache and passed to the loading functions.\n36: \n37:     The buckets get an internal checksum from the cache assigned and use this\n38:     to automatically reject outdated cache material.  Individual bytecode\n39:     cache subclasses don't have to care about cache invalidation.\n40:     \"\"\"\n41: \n42:     def __init__(self, environment, key, checksum):\n43:         self.environment = environment\n44:         self.key = key\n45:         self.checksum = checksum\n46:         self.reset()\n47: \n48:     def reset(self):\n49:         \"\"\"Resets the bucket (unloads the bytecode).\"\"\"\n50:         self.code = None\n51: \n52:     def load_bytecode(self, f):\n53:         \"\"\"Loads bytecode from a file or file like object.\"\"\"\n54:         # make sure the magic header is correct\n55:         magic = f.read(len(bc_magic))\n56:         if magic != bc_magic:\n57:             self.reset()\n58:             return\n59:         # the source code of the file changed, we need to reload\n60:         checksum = pickle.load_bytecode(f)\n61:         if self.checksum != checksum:\n62:             self.reset()\n63:             return\n64:         # now load_bytecode the code.  Because marshal is not able to load_bytecode\n65:         # from arbitrary streams we have to work around that\n66:         if isinstance(f, file):\n67:             self.code = marshal.load_bytecode(f)\n68:         else:\n69:             self.code = marshal.loads(f.read())\n70: \n71:     def write_bytecode(self, f):\n72:         \"\"\"Dump the bytecode into the file or file like object passed.\"\"\"\n73:         if self.code is None:\n74:             raise TypeError('can\\'t write empty bucket')\n75:         f.write(bc_magic)\n76:         pickle.write_bytecode(self.checksum, f, 2)\n77:         if isinstance(f, file):\n78:             marshal.write_bytecode(self.code, f)\n79:         else:\n80:             f.write(marshal.dumps(self.code))\n81: \n82:     def bytecode_from_string(self, string):\n83:         \"\"\"Load bytecode from a string.\"\"\"\n84:         self.load_bytecode(StringIO(string))\n85: \n86:     def bytecode_to_string(self):\n87:         \"\"\"Return the bytecode as string.\"\"\"\n88:         out = StringIO()\n89:         self.write_bytecode(out)\n90:         return out.getvalue()\n91: \n92: \n93: class BytecodeCache(object):\n94:     \"\"\"To implement your own bytecode cache you have to subclass this class\n95:     and override :meth:`load_bytecode` and :meth:`dump_bytecode`.  Both of\n96:     these methods are passed a :class:`~jinja2.bccache.Bucket`.\n97: \n98:     A very basic bytecode cache that saves the bytecode on the file system::\n99: \n100:         from os import path\n101: \n102:         class MyCache(BytecodeCache):\n103: \n104:             def __init__(self, directory):\n105:                 self.directory = directory\n106: \n107:             def load_bytecode(self, bucket):\n108:                 filename = path.join(self.directory, bucket.key)\n109:                 if path.exists(filename):\n110:                     with file(filename, 'rb') as f:\n111:                         bucket.load_bytecode(f)\n112: \n113:             def dump_bytecode(self, bucket):\n114:                 filename = path.join(self.directory, bucket.key)\n115:                 with file(filename, 'wb') as f:\n116:                     bucket.write_bytecode(f)\n117: \n118:     A more advanced version of a filesystem based bytecode cache is part of\n119:     Jinja2.\n120:     \"\"\"\n121: \n122:     def load_bytecode(self, bucket):\n123:         \"\"\"Subclasses have to override this method to load bytecode into a\n124:         bucket.  If they are not able to find code in the cache for the\n125:         bucket, it must not do anything.\n126:         \"\"\"\n127:         raise NotImplementedError()\n128: \n129:     def dump_bytecode(self, bucket):\n130:         \"\"\"Subclasses have to override this method to write the bytecode\n131:         from a bucket back to the cache.  If it unable to do so it must not\n132:         fail silently but raise an exception.\n133:         \"\"\"\n134:         raise NotImplementedError()\n135: \n136:     def clear(self):\n137:         \"\"\"Clears the cache.  This method is not used by Jinja2 but should be\n138:         implemented to allow applications to clear the bytecode cache used\n139:         by a particular environment.\n140:         \"\"\"\n141: \n142:     def get_cache_key(self, name, filename=None):\n143:         \"\"\"Returns the unique hash key for this template name.\"\"\"\n144:         hash = sha1(name.encode('utf-8'))\n145:         if filename is not None:\n146:             if isinstance(filename, unicode):\n147:                 filename = filename.encode('utf-8')\n148:             hash.update('|' + filename)\n149:         return hash.hexdigest()\n150: \n151:     def get_source_checksum(self, source):\n152:         \"\"\"Returns a checksum for the source.\"\"\"\n153:         return sha1(source.encode('utf-8')).hexdigest()\n154: \n155:     def get_bucket(self, environment, name, filename, source):\n156:         \"\"\"Return a cache bucket for the given template.  All arguments are\n157:         mandatory but filename may be `None`.\n158:         \"\"\"\n159:         key = self.get_cache_key(name, filename)\n160:         checksum = self.get_source_checksum(source)\n161:         bucket = Bucket(environment, key, checksum)\n162:         self.load_bytecode(bucket)\n163:         return bucket\n164: \n165:     def set_bucket(self, bucket):\n166:         \"\"\"Put the bucket into the cache.\"\"\"\n167:         self.dump_bytecode(bucket)\n168: \n169: \n170: class FileSystemBytecodeCache(BytecodeCache):\n171:     \"\"\"A bytecode cache that stores bytecode on the filesystem.  It accepts\n172:     two arguments: The directory where the cache items are stored and a\n173:     pattern string that is used to build the filename.\n174: \n175:     If no directory is specified the system temporary items folder is used.\n176: \n177:     The pattern can be used to have multiple separate caches operate on the\n178:     same directory.  The default pattern is ``'__jinja2_%s.cache'``.  ``%s``\n179:     is replaced with the cache key.\n180: \n181:     >>> bcc = FileSystemBytecodeCache('/tmp/jinja_cache', '%s.cache')\n182:     \"\"\"\n183: \n184:     def __init__(self, directory=None, pattern='__jinja2_%s.cache'):\n185:         if directory is None:\n186:             directory = tempfile.gettempdir()\n187:         self.directory = directory\n188:         self.pattern = pattern\n189: \n190:     def _get_cache_filename(self, bucket):\n191:         return path.join(self.directory, self.pattern % bucket.key)\n192: \n193:     def load_bytecode(self, bucket):\n194:         filename = self._get_cache_filename(bucket)\n195:         if path.exists(filename):\n196:             f = file(filename, 'rb')\n197:             try:\n198:                 bucket.load_bytecode(f)\n199:             finally:\n200:                 f.close()\n201: \n202:     def dump_bytecode(self, bucket):\n203:         filename = self._get_cache_filename(bucket)\n204:         f = file(filename, 'wb')\n205:         try:\n206:             bucket.write_bytecode(f)\n207:         finally:\n208:             f.close()\n209: \n210:     def clear(self):\n211:         for filename in filter(listdir(self.directory), self.pattern % '*'):\n212:             try:\n213:                 remove(path.join(self.directory, filename))\n214:             except OSError:\n215:                 pass",
+      "source_summary": "The file object 'f' originates from a file on the filesystem, opened in binary read mode ('rb') by FileSystemBytecodeCache.load_bytecode() method. The file path is constructed using the bucket key and a configured directory, making it potentially controllable by an attacker if the cache directory or keys are not properly secured.",
+      "sink_summary": "The bytecode loaded from the file is assigned to self.code, which can later be executed as Python bytecode when the template is rendered. This represents a potential code execution vulnerability if the bytecode is malicious.",
+      "guard_summary": "There are basic checks for magic header and checksum validation before loading the bytecode, but these do not prevent an attacker from crafting malicious bytecode that passes these checks. The system does not validate or sanitize the bytecode content itself beyond these basic integrity checks.",
+      "risk_pattern": "An attacker can potentially inject malicious bytecode into the cache file, which will be loaded and executed when templates are rendered. The load_bytecode function uses marshal.load_bytecode() directly on data from a file without additional validation or sanitization.",
+      "used_variable_sources": [
+        "f"
+      ],
+      "called_function_context": [
+        "marshal.load_bytecode(f)"
+      ],
+      "enclosing_conditions": [
+        "isinstance(f, file)"
+      ],
+      "context_summary": "The code is part of a bytecode cache system in Jinja2. The load_bytecode method in Bucket class loads bytecode from a file object. When the file object is of type 'file', it uses marshal.load_bytecode() directly on that file object. This operation can execute arbitrary Python bytecode if the file contains malicious content.",
+      "unresolved_facts": [
+        "Whether the cache directory and file names are user-controllable or if there are any access controls on the cache files",
+        "The exact validation mechanism for the magic header and checksum to determine if they are sufficient to prevent malicious code execution"
+      ],
+      "language": "python",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "py/unsafe-unpacking",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 41.2824,
+          "raw_bm25_score": 41.2824,
+          "description": "Extracting files from a potentially malicious tarball using `shutil.unpack_archive()` without validating that the destination file path is within the destination directory can cause files outside the destination directory to be overwritten. More precisely, if the tarball comes from a user controlled location either a remote one or cli argument.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "py/call/wrong-named-class-argument",
+          "cwe_id": "CWE-628",
+          "cwe_name": "Function Call with Incorrectly Specified Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 33.1293,
+          "raw_bm25_score": 33.1293,
+          "description": "Using a named argument whose name does not correspond to a parameter of the __init__ method of the class being instantiated, will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-628. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-628"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "py/timing-attack-against-hash",
+          "cwe_id": "CWE-208",
+          "cwe_name": "Observable Timing Discrepancy",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.521,
+          "raw_bm25_score": 26.521,
+          "description": "When checking a Hash over a message, a constant-time algorithm should be used. Otherwise, an attacker may be able to forge a valid Hash for an arbitrary message by running a timing attack if they can send to the validation procedure. A successful attack can result in authentication bypass.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use constant-time algorithms for sensitive comparisons. Implement timing attack mitigations for authentication and cryptographic operations.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-208"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "py/unsafe-deserialization",
+          "cwe_id": "CWE-502",
+          "cwe_name": "Deserialization of Untrusted Data",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 26.511,
+          "raw_bm25_score": 26.511,
+          "description": "Deserializing user-controlled data may allow attackers to execute arbitrary code.",
+          "pattern": "Identify deserialization operations on untrusted data without proper validation",
+          "remediation": "Use safe serialization formats like JSON. If complex deserialization is needed, implement strict validation and type checking.",
+          "tags": [
+            "external/cwe/cwe-502",
+            "security",
+            "serialization"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "py/call/wrong-number-class-arguments",
+          "cwe_id": "CWE-685",
+          "cwe_name": "Function Call With Incorrect Number of Arguments",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.5857,
+          "raw_bm25_score": 25.5857,
+          "description": "Using too many or too few arguments in a call to the `__init__` method of a class will result in a TypeError at runtime.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-685. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "quality",
+            "reliability",
+            "correctness",
+            "external/cwe/cwe-685"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "py/template-injection",
+          "cwe_id": "CWE-74",
+          "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.4102,
+          "raw_bm25_score": 24.4102,
+          "description": "Using user-controlled data to create a template can lead to remote code execution or cross site scripting.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Use parameterized APIs and separate data from control instructions. Validate input format and escape special characters.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-074"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "py/jinja2/autoescape-false",
+          "cwe_id": "CWE-79",
+          "cwe_name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.118,
+          "raw_bm25_score": 23.118,
+          "description": "Using jinja2 templates with 'autoescape=False' can cause a cross-site scripting vulnerability.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement proper output encoding based on context (HTML, JavaScript, CSS, URL). Use Content Security Policy and validate input.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-079"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "py/csv-injection",
+          "cwe_id": "CWE-1236",
+          "cwe_name": "Improper Neutralization of Formula Elements in a CSV File",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 23.0626,
+          "raw_bm25_score": 23.0626,
+          "description": "From user-controlled data saved in CSV files, it is easy to attempt information disclosure or other malicious activities when automated by spreadsheet software",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "experimental",
+            "external/cwe/cwe-1236"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "py/weak-symmetric-encryption",
+          "cwe_id": "CWE-327",
+          "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.9017,
+          "raw_bm25_score": 22.9017,
+          "description": "Finds uses of symmetric cryptography algorithms that are weak, obsolete, or otherwise unaccepted. The key lengths allowed are 128, 192, and 256 bits. These are all the key lengths supported by AES, so any application of AES is considered acceptable.",
+          "pattern": "Identify usage of weak or deprecated cryptographic algorithms and practices",
+          "remediation": "Use modern cryptographic algorithms and proper key management. Avoid deprecated algorithms and implement proper random number generation.",
+          "tags": [
+            "external/cwe/cwe-327"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "py/flask-debug",
+          "cwe_id": "CWE-489",
+          "cwe_name": "Active Debug Code",
+          "language": "python",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 22.1486,
+          "raw_bm25_score": 22.1486,
+          "description": "Running a Flask app in debug mode may allow an attacker to run arbitrary code through the Werkzeug debugger.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-489. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-215",
+            "external/cwe/cwe-489"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,374 @@
+{
+  "candidate_id": "candidate-4",
+  "filepath": "index.js",
+  "changed_line": 48,
+  "statement": "(this.options || []).every(opt => opt.match(VCHAR_REGEX))",
+  "change_type": "A",
+  "function_name": "IntegrityMetadata.toString",
+  "operation_type": "security_validation",
+  "selection_reason": "strict mode option -> option character validation -> restricts allowed characters in SRI options",
+  "security_relevance_score": 0.7,
+  "code_context": "1: 'use strict'\n2: \n3: const crypto = require('crypto')\n4: const Transform = require('stream').Transform\n5: \n6: const SPEC_ALGORITHMS = ['sha256', 'sha384', 'sha512']\n7: \n8: const BASE64_REGEX = /[a-z0-9+/]+(?:=?=?)/i\n9: const SRI_REGEX = /^([^-]+)-([^?]+)([?\\S*]*)$/\n10: const STRICT_SRI_REGEX = /^([^-]+)-([A-Za-z0-9+/]+(?:=?=?))([?\\x21-\\x7E]*)$/\n11: const VCHAR_REGEX = /[\\x21-\\x7E]+/\n12: \n13: class IntegrityMetadata {\n14:   constructor (metadata, opts) {\n15:     const strict = !!(opts && opts.strict)\n16:     this.source = metadata.trim()\n17:     // 3.1. Integrity metadata\n18:     // https://w3c.github.io/webappsec-subresource-integrity/#integrity-metadata-description\n19:     const match = this.source.match(\n20:       strict\n21:       ? STRICT_SRI_REGEX\n22:       : SRI_REGEX\n23:     )\n24:     if (!match) { return }\n25:     if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }\n26:     this.algorithm = match[1]\n27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)\n194:     checker.on('error', reject)\n195:     checker.on('verified', algo => {\n196:       resolve(algo)\n197:     })",
+  "source_summary": "Options come from user-provided SRI (Subresource Integrity) strings parsed by regex patterns. In strict mode, options are extracted from match[3] of STRICT_SRI_REGEX which captures characters in the range \\x21-\\x7E (printable ASCII).",
+  "sink_summary": "Validated options are joined with '?' and appended to the algorithm-digest string in the toString() output, which may be used in HTML script/link tags for integrity verification.",
+  "guard_summary": "The validation ensures options contain only visible ASCII characters (\\x21-\\x7E) when strict mode is enabled. This prevents injection of control characters, whitespace, or non-ASCII characters that could bypass SRI validation or cause parsing issues.",
+  "risk_pattern": "Strict mode validation enforces RFC-compliant option syntax by restricting options to printable ASCII characters only, preventing potential injection or parsing bypass vulnerabilities in SRI implementations.",
+  "used_variable_sources": [
+    "this.options from constructor parsing of user-provided SRI strings",
+    "VCHAR_REGEX constant defined as /[\\x21-\\x7E]+/"
+  ],
+  "called_function_context": [
+    "String.match() for regex validation",
+    "Array.every() for option validation"
+  ],
+  "enclosing_conditions": [
+    "opts && opts.strict condition enables the validation block",
+    "Validation is part of a compound condition with algorithm and digest validation"
+  ],
+  "context_summary": "The validation occurs in strict mode toString() method, ensuring SRI options comply with W3C specification for visual characters only, preventing malformed options that could bypass integrity checks.",
+  "unresolved_facts": [
+    "Specific attack scenarios where non-VCHAR options could bypass SRI validation are not detailed in the code comments"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "fit_reason": "Regex-based character set validation of SRI options to prevent injection bypass - matches the VCHAR_REGEX validation mechanism",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-117",
+      "cwe_name": "Improper Output Neutralization for Logs",
+      "fit_reason": "Character validation prevents injection in output (HTML integrity attributes), though originally for logs",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-80",
+      "cwe_name": "Improper Neutralization of Script-Related HTML Tags",
+      "fit_reason": "SRI options become part of HTML attributes, requiring proper character neutralization",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-116",
+      "cwe_name": "Improper Encoding or Escaping of Output",
+      "fit_reason": "Character set validation ensures proper encoding of options in HTML integrity attributes",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-730",
+      "cwe_name": "Security Issue (CWE-730)",
+      "fit_reason": "Regex-based validation mechanism could have injection concerns if not properly implemented",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-116",
+    "CWE-117",
+    "CWE-193",
+    "CWE-20",
+    "CWE-327",
+    "CWE-483",
+    "CWE-561",
+    "CWE-676",
+    "CWE-730",
+    "CWE-754",
+    "CWE-758",
+    "CWE-783",
+    "CWE-80",
+    "CWE-829",
+    "CWE-88"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "index.js",
+      "changed_line": 48,
+      "statement": "(this.options || []).every(opt => opt.match(VCHAR_REGEX))",
+      "cwe_id": "CWE-20",
+      "cwe_name": "Improper Input Validation",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The code explicitly validates input (SRI options) using regex pattern matching to ensure only valid visual characters are accepted, which is the core mechanism of CWE-20"
+        },
+        "connection": {
+          "score": 0.9,
+          "evidence": "User-provided SRI strings are parsed into options array, which flows directly to the validation check and then to the output string used in HTML integrity attributes"
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this validation line were removed, SRI options would not be validated in strict mode, allowing non-VCHAR characters that could bypass downstream SRI parsing"
+        },
+        "security_control": {
+          "score": 0.75,
+          "evidence": "",
+          "required_control": "Input validation restricting SRI options to printable ASCII characters (\\x21-\\x7E) as per W3C specification",
+          "control_requirement_evidence": "W3C SRI specification requires option expressions to use visual characters only to prevent injection and parsing bypass",
+          "existing_controls_checked": [
+            "STRICT_SRI_REGEX parsing, algorithm validation, digest validation"
+          ],
+          "deficiency_evidence": "Without this validation, options could contain control characters, whitespace, or non-ASCII characters that might bypass browser SRI validation"
+        },
+        "concrete_impact": {
+          "score": 0.7,
+          "evidence": "Malformed SRI options could potentially bypass integrity verification, allowing malicious script execution if combined with other vulnerabilities"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, SRI options would not be validated for VCHAR compliance in strict mode, potentially allowing injection of control characters or non-ASCII characters that could interfere with downstream SRI parsing.",
+      "supporting_evidence": [
+        "VCHAR_REGEX validation restricts options to printable ASCII characters (\\x21-\\x7E)",
+        "Validation occurs in strict mode when opts.strict is enabled",
+        "Options come from user-provided SRI strings parsed by regex patterns",
+        "Validated options are used in HTML integrity attributes for script/link tags"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Specific attack scenarios demonstrating how non-VCHAR options could bypass browser SRI validation",
+        "Evidence of actual exploitation requiring this specific character restriction"
+      ],
+      "review_comment": "The validation ensures SRI options contain only printable ASCII characters as required by W3C specification, preventing potential injection of control characters or whitespace that could bypass integrity verification. This input validation is correctly implemented using a whitelist approach with VCHAR_REGEX to restrict allowed characters in strict mode.",
+      "change_type": "A",
+      "raw_score": 0.8,
+      "score": 0.8
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "index.js",
+      "changed_line": 48,
+      "statement": "(this.options || []).every(opt => opt.match(VCHAR_REGEX))",
+      "cwe_id": "CWE-117",
+      "cwe_name": "Improper Output Neutralization for Logs",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-117 specifically addresses log message construction from external input without proper neutralization. The demonstrated code validates SRI (Subresource Integrity) options for HTML integrity attributes, not log messages. The mechanism involves validation for HTML attribute safety, not log neutralization."
+        },
+        "connection": {
+          "score": 0.4,
+          "evidence": "User-provided SRI strings are parsed into options (this.options). In strict mode, these options are validated against VCHAR_REGEX (printable ASCII) before being included in the toString() output, which could be used in HTML script/link integrity attributes. The connection from external input to output exists but is for HTML attributes, not logs."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this candidate line were removed, strict mode would not validate that options contain only printable ASCII characters (\\x21-\\x7E). This would allow non-VCHAR characters in SRI options when strict mode is enabled."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "",
+          "required_control": "Neutralization of special elements when writing to log files",
+          "control_requirement_evidence": "CWE-117 requires neutralization of special elements (like newlines, carriage returns, escape sequences) that could be interpreted by log viewing/analysis tools.",
+          "existing_controls_checked": [
+            "VCHAR_REGEX validation restricts to printable ASCII characters (\\x21-\\x7E)"
+          ],
+          "deficiency_evidence": "The demonstrated control validates for HTML attribute safety, not log neutralization. No evidence shows this output is written to logs or that log-specific special elements (like newlines for log injection) are addressed. The control is misaligned with CWE-117 requirements."
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No evidence demonstrates log-related impact. The validation prevents non-printable ASCII characters in SRI options used for HTML integrity attributes, which could affect HTML parsing or SRI validation bypass, but not log injection or log file corruption."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would not validate that SRI options contain only printable ASCII characters (\\x21-\\x7E), potentially allowing control characters, whitespace, or non-ASCII characters in SRI options when strict mode is enabled.",
+      "supporting_evidence": [
+        "User-provided SRI strings are parsed into this.options",
+        "VCHAR_REGEX restricts to printable ASCII characters (\\x21-\\x7E)",
+        "Validation occurs only when opts.strict is true",
+        "Options are included in toString() output for HTML integrity attributes"
+      ],
+      "contradicting_evidence": [
+        "CWE-117 specifically addresses log message construction - no evidence this output is written to logs",
+        "The validation targets HTML integrity attribute safety, not log neutralization",
+        "No log-specific special elements (newlines, carriage returns, escape sequences) are mentioned or addressed"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether the toString() output is ever written to log files",
+        "What downstream systems consume the SRI string and whether they interpret it as logs",
+        "Specific attack scenarios where non-VCHAR options could bypass SRI validation"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.36,
+      "score": 0.36
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "index.js",
+      "changed_line": 48,
+      "statement": "(this.options || []).every(opt => opt.match(VCHAR_REGEX))",
+      "cwe_id": "CWE-80",
+      "cwe_name": "Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-80 requires script tag injection into HTML output. The code validates SRI options using VCHAR_REGEX (/[\\x21-\\x7E]+/) which restricts to printable ASCII characters, but this is character set validation, not HTML neutralization."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "Options come from user-provided SRI strings and are eventually output in HTML integrity attributes, but the validation occurs before HTML context and restricts characters to prevent parsing issues, not script injection."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "The added validation prevents non-printable ASCII characters in SRI options when strict mode is enabled, which could affect downstream parsing but not directly create XSS vulnerability."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "HTML encoding/neutralization for script-related characters",
+          "control_requirement_evidence": "CWE-80 requires neutralization of <, >, & characters when outputting to HTML context",
+          "existing_controls_checked": [
+            "VCHAR_REGEX character set restriction (\\x21-\\x7E)",
+            "Strict mode validation block"
+          ],
+          "deficiency_evidence": "The control restricts character set but does not perform HTML encoding. However, SRI options are attribute values, not HTML content, and the validation prevents problematic characters that could affect parsing."
+        },
+        "concrete_impact": {
+          "score": 0.15,
+          "evidence": "No evidence of script execution or XSS impact. SRI options are used in integrity attributes which are not executed as script, and the validation prevents characters that could break parsing rather than enable injection."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, SRI options in strict mode would not be validated for printable ASCII characters, potentially allowing non-printable characters that could cause parsing errors but not XSS.",
+      "supporting_evidence": [
+        "SRI options are extracted from user-provided strings and included in HTML integrity attributes",
+        "The validation restricts options to printable ASCII characters (\\x21-\\x7E) in strict mode"
+      ],
+      "contradicting_evidence": [
+        "SRI integrity attributes are not executed as HTML/script content - they are metadata for resource verification",
+        "The validation prevents parsing issues, not script injection - it restricts character set rather than neutralizing HTML entities",
+        "No evidence of <, >, & characters being processed as HTML in the SRI context"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "How SRI options are ultimately consumed by HTML parsers/browsers",
+        "Whether malformed SRI options could lead to script execution in specific browser implementations"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.26999999999999996,
+      "score": 0.26999999999999996
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "index.js",
+      "changed_line": 48,
+      "statement": "(this.options || []).every(opt => opt.match(VCHAR_REGEX))",
+      "cwe_id": "CWE-116",
+      "cwe_name": "Improper Encoding or Escaping of Output",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-116 requires improper encoding/escaping that corrupts message structure. The candidate validates input character set but does not encode/escape output data for communication protocols."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "User-provided SRI options are validated and then joined into output string, but no encoding/escaping operation is demonstrated in the output path."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The added validation prevents non-VCHAR characters from entering the options array, but doesn't change how existing options are encoded/escaped in the output."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "",
+          "required_control": "Proper output encoding/escaping for the target context (HTML attributes)",
+          "control_requirement_evidence": "CWE-116 requires encoding/escaping when outputting data to preserve message structure",
+          "existing_controls_checked": [
+            "Input validation restricts characters to VCHAR range",
+            "Options are joined with '?' delimiter without additional encoding"
+          ],
+          "deficiency_evidence": "No demonstrated encoding/escaping mechanism for the output context; validation is input-focused, not output encoding"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "No demonstrated impact from improper encoding; the validation prevents malformed input but doesn't address output encoding vulnerabilities."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, non-VCHAR characters would be allowed in options but the output encoding mechanism would remain unchanged.",
+      "supporting_evidence": [
+        "Input validation restricts options to printable ASCII characters (\\x21-\\x7E)",
+        "Options are incorporated into SRI string output used in HTML attributes"
+      ],
+      "contradicting_evidence": [
+        "The code performs input validation, not output encoding/escaping",
+        "No encoding/escaping functions are called on the output data",
+        "The structured message (SRI string) construction preserves intended format through simple concatenation"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Target output context and required encoding scheme are not specified",
+        "Whether the simple concatenation preserves the intended SRI structure is not demonstrated"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.26,
+      "score": 0.26
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "index.js",
+      "changed_line": 48,
+      "statement": "(this.options || []).every(opt => opt.match(VCHAR_REGEX))",
+      "cwe_id": "CWE-730",
+      "cwe_name": "Security Issue (CWE-730)",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-730 specifically addresses regex injection where user input modifies regex patterns, but here VCHAR_REGEX is a fixed constant (/[\\x21-\\x7E]+/) and user options are validated against it, not injected into it"
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "User-provided SRI options from match[3] flow to the validation check, but they are used as the input to match(), not as part of the regex pattern itself"
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "The added line implements validation that restricts options to printable ASCII characters in strict mode, changing the security control behavior"
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "",
+          "required_control": "Input validation to prevent regex injection",
+          "control_requirement_evidence": "CWE-730 requires validation when user input could modify regex patterns",
+          "existing_controls_checked": [
+            "Fixed VCHAR_REGEX constant prevents pattern modification",
+            "Options are validated against fixed regex, not injected into patterns"
+          ],
+          "deficiency_evidence": "No deficiency exists - the code correctly validates input against a fixed regex rather than allowing regex injection"
+        },
+        "concrete_impact": {
+          "score": 0.1,
+          "evidence": "No evidence of exponential time attacks or regex injection vulnerability; the fixed regex pattern prevents user input from affecting regex evaluation complexity"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, strict mode would not validate that options contain only printable ASCII characters, potentially allowing non-compliant options but not creating a regex injection vulnerability.",
+      "supporting_evidence": [
+        "User-provided SRI options are validated using regex matching",
+        "Validation occurs in security-sensitive SRI integrity checking context"
+      ],
+      "contradicting_evidence": [
+        "VCHAR_REGEX is a fixed constant pattern defined at line 11",
+        "User options are validated against the regex, not injected into regex construction",
+        "The code prevents rather than enables regex injection"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether non-VCHAR options could actually bypass downstream SRI validation",
+        "Specific attack scenarios where malformed options could cause security impact"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.26,
+      "score": 0.26
+    }
+  ],
+  "stage4_status": "completed"
+}

@@ -1,0 +1,693 @@
+diff --git a/cherrymusicserver/cherrymodel.py b/cherrymusicserver/cherrymodel.py
+index 2f00ded..34905e7 100644
+--- a/cherrymusicserver/cherrymodel.py
++++ b/cherrymusicserver/cherrymodel.py
+@@ -36,31 +36,30 @@ from __future__ import unicode_literals
+ 
+ import os
+ import sys
+ from random import choice
+ import cherrypy
+ import audiotranscode
+ from imp import reload
+ 
+ import cherrymusicserver as cherry
+ from cherrymusicserver import service
+ from cherrymusicserver import util
+ from cherrymusicserver import pathprovider
+ from cherrymusicserver.util import Performance
+ from cherrymusicserver import resultorder
+ from cherrymusicserver import log
+-from cherrymusicserver.ext import zipstream
+ 
+ 
+ @service.user(cache='filecache')
+ class CherryModel:
+     def __init__(self):
+         CherryModel.NATIVE_BROWSER_FORMATS = ['ogg', 'mp3']
+         CherryModel.supportedFormats = CherryModel.NATIVE_BROWSER_FORMATS[:]
+         if cherry.config['media.transcode']:
+             self.transcoder = audiotranscode.AudioTranscode()
+             CherryModel.supportedFormats += self.transcoder.availableDecoderFormats()
+             CherryModel.supportedFormats = list(set(CherryModel.supportedFormats))
+ 
+     def abspath(self, path):
+         return os.path.join(cherry.config['media.basedir'], path)
+ 
+@@ -116,36 +115,32 @@ class CherryModel:
+             for dir in sortedfiles:
+                 subpath = os.path.join(absdirpath, dir)
+                 self.addMusicEntry(subpath, musicentries)
+         return musicentries
+ 
+     def addMusicEntry(self, fullpath, list):
+         if os.path.isfile(fullpath):
+             if isplayable(fullpath):
+                 list.append(MusicEntry(strippath(fullpath)))
+         else:
+             list.append(MusicEntry(strippath(fullpath), dir=True))
+ 
+     def updateLibrary(self):
+         self.cache.full_update()
+         return True
+-    
+-    def compress(self, filelist):
+-        fullpath_filelist = [cherry.config['media.basedir']+f for f in filelist]
+-        yield zipstream.ZipStream(fullpath_filelist)
+ 
+-    def file_size_within_limit(filelist, maximum_download_size):
++    def file_size_within_limit(self, filelist, maximum_download_size):
+         acc_size = 0
+         for f in filelist:
+             acc_size += os.path.getsize(self.abspath(f))
+             if acc_size > maximum_download_size:
+                 return False
+         return True
+ 
+     def search(self, term):
+         reload(cherry.tweak)
+         tweaks = cherry.tweak.CherryModelTweaks
+         user = cherrypy.session.get('username', None)
+         if user:
+             log.d(user+' searched for "'+term+'"')
+         max_search_results = cherry.config['search.maxresults']
+         results = self.cache.searchfor(term, maxresults=max_search_results)
+diff --git a/cherrymusicserver/configuration.py b/cherrymusicserver/configuration.py
+index c4fca8f..d288198 100644
+--- a/cherrymusicserver/configuration.py
++++ b/cherrymusicserver/configuration.py
+@@ -83,30 +83,37 @@ def from_defaults():
+         transcode.doc = """
+                     TRANSCODE (experimental!) enables automatic live transcoding
+                     of the media to be able to listen to every format on every device.
+                     This requires you to have the appropriate codecs installed.
+                     Please note that transcoding will significantly increase the stress on the CPU!
+                     """
+ 
+     with c['media.fetch_album_art'] as fetch:
+         fetch.value = False
+         fetch.doc = """
+                     Tries to fetch the album cover from various locations in the web,
+                     if no image is found locally. By default it will be fetched from amazon.
+                     They will be shown next to folders that qualify as a possible
+                     album.
+                     """
++                    
++    with c['media.maximum_download_size'] as maxdl:
++        maxdl.value = 1024*1024*250
++        maxdl.doc = """
++                    Maximum size in bytes of all files to be downloaded in one zipfile.
++                    Defaults to 250 megabytes.
++                    """
+ 
+     with c['search.maxresults'] as maxresults:
+         maxresults.value = 20
+         maxresults.doc = """
+                     MAXRESULTS sets the maximum amount of search results
+                     to be displayed. If MAXRESULTS is set to a higher value,
+                     the search will take longer, but will also be more accurate.
+                     """
+ 
+     with c['search.load_file_db_into_memory'] as memory:
+         memory.value = False
+         memory.doc = """
+                     This will load parts of the database into memory for improved
+                     performance. This option should only be used on systems with
+                     sufficient memory, because it will hurt the performance otherwise.
+diff --git a/cherrymusicserver/httphandler.py b/cherrymusicserver/httphandler.py
+index eeefa15..d8ef118 100644
+--- a/cherrymusicserver/httphandler.py
++++ b/cherrymusicserver/httphandler.py
+@@ -25,58 +25,63 @@
+ # GNU General Public License for more details.
+ #
+ # You should have received a copy of the GNU General Public License
+ # along with this program.  If not, see <http://www.gnu.org/licenses/>
+ #
+ 
+ """This class provides the api to talk to the client.
+ It will then call the cherrymodel, to get the
+ requested information"""
+ 
+ import os  # shouldn't have to list any folder in the future!
+ import json
+ import cherrypy
+ import codecs
+ import sys
++import re
+ try:
+     from urllib.parse import unquote
+ except ImportError:
+     from backport.urllib.parse import unquote
+ try:
+     from urllib import parse
+ except ImportError:
+     from backport.urllib import parse
+ 
+ 
+ import audiotranscode
+ 
+ from cherrymusicserver import renderjson
+ from cherrymusicserver import userdb
+ from cherrymusicserver import log
+ from cherrymusicserver import albumartfetcher
+ from cherrymusicserver import service
+ from cherrymusicserver.cherrymodel import MusicEntry
+ from cherrymusicserver.pathprovider import databaseFilePath, readRes
+ from cherrymusicserver.pathprovider import albumArtFilePath
+ import cherrymusicserver as cherry
+ import cherrymusicserver.metainfo as metainfo
+ from cherrymusicserver.util import Performance
++
++from cherrymusicserver.ext import zipstream
+ import time
+ 
+ debug = True
+ 
+-@service.user(model='cherrymodel', playlistdb='playlist', useroptions='useroptions', userdb='users')
++
++@service.user(model='cherrymodel', playlistdb='playlist',
++              useroptions='useroptions', userdb='users')
+ class HTTPHandler(object):
+     def __init__(self, config):
+         self.config = config
+         self.jsonrenderer = renderjson.JSON()
+ 
+         template_main = 'res/main.html'
+         template_login = 'res/login.html'
+         template_firstrun = 'res/firstrun.html'
+ 
+         self.mainpage = readRes(template_main)
+         self.loginpage = readRes(template_login)
+         self.firstrunpage = readRes(template_firstrun)
+ 
+         self.handlers = {
+             'search': self.api_search,
+@@ -97,31 +102,32 @@ class HTTPHandler(object):
+             'downloadm3u': self.api_downloadm3u,
+             'getsonginfo': self.api_getsonginfo,
+             'getencoders': self.api_getencoders,
+             'getdecoders': self.api_getdecoders,
+             'transcodingenabled': self.api_transcodingenabled,
+             'updatedb': self.api_updatedb,
+             'getconfiguration': self.api_getconfiguration,
+             'compactlistdir': self.api_compactlistdir,
+             'listdir': self.api_listdir,
+             'fetchalbumart': self.api_fetchalbumart,
+             'heartbeat': self.api_heartbeat,
+             'getuseroptions': self.api_getuseroptions,
+             'setuseroption': self.api_setuseroption,
+             'customcss.css': self.api_customcss,
+             'changeplaylist': self.api_changeplaylist,
+-            #'download': self.api_download,
++            'downloadcheck': self.api_downloadcheck,
++            'setuseroptionfor': self.api_setuseroptionfor,
+         }
+ 
+     def issecure(self, url):
+         return parse.urlparse(url).scheme == 'https'
+ 
+     def getBaseUrl(self, redirect_unencrypted=False):
+         ipAndPort = parse.urlparse(cherrypy.url()).netloc
+         is_secure_connection = self.issecure(cherrypy.url())
+         ssl_enabled = cherry.config['server.ssl_enabled']
+         if ssl_enabled and not is_secure_connection:
+             log.d('Not secure, redirecting...')
+             ip = ipAndPort[:ipAndPort.rindex(':')]
+             url = 'https://' + ip + ':' + str(cherry.config['server.ssl_port'])
+             if redirect_unencrypted:
+                 raise cherrypy.HTTPRedirect(url, 302)
+@@ -319,85 +325,135 @@ everybody has to relogin now.''')
+             }
+             .compactlistdir {
+                 background-color: #005500 !important;
+             }
+             div.jp-playlist a {
+                 color: #FFFFFF !important;
+             }
+             div.jp-title, div.jp-playlist {
+                 background-color: #444444 !important;
+             }
+             #playlistCommands {
+                 background-color: #444444;
+             }
+             """
+         return style
+-    
+-    def api_download(self, filelist):
+-        #TODO: make sure file are not outside of basedir
++        
++    def download_check_files(self, filelist):
++        # only admins and allowed users may download
++        if not cherrypy.session['admin']:
++            uo = self.useroptions.forUser(self.getUserId())
++            if not uo.getOptionValue('media.may_download'):
++                return 'not_permitted'
++        # make sure nobody tries to escape from basedir
++        for f in filelist:
++            if '/../' in f:
++                return 'invalid_file'
++        # make sure all files are smaller than maximum download size
+         size_limit = cherry.config['media.maximum_download_size']
+-        active_download = cherrypy.session.get('active_download', False)
+-        if not active_download:
+-            if self.model.file_size_within_limit(filelist, maximum_download_size):
+-                cherrypy.session['active_download'] = True
+-                cherrypy.session.release_lock()                
+-                cherrypy.response.headers["Content-Type"] = 'application/zip'
+-                cherrypy.response.headers['Content-Disposition'] = 'attachment; filename="dl.zip"'
+-                chunk = self.model.compress(filelist)
+-                while not chunk is None:
+-                    yield chunk
+-                    chunk = self.model.compress(filelist)
+-    api_download._cp_config = {'response.stream': True}
+-            
++        if self.model.file_size_within_limit(filelist, size_limit):
++            return 'ok'
++        else:
++            return 'too_big'
++
++    def api_downloadcheck(self, value):
++        filelist = [unquote(filepath) for filepath in json.loads(value)]
++        status = self.download_check_files(filelist)
++        if status == 'not_permitted':
++            return """You are not allowed to download files."""
++        elif status == 'invalid_file':
++            return """Error: File has invalid filename""" % f
++        elif status == 'too_big':
++            size_limit = cherry.config['media.maximum_download_size']
++            return """Can't download: Playlist is bigger than %s mB.
++            The server administrator can change this configuration.
++            """ % (size_limit/1024/1024)
++        elif status == 'ok':
++            return status
++        else:
++            log.e("Unknown download file check status '%s'" % status)
++            return 'error'
++
++    def download(self, value):
++        if not self.isAuthorized():
++            raise cherrypy.HTTPError(401, 'Unauthorized')
++        filelist = [unquote(filepath) for filepath in json.loads(value)]
++        dlstatus = self.download_check_files(filelist)
++        if dlstatus == 'ok':
++            cherrypy.session.release_lock()
++            zipmime = 'application/x-zip-compressed'
++            cherrypy.response.headers["Content-Type"] = zipmime
++            zipname = 'attachment; filename="music.zip"'
++            cherrypy.response.headers['Content-Disposition'] = zipname
++            basedir = cherry.config['media.basedir']
++            fullpath_filelist = [os.path.join(basedir, f) for f in filelist]
++            return zipstream.ZipStream(fullpath_filelist)
++        else:
++            return dlstatus
++    download.exposed = True
++    download._cp_config = {'response.stream': True}
+ 
+     def invert(self, htmlcolor):
+         r, g, b = self.html2rgb(htmlcolor)
+         return '#'+self.rgb2hex(255-r, 255-b, 255-b)
+ 
+     def brightness(self, htmlcolor, brightness):
+         r, g, b = self.html2rgb(htmlcolor)
+         r = min(max(r+brightness, 0), 255)
+         g = min(max(g+brightness, 0), 255)
+         b = min(max(b+brightness, 0), 255)
+         return '#'+self.rgb2hex(r, g, b)
+ 
+     def html2rgb(self, htmlcolor):
+         r = int(htmlcolor[1:3], 16)
+         g = int(htmlcolor[3:5], 16)
+         b = int(htmlcolor[5:7], 16)
+         return r, g, b
+ 
+     def rgb2hex(self, r, g, b):
+         r = hex(r)[2:].zfill(2)
+         g = hex(g)[2:].zfill(2)
+         b = hex(b)[2:].zfill(2)
+         return r+g+b
+ 
+     def api_getuseroptions(self, value):
+         uo = self.useroptions.forUser(self.getUserId())
+         uco = uo.getChangableOptions()
++        if cherrypy.session['admin']:
++            uco['media'] = {'may_download': True}
++        else:
++            uco['media'] = {'may_download': uo.getOptionValue('media.may_download')}
+         return json.dumps(uco)
+ 
+     def api_heartbeat(self, value):
+         uo = self.useroptions.forUser(self.getUserId())
+         uo.setOption('last_time_online', int(time.time()))
+ 
+     def api_setuseroption(self, value):
+         params = json.loads(value)
+         uo = self.useroptions.forUser(self.getUserId())
+         uo.setOption(params["optionkey"], params["optionval"])
+         return "success"
++    
++    def api_setuseroptionfor(self, value):
++        if cherrypy.session['admin']:
++            params = json.loads(value)
++            uo = self.useroptions.forUser(params['userid'])
++            uo.setOption(params["optionkey"], params["optionval"])
++            return "success"
++        else:
++            return "error: not permitted. Only admins can change other users options"
+ 
+     def api_fetchalbumart(self, value):
+         cherrypy.session.release_lock()
+         params = json.loads(value)
+         directory = params['directory']
+ 
+         #try getting a cached album art image
+         b64imgpath = albumArtFilePath(directory)
+         img_data = self.albumartcache_load(b64imgpath)
+         if img_data:
+             cherrypy.response.headers["Content-Length"] = len(img_data)
+             return img_data
+ 
+         #try getting album art inside local folder
+         fetcher = albumartfetcher.AlbumArtFetcher()
+@@ -506,31 +562,33 @@ everybody has to relogin now.''')
+         session_playlist = cherrypy.session.get('playlist', '[]')
+         return session_playlist
+ 
+     def api_getplayables(self, value):
+         """DEPRECATED"""
+         return json.dumps(cherry.config['media.playable'])
+ 
+     def api_getuserlist(self, value):
+         if cherrypy.session['admin']:
+             userlist = self.userdb.getUserList()
+             for user in userlist:
+                 if user['id'] == cherrypy.session['userid']:
+                     user['deletable'] = False
+                 user_options = self.useroptions.forUser(user['id'])
+                 t = user_options.getOptionValue('last_time_online')
++                may_download = user_options.getOptionValue('media.may_download')
+                 user['last_time_online'] = t
++                user['may_download'] = may_download
+             return json.dumps({'time': int(time.time()),
+                                'userlist': userlist})
+         else:
+             return json.dumps({'time': 0, 'userlist': []})
+ 
+     def api_adduser(self, value):
+         if cherrypy.session['admin']:
+             new = json.loads(value)
+             return self.userdb.addUser(new['username'],
+                                        new['password'],
+                                        new['isadmin'])
+         else:
+             return "You didn't think that would work, did you?"
+ 
+     def api_userchangepassword(self, value):
+diff --git a/cherrymusicserver/useroptiondb.py b/cherrymusicserver/useroptiondb.py
+index bfa76e1..31b9fbb 100644
+--- a/cherrymusicserver/useroptiondb.py
++++ b/cherrymusicserver/useroptiondb.py
+@@ -53,30 +53,32 @@ class UserOptionDB:
+             kbs['prev'].value = 89
+             kbs['play'].value = 88
+             kbs['pause'].value = 67
+             kbs['stop'].value = 86
+             kbs['next'].value = 66
+             kbs['search'].value = 83
+         with c['misc.show_playlist_download_buttons'] as pl_download_buttons:
+             pl_download_buttons.value = False
+         with c['misc.autoplay_on_add'] as autoplay_on_add:
+             autoplay_on_add.value = False
+         with c['custom_theme.primary_color'] as primary_color:
+             primary_color.value = '#F02E75'
+             primary_color.valid = '#[0-9a-fA-F]{6}'
+         with c['custom_theme.white_on_black'] as white_on_black:
+             white_on_black.value = False
++        with c['media.may_download'] as may_download:
++            may_download.value = False
+         with c['last_time_online'] as last_time_online:
+             last_time_online.value = 0
+             last_time_online.valid = '\\d+'
+             last_time_online.hidden = True
+             last_time_online.doc = "UNIX TIME (1.1.1970 = never)"
+ 
+         self.DEFAULTS = c.to_configuration()
+ 
+         self.conn = BoundConnector(DBNAME, connector).connection()
+ 
+     def getOptionFromMany(self, key, userids):
+         result = {}
+         for userid in userids:
+             val = self.useroptiondb.conn.execute(
+                 '''SELECT value FROM option WHERE  userid = ? AND name = ?''',
+diff --git a/res/cherrymusic.js b/res/cherrymusic.js
+index 71de805..045be9e 100644
+--- a/res/cherrymusic.js
++++ b/res/cherrymusic.js
+@@ -547,30 +547,52 @@ function loadPlaylist(playlistid, playlistlabel){
+         );
+     } else {
+         $(pldomid).slideToggle('slow');
+     }
+ }
+ 
+ var lastPlaylistHeight = 0;
+ function resizePlaylistSlowly(){
+     var currentHeight = $('.jp-playlist').height();
+     if(lastPlaylistHeight <= currentHeight){
+         $('#playlistContainerParent').animate({'min-height': currentHeight});
+     }
+     lastPlaylistHeight = currentHeight;
+ }
+ 
++function download_editing_playlist(){
++    var pl = playlistManager.getEditingPlaylist();
++    var p = pl.jplayerplaylist.playlist;
++    var track_urls = []
++    for(i=0; i<p.length; i++){
++        track_urls.push(htmldecode(p[i].url.slice(6)));
++    }
++    var tracks_json = JSON.stringify(track_urls)
++    api({action: 'downloadcheck', value: tracks_json},
++        function(msg){
++            if(msg == 'ok'){
++                //add tracks to hidden form and call to call download using post data
++                $('#download-redirect-files').val(tracks_json);
++                $('#download-redirect').submit();
++            } else {
++                alert(msg);
++            }
++        },
++        errorFunc('Failed to check if playlist may be downloaded')
++    );
++}
++
+ /*****
+ OTHER
+ *****/
+ 
+ function reloadPage(){
+     //reconstruct url to suppress page reload post-data warning
+     var reloadurl = window.location.protocol+'//'+window.location.host;
+     window.location.href = reloadurl;
+ }
+ 
+ function logout(){
+     "use strict";
+     var success = reloadPage;
+     api('logout',success);
+ }
+@@ -586,41 +608,50 @@ function updateUserList(){
+         var htmllist = "";
+         var response = $.parseJSON(data);
+         var time = response['time'];
+         $.each(response['userlist'],function(i,e){           
+             var reltime = time - e.last_time_online;
+             htmllist += Mustache.render([
+                 '<li {{#isadmin}}class="admin"{{/isadmin}}>',
+                     '<div class="row-fluid">',
+                         '<div class="span1">',
+                             '<span class="badge ',
+                                 '{{#isonline}}badge-success{{/isonline}}',
+                                 '{{^isonline}}badge-important{{/isonline}}',
+                                 '">&#x2022;',
+                             '</span>',
+                         '</div>',
+-                        '<div class="span4">{{{usernamelabel}}}</div>',
+-                        '<div class="span5"> last seen: {{fuzzytime}}</div>',
+-                        '<div class="span2">',
++                        '<div class="span3">{{{usernamelabel}}}</div>',
++                        '<div class="span3"> last seen: {{fuzzytime}}</div>',
++                        '<div class="span3">',
++                            '{{#isnotadmin}}',
++                            'permit download<input type="checkbox" ',
++                            'onchange="userSetPermitDownload({{userid}}, $(this).is(\':checked\'))" id="misc-autoplay_on_add" value="option1" ',
++                            '{{#may_download}}checked="checked"{{/may_download}}>',
++                            '{{/isnotadmin}}',
++                        '</div>',
++                        '<div class="span1">',
+                             '{{#isdeletable}}',
+                                 '<a class="btn btn-mini btn-danger" href="javascript:;" onclick="userDelete({{userid}})">delete</a>',
+                             '{{/isdeletable}}',
+                         '</div>',
+                     '</div>',
+                 '</li>',
+             ].join(''),{
+                 isadmin: e.admin,
++                may_download: e.may_download,
++                isnotadmin: !e.admin,
+                 isdeletable: e.deletable,
+                 userid: e.id,
+                 isonline: reltime < HEARTBEAT_INTERVAL_MS/500,
+                 usernamelabel: renderUserNameLabel(e.username),
+                 fuzzytime: time2text(reltime),
+             });
+         });
+         $('#adminuserlist').html(htmllist);
+     };
+     busy('#adminuserlist').hide().fadeIn('fast');
+     api('getuserlist',
+         success,
+         errorFunc('cannot fetch user list'),
+         function(){busy('#adminuserlist').fadeOut('fast')}
+     );
+@@ -642,44 +673,63 @@ function addNewUser(){
+     var success = function(data){
+         $('#newusername').val('');
+         $('#newpassword').val('');
+         $('#newisadmin').prop('checked', false);
+         updateUserList();
+     };
+     busy('#adminpanel').hide().fadeIn('fast');
+     api(data,
+         success,
+         errorFunc('failed to add new user'),
+         function(){busy('#adminpanel').fadeOut('fast')}
+     );
+ }
+ 
+ function userDelete(userid){
+-    var data = {'action':'userdelete',
++    var data = {'action':'setuseroptionfor',
+                 'value' : JSON.stringify({
+                     'userid':userid
+                 })};
+     var success = function(data){
+         updateUserList();
+     };
+     busy('#adminuserlist').hide().fadeIn('fast');
+     api(data,
+         success,
+         errorFunc('failed to delete user'),
+         function(){busy('#adminuserlist').fadeOut('fast')}
+     );
+ }
++
++function userSetPermitDownload(userid, allow_download){
++    var data = {'action':'setuseroptionfor',
++                'value' : JSON.stringify({
++                    'optionkey': 'media.may_download',
++                    'optionval': allow_download,
++                    'userid': userid,
++                })};
++    var success = function(data){
++        updateUserList();
++    };
++    busy('#adminuserlist').hide().fadeIn('fast');
++    api(data,
++        success,
++        errorFunc('Failed to set user download state'),
++        function(){busy('#adminuserlist').fadeOut('fast')}
++    );
++}
++
+ function userChangePassword(){
+     if (! validateNewPassword($('#newpassword-change'), $('#repeatpassword-change'))) {
+         return false;
+     }
+     var data = {'action':'userchangepassword',
+                 'value' : JSON.stringify({
+                     'oldpassword':$('#oldpassword-change').val(),
+                     'newpassword':$('#newpassword-change').val()
+                 })};
+     $('#oldpassword-change').val('');
+     var success = function(data){
+         $('#changePassword').find('input').each(function(idx, el) { $(el).val(''); } )
+         $('#changePassword').modal('hide');
+         $('#userOptions').modal('hide');
+         successNotify('Password changed successfully!')();
+diff --git a/res/main.html b/res/main.html
+index 812e6e7..67b92e5 100644
+--- a/res/main.html
++++ b/res/main.html
+@@ -478,30 +478,34 @@ PLAYLIST SAVE DIALOG OVERLAY END -->
+                         <a show-cond="queue" id="save-playlist-from-queue" href="#saveplaylistmodal"  data-toggle="modal" class="hide pull-left new-playlist-from-queue btn btn-mini">save as playlist</a>
+                         <a show-cond="queue" class="hide pull-right clear-playlist btn btn-mini" onclick="playlistManager.clearQueue(); return false;">clear</a>
+                         <a show-cond="queue" class="hide pull-right remove-played-tracks btn btn-mini" onclick="playlistManager.removePlayedFromPlaylist(); return false;" >remove played</a>
+                         <div show-cond="playlist" id="playlist-command-button-group" class="hide pull-left btn-group">
+                             <button show-cond="playlist not-saved" class="btn save-current-playlist-button">save</a>
+                             <button class="btn dropdown-toggle" data-toggle="dropdown">
+                                 <span class="caret"></span>
+                             </button>
+                             <ul class="dropdown-menu">
+                                 <li><a href="#saveplaylistmodal" data-toggle="modal" class="save-as-new-playlist-button" tabindex="-1" href="#">Save as new playlist</a></li>
+                                 <li class="divider"></li>
+                                 <li><a class="delete-playlist-button" tabindex="-1" href="#">Delete playlist</a></li>
+                                 <li><a class="toggle-public-private-playlist" tabindex="-1" href="#"></a></li>
+                             </ul>
+                         </div>
++                        <a class="btn btn-mini" show-cond="user-may-download" onclick="download_editing_playlist()">download</a>
++                        <form style="display: none" id="download-redirect" method="post" action="download">
++                            <input id="download-redirect-files" type="text" name="value" value="" />
++                        </form>
+                     </div>
+                     <div class="playlist-progress row-fluid">
+                         <span class="remaining-tracks-or-time bottom-corners label"></span>
+                         <div class="playlist-progress-bar progress" style="height: 3px;"><div class="bar" style="width: '+parseInt(100-proc*100)+'%;"></div></div>
+                     </div>
+                 </div>
+                 <div id="playlistContainerParent"></div>
+                 <div id="playlistBrowser">
+                     <a href="#" class="btn" onclick="playlistManager.newPlaylist()">create new playlist</a><br>
+                     <span class="center helptext" style="width: 100px">or load a playlist from the list below</span>
+                     <div class="available-playlists" style="display: none">
+                     </div>        
+                 </div>
+             </div>
+             <!-- PLAYLIST TAB END -->
+diff --git a/res/playlistmanager.js b/res/playlistmanager.js
+index ed6aa7b..b2233bc 100644
+--- a/res/playlistmanager.js
++++ b/res/playlistmanager.js
+@@ -356,30 +356,31 @@ PlaylistManager.prototype = {
+         } else {
+             $(this.cssSelector.shuffle).show();
+             $(this.cssSelector.shuffleOff).hide();
+         }
+     },
+     refreshCommands : function(){
+         var epl = this.getEditingPlaylist();
+         if(typeof epl !== 'undefined'){
+             show_ui_conditionally(
+                 ['.playlist-command-buttons',
+                  '#playlist-command-button-group'],
+                 {
+                     'queue': epl.reason_open == 'queue',
+                     'playlist': epl.reason_open != 'queue',
+                     'not-saved': epl.saved == false,
++                    'user-may-download': userOptions.media.may_download,
+                 }
+             );
+             
+             $('.save-current-playlist-button').off().on("click",function(){
+                 var epl = playlistManager.getEditingPlaylist();
+                 savePlaylist(epl.id, false,false,true);                       
+                 $(this).blur();
+                 return false;
+             });
+ 
+             $('.save-as-new-playlist-button').off().on("click",function(){
+                 var epl = playlistManager.getEditingPlaylist();
+                 $('#playlisttitle').val(epl.name+' copy');
+                 if(epl.public){
+                     $("#playlistpublic").attr("checked", true);

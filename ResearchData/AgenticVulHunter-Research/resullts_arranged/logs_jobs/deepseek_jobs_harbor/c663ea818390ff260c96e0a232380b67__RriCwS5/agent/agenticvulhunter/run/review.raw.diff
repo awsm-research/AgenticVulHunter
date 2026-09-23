@@ -1,0 +1,363 @@
+diff --git a/lib/Parser/Parse.cpp b/lib/Parser/Parse.cpp
+index 8da8fd4b9..5e481eaad 100644
+--- a/lib/Parser/Parse.cpp
++++ b/lib/Parser/Parse.cpp
+@@ -2856,46 +2856,48 @@ ParseNodePtr Parser::ParseTerm(BOOL fAllowCall,
+     {
+         PROBE_STACK(m_scriptContext, Js::Constants::MinStackParseOneTerm);
+     }
+ 
+     switch (m_token.tk)
+     {
+     case tkID:
+     {
+         PidRefStack *ref = nullptr;
+         IdentPtr pid = m_token.GetIdentifier(m_phtbl);
+         charcount_t ichLim = m_pscan->IchLimTok();
+         size_t iecpLim = m_pscan->IecpLimTok();
+         ichMin = m_pscan->IchMinTok();
+         iecpMin  = m_pscan->IecpMinTok();
+ 
++        if (pid == wellKnownPropertyPids.async &&
++            m_scriptContext->GetConfig()->IsES7AsyncAndAwaitEnabled())
++        {
++            isAsyncExpr = true;
++        }
++
+         m_pscan->Scan();
+ 
+         // We search for an Async expression (a function declaration or an async lambda expression)
+-        if (pid == wellKnownPropertyPids.async &&
+-            !m_pscan->FHadNewLine() &&
+-            m_scriptContext->GetConfig()->IsES7AsyncAndAwaitEnabled())
++        if (isAsyncExpr && !m_pscan->FHadNewLine())
+         {
+             if (m_token.tk == tkFUNCTION)
+             {
+-                isAsyncExpr = true;
+                 goto LFunction;
+             }
+             else if (m_token.tk == tkID)
+             {
+                 isLambdaExpr = true;
+-                isAsyncExpr = true;
+                 goto LFunction;
+             }
+         }
+ 
+         // Don't push a reference if this is a single lambda parameter, because we'll reparse with
+         // a correct function ID.
+         if (m_token.tk != tkDArrow)
+         {
+             ref = this->PushPidRef(pid);
+         }
+ 
+         if (buildAST)
+         {
+             pnode = CreateNameNode(pid);
+             pnode->ichMin = ichMin;
+@@ -3222,31 +3224,31 @@ LFunction :
+     case tkELSE:
+         if (!m_doingFastScan)
+         {
+             goto LUnknown;
+         }
+         m_pscan->Scan();
+         ParseStatement<buildAST>();
+         break;
+ 
+     default:
+     LUnknown :
+         Error(ERRsyntax);
+         break;
+     }
+ 
+-    pnode = ParsePostfixOperators<buildAST>(pnode, fAllowCall, fInNew, &fCanAssign, &term, pfIsDotOrIndex);
++    pnode = ParsePostfixOperators<buildAST>(pnode, fAllowCall, fInNew, isAsyncExpr, &fCanAssign, &term, pfIsDotOrIndex);
+ 
+     // Pass back identifier if requested
+     if (pToken && term.tk == tkID)
+     {
+         *pToken = term;
+     }
+ 
+     if (pfCanAssign)
+     {
+         *pfCanAssign = fCanAssign;
+     }
+ 
+     return pnode;
+ }
+ 
+@@ -3317,30 +3319,31 @@ BOOL Parser::NodeIsIdent(ParseNodePtr pnode, IdentPtr pid)
+         case knopComma:
+             pnode = pnode->sxBin.pnode2;
+             break;
+ 
+         default:
+             return FALSE;
+         }
+     }
+ }
+ 
+ template<bool buildAST>
+ ParseNodePtr Parser::ParsePostfixOperators(
+     ParseNodePtr pnode,
+     BOOL fAllowCall,
+     BOOL fInNew,
++    BOOL isAsyncExpr,
+     BOOL *pfCanAssign,
+     _Inout_ IdentToken* pToken,
+     _Out_opt_ bool* pfIsDotOrIndex /*= nullptr */)
+ {
+     uint16 count = 0;
+     bool callOfConstants = false;
+     if (pfIsDotOrIndex)
+     {
+         *pfIsDotOrIndex = false;
+     }
+ 
+     for (;;)
+     {
+         uint16 spreadArgCount = 0;
+         switch (m_token.tk)
+@@ -3356,39 +3359,51 @@ ParseNodePtr Parser::ParsePostfixOperators(
+                         Assert(pnode->sxCall.pnodeArgs == nullptr);
+                         pnode->sxCall.pnodeArgs = pnodeArgs;
+                         pnode->sxCall.callOfConstants = callOfConstants;
+                         pnode->sxCall.isApplyCall = false;
+                         pnode->sxCall.isEvalCall = false;
+                         pnode->sxCall.argCount = count;
+                         pnode->sxCall.spreadArgCount = spreadArgCount;
+                         pnode->ichLim = m_pscan->IchLimTok();
+                     }
+                     else
+                     {
+                         pnode = nullptr;
+                         pToken->tk = tkNone; // This is no longer an identifier
+                     }
+                     fInNew = FALSE;
++                    ChkCurTok(tkRParen, ERRnoRparen);
+                 }
+                 else
+                 {
+                     bool fCallIsEval = false;
+                     if (!fAllowCall)
+                     {
+                         return pnode;
+                     }
+ 
++                    uint saveNextBlockId = m_nextBlockId;
++                    uint saveCurrBlockId = GetCurrentBlock()->sxBlock.blockId;
++
++                    if (isAsyncExpr)
++                    {
++                        // Advance the block ID here in case this parenthetical expression turns out to be a lambda parameter list.
++                        // That way the pid ref stacks will be created in their correct final form, and we can simply fix
++                        // up function ID's.
++                        GetCurrentBlock()->sxBlock.blockId = m_nextBlockId++;
++                    }
++
+                     ParseNodePtr pnodeArgs = ParseArgList<buildAST>(&callOfConstants, &spreadArgCount, &count);
+                     // We used to un-defer a deferred function body here if it was called as part of the expression that declared it.
+                     // We now detect this case up front in ParseFncDecl, which is cheaper and simpler.
+                     if (buildAST)
+                     {
+                         pnode = CreateCallNode(knopCall, pnode, pnodeArgs);
+                         Assert(pnode);
+ 
+                         // Detect call to "eval" and record it on the function.
+                         // Note: we used to leave it up to the byte code generator to detect eval calls
+                         // at global scope, but now it relies on the flag the parser sets, so set it here.
+ 
+                         if (count > 0 && this->NodeIsEvalName(pnode->sxCall.pnodeTarget))
+                         {
+                             this->MarkEvalCaller();
+@@ -3399,32 +3414,44 @@ ParseNodePtr Parser::ParsePostfixOperators(
+                         pnode->sxCall.spreadArgCount = spreadArgCount;
+                         pnode->sxCall.isApplyCall = false;
+                         pnode->sxCall.isEvalCall = fCallIsEval;
+                         pnode->sxCall.argCount = count;
+                         pnode->ichLim = m_pscan->IchLimTok();
+                     }
+                     else
+                     {
+                         pnode = nullptr;
+                         if (pToken->tk == tkID && pToken->pid == wellKnownPropertyPids.eval && count > 0) // Detect eval
+                         {
+                             this->MarkEvalCaller();
+                         }
+                         pToken->tk = tkNone; // This is no longer an identifier
+                     }
++
++                    ChkCurTok(tkRParen, ERRnoRparen);
++
++                    if (isAsyncExpr)
++                    {
++                        GetCurrentBlock()->sxBlock.blockId = saveCurrBlockId;
++                        if (m_token.tk == tkDArrow)
++                        {
++                            // We're going to rewind and reinterpret the expression as a parameter list.
++                            // Put back the original next-block-ID so the existing pid ref stacks will be correct.
++                            m_nextBlockId = saveNextBlockId;
++                        }
++                    }
+                 }
+-                ChkCurTok(tkRParen, ERRnoRparen);
+                 if (pfCanAssign)
+                 {
+                     *pfCanAssign = FALSE;
+                 }
+                 if (pfIsDotOrIndex)
+                 {
+                     *pfIsDotOrIndex = false;
+                 }
+                 break;
+             }
+         case tkLBrack:
+             {
+                 m_pscan->Scan();
+                 ParseNodePtr pnodeExpr = ParseExpr<buildAST>();
+                 if (buildAST)
+@@ -12171,31 +12198,31 @@ ParseNodePtr Parser::ParseDestructuredVarDecl(tokens declarationType, bool isDec
+             {
+                 Error(ERRInvalidAssignmentTarget);
+             }
+         }
+     }
+ 
+     if (IsPossiblePatternStart())
+     {
+         // Go recursively
+         pnodeElem = ParseDestructuredLiteral<buildAST>(declarationType, isDecl, false /*topLevel*/, seenRest ? DIC_ShouldNotParseInitializer : DIC_None);
+         if (!isDecl)
+         {
+             BOOL fCanAssign;
+             IdentToken token;
+             // Look for postfix operator
+-            pnodeElem = ParsePostfixOperators<buildAST>(pnodeElem, TRUE, FALSE, &fCanAssign, &token);
++            pnodeElem = ParsePostfixOperators<buildAST>(pnodeElem, TRUE, FALSE, FALSE, &fCanAssign, &token);
+         }
+     }
+     else if (m_token.tk == tkSUPER || m_token.tk == tkID)
+     {
+         if (isDecl)
+         {
+             charcount_t ichMin = m_pscan->IchMinTok();
+             pnodeElem = ParseVariableDeclaration<buildAST>(declarationType, ichMin
+                 ,/* fAllowIn */false, /* pfForInOk */nullptr, /* singleDefOnly */true, /* allowInit */!seenRest, false /*topLevelParse*/);
+ 
+         }
+         else
+         {
+             BOOL fCanAssign;
+             IdentToken token;
+diff --git a/lib/Parser/Parse.h b/lib/Parser/Parse.h
+index 0d5b3a4eb..411ab4ebe 100644
+--- a/lib/Parser/Parse.h
++++ b/lib/Parser/Parse.h
+@@ -823,30 +823,31 @@ private:
+         _Inout_opt_ bool* pfLikelyPattern = nullptr);
+     template<bool buildAST> ParseNodePtr ParseTerm(
+         BOOL fAllowCall = TRUE,
+         LPCOLESTR pNameHint = nullptr,
+         uint32 *pHintLength = nullptr,
+         uint32 *pShortNameOffset = nullptr,
+         _Inout_opt_ IdentToken* pToken = nullptr,
+         bool fUnaryOrParen = false,
+         _Out_opt_ BOOL* pfCanAssign = nullptr,
+         _Inout_opt_ BOOL* pfLikelyPattern = nullptr,
+         _Out_opt_ bool* pfIsDotOrIndex = nullptr);
+     template<bool buildAST> ParseNodePtr ParsePostfixOperators(
+         ParseNodePtr pnode,
+         BOOL fAllowCall, 
+         BOOL fInNew, 
++        BOOL isAsyncExpr,
+         BOOL *pfCanAssign, 
+         _Inout_ IdentToken* pToken, 
+         _Out_opt_ bool* pfIsDotOrIndex = nullptr);
+ 
+     void ThrowNewTargetSyntaxErrForGlobalScope();
+ 
+     template<bool buildAST> ParseNodePtr ParseMetaProperty(
+         tokens metaParentKeyword,
+         charcount_t ichMin,
+         _Out_opt_ BOOL* pfCanAssign = nullptr);
+ 
+     bool IsImportOrExportStatementValidHere();
+ 
+     template<bool buildAST> ParseNodePtr ParseImportDeclaration();
+     template<bool buildAST> void ParseImportClause(ModuleImportOrExportEntryList* importEntryList, bool parsingAfterComma = false);
+diff --git a/test/es6/lambda-params-shadow.js b/test/es6/lambda-params-shadow.js
+index 49e9a1dc1..eeae8037b 100644
+--- a/test/es6/lambda-params-shadow.js
++++ b/test/es6/lambda-params-shadow.js
+@@ -1,22 +1,24 @@
+ //-------------------------------------------------------------------------------------------------------
+ // Copyright (C) Microsoft. All rights reserved.
+ // Licensed under the MIT license. See LICENSE.txt file in the project root for full license information.
+ //-------------------------------------------------------------------------------------------------------
+ 
+ var count = 0;
+ class A {
+     constructor() { count++; }
+     increment() { count++; }
+ }
+ class B extends A {
+     constructor() {
+         super();
+         ((B) => { super.increment() })();
+         (A=> { super.increment() })();
++        let C = async (B) => { B };
++        let D = async A => { A };
+     }
+ }
+ let b = new B();
+ if (count !== 3) {
+     WScript.Echo('fail');
+ }
+ WScript.Echo('pass');
+diff --git a/test/es6/rlexe.xml b/test/es6/rlexe.xml
+index b3bbd0ada..6d90334b1 100644
+--- a/test/es6/rlexe.xml
++++ b/test/es6/rlexe.xml
+@@ -3,37 +3,37 @@
+   <test>
+     <default>
+       <files>lambda1.js</files>
+       <compile-flags>-off:deferparse -args summary -endargs</compile-flags>
+     </default>
+   </test>
+   <test>
+     <default>
+       <files>lambda1.js</files>
+       <compile-flags>-force:deferparse -args summary -endargs</compile-flags>
+     </default>
+   </test>
+   <test>
+     <default>
+       <files>lambda-params-shadow.js</files>
+-      <compile-flags>-off:deferparse -args summary -endargs</compile-flags>
++      <compile-flags>-off:deferparse -es7asyncawait</compile-flags>
+     </default>
+   </test>
+   <test>
+     <default>
+       <files>lambda-params-shadow.js</files>
+-      <compile-flags>-force:deferparse -args summary -endargs</compile-flags>
++      <compile-flags>-force:deferparse -es7asyncawait</compile-flags>
+     </default>
+   </test>
+   <test>
+     <default>
+       <files>NumericLiteralTest.js</files>
+       <compile-flags>-args summary -endargs</compile-flags>
+     </default>
+   </test>
+   <test>
+     <default>
+       <files>boundBug3837520.js</files>
+       <compile-flags>-es6generators -es6classes -args summary -endargs</compile-flags>
+       <tags>BugFix</tags>
+     </default>
+   </test>

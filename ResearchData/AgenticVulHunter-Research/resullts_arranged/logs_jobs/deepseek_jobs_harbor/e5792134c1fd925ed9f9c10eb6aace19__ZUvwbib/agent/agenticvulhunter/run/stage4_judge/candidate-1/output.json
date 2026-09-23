@@ -1,0 +1,390 @@
+{
+  "candidate_id": "candidate-1",
+  "filepath": "sydent/http/servlets/store_invite_servlet.py",
+  "changed_line": 79,
+  "statement": "substitutions[key] = values[0]",
+  "change_type": "A",
+  "function_name": "render_POST",
+  "operation_type": "request_parameter_processing",
+  "selection_reason": "User-controlled request parameters stored without HTML escaping, potentially enabling injection attacks",
+  "security_relevance_score": 0.9,
+  "code_context": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2015 OpenMarket Ltd\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: #     http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: # See the License for the specific language governing permissions and\n15: # limitations under the License.\n16: import nacl.signing\n17: import random\n18: import string\n19: from email.header import Header\n20: \n21: from twisted.web.resource import Resource\n22: from unpaddedbase64 import encode_base64\n23: \n24: import json\n25: from sydent.db.invite_tokens import JoinTokenStore\n26: from sydent.db.threepid_associations import GlobalAssociationStore\n27: \n28: from sydent.http.servlets import require_args, send_cors\n29: from sydent.util.emailutils import sendEmail\n30: \n31: \n32: class StoreInviteServlet(Resource):\n33:     def __init__(self, syd):\n34:         self.sydent = syd\n35: \n36:     def render_POST(self, request):\n37:         send_cors(request)\n38:         err = require_args(request, (\"medium\", \"address\", \"room_id\", \"sender\",))\n39:         if err:\n40:             return json.dumps(err)\n41:         medium = request.args[\"medium\"][0]\n42:         address = request.args[\"address\"][0]\n43:         roomId = request.args[\"room_id\"][0]\n44:         sender = request.args[\"sender\"][0]\n45: \n46:         globalAssocStore = GlobalAssociationStore(self.sydent)\n47:         mxid = globalAssocStore.getMxid(medium, address)\n48:         if mxid:\n49:             request.setResponseCode(400)\n50:             return json.dumps({\n51:                 \"errcode\": \"THREEPID_IN_USE\",\n52:                 \"error\": \"Binding already known\",\n53:                 \"mxid\": mxid,\n54:             })\n55: \n56:         if medium != \"email\":\n57:             request.setResponseCode(400)\n58:             return json.dumps({\n59:                 \"errcode\": \"M_UNRECOGNIZED\",\n60:                 \"error\": \"Didn't understand medium '%s'\" % (medium,),\n61:             })\n62: \n63:         token = self._randomString(128)\n64: \n65:         tokenStore = JoinTokenStore(self.sydent)\n66: \n67:         ephemeralPrivateKey = nacl.signing.SigningKey.generate()\n68:         ephemeralPublicKey = ephemeralPrivateKey.verify_key\n69: \n70:         ephemeralPrivateKeyBase64 = encode_base64(ephemeralPrivateKey.encode(), True)\n71:         ephemeralPublicKeyBase64 = encode_base64(ephemeralPublicKey.encode(), True)\n72: \n73:         tokenStore.storeEphemeralPublicKey(ephemeralPublicKeyBase64)\n74:         tokenStore.storeToken(medium, address, roomId, sender, token)\n75: \n76:         substitutions = {}\n77:         for key, values in request.args.items():\n78:             if len(values) == 1 and type(values[0]) == str:\n79:                 substitutions[key] = values[0]\n80:         substitutions[\"token\"] = token\n81: \n82:         required = [\n83:             'sender_display_name',\n84:             'token',\n85:             'room_name',\n86:             'bracketed_room_name',\n87:             'room_avatar_url',\n88:             'sender_display_name',\n89:             'guest_user_id',\n90:             'guest_access_token',\n91:         ]\n92:         for k in required:\n93:             substitutions.setdefault(k, '')\n94: \n95:         substitutions[\"ephemeral_private_key\"] = ephemeralPrivateKeyBase64\n96:         if substitutions[\"room_name\"] != '':\n97:             substitutions[\"bracketed_room_name\"] = \"(%s)\" % substitutions[\"room_name\"]\n98: \n99:         subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8')\n100:         substitutions[\"subject_header_value\"] = subject_header.encode()\n101: \n102:         sendEmail(self.sydent, \"email.invite_template\", address, substitutions)\n103: \n104:         pubKey = self.sydent.keyring.ed25519.verify_key\n105:         pubKeyBase64 = encode_base64(pubKey.encode())\n106: \n107:         baseUrl = \"%s/_matrix/identity/api/v1\" % (self.sydent.cfg.get('http', 'client_http_base'),)\n108: \n109:         keysToReturn = []\n110:         keysToReturn.append({\n111:             \"public_key\": pubKeyBase64,\n112:             \"key_validity_url\": baseUrl + \"/pubkey/isvalid\",\n113:         })\n114:         keysToReturn.append({\n115:             \"public_key\": ephemeralPublicKeyBase64,\n116:             \"key_validity_url\": baseUrl + \"/pubkey/ephemeral/isvalid\",\n117:         })\n118: \n119:         resp = {\n120:             \"token\": token,\n121:             \"public_key\": pubKeyBase64,\n122:             \"public_keys\": keysToReturn,\n123:             \"display_name\": self.redact(address),\n124:         }\n125: \n126:         return json.dumps(resp)\n127: \n128:     def redact(self, address):\n129:         return \"@\".join(map(self._redact, address.split(\"@\", 1)))\n130: \n131:     def _redact(self, s):\n132:         if len(s) > 5:\n133:             return s[:3] + \"...\"\n134:         elif len(s) > 1:\n135:             return s[0] + \"...\"\n136:         else:\n137:             return \"...\"\n138: \n139:     def _randomString(self, length):\n140:         return ''.join(random.choice(string.ascii_letters) for _ in xrange(length))",
+  "source_summary": "Request parameters from request.args (user-controlled HTTP request data) are directly copied into substitutions dictionary",
+  "sink_summary": "Substitutions are used in email template formatting via string interpolation (line 56 in emailutils.py) and sent via SMTP",
+  "guard_summary": "Limited filtering: only single-value string parameters are included. HTML escaping is applied in emailutils.py line 53 via cgi.escape for *_forhtml variables",
+  "risk_pattern": "User-controlled request parameters are directly interpolated into email templates without validation, though HTML escaping is applied for specific template variables",
+  "used_variable_sources": [
+    "request.args (HTTP request parameters)"
+  ],
+  "called_function_context": [
+    "sendEmail",
+    "cgi.escape",
+    "urllib.quote"
+  ],
+  "enclosing_conditions": [
+    "if len(values) == 1 and type(values[0]) == str"
+  ],
+  "context_summary": "Request parameters are collected into substitutions dictionary for email invitation template. The email template system applies HTML escaping to variables with _forhtml suffix and URL encoding to variables with _forurl suffix",
+  "unresolved_facts": [
+    "Specific email template content and usage patterns",
+    "Whether all template variables that use raw substitutions are properly escaped",
+    "Configuration of email template file location and content"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-93",
+      "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+      "fit_reason": "User-controlled request parameters are directly used in email subject header construction via string formatting, potentially allowing CRLF injection in SMTP headers",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-74",
+      "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+      "fit_reason": "Template injection via unvalidated request parameters in email template substitutions that are formatted into email content",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-116",
+      "cwe_name": "Improper Encoding or Escaping of Output",
+      "fit_reason": "User input is used in email template without proper context-aware escaping for email/SMTP protocol",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-113",
+      "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+      "fit_reason": "Similar header injection pattern but applied to email headers rather than HTTP headers",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-77",
+      "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+      "fit_reason": "Email sending could be interpreted as a command to SMTP server where user input affects command structure",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1004",
+    "CWE-113",
+    "CWE-116",
+    "CWE-1275",
+    "CWE-179",
+    "CWE-208",
+    "CWE-22",
+    "CWE-352",
+    "CWE-425",
+    "CWE-601",
+    "CWE-685",
+    "CWE-74",
+    "CWE-77",
+    "CWE-78",
+    "CWE-79",
+    "CWE-89",
+    "CWE-918",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 79,
+      "statement": "substitutions[key] = values[0]",
+      "cwe_id": "CWE-93",
+      "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code copies user-controlled request parameters into a substitutions dictionary that is used in email header construction. Line 99 shows subject_header = Header(self.sydent.cfg.get('email', 'email.invite.subject', raw=True) % substitutions, 'utf8'), where substitutions containing user data are interpolated into an email subject."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "User-controlled HTTP request parameters (request.args) are directly copied into substitutions dictionary and flow to email subject header construction via string interpolation on line 99, then to sendEmail function."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "If this candidate line were reverted, user-controlled parameters would not be included in the substitutions dictionary, preventing their use in email template interpolation. The line materially adds the injection vector."
+        },
+        "security_control": {
+          "score": 0.25,
+          "evidence": "The Header class constructor with 'utf8' encoding provides some protection, but CRLF sequences in user input could still affect SMTP header injection if not properly neutralized.",
+          "required_control": "CRLF sequence neutralization for email headers",
+          "control_requirement_evidence": "CWE-93 requires neutralization of CRLF sequences when user input is used in contexts where CRLF has special meaning, such as SMTP headers",
+          "existing_controls_checked": [
+            "Header class encoding in twisted.web.resource",
+            "string interpolation in subject construction"
+          ],
+          "deficiency_evidence": "No specific CRLF filtering is applied to user parameters before they are used in email subject construction via string interpolation"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "Potential SMTP header injection could allow email header manipulation, but the specific impact depends on email client/SMTP server behavior and whether CRLF sequences can bypass Header class encoding."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, user-controlled request parameters would not be included in the substitutions dictionary, preventing their use in email template interpolation and eliminating the CRLF injection vector.",
+      "supporting_evidence": [
+        "User-controlled request.args parameters are copied directly into substitutions dictionary",
+        "Substitutions are interpolated into email subject header via string formatting on line 99",
+        "Email subject is used in SMTP email sending via sendEmail function"
+      ],
+      "contradicting_evidence": [
+        "The Header class constructor with 'utf8' encoding may provide some protection against CRLF injection",
+        "No evidence shows actual CRLF sequences being injected or bypassing existing controls"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether the Header class encoding effectively neutralizes CRLF sequences in SMTP context",
+        "Specific email template usage patterns and whether other email headers are vulnerable",
+        "SMTP server configuration and email client behavior with malformed headers"
+      ],
+      "review_comment": "User-controlled request parameters are directly interpolated into email subject headers without CRLF sequence validation. While the Header class provides encoding, CRLF sequences in user input could potentially bypass this and affect SMTP header injection. Validate and sanitize user input for CRLF sequences before using in email headers, or use template variables that enforce proper header encoding.",
+      "change_type": "A",
+      "raw_score": 0.51,
+      "score": 0.51
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 79,
+      "statement": "substitutions[key] = values[0]",
+      "cwe_id": "CWE-74",
+      "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "User-controlled request parameters are directly copied into template substitutions without validation, but the downstream email template system applies context-specific escaping (_forhtml variables get HTML escaping, _forurl variables get URL encoding)"
+        },
+        "connection": {
+          "score": 0.85,
+          "evidence": "Request parameters from request.args flow directly into substitutions dictionary, which is passed to sendEmail function for template interpolation"
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This line adds the mechanism that copies user-controlled parameters into the template substitution system"
+        },
+        "security_control": {
+          "score": 0.35,
+          "evidence": "",
+          "required_control": "context-aware output encoding/escaping for email template interpolation",
+          "control_requirement_evidence": "CWE-74 requires proper neutralization of special elements when passing data to downstream components",
+          "existing_controls_checked": [
+            "HTML escaping for *_forhtml variables",
+            "URL encoding for *_forurl variables",
+            "limited filtering to single string values"
+          ],
+          "deficiency_evidence": "The control is partially implemented but not comprehensive - only specific variable patterns get escaping, while other substitutions may be used in unsafe contexts without validation"
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "Impact depends on template usage patterns and whether escaping covers all injection contexts, which remains unresolved"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, user-controlled request parameters would not be included in email template substitutions, preventing potential injection through this vector.",
+      "supporting_evidence": [
+        "Request parameters from request.args are directly copied into substitutions dictionary",
+        "Substitutions are used in email template formatting via string interpolation",
+        "The change adds this parameter copying mechanism to the code"
+      ],
+      "contradicting_evidence": [
+        "The email template system applies HTML escaping to variables with _forhtml suffix",
+        "URL encoding is applied to variables with _forurl suffix",
+        "Only single-value string parameters are included"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether all template variables that use raw substitutions are properly escaped",
+        "Specific email template content and usage patterns",
+        "Whether unescaped substitutions are used in injection-vulnerable contexts"
+      ],
+      "review_comment": "User-controlled request parameters are copied into email template substitutions without validation. While the template system provides escaping for specific variable patterns (_forhtml, _forurl), other substitutions may be used in unsafe contexts. Apply input validation or ensure all template variable usage receives appropriate context-aware escaping based on their insertion point in the email content.",
+      "change_type": "A",
+      "raw_score": 0.56,
+      "score": 0.56
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 79,
+      "statement": "substitutions[key] = values[0]",
+      "cwe_id": "CWE-116",
+      "cwe_name": "Improper Encoding or Escaping of Output",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The code copies user-controlled request parameters into a substitutions dictionary that is later used in email template formatting. CWE-116 requires improper encoding/escaping for structured message communication, which partially matches as email is a structured message format."
+        },
+        "connection": {
+          "score": 0.85,
+          "evidence": "Request.args contains HTTP request parameters (user-controlled input). These are directly copied into substitutions dictionary (line 79). Substitutions are used in email template formatting via sendEmail (line 102) and string interpolation (line 99: subject_header = Header(... % substitutions))."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If this candidate line were reverted, user-controlled request parameters would not be copied into the substitutions dictionary, preventing their inclusion in email template formatting. The line materially creates the connection between user input and email output."
+        },
+        "security_control": {
+          "score": 0.35,
+          "evidence": "The evidence shows HTML escaping is applied to *_forhtml variables in emailutils.py line 53 via cgi.escape, and URL encoding to *_forurl variables. However, the exact control requirement for email/SMTP context encoding is not demonstrated as missing.",
+          "required_control": "Context-aware encoding/escaping for email/SMTP protocol (headers, body, MIME parts)",
+          "control_requirement_evidence": "CWE-116 requires proper encoding for structured message communication. Email is a structured format with headers, body, and MIME parts requiring different encoding rules.",
+          "existing_controls_checked": [
+            "HTML escaping for *_forhtml variables via cgi.escape",
+            "URL encoding for *_forurl variables via urllib.quote"
+          ],
+          "deficiency_evidence": "No evidence demonstrates that email-specific encoding (SMTP header injection prevention, MIME boundary handling, charset encoding) is missing or insufficient. The template system applies some escaping but the exact email context requirements are not established."
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "Email header injection or body corruption is plausible but not demonstrated. The evidence shows user input reaches email formatting but does not establish a specific security consequence like SMTP command injection, email spoofing, or cross-site scripting via email clients."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, user-controlled request parameters would not be copied into the substitutions dictionary, preventing their inclusion in email template formatting and eliminating the potential encoding/escaping concern for those parameters.",
+      "supporting_evidence": [
+        "Request.args (HTTP request parameters) are user-controlled input",
+        "Substitutions dictionary is used in email template via sendEmail()",
+        "String interpolation occurs with substitutions in subject_header creation (line 99)",
+        "The line is an addition (change_type: 'A') that creates the connection"
+      ],
+      "contradicting_evidence": [
+        "Email template system applies HTML escaping to *_forhtml variables via cgi.escape",
+        "Email template system applies URL encoding to *_forurl variables via urllib.quote",
+        "No evidence shows email-specific encoding deficiencies (SMTP headers, MIME)"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Specific email template content and which variables use raw substitutions",
+        "Whether email headers or body are vulnerable to injection without proper encoding",
+        "Configuration of email template file and its exact usage patterns",
+        "Whether email client rendering introduces XSS risks despite HTML escaping"
+      ],
+      "review_comment": "User-controlled request parameters are copied into email template substitutions without validation. While HTML escaping is applied to *_forhtml variables, ensure all template variables that could appear in email headers or body receive appropriate context-aware encoding for SMTP protocol. Apply proper escaping for email headers to prevent header injection and ensure MIME boundaries are properly handled when user input appears in email content.",
+      "change_type": "A",
+      "raw_score": 0.5700000000000001,
+      "score": 0.5700000000000001
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 79,
+      "statement": "substitutions[key] = values[0]",
+      "cwe_id": "CWE-113",
+      "cwe_name": "Improper Neutralization of CRLF Sequences in HTTP Headers ('HTTP Request/Response Splitting')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-113 specifically targets HTTP header injection via CRLF sequences. The demonstrated behavior involves email template substitution, not HTTP header manipulation."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "User-controlled request parameters flow to email template substitutions, but the path does not involve HTTP response headers. The email is sent via SMTP, not HTTP."
+        },
+        "diff_causality": {
+          "score": 0.4,
+          "evidence": "The added line enables user input to reach email templates, but this is not the HTTP header injection mechanism defined by CWE-113."
+        },
+        "security_control": {
+          "score": 0.2,
+          "evidence": "No HTTP header-specific controls are relevant here. Email escaping exists but is unrelated to HTTP CRLF injection prevention.",
+          "required_control": "CRLF neutralization for HTTP headers",
+          "control_requirement_evidence": "CWE-113 requires neutralization of CRLF sequences when user input is included in HTTP headers",
+          "existing_controls_checked": [
+            "No HTTP header construction from user input observed"
+          ],
+          "deficiency_evidence": "The mechanism operates on email templates, not HTTP headers, so HTTP-specific controls are not applicable"
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "Potential email injection exists, but HTTP request/response splitting impact is not demonstrated."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, user-controlled parameters would not be included in email template substitutions, but HTTP header injection would remain unaffected since no HTTP headers are constructed from these parameters.",
+      "supporting_evidence": [
+        "User-controlled request parameters flow to email template system",
+        "No observed CRLF filtering for the specific use case"
+      ],
+      "contradicting_evidence": [
+        "The vulnerability mechanism targets email templates, not HTTP headers",
+        "Email is sent via SMTP, not as HTTP response",
+        "No evidence of HTTP header construction from user input"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether any HTTP headers are constructed from the substitutions dictionary",
+        "Complete email template content and usage patterns"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.26,
+      "score": 0.26
+    },
+    {
+      "candidate_id": "candidate-1",
+      "filepath": "sydent/http/servlets/store_invite_servlet.py",
+      "changed_line": 79,
+      "statement": "substitutions[key] = values[0]",
+      "cwe_id": "CWE-77",
+      "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.15,
+          "evidence": "CWE-77 requires constructing OS/shell commands or protocol commands with special elements that modify command structure. The demonstrated behaviour is template variable substitution for email content, not command construction. sendEmail appears to be an SMTP library call, not shell command execution."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "User-controlled HTTP request parameters (request.args) are directly copied into substitutions dictionary and passed to sendEmail function. The path is: request.args → substitutions dictionary → sendEmail → email template rendering."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "If this line were reverted, user-controlled parameters would not be included in the substitutions dictionary for email template rendering. The patch adds the mechanism that collects arbitrary request parameters into the template context."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "",
+          "required_control": "Neutralization of special elements that could modify SMTP commands or email headers",
+          "control_requirement_evidence": "CWE-77 requires neutralization when constructing commands. For email sending, special characters in headers (CRLF sequences) could inject additional SMTP commands or modify email structure.",
+          "existing_controls_checked": [
+            "Line 78 filters only single string values",
+            "sendEmail function likely uses SMTP library with proper command separation",
+            "No evidence of CRLF validation or header injection protection in substitutions"
+          ],
+          "deficiency_evidence": "No validation or escaping of CRLF sequences in request parameters before inclusion in substitutions. Subject header (line 99) uses string interpolation with substitutions, potentially allowing header injection if substitutions contain CRLF."
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "Email header injection could allow modifying email headers or injecting additional SMTP commands, but this requires the email template to use substitutions in vulnerable header positions. The demonstrated path shows substitutions used in subject header (line 99), but impact depends on SMTP library behaviour and template usage."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, user-controlled request parameters would not be collected into the substitutions dictionary, preventing any potential injection through template variables. Only the explicitly required parameters (lines 82-93) with default empty values would be available for email template rendering.",
+      "supporting_evidence": [
+        "Request parameters from request.args are directly copied into substitutions dictionary without validation",
+        "Substitutions are used in string interpolation for email subject header (line 99)",
+        "Substitutions dictionary is passed to sendEmail function for template rendering"
+      ],
+      "contradicting_evidence": [
+        "CWE-77 specifically addresses OS/shell command injection, not email template injection",
+        "sendEmail appears to be a library function for SMTP, not shell command execution",
+        "The mechanism is template variable substitution, not command construction with special elements"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether sendEmail executes shell commands or uses SMTP library directly",
+        "Whether SMTP library properly separates commands from data",
+        "Whether email template uses substitutions in positions vulnerable to header injection",
+        "Whether CRLF sequences in substitutions can inject additional SMTP commands"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.47000000000000003,
+      "score": 0.47000000000000003
+    }
+  ],
+  "stage4_status": "completed"
+}

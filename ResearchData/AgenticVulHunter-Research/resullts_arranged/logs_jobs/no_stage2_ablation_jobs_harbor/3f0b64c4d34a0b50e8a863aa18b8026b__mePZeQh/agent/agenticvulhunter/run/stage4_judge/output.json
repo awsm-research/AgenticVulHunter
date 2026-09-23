@@ -1,0 +1,1371 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "index.js",
+    "changed_line": 100,
+    "statement": "const metadata = new IntegrityMetadata(string, opts)",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input sri string -> integrity metadata construction with opts -> security-sensitive parsing behavior",
+    "security_relevance_score": 0.85,
+    "code_context": "1: 'use strict'\n2: \n3: const crypto = require('crypto')\n4: const Transform = require('stream').Transform\n5: \n6: const SPEC_ALGORITHMS = ['sha256', 'sha384', 'sha512']\n7: \n8: const BASE64_REGEX = /[a-z0-9+/]+(?:=?=?)/i\n9: const SRI_REGEX = /^([^-]+)-([^?]+)([?\\S*]*)$/\n10: const STRICT_SRI_REGEX = /^([^-]+)-([A-Za-z0-9+/]+(?:=?=?))([?\\x21-\\x7E]*)$/\n11: const VCHAR_REGEX = /[\\x21-\\x7E]+/\n12: \n13: class IntegrityMetadata {\n14:   constructor (metadata, opts) {\n15:     const strict = !!(opts && opts.strict)\n16:     this.source = metadata.trim()\n17:     // 3.1. Integrity metadata\n18:     // https://w3c.github.io/webappsec-subresource-integrity/#integrity-metadata-description\n19:     const match = this.source.match(\n20:       strict\n21:       ? STRICT_SRI_REGEX\n22:       : SRI_REGEX\n23:     )\n24:     if (!match) { return }\n25:     if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }\n26:     this.algorithm = match[1]\n27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)\n194:     checker.on('error', reject)\n195:     checker.on('verified', algo => {\n196:       resolve(algo)\n197:     })\n198:   })\n199: }\n200: \n201: module.exports.createCheckerStream = createCheckerStream\n202: function createCheckerStream (sri, opts) {\n203:   opts = opts || {}\n204:   sri = parse(sri, opts)\n205:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n206:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n207:     return pickAlgorithm(acc, algo) || acc\n208:   })\n209:   const digests = sri[algorithm].map(m => m.digest)\n210:   const hash = crypto.createHash(algorithm)\n211:   const stream = new Transform({\n212:     transform: function (chunk, enc, cb) {\n213:       hash.update(chunk, enc)\n214:       cb(null, chunk, enc)\n215:     },\n216:     flush: function (cb) {\n217:       const digest = hash.digest('base64')\n218:       if (digests.some(d => d === digest)) {\n219:         stream.emit('verified', algorithm)\n220:         return cb()\n221:       } else {\n222:         const err = new Error(`${algorithm} integrity checksum failed`)\n223:         err.code = 'EBADCHECKSUM'\n224:         err.found = digest\n225:         err.expected = digests\n226:         err.algorithm = algorithm\n227:         return cb(err)\n228:       }\n229:     }\n230:   })\n231:   return stream\n232: }\n233: \n234: function getPrioritizedHash (algo1, algo2) {\n235:   return algo1\n236: }",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-19",
+        "cwe_name": "Data Processing Errors",
+        "fit_reason": "The SRI metadata parsing involves structured data processing with regex matching and extraction, which could lead to incorrect handling or transformation of the input data if not properly validated.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-561",
+        "cwe_name": "Dead Code",
+        "fit_reason": "The regex patterns used for SRI parsing may contain constructs like '$' that can lead to dead code or unexpected behavior if not correctly handled, potentially causing the parsing to fail in specific cases.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "The regex patterns and their usage in parsing SRI metadata may not adequately validate input, leading to potential issues when malformed or unexpected inputs are processed.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-134",
+        "cwe_name": "Use of Externally-Controlled Format String",
+        "fit_reason": "Although not directly using format strings, the parsing logic could be vulnerable to manipulation if regex patterns or extracted values are used in a way that allows external control over string construction.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "fit_reason": "If the parsed SRI metadata is used to construct code or execute operations based on its contents, there's potential for code injection if inputs are not properly sanitized.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-134",
+      "CWE-178",
+      "CWE-19",
+      "CWE-20",
+      "CWE-200",
+      "CWE-254",
+      "CWE-326",
+      "CWE-327",
+      "CWE-494",
+      "CWE-502",
+      "CWE-561",
+      "CWE-758",
+      "CWE-776",
+      "CWE-827",
+      "CWE-829",
+      "CWE-88",
+      "CWE-93",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "index.js",
+        "changed_line": 100,
+        "statement": "const metadata = new IntegrityMetadata(string, opts)",
+        "cwe_id": "CWE-19",
+        "cwe_name": "Data Processing Errors",
+        "cwe_relationship": "family_compatible",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.4,
+            "evidence": "The candidate involves data processing through regex matching and extraction in IntegrityMetadata constructor, which aligns with the general category of Data Processing Errors. However, the specific mechanism is not fully demonstrated as a vulnerability."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The input 'string' parameter from SRI parsing is processed through IntegrityMetadata constructor and regex matching. The connection is demonstrated but lacks explicit evidence of attacker control or concrete impact path."
+          },
+          "diff_causality": {
+            "score": 0.4,
+            "evidence": "Reverting this line would remove the instantiation of IntegrityMetadata, which is part of the SRI parsing logic. However, it's unclear if this directly addresses a vulnerability without more specific evidence of data processing error."
+          },
+          "security_control": {
+            "score": 0.6,
+            "evidence": "The code includes regex validation and checks for algorithm and digest validity, but lacks explicit controls to prevent incorrect handling or transformation of input data that could lead to security issues.",
+            "required_control": "Input validation and sanitization",
+            "control_requirement_evidence": "Data Processing Errors often occur when input is not properly validated before processing, leading to incorrect behavior or exploitation.",
+            "existing_controls_checked": [
+              "SRI_REGEX and STRICT_SRI_REGEX pattern matching",
+              "SPEC_ALGORITHMS validation check"
+            ],
+            "deficiency_evidence": "While regex patterns are used for validation, the code does not enforce strict input sanitization or handle malformed inputs in a way that prevents potential data processing errors."
+          },
+          "concrete_impact": {
+            "score": 0.2,
+            "evidence": "No concrete security consequence is demonstrated. The mechanism could lead to incorrect handling of input data, but there's no evidence of actual exploitation or impact."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the SRI parsing would not instantiate IntegrityMetadata objects, potentially breaking the integrity checking functionality entirely.",
+        "supporting_evidence": [
+          "The code processes SRI strings through regex matching and extraction",
+          "IntegrityMetadata constructor performs data processing on input string"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Attacker control over input string is not established",
+          "Concrete impact or exploitation path is not demonstrated",
+          "Whether the regex validation is sufficient to prevent data processing errors"
+        ],
+        "review_comment": "The SRI parsing logic processes input strings through regex matching and extraction. While basic validation exists, there's insufficient evidence of a concrete vulnerability. The code should enforce stricter input sanitization to prevent potential data processing errors that could lead to incorrect handling of malformed inputs.",
+        "change_type": "A",
+        "raw_score": 0.44000000000000006,
+        "score": 0.44000000000000006
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "index.js",
+        "changed_line": 100,
+        "statement": "const metadata = new IntegrityMetadata(string, opts)",
+        "cwe_id": "CWE-561",
+        "cwe_name": "Dead Code",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The demonstrated behavior does not show dead code. The line 'const metadata = new IntegrityMetadata(string, opts)' is an active instantiation of a class that processes input strings for SRI parsing. There is no evidence of unreachable or unused code in this specific line."
+          },
+          "connection": {
+            "score": 0.0,
+            "evidence": "There is no demonstrated connection between the input string and dead code. The line simply instantiates an object with input parameters, without any indication that the code path is unreachable or unused."
+          },
+          "diff_causality": {
+            "score": 0.0,
+            "evidence": "Reverting this line would not create a dead code scenario. This line is essential for parsing SRI strings into metadata objects. Removing it would break functionality rather than introduce dead code."
+          },
+          "security_control": {
+            "score": 0.0,
+            "evidence": "No security control deficiency is demonstrated in this line. The instantiation of IntegrityMetadata does not involve any missing validation, sanitization, or access control checks.",
+            "required_control": "none established",
+            "control_requirement_evidence": "The CWE-561 definition does not require specific security controls as it relates to dead code, which is a code quality issue rather than a security vulnerability.",
+            "existing_controls_checked": [],
+            "deficiency_evidence": "No deficiency in controls is demonstrated because the line itself is not a security control and does not pertain to dead code issues."
+          },
+          "concrete_impact": {
+            "score": 0.0,
+            "evidence": "There is no concrete security consequence from this line. The instantiation of IntegrityMetadata is part of normal SRI parsing behavior, not a vulnerability that leads to security consequences."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the SRI parsing functionality would be broken because there would be no instantiation of IntegrityMetadata objects from input strings.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The statement 'const metadata = new IntegrityMetadata(string, opts)' is an active code path that processes input strings for SRI parsing and is essential to the functionality of the module."
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.0,
+        "score": 0.0
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "index.js",
+        "changed_line": 100,
+        "statement": "const metadata = new IntegrityMetadata(string, opts)",
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code demonstrates input parsing via regex patterns (SRI_REGEX and STRICT_SRI_REGEX) that may not fully validate inputs, leading to potential improper handling of malformed SRI strings."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "The input 'string' is passed directly into IntegrityMetadata constructor where it's parsed using regex patterns. The connection from input to vulnerable parsing behavior is demonstrated through the code path: parse() -> _parse() -> new IntegrityMetadata(string, opts)."
+          },
+          "diff_causality": {
+            "score": 0.65,
+            "evidence": "If this line were reverted, the integrity metadata would not be constructed from the input string, and thus no parsing of potentially malformed SRI strings would occur. The patch introduces the vulnerability by enabling parsing of user-controlled inputs."
+          },
+          "security_control": {
+            "score": 0.55,
+            "evidence": "The code uses regex validation but does not enforce strict validation for all input components, particularly in non-strict mode. The required control is comprehensive input validation, which is partially implemented through regex matching but lacks sufficient sanitization or whitelisting.",
+            "required_control": "Comprehensive input validation with strict enforcement",
+            "control_requirement_evidence": "CWE-20 requires that inputs be validated to ensure they have the properties required for safe processing. The SRI parsing logic must validate all components of the integrity string including algorithm, digest, and options.",
+            "existing_controls_checked": [
+              "SRI_REGEX and STRICT_SRI_REGEX pattern matching",
+              "SPEC_ALGORITHMS validation in strict mode",
+              "BASE64_REGEX validation for digest",
+              "VCHAR_REGEX validation for options"
+            ],
+            "deficiency_evidence": "While regex patterns are used, they do not fully prevent all malformed inputs from being processed. In non-strict mode, the parsing allows for more permissive matching that could lead to unexpected behavior or bypassed validations."
+          },
+          "concrete_impact": {
+            "score": 0.6,
+            "evidence": "Malformed SRI strings could potentially lead to incorrect integrity checks or unexpected behavior in downstream processing. While not directly causing code execution, it can result in bypassing security checks or incorrect validation of integrity metadata."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, no IntegrityMetadata objects would be created from input strings, and thus no parsing of SRI metadata would occur. The vulnerability would not exist as there would be no mechanism to process potentially malformed inputs.",
+        "supporting_evidence": [
+          "The code uses regex patterns (SRI_REGEX and STRICT_SRI_REGEX) for parsing SRI metadata",
+          "Input string is directly passed to IntegrityMetadata constructor without additional validation",
+          "Non-strict mode allows permissive matching that may not fully validate inputs"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether specific malformed inputs would actually cause security issues in practice",
+          "The exact impact of the regex validation gaps on downstream integrity checks"
+        ],
+        "review_comment": "The code parses SRI metadata from user input without comprehensive validation. The regex patterns allow for permissive matching that could lead to incorrect processing of malformed inputs. A stricter validation approach with whitelisting should be implemented at the point where the input string is parsed into metadata components.",
+        "change_type": "A",
+        "raw_score": 0.67,
+        "score": 0.67
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "index.js",
+        "changed_line": 100,
+        "statement": "const metadata = new IntegrityMetadata(string, opts)",
+        "cwe_id": "CWE-134",
+        "cwe_name": "Use of Externally-Controlled Format String",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The code does not use format strings in any function that accepts a format string as an argument. The vulnerability mechanism of CWE-134 involves using externally-controlled data in format string functions like printf, sprintf, etc., which is not present here."
+          },
+          "connection": {
+            "score": 0.0,
+            "evidence": "There is no demonstrated connection between externally controlled input and a format string usage. The 'string' parameter passed to IntegrityMetadata constructor comes from parsing SRI strings, but these are not used in any format string functions."
+          },
+          "diff_causality": {
+            "score": 0.0,
+            "evidence": "Reverting this line would not change the vulnerability behavior related to format strings since there is no usage of format string functions at all in the codebase."
+          },
+          "security_control": {
+            "score": 0.0,
+            "evidence": "No relevant security control deficiency is demonstrated for CWE-134. The code does not use any format string functions, so there is no applicable control to be missing or weakened.",
+            "required_control": "None applicable",
+            "control_requirement_evidence": "CWE-134 requires protection against externally-controlled format strings, which are not used in this codebase.",
+            "existing_controls_checked": [],
+            "deficiency_evidence": "No format string functions are present in the code, so no control deficiency exists for CWE-134."
+          },
+          "concrete_impact": {
+            "score": 0.0,
+            "evidence": "There is no concrete security consequence related to format string vulnerabilities because the code does not use any format string functions that could be exploited."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, there would be no change in vulnerability behavior related to CWE-134 since this line does not involve format string usage at all.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The codebase does not contain any usage of format string functions such as printf, sprintf, or similar that would be vulnerable to CWE-134.",
+          "The IntegrityMetadata constructor parses SRI strings but does not use them in any format string context."
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.0,
+        "score": 0.0
+      },
+      {
+        "candidate_id": "candidate-1",
+        "filepath": "index.js",
+        "changed_line": 100,
+        "statement": "const metadata = new IntegrityMetadata(string, opts)",
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The candidate line constructs an IntegrityMetadata object from a string and opts, but does not generate or execute code based on the input. The mechanism of CWE-94 (code injection) is not demonstrated."
+          },
+          "connection": {
+            "score": 0.0,
+            "evidence": "There is no demonstrated connection between externally controlled input and a code generation or execution operation. The parsed SRI metadata is used for integrity checking, not code construction."
+          },
+          "diff_causality": {
+            "score": 0.0,
+            "evidence": "Reverting the candidate line would not materially change the vulnerability because the line itself does not introduce or remove a code injection mechanism. The code generation behavior is not present in this context."
+          },
+          "security_control": {
+            "score": 0.0,
+            "evidence": "No security control deficiency is demonstrated for CWE-94. The code does not construct or execute code based on input, so there is no relevant control to assess.",
+            "required_control": "None established",
+            "control_requirement_evidence": "CWE-94 requires controls to prevent code generation from externally influenced input, which is not demonstrated in this context.",
+            "existing_controls_checked": [],
+            "deficiency_evidence": "No deficiency is demonstrated because the mechanism of code injection is not present."
+          },
+          "concrete_impact": {
+            "score": 0.0,
+            "evidence": "There is no concrete security consequence related to code execution or injection. The functionality is limited to parsing and validating SRI metadata for integrity checks."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the parsing of SRI strings into IntegrityMetadata objects would not occur, but this does not affect a code injection vulnerability since no code generation occurs in this context.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The candidate constructs an IntegrityMetadata object from string input without generating or executing code. The SRI parsing is for integrity validation, not code construction."
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.0,
+        "score": 0.0
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "index.js",
+    "changed_line": 131,
+    "statement": "opts",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input data -> digest calculation and metadata construction -> security-sensitive integrity generation",
+    "security_relevance_score": 0.8,
+    "code_context": "1: 'use strict'\n2: \n3: const crypto = require('crypto')\n4: const Transform = require('stream').Transform\n5: \n6: const SPEC_ALGORITHMS = ['sha256', 'sha384', 'sha512']\n7: \n8: const BASE64_REGEX = /[a-z0-9+/]+(?:=?=?)/i\n9: const SRI_REGEX = /^([^-]+)-([^?]+)([?\\S*]*)$/\n10: const STRICT_SRI_REGEX = /^([^-]+)-([A-Za-z0-9+/]+(?:=?=?))([?\\x21-\\x7E]*)$/\n11: const VCHAR_REGEX = /[\\x21-\\x7E]+/\n12: \n13: class IntegrityMetadata {\n14:   constructor (metadata, opts) {\n15:     const strict = !!(opts && opts.strict)\n16:     this.source = metadata.trim()\n17:     // 3.1. Integrity metadata\n18:     // https://w3c.github.io/webappsec-subresource-integrity/#integrity-metadata-description\n19:     const match = this.source.match(\n20:       strict\n21:       ? STRICT_SRI_REGEX\n22:       : SRI_REGEX\n23:     )\n24:     if (!match) { return }\n25:     if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }\n26:     this.algorithm = match[1]\n27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)\n194:     checker.on('error', reject)\n195:     checker.on('verified', algo => {\n196:       resolve(algo)\n197:     })\n198:   })\n199: }\n200: \n201: module.exports.createCheckerStream = createCheckerStream\n202: function createCheckerStream (sri, opts) {\n203:   opts = opts || {}\n204:   sri = parse(sri, opts)\n205:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n206:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n207:     return pickAlgorithm(acc, algo) || acc\n208:   })\n209:   const digests = sri[algorithm].map(m => m.digest)\n210:   const hash = crypto.createHash(algorithm)\n211:   const stream = new Transform({\n212:     transform: function (chunk, enc, cb) {\n213:       hash.update(chunk, enc)\n214:       cb(null, chunk, enc)\n215:     },\n216:     flush: function (cb) {\n217:       const digest = hash.digest('base64')\n218:       if (digests.some(d => d === digest)) {\n219:         stream.emit('verified', algorithm)\n220:         return cb()\n221:       } else {\n222:         const err = new Error(`${algorithm} integrity checksum failed`)\n223:         err.code = 'EBADCHECKSUM'\n224:         err.found = digest\n225:         err.expected = digests\n226:         err.algorithm = algorithm\n227:         return cb(err)\n228:       }\n229:     }\n230:   })\n231:   return stream\n232: }\n233: \n234: function getPrioritizedHash (algo1, algo2) {\n235:   return algo1\n236: }",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-807",
+        "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+        "fit_reason": "Stage-2 evidence shows security-sensitive decision based on untrusted SRI input data, with parsing and validation logic that could be bypassed",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "Stage-2 evidence shows SRI metadata parsing with regex validation that may not adequately validate untrusted input, leading to potential injection or bypass",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-19",
+        "cwe_name": "Data Processing Errors",
+        "fit_reason": "Stage-2 evidence shows structured data processing of SRI metadata with potential for incorrect handling or transformation of input data",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-327",
+        "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+        "fit_reason": "Stage-2 evidence shows cryptographic operations using SHA algorithms, but no explicit weakness in algorithm choice or implementation identified",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-471",
+        "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+        "fit_reason": "Stage-2 evidence shows SRI metadata objects that could be modified by attackers if not properly validated or protected",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-19",
+      "CWE-20",
+      "CWE-254",
+      "CWE-327",
+      "CWE-340",
+      "CWE-471",
+      "CWE-494",
+      "CWE-502",
+      "CWE-506",
+      "CWE-601",
+      "CWE-77",
+      "CWE-807",
+      "CWE-93",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "index.js",
+        "changed_line": 131,
+        "statement": "opts",
+        "cwe_id": "CWE-807",
+        "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code performs security-sensitive decisions based on SRI (Subresource Integrity) metadata, which is parsed from untrusted input. The 'opts' parameter is passed to IntegrityMetadata constructor and influences parsing behavior via strict mode, demonstrating reliance on potentially untrusted inputs for security decisions."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "The 'opts' parameter flows from external input (SRI string) through the parse() function to IntegrityMetadata constructor. The opts.strict flag directly affects regex matching and validation logic, creating a clear path from untrusted input to security-sensitive decision points."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If line 131 (passing opts to IntegrityMetadata) were reverted, the opts parameter would not be passed to the constructor. This would prevent the strict mode behavior from being influenced by external input, removing a potential bypass path for validation checks."
+          },
+          "security_control": {
+            "score": 0.65,
+            "evidence": "The code does validate inputs when strict mode is enabled, but the opts parameter itself is not validated or sanitized before being used to influence security decisions. The patch introduces passing of opts which enables strict mode behavior that could be manipulated by an attacker.",
+            "required_control": "Input sanitization and validation for security-sensitive decision parameters",
+            "control_requirement_evidence": "CWE-807 requires that security decisions not rely on untrusted inputs without proper validation. The opts parameter directly influences parsing behavior in a security-sensitive context.",
+            "existing_controls_checked": [
+              "Strict mode validation using SPEC_ALGORITHMS, BASE64_REGEX, and VCHAR_REGEX",
+              "Input parsing with regex matching"
+            ],
+            "deficiency_evidence": "The opts parameter is passed through without validation or sanitization. An attacker could manipulate the opts to bypass strict mode checks by controlling whether strict mode is enabled."
+          },
+          "concrete_impact": {
+            "score": 0.6,
+            "evidence": "An attacker could potentially bypass strict validation by manipulating the opts parameter to disable strict mode, allowing malformed SRI strings to pass validation that would otherwise be rejected in strict mode. This creates a bypass path for security checks."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the opts parameter would not be passed to IntegrityMetadata constructor, preventing external input from influencing strict mode behavior and removing a potential bypass path for validation checks.",
+        "supporting_evidence": [
+          "The opts parameter flows from parse() function through _parse() to IntegrityMetadata constructor",
+          "opts.strict flag directly influences regex matching behavior in the constructor",
+          "Strict mode enables additional validation checks that could be bypassed by manipulating opts"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the specific manipulation of opts to disable strict mode actually results in a security vulnerability",
+          "The exact impact of bypassing strict validation on overall system security"
+        ],
+        "review_comment": "The opts parameter flows from external input through parse() to IntegrityMetadata constructor, where it influences strict mode behavior. This creates a reliance on untrusted inputs for security decisions. An attacker could manipulate opts to disable strict validation, potentially bypassing important security checks. The patch introduces passing of opts which enables this behavior that could be exploited.",
+        "change_type": "A",
+        "raw_score": 0.74,
+        "score": 0.74
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "index.js",
+        "changed_line": 131,
+        "statement": "opts",
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code parses SRI metadata using regex patterns (SRI_REGEX and STRICT_SRI_REGEX) that may not fully validate untrusted input, allowing potentially malformed or malicious options to be processed without sufficient validation."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "The 'opts' parameter is passed into IntegrityMetadata constructor and used in regex matching and option parsing. The options are extracted from the metadata string and may be used downstream in security-sensitive operations, creating a path from input to vulnerable behavior."
+          },
+          "diff_causality": {
+            "score": 0.65,
+            "evidence": "If line 131 (passing opts to IntegrityMetadata) were reverted, the options would not be parsed or validated in the metadata construction, potentially reducing vulnerability to malformed option injection."
+          },
+          "security_control": {
+            "score": 0.45,
+            "evidence": "The code performs basic regex validation on options but does not enforce strict sanitization or whitelisting of option values, which is required for preventing improper input validation.",
+            "required_control": "Option value sanitization and validation",
+            "control_requirement_evidence": "CWE-20 requires that inputs be validated to ensure they have the properties required to process data safely. Options in SRI metadata are security-sensitive and must be validated to prevent injection or bypass.",
+            "existing_controls_checked": [
+              "BASE64_REGEX validation on digest",
+              "SPEC_ALGORITHMS check for algorithm",
+              "VCHAR_REGEX validation on options"
+            ],
+            "deficiency_evidence": "While VCHAR_REGEX is used, it only validates that option characters are visual chars but does not prevent potentially malicious or malformed option values from being accepted and processed."
+          },
+          "concrete_impact": {
+            "score": 0.55,
+            "evidence": "Malformed options could potentially be passed through to downstream processing, possibly leading to unexpected behavior or injection vulnerabilities in how options are interpreted or used."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the opts parameter would not be passed to IntegrityMetadata constructor, and option parsing would be skipped. This would prevent potentially malformed or malicious options from being processed, reducing the risk of improper input validation.",
+        "supporting_evidence": [
+          "The code uses regex patterns for SRI metadata parsing",
+          "Options are extracted from metadata string using slice and split operations",
+          "VCHAR_REGEX is used to validate option characters but does not prevent all malicious inputs"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the specific options passed through opts actually lead to exploitable behavior",
+          "The exact downstream impact of unvalidated options in security-sensitive operations"
+        ],
+        "review_comment": "The code accepts external 'opts' parameter and passes it to IntegrityMetadata constructor without sufficient validation. Options are parsed from metadata using regex but only validated with VCHAR_REGEX, which may not prevent all malicious inputs. This creates a potential for improper input validation where untrusted options could be processed downstream. Add strict sanitization or whitelisting of option values before processing.",
+        "change_type": "A",
+        "raw_score": 0.64,
+        "score": 0.64
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "index.js",
+        "changed_line": 131,
+        "statement": "opts",
+        "cwe_id": "CWE-19",
+        "cwe_name": "Data Processing Errors",
+        "cwe_relationship": "partial",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.4,
+            "evidence": "The candidate line passes 'opts' to IntegrityMetadata constructor, which processes input data (SRI metadata) and may lead to incorrect handling or transformation of input data. However, the mechanism is not fully aligned with CWE-19's specific definition as it involves more than just data processing errors."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The 'opts' parameter is passed from line 131 to the IntegrityMetadata constructor, which processes input data (SRI metadata). The opts parameter can influence how the SRI metadata is parsed and validated, creating a connection between externally controlled input and the vulnerable operation."
+          },
+          "diff_causality": {
+            "score": 0.6,
+            "evidence": "If line 131 were reverted to not pass 'opts', the IntegrityMetadata constructor would not receive the options parameter, potentially changing how SRI metadata is parsed or validated. This could affect data processing behavior and may have exposed a vulnerability."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "The code does not demonstrate a clear security control deficiency related to data processing errors. While the 'opts' parameter can influence parsing, there is no explicit validation or sanitization of the options that would prevent incorrect handling of input data.",
+            "required_control": "Input validation and sanitization of SRI metadata options",
+            "control_requirement_evidence": "CWE-19 requires safe handling of input throughout processing, which includes validating and sanitizing options in SRI metadata.",
+            "existing_controls_checked": [
+              "The code checks for valid algorithms and base64 digest format but does not validate the options parameter thoroughly."
+            ],
+            "deficiency_evidence": "The options parameter is passed through without sufficient validation or sanitization, which could lead to incorrect handling of input data."
+          },
+          "concrete_impact": {
+            "score": 0.3,
+            "evidence": "While there is potential for incorrect handling of input data due to the 'opts' parameter, a concrete security consequence is not directly demonstrated. The impact depends on how the options are used downstream and whether they can be exploited."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the IntegrityMetadata constructor would not receive the opts parameter, potentially changing how SRI metadata is parsed or validated, which could affect data processing behavior.",
+        "supporting_evidence": [
+          "The 'opts' parameter is passed to the IntegrityMetadata constructor on line 131",
+          "The IntegrityMetadata constructor processes input data (SRI metadata) and may lead to incorrect handling or transformation of input data"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the options parameter can be exploited for malicious purposes",
+          "The exact impact of passing 'opts' to IntegrityMetadata constructor on data processing"
+        ],
+        "review_comment": "The code passes 'opts' to the IntegrityMetadata constructor, which processes SRI metadata. While this may not directly cause a vulnerability, it introduces potential for incorrect handling of input data if options are not properly validated or sanitized. Ensure that all options in SRI metadata are validated and sanitized before processing.",
+        "change_type": "A",
+        "raw_score": 0.45999999999999996,
+        "score": 0.45999999999999996
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "index.js",
+        "changed_line": 131,
+        "statement": "opts",
+        "cwe_id": "CWE-327",
+        "cwe_name": "Use of a Broken or Risky Cryptographic Algorithm",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.8,
+            "evidence": "The code uses crypto.createHash() with algorithm names derived from input opts, which can include insecure algorithms like 'md5' or 'sha1'. The vulnerability arises when these weak algorithms are passed through opts and used in cryptographic operations."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The opts parameter is passed to IntegrityMetadata constructor on line 131, which is then used in cryptographic operations. While the input flows from opts to crypto.createHash(), there's no explicit evidence that attacker-controlled opts directly controls the algorithm choice in a way that introduces risk."
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "If line 131 were reverted (removing opts from IntegrityMetadata constructor), the code would not pass external options to the metadata parser, potentially preventing insecure algorithm selection via opts. The patch directly affects how opts is used in cryptographic context."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "There is no explicit validation or sanitization of the algorithm names passed through opts before being used in crypto.createHash(). The code does not enforce a whitelist of allowed algorithms, making it vulnerable to insecure choices.",
+            "required_control": "Algorithm whitelisting or validation",
+            "control_requirement_evidence": "CWE-327 requires that cryptographic algorithms be strong and not broken. Using user-provided algorithm names without validation creates risk of weak algorithms being selected.",
+            "existing_controls_checked": [
+              "SPEC_ALGORITHMS array is defined but only used in strict mode parsing",
+              "No explicit check on algorithm names from opts"
+            ],
+            "deficiency_evidence": "The code does not validate that the algorithm name passed via opts is a secure one. The algorithm selection is directly influenced by external input without any security controls."
+          },
+          "concrete_impact": {
+            "score": 0.5,
+            "evidence": "If an attacker can control the opts parameter to include weak algorithms like 'md5' or 'sha1', they could potentially weaken the cryptographic integrity checks, leading to data modification or access issues as per CWE-327 impact."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the opts parameter would not be passed to IntegrityMetadata constructor, removing the potential for external input to influence algorithm selection in cryptographic operations.",
+        "supporting_evidence": [
+          "The code uses crypto.createHash() with algorithm names from opts",
+          "IntegrityMetadata constructor accepts opts parameter that can include insecure algorithms",
+          "No validation of algorithm names before cryptographic use"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether attacker control over opts is established",
+          "Whether the specific algorithm choice in opts leads to insecure operations"
+        ],
+        "review_comment": "The code passes external opts parameter to IntegrityMetadata constructor, which can include insecure cryptographic algorithms. Without validation of algorithm names from opts, this allows potentially weak algorithms like 'md5' or 'sha1' to be used in crypto.createHash(). The patch removes the opts parameter from this critical point, preventing attacker-controlled algorithm selection.",
+        "change_type": "A",
+        "raw_score": 0.5999999999999999,
+        "score": 0.5999999999999999
+      },
+      {
+        "candidate_id": "candidate-2",
+        "filepath": "index.js",
+        "changed_line": 131,
+        "statement": "opts",
+        "cwe_id": "CWE-471",
+        "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.8,
+            "evidence": "The code demonstrates that opts are passed into IntegrityMetadata constructor and used to control strict mode behavior, which affects parsing and validation of SRI metadata. If opts is attacker-controllable, it can modify how the integrity metadata is interpreted, thus modifying assumed-immutable data."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The opts parameter flows from external input (e.g., parse() function) into IntegrityMetadata constructor and affects strict mode behavior. However, it's not clear from the code that opts itself is directly attacker-controlled without additional context or a specific attack path."
+          },
+          "diff_causality": {
+            "score": 0.4,
+            "evidence": "If this line were reverted to not pass opts into IntegrityMetadata constructor, then the strict mode behavior would be disabled by default, which could prevent some modification of assumed-immutable data. However, without knowing the exact change in the diff, it's speculative."
+          },
+          "security_control": {
+            "score": 0.6,
+            "evidence": "The code does not validate or sanitize the opts parameter before using it to control strict mode behavior. There is no explicit check that opts is a trusted object or that its properties are safe.",
+            "required_control": "Input validation and sanitization of options",
+            "control_requirement_evidence": "CWE-471 requires protection against modification of assumed-immutable data, which in this case would be the parsing behavior controlled by opts.",
+            "existing_controls_checked": [
+              "No explicit validation or sanitization of opts parameter",
+              "Strict mode is enabled based on opts.strict without input validation"
+            ],
+            "deficiency_evidence": "The opts parameter is passed directly into the constructor without any checks to ensure it's not attacker-controlled or maliciously constructed."
+          },
+          "concrete_impact": {
+            "score": 0.4,
+            "evidence": "If opts is attacker-controlled and contains a strict: true property, it could enforce stricter validation rules that might bypass certain security checks or alter the parsing behavior in unexpected ways, potentially leading to an attack vector."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, opts would not be passed into the IntegrityMetadata constructor, which would mean that strict mode behavior would not be influenced by external options and could potentially prevent modification of assumed-immutable data through attacker-controlled parsing rules.",
+        "supporting_evidence": [
+          "The opts parameter is passed directly to IntegrityMetadata constructor on line 131",
+          "IntegrityMetadata constructor uses opts to determine strict mode behavior",
+          "Strict mode affects validation logic in toString method"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether opts is attacker-controlled or not",
+          "The exact impact of opts on parsing behavior without additional context"
+        ],
+        "review_comment": "The opts parameter flows into IntegrityMetadata constructor and controls strict mode behavior, which can modify how SRI metadata is parsed. If opts is attacker-controllable, it could alter the validation rules applied to integrity metadata. Ensure that opts is validated and sanitized before being used to control parsing behavior.",
+        "change_type": "A",
+        "raw_score": 0.5599999999999999,
+        "score": 0.5599999999999999
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "index.js",
+    "changed_line": 158,
+    "statement": "const meta = new IntegrityMetadata(",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input stream data -> digest calculation and metadata construction -> security-sensitive integrity generation",
+    "security_relevance_score": 0.8,
+    "code_context": "9: const SRI_REGEX = /^([^-]+)-([^?]+)([?\\S*]*)$/\n10: const STRICT_SRI_REGEX = /^([^-]+)-([A-Za-z0-9+/]+(?:=?=?))([?\\x21-\\x7E]*)$/\n11: const VCHAR_REGEX = /[\\x21-\\x7E]+/\n12: \n13: class IntegrityMetadata {\n14:   constructor (metadata, opts) {\n15:     const strict = !!(opts && opts.strict)\n16:     this.source = metadata.trim()\n17:     // 3.1. Integrity metadata\n18:     // https://w3c.github.io/webappsec-subresource-integrity/#integrity-metadata-description\n19:     const match = this.source.match(\n20:       strict\n21:       ? STRICT_SRI_REGEX\n22:       : SRI_REGEX\n23:     )\n24:     if (!match) { return }\n25:     if (strict && !SPEC_ALGORITHMS.some(a => a === match[1])) { return }\n26:     this.algorithm = match[1]\n27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)\n194:     checker.on('error', reject)\n195:     checker.on('verified', algo => {\n196:       resolve(algo)\n197:     })\n198:   })\n199: }\n200: \n201: module.exports.createCheckerStream = createCheckerStream\n202: function createCheckerStream (sri, opts) {\n203:   opts = opts || {}\n204:   sri = parse(sri, opts)\n205:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n206:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n207:     return pickAlgorithm(acc, algo) || acc\n208:   })\n209:   const digests = sri[algorithm].map(m => m.digest)\n210:   const hash = crypto.createHash(algorithm)\n211:   const stream = new Transform({\n212:     transform: function (chunk, enc, cb) {\n213:       hash.update(chunk, enc)\n214:       cb(null, chunk, enc)\n215:     },\n216:     flush: function (cb) {\n217:       const digest = hash.digest('base64')\n218:       if (digests.some(d => d === digest)) {\n219:         stream.emit('verified', algorithm)\n220:         return cb()\n221:       } else {\n222:         const err = new Error(`${algorithm} integrity checksum failed`)\n223:         err.code = 'EBADCHECKSUM'\n224:         err.found = digest\n225:         err.expected = digests\n226:         err.algorithm = algorithm\n227:         return cb(err)\n228:       }\n229:     }\n230:   })\n231:   return stream\n232: }\n233: \n234: function getPrioritizedHash (algo1, algo2) {\n235:   return algo1\n236: }",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-471",
+        "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+        "fit_reason": "The code assumes certain data structures like metadata and digests are immutable, but they could be modified during parsing or validation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-807",
+        "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+        "fit_reason": "The security-sensitive integrity generation relies on untrusted input without sufficient validation, potentially leading to bypass of integrity checks",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-200",
+      "CWE-254",
+      "CWE-327",
+      "CWE-471",
+      "CWE-494",
+      "CWE-502",
+      "CWE-77",
+      "CWE-807",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "index.js",
+        "changed_line": 158,
+        "statement": "const meta = new IntegrityMetadata(",
+        "cwe_id": "CWE-471",
+        "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code creates IntegrityMetadata objects from parsed input strings, which are then used in security-sensitive operations like integrity checking. If the input is attacker-controlled and the metadata object is not properly validated or sanitized, it could be modified during parsing, violating the assumption of immutability."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "The IntegrityMetadata constructor parses input strings (line 19-23) and extracts algorithm and digest values. If these inputs are attacker-controlled, they can influence the metadata object's properties. The connection is demonstrated through the parsing flow from raw string to metadata object construction."
+          },
+          "diff_causality": {
+            "score": 0.65,
+            "evidence": "The patch introduces a new line that creates an IntegrityMetadata object from stream data (line 158). If this line were reverted, the stream-based integrity generation would not occur, but the core parsing mechanism remains. The change is necessary for the vulnerability to manifest in stream processing."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "The code does validate input against regex patterns (SRI_REGEX, STRICT_SRI_REGEX) and checks algorithm validity (SPEC_ALGORITHMS). However, there is no explicit control to prevent modification of the metadata object after construction or to ensure immutability of parsed values during processing.",
+            "required_control": "Input validation and immutability enforcement",
+            "control_requirement_evidence": "CWE-471 requires protection against modification of assumed-immutable data. The code must ensure that parsed metadata cannot be altered after creation.",
+            "existing_controls_checked": [
+              "Regex validation of input strings (SRI_REGEX, STRICT_SRI_REGEX)",
+              "Algorithm validation against SPEC_ALGORITHMS",
+              "Digest base64 validation"
+            ],
+            "deficiency_evidence": "While input is validated, there's no mechanism to prevent modification of the metadata object properties after parsing. The constructor does not enforce immutability or deep copy of parsed values."
+          },
+          "concrete_impact": {
+            "score": 0.55,
+            "evidence": "If an attacker can modify the input string used to create IntegrityMetadata, they could potentially manipulate the algorithm or digest values. This could lead to bypassing integrity checks or causing incorrect validation results, though concrete exploitation requires further conditions."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, stream-based integrity generation would not occur, but the core parsing mechanism would remain unchanged. The vulnerability would not manifest in stream processing contexts, though other paths might still be vulnerable.",
+        "supporting_evidence": [
+          "IntegrityMetadata constructor parses input strings and extracts algorithm/digest values",
+          "Stream processing creates IntegrityMetadata objects from potentially attacker-controlled data",
+          "The code assumes parsed metadata is immutable but does not enforce this assumption"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the input stream data is actually attacker-controlled",
+          "Whether downstream validation prevents exploitation of modified metadata",
+          "Concrete demonstration of modification of immutable data during processing"
+        ],
+        "review_comment": "The code creates IntegrityMetadata objects from potentially attacker-controlled stream data without enforcing immutability. The metadata object properties can be manipulated through malformed input strings, violating the assumption of immutable data. Ensure that parsed metadata is properly validated and protected against modification during processing.",
+        "change_type": "A",
+        "raw_score": 0.6299999999999999,
+        "score": 0.6299999999999999
+      },
+      {
+        "candidate_id": "candidate-3",
+        "filepath": "index.js",
+        "changed_line": 158,
+        "statement": "const meta = new IntegrityMetadata(",
+        "cwe_id": "CWE-807",
+        "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.85,
+            "evidence": "The code creates IntegrityMetadata objects from untrusted input (stream data) without sufficient validation, directly using the parsed metadata in security-sensitive integrity checks."
+          },
+          "connection": {
+            "score": 0.7,
+            "evidence": "The stream data is passed through to IntegrityMetadata constructor and used in integrity verification. The vulnerability path involves untrusted input reaching the security decision point (integrity check)."
+          },
+          "diff_causality": {
+            "score": 0.9,
+            "evidence": "If reverted, the line would not create IntegrityMetadata from stream data, preventing potential bypass of integrity checks through malformed inputs."
+          },
+          "security_control": {
+            "score": 0.65,
+            "evidence": "The code does validate input against regex patterns but does not enforce strict validation for all security-sensitive fields, allowing potentially malicious inputs to pass through.",
+            "required_control": "Input validation and sanitization",
+            "control_requirement_evidence": "CWE-807 requires that security decisions not rely on untrusted inputs without sufficient validation.",
+            "existing_controls_checked": [
+              "SRI_REGEX and STRICT_SRI_REGEX validation in IntegrityMetadata constructor",
+              "SPEC_ALGORITHMS check in strict mode",
+              "BASE64_REGEX validation for digest"
+            ],
+            "deficiency_evidence": "While regex validation exists, it does not prevent all malformed inputs from reaching the integrity decision point. The options parsing (line 30) allows arbitrary strings that could be used maliciously."
+          },
+          "concrete_impact": {
+            "score": 0.75,
+            "evidence": "Malformed input could potentially bypass integrity checks, allowing malicious content to pass verification. This directly impacts the security of subresource integrity protection."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, stream data would not be processed through IntegrityMetadata constructor with unvalidated options, preventing potential bypass of integrity checks through malformed inputs.",
+        "supporting_evidence": [
+          "Stream data is passed to IntegrityMetadata constructor without additional validation",
+          "Options parsing allows arbitrary strings that could be used maliciously",
+          "IntegrityMetadata constructor accepts untrusted input directly into security-sensitive operations"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the specific stream data can actually be controlled by an attacker",
+          "The exact impact of malformed options on integrity verification"
+        ],
+        "review_comment": "Stream data is processed through IntegrityMetadata constructor without sufficient validation, creating a potential bypass for integrity checks. The options parsing allows arbitrary strings that could be used maliciously. Implement strict input validation to prevent untrusted inputs from influencing security decisions.",
+        "change_type": "A",
+        "raw_score": 0.7699999999999999,
+        "score": 0.7699999999999999
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-4",
+    "filepath": "index.js",
+    "changed_line": 176,
+    "statement": "sri = parse(sri, opts)",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input sri -> parse with opts -> security-sensitive integrity validation",
+    "security_relevance_score": 0.75,
+    "code_context": "27:     this.digest = match[2]\n28: \n29:     const rawOpts = match[3]\n30:     this.options = rawOpts ? rawOpts.slice(1).split('?') : []\n31:   }\n32:   toString (opts) {\n33:     if (opts && opts.strict) {\n34:       // Strict mode enforces the standard as close to the foot of the\n35:       // letter as it can.\n36:       if (!(\n37:         // The spec has very restricted productions for algorithms.\n38:         // https://www.w3.org/TR/CSP2/#source-list-syntax\n39:         SPEC_ALGORITHMS.some(x => x === this.algorithm) &&\n40:         // Usually, if someone insists on using a \"different\" base64, we\n41:         // leave it as-is, since there's multiple standards, and the\n42:         // specified is not a URL-safe variant.\n43:         // https://www.w3.org/TR/CSP2/#base64_value\n44:         this.digest.match(BASE64_REGEX) &&\n45:         // Option syntax is strictly visual chars.\n46:         // https://w3c.github.io/webappsec-subresource-integrity/#grammardef-option-expression\n47:         // https://tools.ietf.org/html/rfc5234#appendix-B.1\n48:         (this.options || []).every(opt => opt.match(VCHAR_REGEX))\n49:       )) {\n50:         return ''\n51:       }\n52:     }\n53:     const options = this.options && this.options.length\n54:     ? `?${this.options.join('?')}`\n55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)\n194:     checker.on('error', reject)\n195:     checker.on('verified', algo => {\n196:       resolve(algo)\n197:     })\n198:   })\n199: }\n200: \n201: module.exports.createCheckerStream = createCheckerStream\n202: function createCheckerStream (sri, opts) {\n203:   opts = opts || {}\n204:   sri = parse(sri, opts)\n205:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n206:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n207:     return pickAlgorithm(acc, algo) || acc\n208:   })\n209:   const digests = sri[algorithm].map(m => m.digest)\n210:   const hash = crypto.createHash(algorithm)\n211:   const stream = new Transform({\n212:     transform: function (chunk, enc, cb) {\n213:       hash.update(chunk, enc)\n214:       cb(null, chunk, enc)\n215:     },\n216:     flush: function (cb) {\n217:       const digest = hash.digest('base64')\n218:       if (digests.some(d => d === digest)) {\n219:         stream.emit('verified', algorithm)\n220:         return cb()\n221:       } else {\n222:         const err = new Error(`${algorithm} integrity checksum failed`)\n223:         err.code = 'EBADCHECKSUM'\n224:         err.found = digest\n225:         err.expected = digests\n226:         err.algorithm = algorithm\n227:         return cb(err)\n228:       }\n229:     }\n230:   })\n231:   return stream\n232: }\n233: \n234: function getPrioritizedHash (algo1, algo2) {\n235:   return algo1\n236: }",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-494",
+        "cwe_name": "Download of Code Without Integrity Check",
+        "fit_reason": "The code parses user-controlled SRI strings for integrity validation. If malformed or malicious SRI input is not properly validated, it could lead to bypassing integrity checks and downloading code without proper integrity verification.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-807",
+        "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+        "fit_reason": "The security-sensitive decision of whether the integrity check passes relies on parsing user-controlled SRI input. If this input is not properly validated, it could lead to incorrect security decisions.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "fit_reason": "If the parsing or validation of SRI metadata allows for code injection through malformed input, it could lead to arbitrary code execution. The SRI parsing logic could be a vector for such an attack.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "fit_reason": "The integrity check decision-making process involves selecting an algorithm and comparing digests. If the selection or comparison is flawed, it could lead to incorrect authorization decisions based on integrity validation.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "The parse function takes a user-controlled string (sri) and processes it. If the input is not properly validated, it could lead to unexpected behavior or bypasses in the integrity validation logic.",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-134",
+      "CWE-178",
+      "CWE-19",
+      "CWE-20",
+      "CWE-254",
+      "CWE-378",
+      "CWE-400",
+      "CWE-471",
+      "CWE-494",
+      "CWE-506",
+      "CWE-571",
+      "CWE-685",
+      "CWE-697",
+      "CWE-754",
+      "CWE-776",
+      "CWE-807",
+      "CWE-827",
+      "CWE-829",
+      "CWE-835",
+      "CWE-863",
+      "CWE-916",
+      "CWE-94"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "index.js",
+        "changed_line": 176,
+        "statement": "sri = parse(sri, opts)",
+        "cwe_id": "CWE-494",
+        "cwe_name": "Download of Code Without Integrity Check",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.8,
+            "evidence": "The code parses user-controlled SRI strings for integrity validation, which is the core mechanism of CWE-494. The parse function processes input from external sources and performs integrity checks."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The sri parameter comes from external input (user-controlled) and is passed to parse() which then validates integrity. However, the connection path is not fully demonstrated as to whether the parsed SRI is directly used for code download or if it's just validation."
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "If this line were reverted, the integrity validation would not occur, meaning that code could be downloaded without integrity checks. The patch adds the parsing of SRI strings which is necessary for integrity verification."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "The security control in question is the validation of SRI strings before integrity checking. While there are some validations in the toString method, the parse function itself does not perform sufficient validation to prevent malformed or malicious inputs from bypassing integrity checks.",
+            "required_control": "Input validation and sanitization of SRI strings",
+            "control_requirement_evidence": "CWE-494 requires that code be downloaded only after verifying integrity. The parse function must validate the input SRI string before it can be used for integrity checking.",
+            "existing_controls_checked": [
+              "The toString method has some validation (SPEC_ALGORITHMS, BASE64_REGEX, VCHAR_REGEX) but this is not applied during parsing",
+              "The _parse function does not perform additional validation beyond basic parsing"
+            ],
+            "deficiency_evidence": "The parse() function accepts raw SRI strings without sufficient validation. The _parse function simply splits and processes input without checking for malformed or malicious inputs that could bypass integrity checks."
+          },
+          "concrete_impact": {
+            "score": 0.5,
+            "evidence": "There is a potential impact where malformed SRI input could bypass integrity checks, but the concrete path to actual code download is not demonstrated in this specific line. The vulnerability would manifest if the parsed SRI is used for actual code downloading."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, no SRI parsing would occur, meaning that any integrity validation would be bypassed and code could be downloaded without checking its integrity.",
+        "supporting_evidence": [
+          "The parse function is called with user-controlled sri parameter",
+          "The _parse function processes input strings without sufficient validation",
+          "CWE-494 specifically requires integrity checks before downloading code"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the parsed SRI is actually used for code download in this context",
+          "The exact flow from SRI parsing to code execution/download",
+          "Whether downstream validation prevents the vulnerability"
+        ],
+        "review_comment": "The parse() function accepts user-controlled SRI strings without sufficient validation, potentially allowing malformed inputs to bypass integrity checks. The vulnerability requires that SRI strings be validated before being used for integrity verification. Ensure that SRI input is properly validated and sanitized before any integrity checking occurs.",
+        "change_type": "A",
+        "raw_score": 0.5999999999999999,
+        "score": 0.5999999999999999
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "index.js",
+        "changed_line": 176,
+        "statement": "sri = parse(sri, opts)",
+        "cwe_id": "CWE-807",
+        "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 1.0,
+            "evidence": "The candidate line demonstrates a security-sensitive decision where the integrity check (sri) is parsed from untrusted input, directly aligning with CWE-807's mechanism of relying on untrusted inputs in security decisions."
+          },
+          "connection": {
+            "score": 1.0,
+            "evidence": "The input 'sri' is passed directly to the parse function without validation or sanitization, and this parsed data is used for integrity verification in checkData and createCheckerStream functions, establishing a clear path from untrusted input to security-sensitive decision."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If the candidate line were reverted, the sri parsing would not occur, preventing the use of potentially malicious or malformed SRI strings in integrity checks. The patch introduces the reliance on untrusted input for security decisions."
+          },
+          "security_control": {
+            "score": 0.6,
+            "evidence": "The code does not implement validation or sanitization of the parsed SRI input before using it in security-sensitive operations. While there are some regex validations within the IntegrityMetadata class, these do not prevent all forms of malicious input that could bypass integrity checks.",
+            "required_control": "Input validation and sanitization",
+            "control_requirement_evidence": "CWE-807 requires that inputs used in security decisions must be validated to ensure they cannot be manipulated by untrusted actors to bypass protection mechanisms.",
+            "existing_controls_checked": [
+              "SPEC_ALGORITHMS.some(x => x === this.algorithm) - only validates against a fixed list",
+              "BASE64_REGEX - validates digest format but not content",
+              "VCHAR_REGEX - validates option syntax but not malicious options"
+            ],
+            "deficiency_evidence": "The parse function accepts arbitrary SRI strings without comprehensive validation. The regex checks are insufficient to prevent all forms of input manipulation that could lead to bypassing integrity checks."
+          },
+          "concrete_impact": {
+            "score": 0.7,
+            "evidence": "If an attacker can manipulate the SRI string, they could potentially bypass integrity checks by providing a valid-looking but incorrect digest or algorithm, leading to security vulnerabilities where malicious content is accepted as legitimate."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the sri parsing would not occur, preventing the use of potentially malicious or malformed SRI strings in integrity checks. The function would not be able to process user-provided SRI data for verification, thus removing the attack surface where untrusted input could influence security decisions.",
+        "supporting_evidence": [
+          "The parse function is called with sri and opts parameters directly from user input",
+          "The parsed sri is used in checkData and createCheckerStream functions for integrity verification",
+          "IntegrityMetadata class performs basic validation but not comprehensive sanitization of inputs"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [],
+        "review_comment": "The code relies on untrusted SRI input for integrity verification without proper validation. The parse function accepts arbitrary strings that are then used in security-sensitive decisions. Input should be validated to prevent manipulation that could bypass integrity checks. Implement comprehensive input validation before using SRI data in integrity verification.",
+        "change_type": "A",
+        "raw_score": 0.82,
+        "score": 0.82
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "index.js",
+        "changed_line": 176,
+        "statement": "sri = parse(sri, opts)",
+        "cwe_id": "CWE-94",
+        "cwe_name": "Improper Control of Generation of Code ('Code Injection')",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The demonstrated mechanism involves parsing Subresource Integrity (SRI) metadata, not code generation or injection. SRI is used for integrity validation of resources, not for executing code."
+          },
+          "connection": {
+            "score": 0.0,
+            "evidence": "There is no connection between externally controlled input and code execution. The parsing operation is for integrity checking, not code generation."
+          },
+          "diff_causality": {
+            "score": 0.0,
+            "evidence": "The change at line 176 is part of a function that parses SRI strings for integrity validation. Reverting this would not introduce or remove a code injection vulnerability, as the mechanism is unrelated to code generation."
+          },
+          "security_control": {
+            "score": 0.0,
+            "evidence": "No security control deficiency relevant to code injection is demonstrated. The function parses SRI metadata for integrity checking, which does not involve code execution.",
+            "required_control": "Code injection prevention controls (e.g., input sanitization, parameterized queries)",
+            "control_requirement_evidence": "CWE-94 requires preventing externally influenced input from modifying code generation behavior, which is not present in SRI parsing.",
+            "existing_controls_checked": [
+              "Input validation in _parse function",
+              "SRI metadata structure validation"
+            ],
+            "deficiency_evidence": "No evidence of missing controls for code injection prevention. The operation is purely integrity checking."
+          },
+          "concrete_impact": {
+            "score": 0.0,
+            "evidence": "No concrete security consequence of code execution or security bypass is demonstrated. The function performs SRI parsing and validation, not code generation."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the checkData function would not parse the SRI input before integrity checking, potentially causing a failure in integrity verification rather than introducing a code injection vulnerability.",
+        "supporting_evidence": [
+          "The parse function is used for parsing SRI metadata strings",
+          "SRI is designed for integrity validation of resources, not code execution",
+          "The code uses crypto.createHash() and base64 encoding for integrity checking"
+        ],
+        "contradicting_evidence": [
+          "SRI parsing does not involve code generation or execution",
+          "The parse function only creates metadata objects from strings",
+          "No evidence of code injection vectors in the SRI parsing logic"
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.0,
+        "score": 0.0
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "index.js",
+        "changed_line": 176,
+        "statement": "sri = parse(sri, opts)",
+        "cwe_id": "CWE-863",
+        "cwe_name": "Incorrect Authorization",
+        "cwe_relationship": "mismatch",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.0,
+            "evidence": "The demonstrated mechanism involves integrity validation and digest comparison, not authorization decisions. CWE-863 requires incorrect authorization checks, which are not present in the integrity parsing logic."
+          },
+          "connection": {
+            "score": 0.0,
+            "evidence": "There is no connection between the input sri parameter and any authorization decision or access control mechanism. The parse function only handles integrity metadata parsing and validation."
+          },
+          "diff_causality": {
+            "score": 0.0,
+            "evidence": "Reverting line 176 would not change any authorization behavior since the line only parses SRIs for integrity checking, not for access control decisions."
+          },
+          "security_control": {
+            "score": 0.0,
+            "evidence": "No authorization controls are involved in this code path. The function performs integrity validation but does not make authorization decisions.",
+            "required_control": "Authorization decision making",
+            "control_requirement_evidence": "CWE-863 requires incorrect authorization checks, which involve access control decisions based on actor permissions or roles.",
+            "existing_controls_checked": [],
+            "deficiency_evidence": "The code does not perform any authorization checks or access control decisions."
+          },
+          "concrete_impact": {
+            "score": 0.0,
+            "evidence": "No concrete security consequence related to incorrect authorization exists in this code path. The function only validates integrity of data, not access permissions."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the parse function would not be called to validate SRIs for integrity checking, but this would not affect any authorization decisions since none are made in this code path.",
+        "supporting_evidence": [],
+        "contradicting_evidence": [
+          "The parse function only handles integrity metadata parsing and validation, not access control or authorization decisions",
+          "No authorization checks or access control mechanisms are present in the code path involving line 176"
+        ],
+        "contradiction_severity": "fatal",
+        "unresolved_facts": [],
+        "review_comment": "",
+        "change_type": "A",
+        "raw_score": 0.0,
+        "score": 0.0
+      },
+      {
+        "candidate_id": "candidate-4",
+        "filepath": "index.js",
+        "changed_line": 176,
+        "statement": "sri = parse(sri, opts)",
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.8,
+            "evidence": "The parse function receives a user-controlled string 'sri' and processes it without sufficient validation, which aligns with the CWE-20 mechanism of improper input validation."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The 'sri' parameter is passed directly from an external source to the parse function, which then processes it for integrity validation. However, the exact path from input to vulnerable operation is not fully demonstrated in this specific line."
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "If line 176 were reverted (removing sri = parse(sri, opts)), the integrity validation would not occur, which would prevent the vulnerability from manifesting. The patch directly addresses the input processing step."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "The code does not demonstrate sufficient input validation controls for the 'sri' parameter before it is processed by the parse function. While there are some validations in the IntegrityMetadata class, they are not comprehensive enough to prevent all potential issues.",
+            "required_control": "Input validation and sanitization of user-provided integrity strings",
+            "control_requirement_evidence": "CWE-20 requires that inputs be validated to ensure they have the properties required for safe processing. The parse function processes unvalidated input without sufficient checks.",
+            "existing_controls_checked": [
+              "IntegrityMetadata class validation (limited)",
+              "SPEC_ALGORITHMS check",
+              "BASE64_REGEX check",
+              "VCHAR_REGEX check"
+            ],
+            "deficiency_evidence": "The validation in IntegrityMetadata is insufficient to prevent all potential malformed inputs that could bypass integrity checks. The parse function does not validate the overall structure or content of the input string before processing."
+          },
+          "concrete_impact": {
+            "score": 0.5,
+            "evidence": "There is a potential for bypassing integrity validation if inputs are not properly validated, which could lead to code execution or data modification. However, the specific impact path is not fully demonstrated in this line alone."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the parse function would not be called on the sri parameter, and integrity validation would not occur. This would prevent any potential bypass of integrity checks through malformed inputs.",
+        "supporting_evidence": [
+          "The parse function takes user-controlled input 'sri' and processes it without sufficient validation",
+          "The code shows that sri is passed directly to the parse function in checkData at line 176"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the specific input validation deficiencies are sufficient to cause a vulnerability",
+          "The exact impact path from unvalidated input to security consequence"
+        ],
+        "review_comment": "The parse function receives user-controlled input without sufficient validation, creating a potential for bypassing integrity checks. The patch adds the call to parse(sri, opts) which processes the input but does not include comprehensive validation. A more robust input validation should be implemented before processing the integrity string to prevent malformed inputs from bypassing security checks.",
+        "change_type": "A",
+        "raw_score": 0.5999999999999999,
+        "score": 0.5999999999999999
+      }
+    ],
+    "stage4_status": "completed"
+  },
+  {
+    "candidate_id": "candidate-5",
+    "filepath": "index.js",
+    "changed_line": 204,
+    "statement": "sri = parse(sri, opts)",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "security_sensitive_decision",
+    "selection_reason": "observable input sri -> parse with opts -> security-sensitive integrity validation",
+    "security_relevance_score": 0.75,
+    "code_context": "55:     : ''\n56:     return `${this.algorithm}-${this.digest}${options}`\n57:   }\n58: }\n59: \n60: class Integrity {\n61:   toString (opts) {\n62:     opts = opts || {}\n63:     let sep = opts.sep || ' '\n64:     if (opts.strict) {\n65:       // Entries must be separated by whitespace, according to spec.\n66:       sep = sep.replace(/\\S+/g, ' ')\n67:     }\n68:     return Object.keys(this).map(k => {\n69:       return this[k].map(meta => {\n70:         return IntegrityMetadata.prototype.toString.call(meta, opts)\n71:       }).filter(x => x.length).join(sep)\n72:     }).filter(x => x.length).join(sep)\n73:   }\n74:   concat (integrity, opts) {\n75:     const other = typeof integrity === 'string'\n76:     ? integrity\n77:     : serialize(integrity)\n78:     return parse(`${this.toString()} ${other}`, opts)\n79:   }\n80: }\n81: \n82: module.exports.parse = parse\n83: function parse (sri, opts) {\n84:   opts = opts || {}\n85:   if (typeof sri === 'string') {\n86:     return _parse(sri, opts)\n87:   } else if (sri.algorithm && sri.digest) {\n88:     const fullSri = new Integrity()\n89:     fullSri[sri.algorithm] = [sri]\n90:     return _parse(serialize(fullSri, opts), opts)\n91:   } else {\n92:     return _parse(serialize(sri, opts), opts)\n93:   }\n94: }\n95: \n96: function _parse (integrity, opts) {\n97:   // 3.4.3. Parse metadata\n98:   // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata\n99:   return integrity.trim().split(/\\s+/).reduce((acc, string) => {\n100:     const metadata = new IntegrityMetadata(string, opts)\n101:     if (metadata.algorithm && metadata.digest) {\n102:       const algo = metadata.algorithm\n103:       if (!acc[algo]) { acc[algo] = [] }\n104:       acc[algo].push(metadata)\n105:     }\n106:     return acc\n107:   }, new Integrity())\n108: }\n109: \n110: module.exports.serialize = serialize\n111: module.exports.unparse = serialize\n112: function serialize (obj, opts) {\n113:   if (obj.algorithm && obj.digest) {\n114:     return IntegrityMetadata.prototype.toString.call(obj, opts)\n115:   } else {\n116:     return Integrity.prototype.toString.call(obj, opts)\n117:   }\n118: }\n119: \n120: module.exports.fromData = fromData\n121: function fromData (data, opts) {\n122:   opts = opts || {}\n123:   const algorithms = opts.algorithms || ['sha512']\n124:   const optString = opts.options && opts.options.length\n125:   ? `?${opts.options.join('?')}`\n126:   : ''\n127:   return algorithms.reduce((acc, algo) => {\n128:     const digest = crypto.createHash(algo).update(data).digest('base64')\n129:     const meta = new IntegrityMetadata(\n130:       `${algo}-${digest}${optString}`,\n131:        opts\n132:     )\n133:     if (meta.algorithm && meta.digest) {\n134:       const algo = meta.algorithm\n135:       if (!acc[algo]) { acc[algo] = [] }\n136:       acc[algo].push(meta)\n137:     }\n138:     return acc\n139:   }, new Integrity())\n140: }\n141: \n142: module.exports.fromStream = fromStream\n143: function fromStream (stream, opts) {\n144:   opts = opts || {}\n145:   const algorithms = opts.algorithms || ['sha512']\n146:   const optString = opts.options && opts.options.length\n147:   ? `?${opts.options.join('?')}`\n148:   : ''\n149:   const P = opts.promise || Promise\n150:   return new P((resolve, reject) => {\n151:     const hashes = algorithms.map(algo => crypto.createHash(algo))\n152:     stream.on('data', d => hashes.forEach(hash => hash.update(d)))\n153:     stream.on('error', reject)\n154:     stream.on('end', () => {\n155:       resolve(algorithms.reduce((acc, algo, i) => {\n156:         const hash = hashes[i]\n157:         const digest = hash.digest('base64')\n158:         const meta = new IntegrityMetadata(\n159:           `${algo}-${digest}${optString}`,\n160:           opts\n161:         )\n162:         if (meta.algorithm && meta.digest) {\n163:           const algo = meta.algorithm\n164:           if (!acc[algo]) { acc[algo] = [] }\n165:           acc[algo].push(meta)\n166:         }\n167:         return acc\n168:       }, new Integrity()))\n169:     })\n170:   })\n171: }\n172: \n173: module.exports.checkData = checkData\n174: function checkData (data, sri, opts) {\n175:   opts = opts || {}\n176:   sri = parse(sri, opts)\n177:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n178:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n179:     return pickAlgorithm(acc, algo) || acc\n180:   })\n181:   const digests = sri[algorithm].map(m => m.digest)\n182:   const digest = crypto.createHash(algorithm).update(data).digest('base64')\n183:   return digests.some(d => d === digest) && algorithm\n184: }\n185: \n186: module.exports.checkStream = checkStream\n187: function checkStream (stream, sri, opts) {\n188:   opts = opts || {}\n189:   const P = opts.Promise || Promise\n190:   const checker = createCheckerStream(sri, opts)\n191:   return new P((resolve, reject) => {\n192:     stream.pipe(checker)\n193:     stream.on('error', reject)\n194:     checker.on('error', reject)\n195:     checker.on('verified', algo => {\n196:       resolve(algo)\n197:     })\n198:   })\n199: }\n200: \n201: module.exports.createCheckerStream = createCheckerStream\n202: function createCheckerStream (sri, opts) {\n203:   opts = opts || {}\n204:   sri = parse(sri, opts)\n205:   const pickAlgorithm = opts.pickAlgorithm || getPrioritizedHash\n206:   const algorithm = Object.keys(sri).reduce((acc, algo) => {\n207:     return pickAlgorithm(acc, algo) || acc\n208:   })\n209:   const digests = sri[algorithm].map(m => m.digest)\n210:   const hash = crypto.createHash(algorithm)\n211:   const stream = new Transform({\n212:     transform: function (chunk, enc, cb) {\n213:       hash.update(chunk, enc)\n214:       cb(null, chunk, enc)\n215:     },\n216:     flush: function (cb) {\n217:       const digest = hash.digest('base64')\n218:       if (digests.some(d => d === digest)) {\n219:         stream.emit('verified', algorithm)\n220:         return cb()\n221:       } else {\n222:         const err = new Error(`${algorithm} integrity checksum failed`)\n223:         err.code = 'EBADCHECKSUM'\n224:         err.found = digest\n225:         err.expected = digests\n226:         err.algorithm = algorithm\n227:         return cb(err)\n228:       }\n229:     }\n230:   })\n231:   return stream\n232: }\n233: \n234: function getPrioritizedHash (algo1, algo2) {\n235:   return algo1\n236: }",
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "The parse function takes untrusted input (SRI string) without sufficient validation, leading to potential security issues during integrity metadata parsing",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-807",
+        "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+        "fit_reason": "The security-sensitive decision to validate integrity checksums relies on potentially malicious SRI input that is not properly validated or sanitized",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-471",
+        "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+        "fit_reason": "The parsed integrity metadata objects are treated as immutable but could be modified by an attacker through crafted input during parsing",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-178",
+      "CWE-20",
+      "CWE-254",
+      "CWE-471",
+      "CWE-494",
+      "CWE-571",
+      "CWE-685",
+      "CWE-807",
+      "CWE-863",
+      "CWE-916"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25",
+    "cwe_assessments": [
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "index.js",
+        "changed_line": 204,
+        "statement": "sri = parse(sri, opts)",
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.8,
+            "evidence": "The parse function receives untrusted SRI string input and processes it without sufficient validation, which aligns with CWE-20's mechanism of improper input validation."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The SRI string is passed directly to the parse function from createCheckerStream, establishing a clear path from externally controlled input to integrity metadata parsing."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If line 204 were reverted (i.e., sri = parse(sri, opts) removed), the integrity validation would not occur in createCheckerStream, weakening the security posture significantly."
+          },
+          "security_control": {
+            "score": 0.7,
+            "evidence": "There is no explicit input validation or sanitization of the SRI string before parsing, which is required for preventing improper input handling.",
+            "required_control": "Input validation and sanitization",
+            "control_requirement_evidence": "CWE-20 requires that inputs be validated to ensure they have the properties needed to process data safely. The parse function does not validate the SRI string before processing it.",
+            "existing_controls_checked": [
+              "No explicit input validation or sanitization in the parse function",
+              "The _parse function directly processes the integrity string without checks"
+            ],
+            "deficiency_evidence": "The code accepts any SRI string and passes it to _parse without checking for malformed or malicious inputs, which is a deficiency in input validation."
+          },
+          "concrete_impact": {
+            "score": 0.6,
+            "evidence": "Improperly validated SRI input could lead to unexpected behavior during integrity checks, potentially allowing an attacker to bypass integrity verification if the parsing logic is flawed or if malicious inputs are accepted."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the createCheckerStream function would not parse the SRI string, and thus would not perform any integrity validation, making it vulnerable to attacks that could bypass integrity checks.",
+        "supporting_evidence": [
+          "The parse function takes untrusted input (SRI string) without sufficient validation",
+          "The SRI string is passed directly from createCheckerStream to the parse function"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the specific parsing logic in _parse is vulnerable to malformed inputs or injection attacks",
+          "Whether downstream validation of parsed integrity metadata occurs"
+        ],
+        "review_comment": "The SRI string input is passed directly to parse() without validation, which constitutes improper input validation. The createCheckerStream function relies on this unvalidated input for integrity checks. Adding input validation before parsing would prevent potential issues with malformed or malicious SRI strings that could bypass integrity verification.",
+        "change_type": "A",
+        "raw_score": 0.7000000000000001,
+        "score": 0.7000000000000001
+      },
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "index.js",
+        "changed_line": 204,
+        "statement": "sri = parse(sri, opts)",
+        "cwe_id": "CWE-807",
+        "cwe_name": "Reliance on Untrusted Inputs in a Security Decision",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 1.0,
+            "evidence": "The candidate line performs a security-sensitive integrity validation by parsing SRI input, which is directly used in a security decision (checksum verification). This matches the CWE mechanism of relying on untrusted inputs in security decisions."
+          },
+          "connection": {
+            "score": 0.8,
+            "evidence": "The SRI string input flows from an external source to the parse() function, which is then used in a security-sensitive decision (checksum verification). The connection path is: external SRI input -> parse(sri, opts) -> integrity validation decision."
+          },
+          "diff_causality": {
+            "score": 0.8,
+            "evidence": "If this line were reverted, the SRI parsing and subsequent security decision would not occur. The patch introduces the reliance on potentially malicious SRI input for integrity checking, which is the core of CWE-807."
+          },
+          "security_control": {
+            "score": 0.6,
+            "evidence": "The code does not implement any validation or sanitization of the SRI input before parsing and using it in security decisions. The parse() function accepts arbitrary SRI strings without checking for malformed or malicious inputs that could bypass integrity checks.",
+            "required_control": "Input validation and sanitization",
+            "control_requirement_evidence": "CWE-807 requires that security-sensitive decisions not rely on untrusted inputs without proper validation to prevent bypass of protection mechanisms.",
+            "existing_controls_checked": [
+              "No explicit input validation or sanitization in the parse() function",
+              "No allowlist or whitelist of acceptable SRI formats"
+            ],
+            "deficiency_evidence": "The parse() function directly accepts and processes SRI strings without validating their structure or content, allowing potentially malicious inputs to influence integrity verification decisions."
+          },
+          "concrete_impact": {
+            "score": 0.7,
+            "evidence": "Malicious SRI input could bypass integrity checks by providing malformed or crafted entries that pass the parsing but fail to properly validate against expected checksums, leading to security vulnerabilities in subresource integrity verification."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the SRI parsing and integrity validation would not occur, removing the reliance on potentially malicious inputs for security decisions. The code would not perform any integrity checking based on external input.",
+        "supporting_evidence": [
+          "The parse() function is called with unvalidated SRI input from external sources",
+          "Security-sensitive decision (integrity verification) relies directly on parsed SRI data",
+          "No validation or sanitization of SRI input before use in security decisions"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether the specific parsing behavior allows bypass of integrity checks through crafted inputs",
+          "The exact impact of unvalidated SRI input on downstream verification"
+        ],
+        "review_comment": "The code relies on untrusted SRI input for integrity validation without proper validation or sanitization. An attacker could craft malicious SRI strings that bypass integrity checks. Implement input validation to ensure SRI strings conform to expected formats before parsing and using them in security decisions.",
+        "change_type": "A",
+        "raw_score": 0.78,
+        "score": 0.78
+      },
+      {
+        "candidate_id": "candidate-5",
+        "filepath": "index.js",
+        "changed_line": 204,
+        "statement": "sri = parse(sri, opts)",
+        "cwe_id": "CWE-471",
+        "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+        "cwe_relationship": "exact",
+        "category_scores": {
+          "exact_cwe_mechanism": {
+            "score": 0.8,
+            "evidence": "The code parses integrity metadata from input and stores it in objects that are later used for security-sensitive operations. If the parsing process does not properly protect these objects from modification, they can be altered by an attacker through crafted input."
+          },
+          "connection": {
+            "score": 0.6,
+            "evidence": "The parsed sri object is directly used in integrity validation logic (line 204, 206-209). The input 'sri' comes from external sources and is processed through parse() function which could allow modification of the resulting objects."
+          },
+          "diff_causality": {
+            "score": 0.7,
+            "evidence": "If line 204 were reverted, the parsing step would not occur, and no mutable objects derived from external input would be created for integrity checking. The patch introduces the parsing that enables potential modification of assumed-immutable data."
+          },
+          "security_control": {
+            "score": 0.4,
+            "evidence": "The code does not implement any mechanism to freeze or protect the parsed integrity metadata objects from modification after parsing. There is no explicit immutability enforcement for the objects returned by parse().",
+            "required_control": "Object immutability protection",
+            "control_requirement_evidence": "CWE-471 requires that assumed-immutable data be protected from attacker modification, which necessitates preventing modification of parsed objects.",
+            "existing_controls_checked": [
+              "No explicit object freezing or sealing in the parse function",
+              "No validation or sanitization of parsed metadata objects"
+            ],
+            "deficiency_evidence": "The parse() function returns mutable IntegrityMetadata and Integrity objects without any immutability enforcement. The objects are directly used for security-sensitive operations without protection against modification."
+          },
+          "concrete_impact": {
+            "score": 0.5,
+            "evidence": "If an attacker can modify the parsed integrity metadata objects, they could potentially bypass integrity checks by altering the expected digest values or algorithm fields, leading to validation failures or false positives."
+          }
+        },
+        "diff_counterfactual": "If the candidate line were reverted, the parse() function would not be called on external input, and no mutable objects derived from attacker-controlled data would be created for integrity checking. The code would not process external SRIs in a way that could allow modification of assumed-immutable data.",
+        "supporting_evidence": [
+          "The parse() function processes external input (sri) into mutable objects",
+          "The parsed objects are directly used in security-sensitive validation logic",
+          "No immutability enforcement is applied to the returned objects"
+        ],
+        "contradicting_evidence": [],
+        "contradiction_severity": "none",
+        "unresolved_facts": [
+          "Whether specific modification attacks are possible with the current implementation",
+          "The exact extent of how attacker-controlled input affects object properties"
+        ],
+        "review_comment": "The parse() function processes external SRIs into mutable objects that are later used for integrity validation. These objects should be protected from modification to prevent attackers from altering expected digest values or algorithm fields, which could bypass security checks. Implement object freezing or sealing after parsing to ensure the integrity metadata remains immutable.",
+        "change_type": "A",
+        "raw_score": 0.5999999999999999,
+        "score": 0.5999999999999999
+      }
+    ],
+    "stage4_status": "completed"
+  }
+]

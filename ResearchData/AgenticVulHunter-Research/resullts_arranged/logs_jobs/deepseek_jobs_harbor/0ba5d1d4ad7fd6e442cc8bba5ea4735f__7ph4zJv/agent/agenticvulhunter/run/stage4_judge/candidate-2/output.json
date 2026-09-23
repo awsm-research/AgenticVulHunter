@@ -1,0 +1,375 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "anymail/utils.py",
+  "changed_line": 375,
+  "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+  "change_type": "A",
+  "function_name": "get_request_uri",
+  "operation_type": "security_sensitive_construction",
+  "selection_reason": "basic auth credentials -> embed into URL -> potential credential exposure in logs/signatures",
+  "security_relevance_score": 0.8,
+  "code_context": "226:     ANYMAIL = { \"MAILGUN_API_KEY\": \"xyz\", ... }\n227:     ANYMAIL_MAILGUN_API_KEY = \"xyz\"\n228:     MAILGUN_API_KEY = \"xyz\"\n229:     \"\"\"\n230: \n231:     try:\n232:         value = kwargs.pop(name)\n233:         if name in ['username', 'password']:\n234:             # Work around a problem in django.core.mail.send_mail, which calls\n235:             # get_connection(... username=None, password=None) by default.\n236:             # We need to ignore those None defaults (else settings like\n237:             # 'SENDGRID_USERNAME' get unintentionally overridden from kwargs).\n238:             if value is not None:\n239:                 return value\n240:         else:\n241:             return value\n242:     except (AttributeError, KeyError):\n243:         pass\n244: \n245:     if esp_name is not None:\n246:         setting = \"{}_{}\".format(esp_name.upper(), name.upper())\n247:     else:\n248:         setting = name.upper()\n249:     anymail_setting = \"ANYMAIL_%s\" % setting\n250: \n251:     try:\n252:         return settings.ANYMAIL[setting]\n253:     except (AttributeError, KeyError):\n254:         try:\n255:             return getattr(settings, anymail_setting)\n256:         except AttributeError:\n257:             if allow_bare:\n258:                 try:\n259:                     return getattr(settings, setting)\n260:                 except AttributeError:\n261:                     pass\n262:             if default is UNSET:\n263:                 message = \"You must set %s or ANYMAIL = {'%s': ...}\" % (anymail_setting, setting)\n264:                 if allow_bare:\n265:                     message += \" or %s\" % setting\n266:                 message += \" in your Django settings\"\n267:                 raise AnymailConfigurationError(message)\n268:             else:\n269:                 return default\n270: \n271: \n272: def collect_all_methods(cls, method_name):\n273:     \"\"\"Return list of all `method_name` methods for cls and its superclass chain.\n274: \n275:     List is in MRO order, with no duplicates. Methods are unbound.\n276: \n277:     (This is used to simplify mixins and subclasses that contribute to a method set,\n278:     without requiring superclass chaining, and without requiring cooperating\n279:     superclasses.)\n280:     \"\"\"\n281:     methods = []\n282:     for ancestor in cls.__mro__:\n283:         try:\n284:             validator = getattr(ancestor, method_name)\n285:         except AttributeError:\n286:             pass\n287:         else:\n288:             if validator not in methods:\n289:                 methods.append(validator)\n290:     return methods\n291: \n292: \n293: EPOCH = datetime(1970, 1, 1, tzinfo=utc)\n294: \n295: \n296: def timestamp(dt):\n297:     \"\"\"Return the unix timestamp (seconds past the epoch) for datetime dt\"\"\"\n298:     # This is the equivalent of Python 3.3's datetime.timestamp\n299:     try:\n300:         return dt.timestamp()\n301:     except AttributeError:\n302:         if dt.tzinfo is None:\n303:             return mktime(dt.timetuple())\n304:         else:\n305:             return (dt - EPOCH).total_seconds()\n306: \n307: \n308: def rfc2822date(dt):\n309:     \"\"\"Turn a datetime into a date string as specified in RFC 2822.\"\"\"\n310:     # This is almost the equivalent of Python 3.3's email.utils.format_datetime,\n311:     # but treats naive datetimes as local rather than \"UTC with no information ...\"\n312:     timeval = timestamp(dt)\n313:     return formatdate(timeval, usegmt=True)\n314: \n315: \n316: def is_lazy(obj):\n317:     \"\"\"Return True if obj is a Django lazy object.\"\"\"\n318:     # See django.utils.functional.lazy. (This appears to be preferred\n319:     # to checking for `not isinstance(obj, six.text_type)`.)\n320:     return isinstance(obj, Promise)\n321: \n322: \n323: def force_non_lazy(obj):\n324:     \"\"\"If obj is a Django lazy object, return it coerced to text; otherwise return it unchanged.\n325: \n326:     (Similar to django.utils.encoding.force_text, but doesn't alter non-text objects.)\n327:     \"\"\"\n328:     if is_lazy(obj):\n329:         return six.text_type(obj)\n330: \n331:     return obj\n332: \n333: \n334: def force_non_lazy_list(obj):\n335:     \"\"\"Return a (shallow) copy of sequence obj, with all values forced non-lazy.\"\"\"\n336:     try:\n337:         return [force_non_lazy(item) for item in obj]\n338:     except (AttributeError, TypeError):\n339:         return force_non_lazy(obj)\n340: \n341: \n342: def force_non_lazy_dict(obj):\n343:     \"\"\"Return a (deep) copy of dict obj, with all values forced non-lazy.\"\"\"\n344:     try:\n345:         return {key: force_non_lazy_dict(value) for key, value in obj.items()}\n346:     except (AttributeError, TypeError):\n347:         return force_non_lazy(obj)\n348: \n349: \n350: def get_request_basic_auth(request):\n351:     \"\"\"Returns HTTP basic auth string sent with request, or None.\n352: \n353:     If request includes basic auth, result is string 'username:password'.\n354:     \"\"\"\n355:     try:\n356:         authtype, authdata = request.META['HTTP_AUTHORIZATION'].split()\n357:         if authtype.lower() == \"basic\":\n358:             return base64.b64decode(authdata).decode('utf-8')\n359:     except (IndexError, KeyError, TypeError, ValueError):\n360:         pass\n361:     return None\n362: \n363: \n364: def get_request_uri(request):\n365:     \"\"\"Returns the \"exact\" url used to call request.\n366: \n367:     Like :func:`django.http.request.HTTPRequest.build_absolute_uri`,\n368:     but also inlines HTTP basic auth, if present.\n369:     \"\"\"\n370:     url = request.build_absolute_uri()\n371:     basic_auth = get_request_basic_auth(request)\n372:     if basic_auth is not None:\n373:         # must reassemble url with auth\n374:         parts = urlsplit(url)\n375:         url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,\n376:                           parts.path, parts.query, parts.fragment))\n377:     return url",
+  "source_summary": "basic_auth comes from HTTP Authorization header via get_request_basic_auth, which decodes base64 credentials. This is user-provided authentication data.",
+  "sink_summary": "The constructed URL with embedded credentials is used in Mandrill webhook signature validation (signed_data) and included in error messages when signature validation fails, potentially exposing credentials in logs.",
+  "guard_summary": "No sanitization or filtering of credentials before embedding. The URL construction is intentional to include exact request details for signature verification.",
+  "risk_pattern": "HTTP Basic Auth credentials are extracted from request headers and embedded into URL strings used for cryptographic signing and error reporting, potentially exposing credentials in application logs or error responses.",
+  "used_variable_sources": [
+    "request.META['HTTP_AUTHORIZATION']"
+  ],
+  "called_function_context": [
+    "get_request_basic_auth",
+    "request.build_absolute_uri",
+    "urlsplit",
+    "urlunsplit"
+  ],
+  "enclosing_conditions": [
+    "if basic_auth is not None"
+  ],
+  "context_summary": "Function constructs complete request URI including basic auth for webhook signature verification. When signature validation fails, the URL with embedded credentials is included in error messages.",
+  "unresolved_facts": [
+    "Whether error messages with embedded credentials are logged to external systems",
+    "Whether there are other callers of get_request_uri beyond Mandrill webhooks"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-200",
+      "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+      "fit_reason": "HTTP Basic Auth credentials embedded in URL and potentially exposed in error messages/logs leads to credential exposure",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-497",
+      "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+      "fit_reason": "Credentials included in error messages when signature validation fails, exposing sensitive authentication data",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "fit_reason": "Insecure handling of credentials by embedding them in URLs for signature verification without proper protection",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-534",
+      "cwe_name": "Information Exposure Through Debug Log Files",
+      "fit_reason": "Credentials could be exposed through debug logs if error messages with embedded URLs are logged",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-117",
+      "cwe_name": "Improper Output Neutralization for Logs",
+      "fit_reason": "User-controlled credentials embedded in URLs without neutralization before inclusion in log entries",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-113",
+    "CWE-117",
+    "CWE-1236",
+    "CWE-20",
+    "CWE-200",
+    "CWE-208",
+    "CWE-22",
+    "CWE-255",
+    "CWE-321",
+    "CWE-347",
+    "CWE-497",
+    "CWE-534",
+    "CWE-93"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "anymail/utils.py",
+      "changed_line": 375,
+      "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+      "cwe_id": "CWE-200",
+      "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+      "cwe_relationship": "exact",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.85,
+          "evidence": "The code explicitly embeds HTTP Basic Auth credentials (username:password) into URL construction, which is then used in error messages and signature validation contexts where unauthorized actors could access the sensitive authentication data."
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "HTTP Authorization header → get_request_basic_auth() decodes credentials → embedded in URL via string concatenation → used in Mandrill webhook signature validation and error messages → potential exposure in logs/error responses"
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This line is the specific operation that embeds credentials into the URL. Without this line, credentials would not be included in the constructed URI, preventing the exposure mechanism."
+        },
+        "security_control": {
+          "score": 0.7,
+          "evidence": "The required control is credential sanitization/filtering before embedding in URLs used for non-authentication purposes. This control is required because embedding credentials in URLs violates the principle of credential isolation and creates exposure vectors.",
+          "required_control": "Credential sanitization and isolation from non-authentication contexts",
+          "control_requirement_evidence": "CWE-200 requires preventing unauthorized access to sensitive information. Embedding credentials in URLs used for error reporting bypasses credential isolation principles.",
+          "existing_controls_checked": [
+            "No filtering of credentials before URL embedding",
+            "Intentional inclusion for signature verification without consideration for error exposure"
+          ],
+          "deficiency_evidence": "Credentials are directly embedded without sanitization, and the URL is used in error handling contexts where unauthorized actors could access it."
+        },
+        "concrete_impact": {
+          "score": 0.65,
+          "evidence": "Credential exposure could lead to unauthorized access to protected resources if credentials are logged or exposed in error messages, though the exact logging/error handling implementation is not fully established."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, HTTP Basic Auth credentials would not be embedded in the URL, preventing their potential exposure in error messages and logs while still allowing signature verification to function (though potentially with reduced accuracy).",
+      "supporting_evidence": [
+        "HTTP Basic Auth credentials are extracted from request headers and decoded",
+        "Credentials are explicitly concatenated into URL netloc component",
+        "The constructed URL is used in webhook signature validation context",
+        "Error messages containing the URL are generated when signature validation fails"
+      ],
+      "contradicting_evidence": [],
+      "contradiction_severity": "none",
+      "unresolved_facts": [
+        "Whether error messages with embedded credentials are logged to external systems",
+        "Whether there are access controls on error logs that would prevent unauthorized viewing",
+        "The specific error handling implementation for Mandrill webhook signature failures"
+      ],
+      "review_comment": "The code embeds HTTP Basic Auth credentials into URLs used for webhook signature verification, creating a credential exposure risk when these URLs appear in error messages or logs. Remove credential embedding from the URI construction and use alternative methods for signature verification that don't require including authentication data. Consider storing credentials separately from the request URI or using a hash-based signature approach that doesn't expose raw credentials.",
+      "change_type": "A",
+      "raw_score": 0.77,
+      "score": 0.77
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "anymail/utils.py",
+      "changed_line": 375,
+      "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+      "cwe_id": "CWE-497",
+      "cwe_name": "Exposure of Sensitive System Information to an Unauthorized Control Sphere",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "CWE-497 requires exposure of system-level information to unauthorized actors. The demonstrated behavior shows exposure of user authentication credentials (basic auth) which are system-sensitive information, but not necessarily system-level configuration or internal state."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "HTTP Authorization header (user-provided credentials) → basic_auth extraction → URL construction with embedded credentials → used in Mandrill webhook signature validation and error messages when validation fails"
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "The candidate line directly embeds basic authentication credentials into the URL string. If reverted, credentials would not be included in the constructed URI used for signature validation and error reporting."
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "The required control is filtering sensitive authentication data from error messages and logs. The control is required because CWE-497 involves preventing unauthorized access to sensitive information through information disclosure channels.",
+          "required_control": "Filtering of authentication credentials from error messages and logging outputs",
+          "control_requirement_evidence": "CWE-497 requires preventing exposure of sensitive information to unauthorized parties. Error messages and logs are common disclosure vectors that should not contain authentication credentials.",
+          "existing_controls_checked": [
+            "No filtering of credentials before URL construction",
+            "Intentional inclusion for signature verification purposes"
+          ],
+          "deficiency_evidence": "The code intentionally embeds credentials into URLs used for error reporting without any sanitization, creating a direct path for credential exposure when signature validation fails."
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "Credential exposure is conditional on signature validation failures and subsequent error logging. The evidence shows the mechanism but not confirmed exposure instances."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, basic authentication credentials would not be embedded into the URL used for webhook signature validation and error reporting, preventing potential credential exposure in logs when signature validation fails.",
+      "supporting_evidence": [
+        "Basic auth credentials are extracted from HTTP Authorization header and embedded into URL construction",
+        "The constructed URL with credentials is used in Mandrill webhook signature validation",
+        "When signature validation fails, the URL with embedded credentials is included in error messages"
+      ],
+      "contradicting_evidence": [
+        "CWE-497 specifically addresses system-level information exposure, while this involves user authentication credentials which may be considered application-level"
+      ],
+      "contradiction_severity": "minor",
+      "unresolved_facts": [
+        "Whether error messages with embedded credentials are actually logged to external systems",
+        "Whether there are access controls on error logs that prevent unauthorized viewing",
+        "The specific error handling flow that includes the credential-containing URL"
+      ],
+      "review_comment": "The code embeds HTTP Basic Auth credentials into URLs used for webhook signature validation, which are then included in error messages when validation fails. This creates a path for credential exposure through application logs. Remove credential embedding from the URL construction for error reporting purposes, or implement credential filtering before including the URL in error messages while maintaining the original URL for signature verification internally.",
+      "change_type": "A",
+      "raw_score": 0.6,
+      "score": 0.6
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "anymail/utils.py",
+      "changed_line": 375,
+      "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+      "cwe_id": "CWE-255",
+      "cwe_name": "Credentials Management Errors",
+      "cwe_relationship": "family_compatible",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "CWE-255 is a category grouping, not a specific mechanism. The code demonstrates credential handling but doesn't match a specific CWE-255 subcategory mechanism."
+        },
+        "connection": {
+          "score": 0.75,
+          "evidence": "HTTP Authorization header → base64 decoded credentials → embedded in URL → used in signature validation and error messages"
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this line were reverted, credentials would not be embedded in the URL, preventing potential exposure in logs/error messages"
+        },
+        "security_control": {
+          "score": 0.6,
+          "evidence": "Credentials are embedded in URLs without sanitization for logging contexts",
+          "required_control": "Credential sanitization before inclusion in non-authentication contexts",
+          "control_requirement_evidence": "CWE-255 requires proper credential management including avoiding exposure in logs/transmission",
+          "existing_controls_checked": [
+            "Basic auth extraction and decoding works correctly",
+            "No filtering of credentials before URL embedding"
+          ],
+          "deficiency_evidence": "Credentials are embedded in URLs that may be logged without sanitization, bypassing credential protection principles"
+        },
+        "concrete_impact": {
+          "score": 0.45,
+          "evidence": "Potential credential exposure in error logs, but actual logging behavior is not demonstrated"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, basic auth credentials would not be embedded in the URL, preventing potential credential exposure in signature validation error messages and logs.",
+      "supporting_evidence": [
+        "Basic auth credentials extracted from HTTP headers and embedded in URL construction",
+        "URL with embedded credentials used in signature validation and error reporting",
+        "No sanitization of credentials before inclusion in URL"
+      ],
+      "contradicting_evidence": [
+        "CWE-255 is a category, not a specific vulnerability mechanism"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether error messages with embedded credentials are actually logged",
+        "Whether logged data reaches external systems or untrusted parties",
+        "Specific logging configuration and data retention policies"
+      ],
+      "review_comment": "Basic authentication credentials are extracted from HTTP headers and embedded into URLs used for webhook signature validation. When signature validation fails, these URLs containing credentials may be included in error messages and application logs. Sanitize credentials before including them in URLs or error messages by either redacting the credentials or using a separate authentication mechanism for signature verification that doesn't expose credentials in logs.",
+      "change_type": "A",
+      "raw_score": 0.5900000000000001,
+      "score": 0.5900000000000001
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "anymail/utils.py",
+      "changed_line": 375,
+      "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+      "cwe_id": "CWE-534",
+      "cwe_name": "Information Exposure Through Debug Log Files",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The code embeds credentials into URLs that may be logged, but CWE-534 specifically addresses debug log files, not general error logging or signature validation contexts. The demonstrated behavior is credential exposure through logging, but not necessarily debug-specific logging."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "HTTP basic auth credentials from request headers are decoded and embedded into URL strings that are used in Mandrill webhook signature validation and included in error messages when validation fails."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "If this candidate line were reverted, basic auth credentials would not be embedded into the URL, preventing their potential exposure in logs. The line directly creates the credential-containing URL."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "No credential filtering or sanitization before URL embedding. The URL construction is intentional for signature verification.",
+          "required_control": "Credential sanitization before inclusion in loggable data structures",
+          "control_requirement_evidence": "CWE-534 requires preventing sensitive information from being written to debug logs",
+          "existing_controls_checked": [
+            "No filtering of credentials before URL construction",
+            "Intentional embedding for signature verification purposes"
+          ],
+          "deficiency_evidence": "Credentials are embedded without sanitization, but the primary purpose is functional (signature verification) rather than debug logging"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "Potential credential exposure if error messages with embedded URLs are logged, but the specific logging to debug files is not demonstrated. The evidence shows the credential-containing URL is used in error contexts."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, basic auth credentials would not be embedded into the URL, preventing potential credential exposure in logs when signature validation fails or error messages are generated.",
+      "supporting_evidence": [
+        "Basic auth credentials are extracted from HTTP headers and embedded into URL strings",
+        "The URL with embedded credentials is used in error messages when signature validation fails",
+        "No sanitization or filtering of credentials before URL construction"
+      ],
+      "contradicting_evidence": [
+        "CWE-534 specifically addresses debug log files, but the evidence shows credential exposure through error messages, not necessarily debug logging",
+        "The primary purpose of credential embedding is functional (signature verification) rather than debug output"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether error messages with embedded credentials are actually logged to debug files",
+        "Whether there are logging configurations that would capture these error messages",
+        "Whether the credential-containing URLs are exposed through other channels beyond error messages"
+      ],
+      "review_comment": "The code embeds HTTP basic auth credentials into URLs used for webhook signature validation. When signature validation fails, these URLs containing credentials may be included in error messages that could be logged. While this serves a functional purpose for signature verification, credentials should be sanitized before inclusion in any loggable data structures. Consider extracting credential information separately from the URL construction or implementing credential redaction for logging purposes.",
+      "change_type": "A",
+      "raw_score": 0.55,
+      "score": 0.55
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "anymail/utils.py",
+      "changed_line": 375,
+      "statement": "url = urlunsplit((parts.scheme, basic_auth + '@' + parts.netloc,",
+      "cwe_id": "CWE-117",
+      "cwe_name": "Improper Output Neutralization for Logs",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.45,
+          "evidence": "The code embeds user-controlled basic auth credentials into URL strings that are used in error messages and signature validation contexts where they may be logged. However, CWE-117 specifically requires log output, and the evidence doesn't demonstrate actual logging."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "HTTP Authorization header → base64 decoded credentials → embedded in URL → used in signed_data for Mandrill webhook validation → included in error messages when validation fails"
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "The candidate line directly embeds credentials into the URL. If reverted, credentials would not be included in the constructed URI used for signature validation and error reporting."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "",
+          "required_control": "Neutralization/sanitization of sensitive data before inclusion in loggable outputs",
+          "control_requirement_evidence": "CWE-117 requires neutralization when external input is written to logs to prevent sensitive data exposure",
+          "existing_controls_checked": [
+            "No filtering of credentials before URL construction",
+            "Intentional inclusion for signature verification"
+          ],
+          "deficiency_evidence": "Credentials are embedded without sanitization, but the evidence doesn't establish this is specifically for logging rather than functional requirements"
+        },
+        "concrete_impact": {
+          "score": 0.35,
+          "evidence": "Potential credential exposure if error messages with embedded URLs are logged, but no evidence demonstrates actual logging to external systems or file storage"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, basic auth credentials would not be embedded in the constructed URL, preventing their potential inclusion in error messages and signature validation data.",
+      "supporting_evidence": [
+        "Basic auth credentials extracted from HTTP Authorization header and embedded into URL",
+        "URL with credentials used in Mandrill webhook signature validation context",
+        "Error messages include the constructed URL when signature validation fails"
+      ],
+      "contradicting_evidence": [
+        "No evidence demonstrates actual logging to files or external systems",
+        "The credential embedding appears intentional for signature verification functionality"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether error messages with embedded URLs are actually logged to persistent storage",
+        "Whether there are logging configurations that would capture these error messages",
+        "Whether other callers of get_request_uri exist beyond Mandrill webhooks"
+      ],
+      "review_comment": "The code embeds HTTP basic auth credentials into URLs used for webhook signature validation. When validation fails, these URLs containing credentials may be included in error messages. While this supports accurate signature verification, it creates credential exposure risk if error messages are logged. Filter credentials from error messages while preserving them for signature validation by separating the authentication component from the display/logging component.",
+      "change_type": "A",
+      "raw_score": 0.55,
+      "score": 0.55
+    }
+  ],
+  "stage4_status": "completed"
+}

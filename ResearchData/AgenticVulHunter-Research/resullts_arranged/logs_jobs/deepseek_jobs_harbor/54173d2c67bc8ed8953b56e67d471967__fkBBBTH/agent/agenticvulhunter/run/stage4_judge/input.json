@@ -1,0 +1,462 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "PIL/JpegImagePlugin.py",
+    "changed_line": 546,
+    "statement": "extra += b\"\\xFF\\xE2\" + size + b\"ICC_PROFILE\\0\" + o8(i) + o8(len(markers)) + marker",
+    "change_type": "A",
+    "function_name": "_save",
+    "operation_type": "data_construction",
+    "selection_reason": "External ICC profile data -> concatenated into JPEG marker -> potential for malformed ICC data to affect parsing",
+    "security_relevance_score": 0.7,
+    "code_context": "397:         pass\n398:     else:\n399:         info = TiffImagePlugin.ImageFileDirectory(head)\n400:         info.load(file)\n401:         for key, value in info.items():\n402:             exif[key] = fixup(value)\n403:     # get gpsinfo extension\n404:     try:\n405:         file.seek(exif[0x8825])\n406:     except KeyError:\n407:         pass\n408:     else:\n409:         info = TiffImagePlugin.ImageFileDirectory(head)\n410:         info.load(file)\n411:         exif[0x8825] = gps = {}\n412:         for key, value in info.items():\n413:             gps[key] = fixup(value)\n414:     return exif\n415: \n416: # --------------------------------------------------------------------\n417: # stuff to save JPEG files\n418: \n419: RAWMODE = {\n420:     \"1\": \"L\",\n421:     \"L\": \"L\",\n422:     \"RGB\": \"RGB\",\n423:     \"RGBA\": \"RGB\",\n424:     \"RGBX\": \"RGB\",\n425:     \"CMYK\": \"CMYK;I\", # assume adobe conventions\n426:     \"YCbCr\": \"YCbCr\",\n427: }\n428: \n429: zigzag_index = ( 0,  1,  5,  6, 14, 15, 27, 28,\n430:                  2,  4,  7, 13, 16, 26, 29, 42,\n431:                  3,  8, 12, 17, 25, 30, 41, 43,\n432:                  9, 11, 18, 24, 31, 40, 44, 53,\n433:                 10, 19, 23, 32, 39, 45, 52, 54,\n434:                 20, 22, 33, 38, 46, 51, 55, 60,\n435:                 21, 34, 37, 47, 50, 56, 59, 61,\n436:                 35, 36, 48, 49, 57, 58, 62, 63)\n437: \n438: samplings = {\n439:              (1, 1, 1, 1, 1, 1): 0,\n440:              (2, 1, 1, 1, 1, 1): 1,\n441:              (2, 2, 1, 1, 1, 1): 2,\n442:             }\n443: \n444: def convert_dict_qtables(qtables):\n445:     qtables = [qtables[key] for key in range(len(qtables)) if key in qtables]\n446:     for idx, table in enumerate(qtables):\n447:         qtables[idx] = [table[i] for i in zigzag_index]\n448:     return qtables\n449: \n450: def get_sampling(im):\n451:     sampling = im.layer[0][1:3] + im.layer[1][1:3] + im.layer[2][1:3]\n452:     return samplings.get(sampling, -1)\n453: \n454: def _save(im, fp, filename):\n455: \n456:     try:\n457:         rawmode = RAWMODE[im.mode]\n458:     except KeyError:\n459:         raise IOError(\"cannot write mode %s as JPEG\" % im.mode)\n460: \n461:     info = im.encoderinfo\n462: \n463:     dpi = info.get(\"dpi\", (0, 0))\n464: \n465:     quality = info.get(\"quality\", 0)\n466:     subsampling = info.get(\"subsampling\", -1)\n467:     qtables = info.get(\"qtables\")\n468: \n469:     if quality == \"keep\":\n470:         quality = 0\n471:         subsampling = \"keep\"\n472:         qtables = \"keep\"\n473:     elif quality in presets:\n474:         preset = presets[quality]\n475:         quality = 0\n476:         subsampling = preset.get('subsampling', -1)\n477:         qtables = preset.get('quantization')\n478:     elif not isinstance(quality, int):\n479:         raise ValueError(\"Invalid quality setting\")\n480:     else:\n481:         if subsampling in presets:\n482:             subsampling = presets[subsampling].get('subsampling', -1)\n483:         if qtables in presets:\n484:             qtables = presets[qtables].get('quantization')\n485: \n486:     if subsampling == \"4:4:4\":\n487:         subsampling = 0\n488:     elif subsampling == \"4:2:2\":\n489:         subsampling = 1\n490:     elif subsampling == \"4:1:1\":\n491:         subsampling = 2\n492:     elif subsampling == \"keep\":\n493:         if im.format != \"JPEG\":\n494:             raise ValueError(\"Cannot use 'keep' when original image is not a JPEG\")\n495:         subsampling = get_sampling(im)\n496: \n497:     def validate_qtables(qtables):\n498:         if qtables is None:\n499:             return qtables\n500:         if isStringType(qtables):\n501:             try:\n502:                 lines = [int(num) for line in qtables.splitlines()\n503:                          for num in line.split('#', 1)[0].split()]\n504:             except ValueError:\n505:                 raise ValueError(\"Invalid quantization table\")\n506:             else:\n507:                 qtables = [lines[s:s+64] for s in range(0, len(lines), 64)]\n508:         if isinstance(qtables, (tuple, list, dict)):\n509:             if isinstance(qtables, dict):\n510:                 qtables = convert_dict_qtables(qtables)\n511:             elif isinstance(qtables, tuple):\n512:                 qtables = list(qtables)\n513:             if not (0 < len(qtables) < 5):\n514:                 raise ValueError(\"None or too many quantization tables\")\n515:             for idx, table in enumerate(qtables):\n516:                 try:\n517:                     if len(table) != 64:\n518:                         raise\n519:                     table = array.array('b', table)\n520:                 except TypeError:\n521:                     raise ValueError(\"Invalid quantization table\")\n522:                 else:\n523:                     qtables[idx] = list(table)\n524:             return qtables\n525: \n526:     if qtables == \"keep\":\n527:         if im.format != \"JPEG\":\n528:             raise ValueError(\"Cannot use 'keep' when original image is not a JPEG\")\n529:         qtables = getattr(im, \"quantization\", None)\n530:     qtables = validate_qtables(qtables)\n531: \n532:     extra = b\"\"\n533: \n534:     icc_profile = info.get(\"icc_profile\")\n535:     if icc_profile:\n536:         ICC_OVERHEAD_LEN = 14\n537:         MAX_BYTES_IN_MARKER = 65533\n538:         MAX_DATA_BYTES_IN_MARKER = MAX_BYTES_IN_MARKER - ICC_OVERHEAD_LEN\n539:         markers = []\n540:         while icc_profile:\n541:             markers.append(icc_profile[:MAX_DATA_BYTES_IN_MARKER])\n542:             icc_profile = icc_profile[MAX_DATA_BYTES_IN_MARKER:]\n543:         i = 1\n544:         for marker in markers:\n545:             size = struct.pack(\">H\", 2 + ICC_OVERHEAD_LEN + len(marker))\n546:             extra += b\"\\xFF\\xE2\" + size + b\"ICC_PROFILE\\0\" + o8(i) + o8(len(markers)) + marker\n547:             i += 1\n548: \n549:     # get keyword arguments\n550:     im.encoderconfig = (\n551:         quality,\n552:         # \"progressive\" is the official name, but older documentation\n553:         # says \"progression\"\n554:         # FIXME: issue a warning if the wrong form is used (post-1.1.7)\n555:         \"progressive\" in info or \"progression\" in info,\n556:         info.get(\"smooth\", 0),\n557:         \"optimize\" in info,\n558:         info.get(\"streamtype\", 0),\n559:         dpi[0], dpi[1],\n560:         subsampling,\n561:         qtables,\n562:         extra,\n563:         info.get(\"exif\", b\"\")\n564:         )\n565: \n566: \n567:     # if we optimize, libjpeg needs a buffer big enough to hold the whole image in a shot.\n568:     # Guessing on the size, at im.size bytes. (raw pizel size is channels*size, this\n569:     # is a value that's been used in a django patch.\n570:     # https://github.com/jdriscoll/django-imagekit/issues/50\n571:     bufsize=0\n572:     if \"optimize\" in info or \"progressive\" in info or \"progression\" in info:\n573:         if quality >= 95:\n574:             bufsize = 2 * im.size[0] * im.size[1]\n575:         else:\n576:             bufsize = im.size[0] * im.size[1]\n577: \n578:     # The exif info needs to be written as one block, + APP1, + one spare byte.\n579:     # Ensure that our buffer is big enough\n580:     bufsize = max(ImageFile.MAXBLOCK, bufsize, len(info.get(\"exif\",b\"\")) + 5 )\n581: \n582:     ImageFile._save(im, fp, [(\"jpeg\", (0,0)+im.size, 0, rawmode)], bufsize)\n583: \n584: def _save_cjpeg(im, fp, filename):\n585:     # ALTERNATIVE: handle JPEGs via the IJG command line utilities.\n586:     import os\n587:     file = im._dump()\n588:     os.system(\"cjpeg %s >%s\" % (file, filename))\n589:     try: os.unlink(file)\n590:     except: pass\n591: \n592: # -------------------------------------------------------------------q-\n593: # Registry stuff\n594: \n595: Image.register_open(\"JPEG\", JpegImageFile, _accept)\n596: Image.register_save(\"JPEG\", _save)\n597: \n598: Image.register_extension(\"JPEG\", \".jfif\")\n599: Image.register_extension(\"JPEG\", \".jpe\")\n600: Image.register_extension(\"JPEG\", \".jpg\")\n601: Image.register_extension(\"JPEG\", \".jpeg\")\n602: \n603: Image.register_mime(\"JPEG\", \"image/jpeg\")",
+    "source_summary": "icc_profile from im.encoderinfo.get(\"icc_profile\"), which comes from user-provided save options (params in Image.save()). External input.",
+    "sink_summary": "extra variable passed to im.encoderconfig, then to ImageFile._save() which writes to JPEG file output. ICC profile data embedded in JPEG APP2 markers.",
+    "guard_summary": "ICC profile split into chunks <= 65519 bytes to fit JPEG marker size limit (65533 bytes total, 14 bytes overhead). o8 truncates sequence and count to single byte (0-255). No validation of ICC profile structure or content.",
+    "risk_pattern": "Untrusted ICC profile data embedded directly into JPEG markers without validation; sequence/count truncation via o8 may cause wrapping; malformed data could affect downstream parsers.",
+    "used_variable_sources": [
+      "im.encoderinfo.get(\"icc_profile\")"
+    ],
+    "called_function_context": [
+      "o8 (from PIL/_binary.py, truncates to single byte)",
+      "struct.pack (creates big-endian size)"
+    ],
+    "enclosing_conditions": [
+      "if icc_profile:",
+      "for marker in markers:"
+    ],
+    "context_summary": "In _save function, constructing JPEG APP2 markers for ICC profile embedding. ICC profile split into chunks, each prefixed with marker header containing sequence number and total count.",
+    "unresolved_facts": [
+      "How ImageFile._save handles extra data and whether there are validation steps in JPEG writing",
+      "Whether other parts of PIL validate or use icc_profile data",
+      "Maximum realistic size of icc_profile from user input"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "Untrusted ICC profile data embedded in JPEG markers without validation; matches general input validation failure pattern",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-125",
+        "cwe_name": "Out-of-bounds Read",
+        "fit_reason": "Malformed ICC profile data could cause downstream parsers to read beyond buffer boundaries",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-119",
+        "cwe_name": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
+        "fit_reason": "Embedding untrusted data in structured file format may lead to memory corruption in downstream parsers",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-19",
+        "cwe_name": "Data Processing Errors",
+        "fit_reason": "Legacy category covering incorrect handling of structured data like ICC profiles in JPEG format",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-74",
+        "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+        "fit_reason": "Untrusted ICC data injected into JPEG output stream without proper neutralization",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-119",
+      "CWE-125",
+      "CWE-19",
+      "CWE-20",
+      "CWE-22",
+      "CWE-409",
+      "CWE-502",
+      "CWE-601",
+      "CWE-685",
+      "CWE-687",
+      "CWE-74",
+      "CWE-77",
+      "CWE-770",
+      "CWE-776",
+      "CWE-827"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "PIL/PdfImagePlugin.py",
+    "changed_line": 107,
+    "statement": "colorspace += \"%02x%02x%02x \" % (r, g, b)",
+    "change_type": "A",
+    "function_name": "_save",
+    "operation_type": "string_formatting",
+    "selection_reason": "image palette data -> string formatting -> PDF colorspace construction",
+    "security_relevance_score": 0.6,
+    "code_context": "1: #\n2: # The Python Imaging Library.\n3: # $Id$\n4: #\n5: # PDF (Acrobat) file handling\n6: #\n7: # History:\n8: # 1996-07-16 fl   Created\n9: # 1997-01-18 fl   Fixed header\n10: # 2004-02-21 fl   Fixes for 1/L/CMYK images, etc.\n11: # 2004-02-24 fl   Fixes for 1 and P images.\n12: #\n13: # Copyright (c) 1997-2004 by Secret Labs AB.  All rights reserved.\n14: # Copyright (c) 1996-1997 by Fredrik Lundh.\n15: #\n16: # See the README file for information on usage and redistribution.\n17: #\n18: \n19: ##\n20: # Image plugin for PDF images (output only).\n21: ##\n22: \n23: __version__ = \"0.4\"\n24: \n25: from PIL import Image, ImageFile\n26: from PIL._binary import i8\n27: import io\n28: \n29: \n30: #\n31: # --------------------------------------------------------------------\n32: \n33: # object ids:\n34: #  1. catalogue\n35: #  2. pages\n36: #  3. image\n37: #  4. page\n38: #  5. page contents\n39: \n40: def _obj(fp, obj, **dict):\n41:     fp.write(\"%d 0 obj\\n\" % obj)\n42:     if dict:\n43:         fp.write(\"<<\\n\")\n44:         for k, v in dict.items():\n45:             if v is not None:\n46:                 fp.write(\"/%s %s\\n\" % (k, v))\n47:         fp.write(\">>\\n\")\n48: \n49: def _endobj(fp):\n50:     fp.write(\"endobj\\n\")\n51: \n52: ##\n53: # (Internal) Image save plugin for the PDF format.\n54: \n55: def _save(im, fp, filename):\n56:     resolution = im.encoderinfo.get(\"resolution\", 72.0)\n57: \n58:     #\n59:     # make sure image data is available\n60:     im.load()\n61: \n62:     xref = [0]*(5+1) # placeholders\n63: \n64:     class TextWriter:\n65:         def __init__(self, fp):\n66:             self.fp = fp\n67:         def __getattr__(self, name):\n68:             return getattr(self.fp, name)\n69:         def write(self, value):\n70:             self.fp.write(value.encode('latin-1'))\n71: \n72:     fp = TextWriter(fp)\n73: \n74:     fp.write(\"%PDF-1.2\\n\")\n75:     fp.write(\"% created by PIL PDF driver \" + __version__ + \"\\n\")\n76: \n77:     #\n78:     # Get image characteristics\n79: \n80:     width, height = im.size\n81: \n82:     # FIXME: Should replace ASCIIHexDecode with RunLengthDecode (packbits)\n83:     # or LZWDecode (tiff/lzw compression).  Note that PDF 1.2 also supports\n84:     # Flatedecode (zip compression).\n85: \n86:     bits = 8\n87:     params = None\n88: \n89:     if im.mode == \"1\":\n90:         filter = \"/ASCIIHexDecode\"\n91:         colorspace = \"/DeviceGray\"\n92:         procset = \"/ImageB\" # grayscale\n93:         bits = 1\n94:     elif im.mode == \"L\":\n95:         filter = \"/DCTDecode\"\n96:         # params = \"<< /Predictor 15 /Columns %d >>\" % (width-2)\n97:         colorspace = \"/DeviceGray\"\n98:         procset = \"/ImageB\" # grayscale\n99:     elif im.mode == \"P\":\n100:         filter = \"/ASCIIHexDecode\"\n101:         colorspace = \"[ /Indexed /DeviceRGB 255 <\"\n102:         palette = im.im.getpalette(\"RGB\")\n103:         for i in range(256):\n104:             r = i8(palette[i*3])\n105:             g = i8(palette[i*3+1])\n106:             b = i8(palette[i*3+2])\n107:             colorspace += \"%02x%02x%02x \" % (r, g, b)\n108:         colorspace += b\"> ]\"\n109:         procset = \"/ImageI\" # indexed color\n110:     elif im.mode == \"RGB\":\n111:         filter = \"/DCTDecode\"\n112:         colorspace = \"/DeviceRGB\"\n113:         procset = \"/ImageC\" # color images\n114:     elif im.mode == \"CMYK\":\n115:         filter = \"/DCTDecode\"\n116:         colorspace = \"/DeviceCMYK\"\n117:         procset = \"/ImageC\" # color images\n118:     else:\n119:         raise ValueError(\"cannot save mode %s\" % im.mode)\n120: \n121:     #\n122:     # catalogue\n123: \n124:     xref[1] = fp.tell()\n125:     _obj(fp, 1, Type = \"/Catalog\",\n126:                 Pages = \"2 0 R\")\n127:     _endobj(fp)\n128: \n129:     #\n130:     # pages\n131: \n132:     xref[2] = fp.tell()\n133:     _obj(fp, 2, Type = \"/Pages\",\n134:                 Count = 1,\n135:                 Kids = \"[4 0 R]\")\n136:     _endobj(fp)\n137: \n138:     #\n139:     # image\n140: \n141:     op = io.BytesIO()\n142: \n143:     if filter == \"/ASCIIHexDecode\":\n144:         if bits == 1:\n145:             # FIXME: the hex encoder doesn't support packed 1-bit\n146:             # images; do things the hard way...\n147:             data = im.tostring(\"raw\", \"1\")\n148:             im = Image.new(\"L\", (len(data), 1), None)\n149:             im.putdata(data)\n150:         ImageFile._save(im, op, [(\"hex\", (0,0)+im.size, 0, im.mode)])\n151:     elif filter == \"/DCTDecode\":\n152:         Image.SAVE[\"JPEG\"](im, op, filename)\n153:     elif filter == \"/FlateDecode\":\n154:         ImageFile._save(im, op, [(\"zip\", (0,0)+im.size, 0, im.mode)])\n155:     elif filter == \"/RunLengthDecode\":\n156:         ImageFile._save(im, op, [(\"packbits\", (0,0)+im.size, 0, im.mode)])\n157:     else:\n158:         raise ValueError(\"unsupported PDF filter (%s)\" % filter)\n159: \n160:     xref[3] = fp.tell()\n161:     _obj(fp, 3, Type = \"/XObject\",\n162:                 Subtype = \"/Image\",\n163:                 Width = width, # * 72.0 / resolution,\n164:                 Height = height, # * 72.0 / resolution,\n165:                 Length = len(op.getvalue()),\n166:                 Filter = filter,\n167:                 BitsPerComponent = bits,\n168:                 DecodeParams = params,\n169:                 ColorSpace = colorspace)\n170: \n171:     fp.write(\"stream\\n\")\n172:     fp.fp.write(op.getvalue())\n173:     fp.write(\"\\nendstream\\n\")\n174: \n175:     _endobj(fp)\n176: \n177:     #\n178:     # page\n179: \n180:     xref[4] = fp.tell()\n181:     _obj(fp, 4)\n182:     fp.write(\"<<\\n/Type /Page\\n/Parent 2 0 R\\n\"\\\n183:              \"/Resources <<\\n/ProcSet [ /PDF %s ]\\n\"\\\n184:              \"/XObject << /image 3 0 R >>\\n>>\\n\"\\\n185:              \"/MediaBox [ 0 0 %d %d ]\\n/Contents 5 0 R\\n>>\\n\" %\\\n186:              (procset, int(width * 72.0 /resolution) , int(height * 72.0 / resolution)))\n187:     _endobj(fp)\n188: \n189:     #\n190:     # page contents\n191: \n192:     op = TextWriter(io.BytesIO())\n193: \n194:     op.write(\"q %d 0 0 %d 0 0 cm /image Do Q\\n\" % (int(width * 72.0 / resolution), int(height * 72.0 / resolution)))\n195: \n196:     xref[5] = fp.tell()\n197:     _obj(fp, 5, Length = len(op.fp.getvalue()))\n198: \n199:     fp.write(\"stream\\n\")\n200:     fp.fp.write(op.fp.getvalue())\n201:     fp.write(\"\\nendstream\\n\")\n202: \n203:     _endobj(fp)\n204: \n205:     #\n206:     # trailer\n207:     startxref = fp.tell()\n208:     fp.write(\"xref\\n0 %d\\n0000000000 65535 f \\n\" % len(xref))\n209:     for x in xref[1:]:\n210:         fp.write(\"%010d 00000 n \\n\" % x)\n211:     fp.write(\"trailer\\n<<\\n/Size %d\\n/Root 1 0 R\\n>>\\n\" % len(xref))\n212:     fp.write(\"startxref\\n%d\\n%%%%EOF\\n\" % startxref)\n213:     fp.flush()\n214: \n215: #\n216: # --------------------------------------------------------------------\n217: \n218: Image.register_save(\"PDF\", _save)\n219: \n220: Image.register_extension(\"PDF\", \".pdf\")\n221: \n222: Image.register_mime(\"PDF\", \"application/pdf\")",
+    "source_summary": "Image palette data from im.im.getpalette(\"RGB\") containing 768 bytes of RGB values",
+    "sink_summary": "PDF ColorSpace field in XObject dictionary written to file via _obj() function",
+    "guard_summary": "No validation or sanitization of palette values; direct string formatting into PDF content",
+    "risk_pattern": "Untrusted image palette data formatted into PDF colorspace definition without escaping or validation",
+    "used_variable_sources": [
+      "im.im.getpalette(\"RGB\")"
+    ],
+    "called_function_context": [
+      "i8()",
+      "_obj()"
+    ],
+    "enclosing_conditions": [
+      "im.mode == \"P\" (indexed color palette mode)"
+    ],
+    "context_summary": "Loop iterates through 256 palette entries, extracting RGB values and formatting them as hex strings into PDF colorspace definition",
+    "unresolved_facts": [
+      "Whether palette data can contain malicious content that could exploit PDF parsing",
+      "Whether the latin-1 encoding in TextWriter provides any security filtering"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-74",
+        "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+        "fit_reason": "Untrusted palette data formatted into PDF ColorSpace field without neutralization of PDF special characters",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "No validation of palette data before incorporating into PDF ColorSpace definition",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-77",
+        "cwe_name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')",
+        "fit_reason": "Similar injection pattern but applied to PDF syntax rather than command line",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-117",
+        "cwe_name": "Improper Output Neutralization for Logs",
+        "fit_reason": "Similar injection mechanism but applied to PDF document structure instead of logs",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-117",
+      "CWE-1236",
+      "CWE-19",
+      "CWE-20",
+      "CWE-22",
+      "CWE-409",
+      "CWE-425",
+      "CWE-489",
+      "CWE-502",
+      "CWE-534",
+      "CWE-685",
+      "CWE-74",
+      "CWE-77",
+      "CWE-78",
+      "CWE-827",
+      "CWE-90",
+      "CWE-943",
+      "CWE-95"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "PIL/ExifTags.py",
+    "changed_line": 70,
+    "statement": "0x1001: \"RelatedImageLength\",  # FIXME / Dictionary contains duplicate keys",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "data_structure_modification",
+    "selection_reason": "Duplicate dictionary keys added -> potential for unexpected EXIF tag processing behavior",
+    "security_relevance_score": 0.5,
+    "code_context": "1: #\n2: # The Python Imaging Library.\n3: # $Id$\n4: #\n5: # EXIF tags\n6: #\n7: # Copyright (c) 2003 by Secret Labs AB\n8: #\n9: # See the README file for information on usage and redistribution.\n10: #\n11: \n12: ##\n13: # This module provides constants and clear-text names for various\n14: # well-known EXIF tags.\n15: ##\n16: \n17: ##\n18: # Maps EXIF tags to tag names.\n19: \n20: TAGS = {\n21: \n22:     # possibly incomplete\n23:     0x00fe: \"NewSubfileType\",\n24:     0x00ff: \"SubfileType\",\n25:     0x0100: \"ImageWidth\",\n26:     0x0101: \"ImageLength\",\n27:     0x0102: \"BitsPerSample\",\n28:     0x0103: \"Compression\",\n29:     0x0106: \"PhotometricInterpretation\",\n30:     0x0107: \"Threshholding\",\n31:     0x0108: \"CellWidth\",\n32:     0x0109: \"CellLenght\",\n33:     0x010a: \"FillOrder\",\n34:     0x010d: \"DocumentName\",\n35:     0x011d: \"PageName\",\n36:     0x010e: \"ImageDescription\",\n37:     0x010f: \"Make\",\n38:     0x0110: \"Model\",\n39:     0x0111: \"StripOffsets\",\n40:     0x0112: \"Orientation\",\n41:     0x0115: \"SamplesPerPixel\",\n42:     0x0116: \"RowsPerStrip\",\n43:     0x0117: \"StripByteConunts\",\n44:     0x0118: \"MinSampleValue\",\n45:     0x0119: \"MaxSampleValue\",\n46:     0x011a: \"XResolution\",\n47:     0x011b: \"YResolution\",\n48:     0x011c: \"PlanarConfiguration\",\n49:     0x0120: \"FreeOffsets\",\n50:     0x0121: \"FreeByteCounts\",\n51:     0x0122: \"GrayResponseUnit\",\n52:     0x0123: \"GrayResponseCurve\",\n53:     0x0128: \"ResolutionUnit\",\n54:     0x012d: \"TransferFunction\",\n55:     0x0131: \"Software\",\n56:     0x0132: \"DateTime\",\n57:     0x013b: \"Artist\",\n58:     0x013c: \"HostComputer\",\n59:     0x013e: \"WhitePoint\",\n60:     0x013f: \"PrimaryChromaticities\",\n61:     0x0140: \"ColorMap\",\n62:     0x0152: \"ExtraSamples\",\n63:     0x0201: \"JpegIFOffset\",\n64:     0x0202: \"JpegIFByteCount\",\n65:     0x0211: \"YCbCrCoefficients\",\n66:     0x0212: \"YCbCrSubSampling\",\n67:     0x0213: \"YCbCrPositioning\",\n68:     0x0214: \"ReferenceBlackWhite\",\n69:     0x1000: \"RelatedImageFileFormat\",\n70:     0x1001: \"RelatedImageLength\",  # FIXME / Dictionary contains duplicate keys\n71:     0x1001: \"RelatedImageWidth\",   # FIXME \\ Dictionary contains duplicate keys\n72:     0x828d: \"CFARepeatPatternDim\",\n73:     0x828e: \"CFAPattern\",\n74:     0x828f: \"BatteryLevel\",\n75:     0x8298: \"Copyright\",\n76:     0x829a: \"ExposureTime\",\n77:     0x829d: \"FNumber\",\n78:     0x8769: \"ExifOffset\",\n79:     0x8773: \"InterColorProfile\",\n80:     0x8822: \"ExposureProgram\",\n81:     0x8824: \"SpectralSensitivity\",\n82:     0x8825: \"GPSInfo\",\n83:     0x8827: \"ISOSpeedRatings\",\n84:     0x8828: \"OECF\",\n85:     0x8829: \"Interlace\",\n86:     0x882a: \"TimeZoneOffset\",\n87:     0x882b: \"SelfTimerMode\",\n88:     0x9000: \"ExifVersion\",\n89:     0x9003: \"DateTimeOriginal\",\n90:     0x9004: \"DateTimeDigitized\",\n91:     0x9101: \"ComponentsConfiguration\",\n92:     0x9102: \"CompressedBitsPerPixel\",\n93:     0x9201: \"ShutterSpeedValue\",\n94:     0x9202: \"ApertureValue\",\n95:     0x9203: \"BrightnessValue\",\n96:     0x9204: \"ExposureBiasValue\",\n97:     0x9205: \"MaxApertureValue\",\n98:     0x9206: \"SubjectDistance\",\n99:     0x9207: \"MeteringMode\",\n100:     0x9208: \"LightSource\",\n101:     0x9209: \"Flash\",\n102:     0x920a: \"FocalLength\",\n103:     0x920b: \"FlashEnergy\",\n104:     0x920c: \"SpatialFrequencyResponse\",\n105:     0x920d: \"Noise\",\n106:     0x9211: \"ImageNumber\",\n107:     0x9212: \"SecurityClassification\",\n108:     0x9213: \"ImageHistory\",\n109:     0x9214: \"SubjectLocation\",\n110:     0x9215: \"ExposureIndex\",\n111:     0x9216: \"TIFF/EPStandardID\",\n112:     0x927c: \"MakerNote\",\n113:     0x9286: \"UserComment\",\n114:     0x9290: \"SubsecTime\",\n115:     0x9291: \"SubsecTimeOriginal\",\n116:     0x9292: \"SubsecTimeDigitized\",\n117:     0xa000: \"FlashPixVersion\",\n118:     0xa001: \"ColorSpace\",\n119:     0xa002: \"ExifImageWidth\",\n120:     0xa003: \"ExifImageHeight\",\n121:     0xa004: \"RelatedSoundFile\",\n122:     0xa005: \"ExifInteroperabilityOffset\",\n123:     0xa20b: \"FlashEnergy\",\n124:     0xa20c: \"SpatialFrequencyResponse\",\n125:     0xa20e: \"FocalPlaneXResolution\",\n126:     0xa20f: \"FocalPlaneYResolution\",\n127:     0xa210: \"FocalPlaneResolutionUnit\",\n128:     0xa214: \"SubjectLocation\",\n129:     0xa215: \"ExposureIndex\",\n130:     0xa217: \"SensingMethod\",\n131:     0xa300: \"FileSource\",\n132:     0xa301: \"SceneType\",\n133:     0xa302: \"CFAPattern\",\n134:     0xa401: \"CustomRendered\",\n135:     0xa402: \"ExposureMode\",\n136:     0xa403: \"WhiteBalance\",\n137:     0xa404: \"DigitalZoomRatio\",\n138:     0xa405: \"FocalLengthIn35mmFilm\",\n139:     0xa406: \"SceneCaptureType\",\n140:     0xa407: \"GainControl\",\n141:     0xa408: \"Contrast\",\n142:     0xa409: \"Saturation\",\n143:     0xa40a: \"Sharpness\",\n144:     0xa40b: \"DeviceSettingDescription\",\n145:     0xa40c: \"SubjectDistanceRange\",\n146:     0xa420: \"ImageUniqueID\",\n147:     0xa430: \"CameraOwnerName\",\n148:     0xa431: \"BodySerialNumber\",\n149:     0xa432: \"LensSpecification\",\n150:     0xa433: \"LensMake\",\n151:     0xa434: \"LensModel\",\n152:     0xa435: \"LensSerialNumber\",\n153:     0xa500: \"Gamma\",\n154: \n155: }\n156: \n157: ##\n158: # Maps EXIF GPS tags to tag names.\n159: \n160: GPSTAGS = {\n161:     0: \"GPSVersionID\",\n162:     1: \"GPSLatitudeRef\",\n163:     2: \"GPSLatitude\",\n164:     3: \"GPSLongitudeRef\",\n165:     4: \"GPSLongitude\",\n166:     5: \"GPSAltitudeRef\",\n167:     6: \"GPSAltitude\",\n168:     7: \"GPSTimeStamp\",\n169:     8: \"GPSSatellites\",\n170:     9: \"GPSStatus\",\n171:     10: \"GPSMeasureMode\",\n172:     11: \"GPSDOP\",\n173:     12: \"GPSSpeedRef\",\n174:     13: \"GPSSpeed\",\n175:     14: \"GPSTrackRef\",\n176:     15: \"GPSTrack\",\n177:     16: \"GPSImgDirectionRef\",\n178:     17: \"GPSImgDirection\",\n179:     18: \"GPSMapDatum\",\n180:     19: \"GPSDestLatitudeRef\",\n181:     20: \"GPSDestLatitude\",\n182:     21: \"GPSDestLongitudeRef\",\n183:     22: \"GPSDestLongitude\",\n184:     23: \"GPSDestBearingRef\",\n185:     24: \"GPSDestBearing\",\n186:     25: \"GPSDestDistanceRef\",\n187:     26: \"GPSDestDistance\",\n188:     27: \"GPSProcessingMethod\",\n189:     28: \"GPSAreaInformation\",\n190:     29: \"GPSDateStamp\",\n191:     30: \"GPSDifferential\",\n192:     31: \"GPSHPositioningError\",\n193: }",
+    "source_summary": "EXIF tag definition dictionary mapping hexadecimal tag codes to human-readable names",
+    "sink_summary": "Dictionary lookup operations in TiffImagePlugin.py using .get() method for tag name resolution",
+    "guard_summary": "No validation for duplicate keys in dictionary definition; Python dictionary behavior silently overwrites duplicate keys",
+    "risk_pattern": "Duplicate dictionary key causes silent data loss where only the last value (\"RelatedImageWidth\") is retained, potentially leading to incorrect tag name resolution in EXIF metadata processing",
+    "used_variable_sources": [
+      "TAGS dictionary definition"
+    ],
+    "called_function_context": [
+      "TiffTags.TAGS.get() for tag name lookup"
+    ],
+    "enclosing_conditions": [
+      "Debug mode condition in TiffImagePlugin.py line 424"
+    ],
+    "context_summary": "The TAGS dictionary is used by TiffImagePlugin.py to map EXIF tag codes to human-readable names. The duplicate key 0x1001 will cause \"RelatedImageLength\" to be silently overwritten by \"RelatedImageWidth\" due to Python dictionary behavior.",
+    "unresolved_facts": [
+      "Whether any code depends on the \"RelatedImageLength\" tag name being available",
+      "Whether there are any iteration patterns over TAGS.values() that might be affected",
+      "Whether the duplicate affects any validation or processing logic beyond name resolution"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-561",
+        "cwe_name": "Dead Code",
+        "fit_reason": "Duplicate dictionary key causes 'RelatedImageLength' tag name to be silently overwritten and become unreachable dead code",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-471",
+        "cwe_name": "Modification of Assumed-Immutable Data (MAID)",
+        "fit_reason": "EXIF tag mapping dictionary is assumed immutable but contains duplicate keys that corrupt the intended mapping",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-19",
+        "cwe_name": "Data Processing Errors",
+        "fit_reason": "Incorrect handling of structured EXIF tag data due to duplicate keys in mapping dictionary",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-628",
+        "cwe_name": "Function Call with Incorrectly Specified Arguments",
+        "fit_reason": "Dictionary lookup operations may receive incorrect tag name mappings due to silent key overwrite",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1321",
+      "CWE-179",
+      "CWE-19",
+      "CWE-22",
+      "CWE-252",
+      "CWE-390",
+      "CWE-471",
+      "CWE-489",
+      "CWE-561",
+      "CWE-628",
+      "CWE-685",
+      "CWE-687",
+      "CWE-732",
+      "CWE-863"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-4",
+    "filepath": "PIL/ExifTags.py",
+    "changed_line": 71,
+    "statement": "0x1001: \"RelatedImageWidth\",   # FIXME \\ Dictionary contains duplicate keys",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "data_structure_modification",
+    "selection_reason": "Duplicate dictionary keys added -> potential for unexpected EXIF tag processing behavior",
+    "security_relevance_score": 0.5,
+    "code_context": "1: #\n2: # The Python Imaging Library.\n3: # $Id$\n4: #\n5: # EXIF tags\n6: #\n7: # Copyright (c) 2003 by Secret Labs AB\n8: #\n9: # See the README file for information on usage and redistribution.\n10: #\n11: \n12: ##\n13: # This module provides constants and clear-text names for various\n14: # well-known EXIF tags.\n15: ##\n16: \n17: ##\n18: # Maps EXIF tags to tag names.\n19: \n20: TAGS = {\n21: \n22:     # possibly incomplete\n23:     0x00fe: \"NewSubfileType\",\n24:     0x00ff: \"SubfileType\",\n25:     0x0100: \"ImageWidth\",\n26:     0x0101: \"ImageLength\",\n27:     0x0102: \"BitsPerSample\",\n28:     0x0103: \"Compression\",\n29:     0x0106: \"PhotometricInterpretation\",\n30:     0x0107: \"Threshholding\",\n31:     0x0108: \"CellWidth\",\n32:     0x0109: \"CellLenght\",\n33:     0x010a: \"FillOrder\",\n34:     0x010d: \"DocumentName\",\n35:     0x011d: \"PageName\",\n36:     0x010e: \"ImageDescription\",\n37:     0x010f: \"Make\",\n38:     0x0110: \"Model\",\n39:     0x0111: \"StripOffsets\",\n40:     0x0112: \"Orientation\",\n41:     0x0115: \"SamplesPerPixel\",\n42:     0x0116: \"RowsPerStrip\",\n43:     0x0117: \"StripByteConunts\",\n44:     0x0118: \"MinSampleValue\",\n45:     0x0119: \"MaxSampleValue\",\n46:     0x011a: \"XResolution\",\n47:     0x011b: \"YResolution\",\n48:     0x011c: \"PlanarConfiguration\",\n49:     0x0120: \"FreeOffsets\",\n50:     0x0121: \"FreeByteCounts\",\n51:     0x0122: \"GrayResponseUnit\",\n52:     0x0123: \"GrayResponseCurve\",\n53:     0x0128: \"ResolutionUnit\",\n54:     0x012d: \"TransferFunction\",\n55:     0x0131: \"Software\",\n56:     0x0132: \"DateTime\",\n57:     0x013b: \"Artist\",\n58:     0x013c: \"HostComputer\",\n59:     0x013e: \"WhitePoint\",\n60:     0x013f: \"PrimaryChromaticities\",\n61:     0x0140: \"ColorMap\",\n62:     0x0152: \"ExtraSamples\",\n63:     0x0201: \"JpegIFOffset\",\n64:     0x0202: \"JpegIFByteCount\",\n65:     0x0211: \"YCbCrCoefficients\",\n66:     0x0212: \"YCbCrSubSampling\",\n67:     0x0213: \"YCbCrPositioning\",\n68:     0x0214: \"ReferenceBlackWhite\",\n69:     0x1000: \"RelatedImageFileFormat\",\n70:     0x1001: \"RelatedImageLength\",  # FIXME / Dictionary contains duplicate keys\n71:     0x1001: \"RelatedImageWidth\",   # FIXME \\ Dictionary contains duplicate keys\n72:     0x828d: \"CFARepeatPatternDim\",\n73:     0x828e: \"CFAPattern\",\n74:     0x828f: \"BatteryLevel\",\n75:     0x8298: \"Copyright\",\n76:     0x829a: \"ExposureTime\",\n77:     0x829d: \"FNumber\",\n78:     0x8769: \"ExifOffset\",\n79:     0x8773: \"InterColorProfile\",\n80:     0x8822: \"ExposureProgram\",\n81:     0x8824: \"SpectralSensitivity\",\n82:     0x8825: \"GPSInfo\",\n83:     0x8827: \"ISOSpeedRatings\",\n84:     0x8828: \"OECF\",\n85:     0x8829: \"Interlace\",\n86:     0x882a: \"TimeZoneOffset\",\n87:     0x882b: \"SelfTimerMode\",\n88:     0x9000: \"ExifVersion\",\n89:     0x9003: \"DateTimeOriginal\",\n90:     0x9004: \"DateTimeDigitized\",\n91:     0x9101: \"ComponentsConfiguration\",\n92:     0x9102: \"CompressedBitsPerPixel\",\n93:     0x9201: \"ShutterSpeedValue\",\n94:     0x9202: \"ApertureValue\",\n95:     0x9203: \"BrightnessValue\",\n96:     0x9204: \"ExposureBiasValue\",\n97:     0x9205: \"MaxApertureValue\",\n98:     0x9206: \"SubjectDistance\",\n99:     0x9207: \"MeteringMode\",\n100:     0x9208: \"LightSource\",\n101:     0x9209: \"Flash\",\n102:     0x920a: \"FocalLength\",\n103:     0x920b: \"FlashEnergy\",\n104:     0x920c: \"SpatialFrequencyResponse\",\n105:     0x920d: \"Noise\",\n106:     0x9211: \"ImageNumber\",\n107:     0x9212: \"SecurityClassification\",\n108:     0x9213: \"ImageHistory\",\n109:     0x9214: \"SubjectLocation\",\n110:     0x9215: \"ExposureIndex\",\n111:     0x9216: \"TIFF/EPStandardID\",\n112:     0x927c: \"MakerNote\",\n113:     0x9286: \"UserComment\",\n114:     0x9290: \"SubsecTime\",\n115:     0x9291: \"SubsecTimeOriginal\",\n116:     0x9292: \"SubsecTimeDigitized\",\n117:     0xa000: \"FlashPixVersion\",\n118:     0xa001: \"ColorSpace\",\n119:     0xa002: \"ExifImageWidth\",\n120:     0xa003: \"ExifImageHeight\",\n121:     0xa004: \"RelatedSoundFile\",\n122:     0xa005: \"ExifInteroperabilityOffset\",\n123:     0xa20b: \"FlashEnergy\",\n124:     0xa20c: \"SpatialFrequencyResponse\",\n125:     0xa20e: \"FocalPlaneXResolution\",\n126:     0xa20f: \"FocalPlaneYResolution\",\n127:     0xa210: \"FocalPlaneResolutionUnit\",\n128:     0xa214: \"SubjectLocation\",\n129:     0xa215: \"ExposureIndex\",\n130:     0xa217: \"SensingMethod\",\n131:     0xa300: \"FileSource\",\n132:     0xa301: \"SceneType\",\n133:     0xa302: \"CFAPattern\",\n134:     0xa401: \"CustomRendered\",\n135:     0xa402: \"ExposureMode\",\n136:     0xa403: \"WhiteBalance\",\n137:     0xa404: \"DigitalZoomRatio\",\n138:     0xa405: \"FocalLengthIn35mmFilm\",\n139:     0xa406: \"SceneCaptureType\",\n140:     0xa407: \"GainControl\",\n141:     0xa408: \"Contrast\",\n142:     0xa409: \"Saturation\",\n143:     0xa40a: \"Sharpness\",\n144:     0xa40b: \"DeviceSettingDescription\",\n145:     0xa40c: \"SubjectDistanceRange\",\n146:     0xa420: \"ImageUniqueID\",\n147:     0xa430: \"CameraOwnerName\",\n148:     0xa431: \"BodySerialNumber\",\n149:     0xa432: \"LensSpecification\",\n150:     0xa433: \"LensMake\",\n151:     0xa434: \"LensModel\",\n152:     0xa435: \"LensSerialNumber\",\n153:     0xa500: \"Gamma\",\n154: \n155: }\n156: \n157: ##\n158: # Maps EXIF GPS tags to tag names.\n159: \n160: GPSTAGS = {\n161:     0: \"GPSVersionID\",\n162:     1: \"GPSLatitudeRef\",\n163:     2: \"GPSLatitude\",\n164:     3: \"GPSLongitudeRef\",\n165:     4: \"GPSLongitude\",\n166:     5: \"GPSAltitudeRef\",\n167:     6: \"GPSAltitude\",\n168:     7: \"GPSTimeStamp\",\n169:     8: \"GPSSatellites\",\n170:     9: \"GPSStatus\",\n171:     10: \"GPSMeasureMode\",\n172:     11: \"GPSDOP\",\n173:     12: \"GPSSpeedRef\",\n174:     13: \"GPSSpeed\",\n175:     14: \"GPSTrackRef\",\n176:     15: \"GPSTrack\",\n177:     16: \"GPSImgDirectionRef\",\n178:     17: \"GPSImgDirection\",\n179:     18: \"GPSMapDatum\",\n180:     19: \"GPSDestLatitudeRef\",\n181:     20: \"GPSDestLatitude\",\n182:     21: \"GPSDestLongitudeRef\",\n183:     22: \"GPSDestLongitude\",\n184:     23: \"GPSDestBearingRef\",\n185:     24: \"GPSDestBearing\",\n186:     25: \"GPSDestDistanceRef\",\n187:     26: \"GPSDestDistance\",\n188:     27: \"GPSProcessingMethod\",\n189:     28: \"GPSAreaInformation\",\n190:     29: \"GPSDateStamp\",\n191:     30: \"GPSDifferential\",\n192:     31: \"GPSHPositioningError\",\n193: }",
+    "source_summary": "Static dictionary definition containing EXIF tag mappings",
+    "sink_summary": "Dictionary lookup operations using .get() method in TiffImagePlugin.py for tag name resolution",
+    "guard_summary": "No validation for duplicate keys in dictionary definition; Python dictionary behavior overwrites previous values",
+    "risk_pattern": "Duplicate dictionary key causes silent overwrite of tag mapping, potentially leading to incorrect tag name resolution during EXIF metadata processing",
+    "used_variable_sources": [
+      "Static dictionary definition"
+    ],
+    "called_function_context": [
+      "TiffTags.TAGS.get()"
+    ],
+    "enclosing_conditions": [
+      "Debug mode condition in TiffImagePlugin.py"
+    ],
+    "context_summary": "The TAGS dictionary maps EXIF tag numbers to human-readable names. The duplicate key 0x1001 appears twice: first as \"RelatedImageLength\" (line 70) and then as \"RelatedImageWidth\" (line 71). Python dictionaries overwrite previous values when duplicate keys are encountered.",
+    "unresolved_facts": [
+      "Whether ExifTags.TAGS is actually imported and used (no imports found in search)",
+      "Which tag name (RelatedImageLength or RelatedImageWidth) is actually used when looking up key 0x1001",
+      "Whether this affects production code or only debug output"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-561",
+        "cwe_name": "Dead Code",
+        "fit_reason": "Rule py/duplicate-key-dict-literal specifically addresses duplicate dictionary keys where 'All but the last will be lost', matching the exact mechanism in Stage-2 evidence",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-19",
+        "cwe_name": "Data Processing Errors",
+        "fit_reason": "Legacy category for incorrect handling of structured data, fits the duplicate key mapping error in EXIF tag processing",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-390",
+        "cwe_name": "Detection of Error Condition Without Action",
+        "fit_reason": "Duplicate key represents an error condition that goes undetected and unhandled, leading to silent data corruption",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-628",
+        "cwe_name": "Function Call with Incorrectly Specified Arguments",
+        "fit_reason": "Dictionary lookup with duplicate keys results in incorrect mapping resolution, similar to incorrect argument specification",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-1321",
+      "CWE-179",
+      "CWE-19",
+      "CWE-327",
+      "CWE-340",
+      "CWE-390",
+      "CWE-489",
+      "CWE-561",
+      "CWE-59",
+      "CWE-628",
+      "CWE-685",
+      "CWE-730",
+      "CWE-79",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-5",
+    "filepath": "PIL/TiffTags.py",
+    "changed_line": 164,
+    "statement": "50741: \"BestQualityScale\",  # FIXME! Dictionary contains duplicate keys 50741",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "dictionary_definition",
+    "selection_reason": "duplicate TIFF tag key definition could cause parsing inconsistencies",
+    "security_relevance_score": 0.4,
+    "code_context": "15: ##\n16: # This module provides constants and clear-text names for various\n17: # well-known TIFF tags.\n18: ##\n19: \n20: ##\n21: # Map tag numbers (or tag number, tag value tuples) to tag names.\n22: \n23: TAGS = {\n24: \n25:     254: \"NewSubfileType\",\n26:     255: \"SubfileType\",\n27:     256: \"ImageWidth\",\n28:     257: \"ImageLength\",\n29:     258: \"BitsPerSample\",\n30: \n31:     259: \"Compression\",\n32:     (259, 1): \"Uncompressed\",\n33:     (259, 2): \"CCITT 1d\",\n34:     (259, 3): \"Group 3 Fax\",\n35:     (259, 4): \"Group 4 Fax\",\n36:     (259, 5): \"LZW\",\n37:     (259, 6): \"JPEG\",\n38:     (259, 32773): \"PackBits\",\n39: \n40:     262: \"PhotometricInterpretation\",\n41:     (262, 0): \"WhiteIsZero\",\n42:     (262, 1): \"BlackIsZero\",\n43:     (262, 2): \"RGB\",\n44:     (262, 3): \"RGB Palette\",\n45:     (262, 4): \"Transparency Mask\",\n46:     (262, 5): \"CMYK\",\n47:     (262, 6): \"YCbCr\",\n48:     (262, 8): \"CieLAB\",\n49:     (262, 32803): \"CFA\", # TIFF/EP, Adobe DNG\n50:     (262, 32892): \"LinearRaw\", # Adobe DNG\n51: \n52:     263: \"Thresholding\",\n53:     264: \"CellWidth\",\n54:     265: \"CellHeight\",\n55:     266: \"FillOrder\",\n56:     269: \"DocumentName\",\n57: \n58:     270: \"ImageDescription\",\n59:     271: \"Make\",\n60:     272: \"Model\",\n61:     273: \"StripOffsets\",\n62:     274: \"Orientation\",\n63:     277: \"SamplesPerPixel\",\n64:     278: \"RowsPerStrip\",\n65:     279: \"StripByteCounts\",\n66: \n67:     280: \"MinSampleValue\",\n68:     281: \"MaxSampleValue\",\n69:     282: \"XResolution\",\n70:     283: \"YResolution\",\n71:     284: \"PlanarConfiguration\",\n72:     (284, 1): \"Contigous\",\n73:     (284, 2): \"Separate\",\n74: \n75:     285: \"PageName\",\n76:     286: \"XPosition\",\n77:     287: \"YPosition\",\n78:     288: \"FreeOffsets\",\n79:     289: \"FreeByteCounts\",\n80: \n81:     290: \"GrayResponseUnit\",\n82:     291: \"GrayResponseCurve\",\n83:     292: \"T4Options\",\n84:     293: \"T6Options\",\n85:     296: \"ResolutionUnit\",\n86:     297: \"PageNumber\",\n87: \n88:     301: \"TransferFunction\",\n89:     305: \"Software\",\n90:     306: \"DateTime\",\n91: \n92:     315: \"Artist\",\n93:     316: \"HostComputer\",\n94:     317: \"Predictor\",\n95:     318: \"WhitePoint\",\n96:     319: \"PrimaryChromaticies\",\n97: \n98:     320: \"ColorMap\",\n99:     321: \"HalftoneHints\",\n100:     322: \"TileWidth\",\n101:     323: \"TileLength\",\n102:     324: \"TileOffsets\",\n103:     325: \"TileByteCounts\",\n104: \n105:     332: \"InkSet\",\n106:     333: \"InkNames\",\n107:     334: \"NumberOfInks\",\n108:     336: \"DotRange\",\n109:     337: \"TargetPrinter\",\n110:     338: \"ExtraSamples\",\n111:     339: \"SampleFormat\",\n112: \n113:     340: \"SMinSampleValue\",\n114:     341: \"SMaxSampleValue\",\n115:     342: \"TransferRange\",\n116: \n117:     347: \"JPEGTables\",\n118: \n119:     # obsolete JPEG tags\n120:     512: \"JPEGProc\",\n121:     513: \"JPEGInterchangeFormat\",\n122:     514: \"JPEGInterchangeFormatLength\",\n123:     515: \"JPEGRestartInterval\",\n124:     517: \"JPEGLosslessPredictors\",\n125:     518: \"JPEGPointTransforms\",\n126:     519: \"JPEGQTables\",\n127:     520: \"JPEGDCTables\",\n128:     521: \"JPEGACTables\",\n129: \n130:     529: \"YCbCrCoefficients\",\n131:     530: \"YCbCrSubSampling\",\n132:     531: \"YCbCrPositioning\",\n133:     532: \"ReferenceBlackWhite\",\n134: \n135:     # XMP\n136:     700: \"XMP\",\n137: \n138:     33432: \"Copyright\",\n139: \n140:     # various extensions (should check specs for \"official\" names)\n141:     33723: \"IptcNaaInfo\",\n142:     34377: \"PhotoshopInfo\",\n143: \n144:     # Exif IFD\n145:     34665: \"ExifIFD\",\n146: \n147:     # ICC Profile\n148:     34675: \"ICCProfile\",\n149: \n150:     # Adobe DNG\n151:     50706: \"DNGVersion\",\n152:     50707: \"DNGBackwardVersion\",\n153:     50708: \"UniqueCameraModel\",\n154:     50709: \"LocalizedCameraModel\",\n155:     50710: \"CFAPlaneColor\",\n156:     50711: \"CFALayout\",\n157:     50712: \"LinearizationTable\",\n158:     50713: \"BlackLevelRepeatDim\",\n159:     50714: \"BlackLevel\",\n160:     50715: \"BlackLevelDeltaH\",\n161:     50716: \"BlackLevelDeltaV\",\n162:     50717: \"WhiteLevel\",\n163:     50718: \"DefaultScale\",\n164:     50741: \"BestQualityScale\",  # FIXME! Dictionary contains duplicate keys 50741\n165:     50719: \"DefaultCropOrigin\",\n166:     50720: \"DefaultCropSize\",\n167:     50778: \"CalibrationIlluminant1\",\n168:     50779: \"CalibrationIlluminant2\",\n169:     50721: \"ColorMatrix1\",\n170:     50722: \"ColorMatrix2\",\n171:     50723: \"CameraCalibration1\",\n172:     50724: \"CameraCalibration2\",\n173:     50725: \"ReductionMatrix1\",\n174:     50726: \"ReductionMatrix2\",\n175:     50727: \"AnalogBalance\",\n176:     50728: \"AsShotNeutral\",\n177:     50729: \"AsShotWhiteXY\",\n178:     50730: \"BaselineExposure\",\n179:     50731: \"BaselineNoise\",\n180:     50732: \"BaselineSharpness\",\n181:     50733: \"BayerGreenSplit\",\n182:     50734: \"LinearResponseLimit\",\n183:     50735: \"CameraSerialNumber\",\n184:     50736: \"LensInfo\",\n185:     50737: \"ChromaBlurRadius\",\n186:     50738: \"AntiAliasStrength\",\n187:     50740: \"DNGPrivateData\",\n188:     50741: \"MakerNoteSafety\",  # FIXME! Dictionary contains duplicate keys 50741\n189: \n190:     #ImageJ\n191:     50838: \"ImageJMetaDataByteCounts\", # private tag registered with Adobe\n192:     50839: \"ImageJMetaData\", # private tag registered with Adobe\n193: }\n194: \n195: ##\n196: # Map type numbers to type names.\n197: \n198: TYPES = {\n199: \n200:     1: \"byte\",\n201:     2: \"ascii\",\n202:     3: \"short\",\n203:     4: \"long\",\n204:     5: \"rational\",\n205:     6: \"signed byte\",\n206:     7: \"undefined\",\n207:     8: \"signed short\",\n208:     9: \"signed long\",\n209:     10: \"signed rational\",\n210:     11: \"float\",\n211:     12: \"double\",\n212: \n213: }",
+    "source_summary": "Static TIFF tag definitions mapping numeric codes to human-readable names",
+    "sink_summary": "Dictionary lookup operations in TIFF image processing for tag name resolution and debugging output",
+    "guard_summary": "No validation for duplicate keys in dictionary definition; Python's dict behavior overwrites previous values",
+    "risk_pattern": "Duplicate dictionary key causes silent overwrite of tag name mapping, potentially leading to incorrect tag identification in TIFF metadata processing",
+    "used_variable_sources": [
+      "TAGS dictionary definition"
+    ],
+    "called_function_context": [
+      "TiffTags.TAGS.get() for tag name resolution"
+    ],
+    "enclosing_conditions": [
+      "Debug mode output",
+      "Tag name resolution in TIFF processing"
+    ],
+    "context_summary": "The TAGS dictionary is used to map TIFF tag numbers to human-readable names. With duplicate key 50741, the second definition ('MakerNoteSafety') overwrites the first ('BestQualityScale'), causing inconsistent tag name resolution throughout the TIFF processing pipeline.",
+    "unresolved_facts": [
+      "Which tag name (BestQualityScale vs MakerNoteSafety) is the correct mapping for TIFF tag 50741",
+      "Whether this inconsistency affects non-debug functionality or only debug output"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-561",
+        "cwe_name": "Dead Code",
+        "fit_reason": "Duplicate key in dictionary literal causes 'BestQualityScale' mapping to be dead code, overwritten by 'MakerNoteSafety'",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-19",
+        "cwe_name": "Data Processing Errors",
+        "fit_reason": "Incorrect handling of structured TIFF tag data due to duplicate key causing inconsistent tag name resolution",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-19",
+      "CWE-340",
+      "CWE-390",
+      "CWE-489",
+      "CWE-561",
+      "CWE-59",
+      "CWE-685",
+      "CWE-687",
+      "CWE-730",
+      "CWE-770",
+      "CWE-827"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-6",
+    "filepath": "PIL/TiffTags.py",
+    "changed_line": 188,
+    "statement": "50741: \"MakerNoteSafety\",  # FIXME! Dictionary contains duplicate keys 50741",
+    "change_type": "A",
+    "function_name": "",
+    "operation_type": "dictionary_definition",
+    "selection_reason": "duplicate TIFF tag key definition could cause parsing inconsistencies",
+    "security_relevance_score": 0.4,
+    "code_context": "39: \n40:     262: \"PhotometricInterpretation\",\n41:     (262, 0): \"WhiteIsZero\",\n42:     (262, 1): \"BlackIsZero\",\n43:     (262, 2): \"RGB\",\n44:     (262, 3): \"RGB Palette\",\n45:     (262, 4): \"Transparency Mask\",\n46:     (262, 5): \"CMYK\",\n47:     (262, 6): \"YCbCr\",\n48:     (262, 8): \"CieLAB\",\n49:     (262, 32803): \"CFA\", # TIFF/EP, Adobe DNG\n50:     (262, 32892): \"LinearRaw\", # Adobe DNG\n51: \n52:     263: \"Thresholding\",\n53:     264: \"CellWidth\",\n54:     265: \"CellHeight\",\n55:     266: \"FillOrder\",\n56:     269: \"DocumentName\",\n57: \n58:     270: \"ImageDescription\",\n59:     271: \"Make\",\n60:     272: \"Model\",\n61:     273: \"StripOffsets\",\n62:     274: \"Orientation\",\n63:     277: \"SamplesPerPixel\",\n64:     278: \"RowsPerStrip\",\n65:     279: \"StripByteCounts\",\n66: \n67:     280: \"MinSampleValue\",\n68:     281: \"MaxSampleValue\",\n69:     282: \"XResolution\",\n70:     283: \"YResolution\",\n71:     284: \"PlanarConfiguration\",\n72:     (284, 1): \"Contigous\",\n73:     (284, 2): \"Separate\",\n74: \n75:     285: \"PageName\",\n76:     286: \"XPosition\",\n77:     287: \"YPosition\",\n78:     288: \"FreeOffsets\",\n79:     289: \"FreeByteCounts\",\n80: \n81:     290: \"GrayResponseUnit\",\n82:     291: \"GrayResponseCurve\",\n83:     292: \"T4Options\",\n84:     293: \"T6Options\",\n85:     296: \"ResolutionUnit\",\n86:     297: \"PageNumber\",\n87: \n88:     301: \"TransferFunction\",\n89:     305: \"Software\",\n90:     306: \"DateTime\",\n91: \n92:     315: \"Artist\",\n93:     316: \"HostComputer\",\n94:     317: \"Predictor\",\n95:     318: \"WhitePoint\",\n96:     319: \"PrimaryChromaticies\",\n97: \n98:     320: \"ColorMap\",\n99:     321: \"HalftoneHints\",\n100:     322: \"TileWidth\",\n101:     323: \"TileLength\",\n102:     324: \"TileOffsets\",\n103:     325: \"TileByteCounts\",\n104: \n105:     332: \"InkSet\",\n106:     333: \"InkNames\",\n107:     334: \"NumberOfInks\",\n108:     336: \"DotRange\",\n109:     337: \"TargetPrinter\",\n110:     338: \"ExtraSamples\",\n111:     339: \"SampleFormat\",\n112: \n113:     340: \"SMinSampleValue\",\n114:     341: \"SMaxSampleValue\",\n115:     342: \"TransferRange\",\n116: \n117:     347: \"JPEGTables\",\n118: \n119:     # obsolete JPEG tags\n120:     512: \"JPEGProc\",\n121:     513: \"JPEGInterchangeFormat\",\n122:     514: \"JPEGInterchangeFormatLength\",\n123:     515: \"JPEGRestartInterval\",\n124:     517: \"JPEGLosslessPredictors\",\n125:     518: \"JPEGPointTransforms\",\n126:     519: \"JPEGQTables\",\n127:     520: \"JPEGDCTables\",\n128:     521: \"JPEGACTables\",\n129: \n130:     529: \"YCbCrCoefficients\",\n131:     530: \"YCbCrSubSampling\",\n132:     531: \"YCbCrPositioning\",\n133:     532: \"ReferenceBlackWhite\",\n134: \n135:     # XMP\n136:     700: \"XMP\",\n137: \n138:     33432: \"Copyright\",\n139: \n140:     # various extensions (should check specs for \"official\" names)\n141:     33723: \"IptcNaaInfo\",\n142:     34377: \"PhotoshopInfo\",\n143: \n144:     # Exif IFD\n145:     34665: \"ExifIFD\",\n146: \n147:     # ICC Profile\n148:     34675: \"ICCProfile\",\n149: \n150:     # Adobe DNG\n151:     50706: \"DNGVersion\",\n152:     50707: \"DNGBackwardVersion\",\n153:     50708: \"UniqueCameraModel\",\n154:     50709: \"LocalizedCameraModel\",\n155:     50710: \"CFAPlaneColor\",\n156:     50711: \"CFALayout\",\n157:     50712: \"LinearizationTable\",\n158:     50713: \"BlackLevelRepeatDim\",\n159:     50714: \"BlackLevel\",\n160:     50715: \"BlackLevelDeltaH\",\n161:     50716: \"BlackLevelDeltaV\",\n162:     50717: \"WhiteLevel\",\n163:     50718: \"DefaultScale\",\n164:     50741: \"BestQualityScale\",  # FIXME! Dictionary contains duplicate keys 50741\n165:     50719: \"DefaultCropOrigin\",\n166:     50720: \"DefaultCropSize\",\n167:     50778: \"CalibrationIlluminant1\",\n168:     50779: \"CalibrationIlluminant2\",\n169:     50721: \"ColorMatrix1\",\n170:     50722: \"ColorMatrix2\",\n171:     50723: \"CameraCalibration1\",\n172:     50724: \"CameraCalibration2\",\n173:     50725: \"ReductionMatrix1\",\n174:     50726: \"ReductionMatrix2\",\n175:     50727: \"AnalogBalance\",\n176:     50728: \"AsShotNeutral\",\n177:     50729: \"AsShotWhiteXY\",\n178:     50730: \"BaselineExposure\",\n179:     50731: \"BaselineNoise\",\n180:     50732: \"BaselineSharpness\",\n181:     50733: \"BayerGreenSplit\",\n182:     50734: \"LinearResponseLimit\",\n183:     50735: \"CameraSerialNumber\",\n184:     50736: \"LensInfo\",\n185:     50737: \"ChromaBlurRadius\",\n186:     50738: \"AntiAliasStrength\",\n187:     50740: \"DNGPrivateData\",\n188:     50741: \"MakerNoteSafety\",  # FIXME! Dictionary contains duplicate keys 50741\n189: \n190:     #ImageJ\n191:     50838: \"ImageJMetaDataByteCounts\", # private tag registered with Adobe\n192:     50839: \"ImageJMetaData\", # private tag registered with Adobe\n193: }\n194: \n195: ##\n196: # Map type numbers to type names.\n197: \n198: TYPES = {\n199: \n200:     1: \"byte\",\n201:     2: \"ascii\",\n202:     3: \"short\",\n203:     4: \"long\",\n204:     5: \"rational\",\n205:     6: \"signed byte\",\n206:     7: \"undefined\",\n207:     8: \"signed short\",\n208:     9: \"signed long\",\n209:     10: \"signed rational\",\n210:     11: \"float\",\n211:     12: \"double\",\n212: \n213: }",
+    "source_summary": "TIFF tag number 50741 defined twice in TAGS dictionary with different names: 'BestQualityScale' (line 164) and 'MakerNoteSafety' (line 188)",
+    "sink_summary": "Dictionary lookups via .get() method in TiffImagePlugin.py for tag name resolution during TIFF image processing",
+    "guard_summary": "Python dictionary .get() method used consistently, which returns the last value for duplicate keys, preventing KeyError but causing inconsistent tag name resolution",
+    "risk_pattern": "Duplicate dictionary key causes inconsistent tag name resolution where tag 50741 may be reported as either 'BestQualityScale' or 'MakerNoteSafety' depending on dictionary iteration order or lookup method",
+    "used_variable_sources": [
+      "TAGS dictionary definition"
+    ],
+    "called_function_context": [
+      "TiffTags.TAGS.get()"
+    ],
+    "enclosing_conditions": [
+      "Debug mode condition in TiffImagePlugin.py lines 424-429 and 538-543"
+    ],
+    "context_summary": "TAGS dictionary maps TIFF tag numbers to human-readable names, used for debugging and tag name resolution in TIFF image processing",
+    "unresolved_facts": [
+      "Whether any code paths rely on consistent tag name resolution beyond debugging output",
+      "Whether the duplicate key affects any functionality beyond debug output consistency"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-561",
+        "cwe_name": "Dead Code",
+        "fit_reason": "Duplicate dictionary key causes the first definition (BestQualityScale) to be lost, making it effectively dead code",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-19",
+        "cwe_name": "Data Processing Errors",
+        "fit_reason": "Inconsistent tag mapping due to duplicate keys could lead to incorrect TIFF data processing and interpretation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-20",
+        "cwe_name": "Improper Input Validation",
+        "fit_reason": "Lack of validation for duplicate keys in mapping table could allow inconsistent parsing of TIFF file metadata",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-116",
+      "CWE-19",
+      "CWE-20",
+      "CWE-22",
+      "CWE-340",
+      "CWE-390",
+      "CWE-489",
+      "CWE-561",
+      "CWE-563",
+      "CWE-628",
+      "CWE-685",
+      "CWE-730",
+      "CWE-770",
+      "CWE-79",
+      "CWE-827"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  }
+]

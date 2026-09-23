@@ -1,0 +1,298 @@
+{
+  "candidate_id": "candidate-2",
+  "filepath": "jinja2/loaders.py",
+  "changed_line": 101,
+  "statement": "bucket = bcc.get_bucket(environment, name, filename, source)",
+  "change_type": "A",
+  "function_name": "BaseLoader.load",
+  "operation_type": "bytecode_cache_operation",
+  "selection_reason": "potential typo (bcc vs bbc) -> runtime error -> template loading failure",
+  "security_relevance_score": 0.6,
+  "code_context": "1: # -*- coding: utf-8 -*-\n2: \"\"\"\n3:     jinja2.loaders\n4:     ~~~~~~~~~~~~~~\n5: \n6:     Jinja loader classes.\n7: \n8:     :copyright: 2008 by Armin Ronacher.\n9:     :license: BSD, see LICENSE for more details.\n10: \"\"\"\n11: from os import path\n12: try:\n13:     from hashlib import sha1\n14: except ImportError:\n15:     from sha import new as sha1\n16: from jinja2.exceptions import TemplateNotFound\n17: from jinja2.utils import LRUCache\n18: \n19: \n20: def split_template_path(template):\n21:     \"\"\"Split a path into segments and perform a sanity check.  If it detects\n22:     '..' in the path it will raise a `TemplateNotFound` error.\n23:     \"\"\"\n24:     pieces = []\n25:     for piece in template.split('/'):\n26:         if path.sep in piece \\\n27:            or (path.altsep and path.altsep in piece) or \\\n28:            piece == path.pardir:\n29:             raise TemplateNotFound(template)\n30:         elif piece and piece != '.':\n31:             pieces.append(piece)\n32:     return pieces\n33: \n34: \n35: class BaseLoader(object):\n36:     \"\"\"Baseclass for all loaders.  Subclass this and override `get_source` to\n37:     implement a custom loading mechanism.  The environment provides a\n38:     `get_template` method that calls the loader's `load` method to get the\n39:     :class:`Template` object.\n40: \n41:     A very basic example for a loader that looks up templates on the file\n42:     system could look like this::\n43: \n44:         from jinja2 import BaseLoader, TemplateNotFound\n45:         from os.path import join, exists, getmtime\n46: \n47:         class MyLoader(BaseLoader):\n48: \n49:             def __init__(self, path):\n50:                 self.path = path\n51: \n52:             def get_source(self, environment, template):\n53:                 path = join(self.path, template)\n54:                 if not exists(path):\n55:                     raise TemplateNotFound(template)\n56:                 mtime = getmtime(path)\n57:                 with file(path) as f:\n58:                     source = f.read().decode('utf-8')\n59:                 return source, path, lambda: mtime == getmtime(path)\n60:     \"\"\"\n61: \n62:     def get_source(self, environment, template):\n63:         \"\"\"Get the template source, filename and reload helper for a template.\n64:         It's passed the environment and template name and has to return a\n65:         tuple in the form ``(source, filename, uptodate)`` or raise a\n66:         `TemplateNotFound` error if it can't locate the template.\n67: \n68:         The source part of the returned tuple must be the source of the\n69:         template as unicode string or a ASCII bytestring.  The filename should\n70:         be the name of the file on the filesystem if it was loaded from there,\n71:         otherwise `None`.  The filename is used by python for the tracebacks\n72:         if no loader extension is used.\n73: \n74:         The last item in the tuple is the `uptodate` function.  If auto\n75:         reloading is enabled it's always called to check if the template\n76:         changed.  No arguments are passed so the function must store the\n77:         old state somewhere (for example in a closure).  If it returns `False`\n78:         the template will be reloaded.\n79:         \"\"\"\n80:         raise TemplateNotFound(template)\n81: \n82:     def load(self, environment, name, globals=None):\n83:         \"\"\"Loads a template.  This method looks up the template in the cache\n84:         or loads one by calling :meth:`get_source`.  Subclasses should not\n85:         override this method as loaders working on collections of other\n86:         loaders (such as :class:`PrefixLoader` or :class:`ChoiceLoader`)\n87:         will not call this method but `get_source` directly.\n88:         \"\"\"\n89:         code = None\n90:         if globals is None:\n91:             globals = {}\n92: \n93:         # first we try to get the source for this template together\n94:         # with the filename and the uptodate function.\n95:         source, filename, uptodate = self.get_source(environment, name)\n96: \n97:         # try to load the code from the bytecode cache if there is a\n98:         # bytecode cache configured.\n99:         bbc = environment.bytecode_cache\n100:         if bbc is not None:\n101:             bucket = bcc.get_bucket(environment, name, filename, source)\n102:             code = bucket.code\n103: \n104:         # if we don't have code so far (not cached, no longer up to\n105:         # date) etc. we compile the template\n106:         if code is None:\n107:             code = environment.compile(source, name, filename)\n108: \n109:         # if the bytecode cache is available and the bucket doesn't\n110:         # have a code so far, we give the bucket the new code and put\n111:         # it back to the bytecode cache.\n112:         if bbc is not None and bucket.code is None:\n113:             bucket.code = code\n114:             bbc.set_bucket(bucket)\n115: \n116:         return environment.template_class.from_code(environment, code,\n117:                                                     globals, uptodate)\n118: \n119: \n120: class FileSystemLoader(BaseLoader):\n121:     \"\"\"Loads templates from the file system.  This loader can find templates\n122:     in folders on the file system and is the preferred way to load them.\n123: \n124:     The loader takes the path to the templates as string, or if multiple\n125:     locations are wanted a list of them which is then looked up in the\n126:     given order:\n127: \n128:     >>> loader = FileSystemLoader('/path/to/templates')\n129:     >>> loader = FileSystemLoader(['/path/to/templates', '/other/path'])\n130: \n131:     Per default the template encoding is ``'utf-8'`` which can be changed\n132:     by setting the `encoding` parameter to something else.\n133:     \"\"\"\n134: \n135:     def __init__(self, searchpath, encoding='utf-8'):\n136:         if isinstance(searchpath, basestring):\n137:             searchpath = [searchpath]\n138:         self.searchpath = list(searchpath)\n139:         self.encoding = encoding\n140: \n141:     def get_source(self, environment, template):\n142:         pieces = split_template_path(template)\n143:         for searchpath in self.searchpath:\n144:             filename = path.join(searchpath, *pieces)\n145:             if not path.isfile(filename):\n146:                 continue\n147:             f = file(filename)\n148:             try:\n149:                 contents = f.read().decode(self.encoding)\n150:             finally:\n151:                 f.close()\n152:             old = path.getmtime(filename)\n153:             return contents, filename, lambda: path.getmtime(filename) == old\n154:         raise TemplateNotFound(template)\n155: \n156: \n157: class PackageLoader(BaseLoader):\n158:     \"\"\"Load templates from python eggs or packages.  It is constructed with\n159:     the name of the python package and the path to the templates in that\n160:     package:\n161: \n162:     >>> loader = PackageLoader('mypackage', 'views')\n163: \n164:     If the package path is not given, ``'templates'`` is assumed.\n165: \n166:     Per default the template encoding is ``'utf-8'`` which can be changed\n167:     by setting the `encoding` parameter to something else.  Due to the nature\n168:     of eggs it's only possible to reload templates if the package was loaded\n169:     from the file system and not a zip file.\n170:     \"\"\"\n171: \n172:     def __init__(self, package_name, package_path='templates',\n173:                  encoding='utf-8'):\n174:         from pkg_resources import DefaultProvider, ResourceManager, get_provider\n175:         provider = get_provider(package_name)\n176:         self.encoding = encoding\n177:         self.manager = ResourceManager()\n178:         self.filesystem_bound = isinstance(provider, DefaultProvider)\n179:         self.provider = provider\n180:         self.package_path = package_path\n181: \n182:     def get_source(self, environment, template):\n183:         pieces = split_template_path(template)\n184:         p = '/'.join((self.package_path,) + tuple(pieces))\n185:         if not self.provider.has_resource(p):\n186:             raise TemplateNotFound(template)\n187: \n188:         filename = uptodate = None\n189:         if self.filesystem_bound:\n190:             filename = self.provider.get_resource_filename(self.manager, p)\n191:             mtime = path.getmtime(filename)\n192:             def uptodate():\n193:                 return path.getmtime(filename) == mtime\n194: \n195:         source = self.provider.get_resource_string(self.manager, p)\n196:         return source.decode(self.encoding), filename, uptodate\n197: \n198: \n199: class DictLoader(BaseLoader):\n200:     \"\"\"Loads a template from a python dict.  It's passed a dict of unicode\n201:     strings bound to template names.  This loader is useful for unittesting:\n202: \n203:     >>> loader = DictLoader({'index.html': 'source here'})\n204: \n205:     Because auto reloading is rarely useful this is disabled per default.\n206:     \"\"\"\n207: \n208:     def __init__(self, mapping):\n209:         self.mapping = mapping\n210: \n211:     def get_source(self, environment, template):\n212:         if template in self.mapping:\n213:             source = self.mapping[template]\n214:             return source, None, lambda: source != self.mapping[template]\n215:         raise TemplateNotFound(template)\n216: \n217: \n218: class FunctionLoader(BaseLoader):\n219:     \"\"\"A loader that is passed a function which does the loading.  The\n220:     function becomes the name of the template passed and has to return either\n221:     an unicode string with the template source, a tuple in the form ``(source,\n222:     filename, uptodatefunc)`` or `None` if the template does not exist.\n223: \n224:     >>> def load_template(name):\n225:     ...     if name == 'index.html'\n226:     ...         return '...'\n227:     ...\n228:     >>> loader = FunctionLoader(load_template)\n229: \n230:     The `uptodatefunc` is a function that is called if autoreload is enabled\n231:     and has to return `True` if the template is still up to date.  For more\n232:     details have a look at :meth:`BaseLoader.get_source` which has the same\n233:     return value.\n234:     \"\"\"\n235: \n236:     def __init__(self, load_func):\n237:         self.load_func = load_func\n238: \n239:     def get_source(self, environment, template):\n240:         rv = self.load_func(template)\n241:         if rv is None:\n242:             raise TemplateNotFound(template)\n243:         elif isinstance(rv, basestring):\n244:             return rv, None, None\n245:         return rv\n246: \n247: \n248: class PrefixLoader(BaseLoader):\n249:     \"\"\"A loader that is passed a dict of loaders where each loader is bound\n250:     to a prefix.  The prefix is delimited from the template by a slash per",
+  "source_summary": "Template source, name, and filename obtained from loader's get_source method",
+  "sink_summary": "Bytecode cache bucket retrieval for template compilation optimization",
+  "guard_summary": "Conditional check (bbc is not None) guards execution, but variable name mismatch prevents proper execution",
+  "risk_pattern": "Variable name typo (bcc instead of bbc) causes NameError at runtime, breaking template loading when bytecode cache is configured",
+  "used_variable_sources": [
+    "environment.bytecode_cache",
+    "self.get_source() return values"
+  ],
+  "called_function_context": [
+    "get_bucket method from BytecodeCache class (intended but not reached due to typo)"
+  ],
+  "enclosing_conditions": [
+    "if bbc is not None"
+  ],
+  "context_summary": "Template loading flow attempts to use bytecode cache for performance optimization, but variable reference error prevents cache functionality",
+  "unresolved_facts": [
+    "Specific impact on applications using bytecode caching configuration",
+    "Whether this affects template rendering security or only performance"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-628",
+      "cwe_name": "Function Call with Incorrectly Specified Arguments",
+      "fit_reason": "Variable name typo (bcc vs bbc) causes runtime error similar to incorrect argument specification - both result in runtime exceptions that break functionality",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-685",
+      "cwe_name": "Function Call With Incorrect Number of Arguments",
+      "fit_reason": "Like incorrect argument count, the variable name mismatch causes a runtime exception that prevents proper function execution",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-563",
+      "cwe_name": "Assignment to Variable without Use",
+      "fit_reason": "Variable 'bbc' is assigned but unused due to typo referencing 'bcc' instead",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-584",
+      "cwe_name": "Return Inside Finally Block",
+      "fit_reason": "Both represent coding errors that can cause unexpected runtime behavior and application failure",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-208",
+    "CWE-340",
+    "CWE-348",
+    "CWE-390",
+    "CWE-396",
+    "CWE-400",
+    "CWE-563",
+    "CWE-581",
+    "CWE-584",
+    "CWE-628",
+    "CWE-685",
+    "CWE-74",
+    "CWE-863"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "jinja2/loaders.py",
+      "changed_line": 101,
+      "statement": "bucket = bcc.get_bucket(environment, name, filename, source)",
+      "cwe_id": "CWE-628",
+      "cwe_name": "Function Call with Incorrectly Specified Arguments",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-628 requires incorrect argument specification to a function call, but this is a variable name error (bcc vs bbc) causing NameError, not incorrect arguments to get_bucket"
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "Template name and source from get_source() are connected to the intended bytecode cache operation, but the typo prevents actual function execution"
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "If this line were reverted, the typo would be removed and the bytecode cache functionality would work correctly"
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "none established",
+          "control_requirement_evidence": "CWE-628 does not involve security controls but rather programming errors in function calls",
+          "existing_controls_checked": [
+            "conditional check (bbc is not None) guards execution but is bypassed by typo"
+          ],
+          "deficiency_evidence": "No security control deficiency demonstrated; this is a programming error affecting functionality, not security"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "Runtime NameError breaks template loading functionality when bytecode cache is configured, but no security impact is demonstrated"
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the typo would be corrected and the bytecode cache functionality would work as intended instead of throwing a NameError.",
+      "supporting_evidence": [
+        "Variable name mismatch (bcc vs bbc) causes runtime error",
+        "Error occurs when bytecode cache is configured (bbc is not None)"
+      ],
+      "contradicting_evidence": [
+        "This is a variable reference error, not incorrect function arguments",
+        "No security impact demonstrated - affects functionality only"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether this affects template rendering security or only performance/functionality",
+        "Specific impact on applications using bytecode caching configuration"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.32,
+      "score": 0.32
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "jinja2/loaders.py",
+      "changed_line": 101,
+      "statement": "bucket = bcc.get_bucket(environment, name, filename, source)",
+      "cwe_id": "CWE-685",
+      "cwe_name": "Function Call With Incorrect Number of Arguments",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-685 specifically addresses incorrect argument counts in function calls. This is a variable name mismatch (bcc vs bbc), not an argument count issue."
+        },
+        "connection": {
+          "score": 0.2,
+          "evidence": "The code attempts to call get_bucket on a variable 'bcc' that is undefined, while 'bbc' (environment.bytecode_cache) is defined but unused."
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If this candidate line were reverted, the NameError would be avoided and bytecode caching would function correctly when environment.bytecode_cache is configured."
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "No security control is required for this CWE mechanism",
+          "control_requirement_evidence": "CWE-685 requires validation of function argument counts, but this is a variable name error, not an argument validation issue",
+          "existing_controls_checked": [
+            "None applicable - this is a programming error, not a security control deficiency"
+          ],
+          "deficiency_evidence": "The issue is a typo, not a missing security control"
+        },
+        "concrete_impact": {
+          "score": 0.3,
+          "evidence": "The typo causes a NameError at runtime, breaking template loading functionality when bytecode caching is configured, but this is a reliability issue, not a security vulnerability."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the NameError would not occur, and the bytecode cache functionality would work correctly when environment.bytecode_cache is configured.",
+      "supporting_evidence": [
+        "Variable 'bbc' is defined at line 99 as environment.bytecode_cache",
+        "Variable 'bcc' is undefined and causes a NameError"
+      ],
+      "contradicting_evidence": [
+        "This is a variable name mismatch, not an incorrect number of arguments in a function call",
+        "The function call itself has the correct number of arguments (4) for get_bucket method"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [
+        "Whether this affects template rendering security or only reliability/performance",
+        "Specific impact on applications using bytecode caching configuration"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.30000000000000004,
+      "score": 0.30000000000000004
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "jinja2/loaders.py",
+      "changed_line": 101,
+      "statement": "bucket = bcc.get_bucket(environment, name, filename, source)",
+      "cwe_id": "CWE-563",
+      "cwe_name": "Assignment to Variable without Use",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.1,
+          "evidence": "CWE-563 requires assignment to a variable that is never used. Here, 'bbc' is assigned at line 99 but the typo 'bcc' is used at line 101, making 'bbc' effectively unused. However, this is not a dead store - it's a runtime error scenario."
+        },
+        "connection": {
+          "score": 0.3,
+          "evidence": "The variable 'bbc' is assigned from environment.bytecode_cache and the typo 'bcc' creates a NameError at runtime when bytecode cache is configured"
+        },
+        "diff_causality": {
+          "score": 0.8,
+          "evidence": "If the candidate line were removed, the NameError would not occur and the bytecode cache functionality would work correctly when 'bbc' is properly referenced"
+        },
+        "security_control": {
+          "score": 0.1,
+          "evidence": "",
+          "required_control": "No security control is required for CWE-563 as it's a code quality issue, not a security vulnerability",
+          "control_requirement_evidence": "CWE-563 describes a code quality issue where assigned variables are unused, not a security vulnerability requiring controls",
+          "existing_controls_checked": [
+            "None applicable - this is a runtime error scenario, not a security control deficiency"
+          ],
+          "deficiency_evidence": "No security control deficiency exists - this is a typo causing runtime failure"
+        },
+        "concrete_impact": {
+          "score": 0.2,
+          "evidence": "The impact is a runtime NameError when bytecode cache is configured, causing template loading to fail. This is a reliability issue, not a security vulnerability."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the code would correctly reference 'bbc' instead of the undefined 'bcc', allowing bytecode cache functionality to work properly when configured.",
+      "supporting_evidence": [
+        "Line 99 assigns 'bbc = environment.bytecode_cache'",
+        "Line 101 incorrectly references 'bcc.get_bucket()' instead of 'bbc.get_bucket()'",
+        "The conditional 'if bbc is not None' guards the execution but the typo causes NameError"
+      ],
+      "contradicting_evidence": [
+        "CWE-563 requires 'assignment without use' but here the variable is intended to be used and would be used if not for the typo",
+        "This is a runtime error scenario, not a dead store/unused variable scenario"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether this typo could have security implications beyond reliability issues",
+        "Specific attack vectors that could exploit the runtime error"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.30000000000000004,
+      "score": 0.30000000000000004
+    },
+    {
+      "candidate_id": "candidate-2",
+      "filepath": "jinja2/loaders.py",
+      "changed_line": 101,
+      "statement": "bucket = bcc.get_bucket(environment, name, filename, source)",
+      "cwe_id": "CWE-584",
+      "cwe_name": "Return Inside Finally Block",
+      "cwe_relationship": "mismatch",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.0,
+          "evidence": "CWE-584 requires a return statement inside a finally block that discards exceptions. The candidate shows a variable name typo (bcc instead of bbc) causing NameError, with no finally block or return statement present."
+        },
+        "connection": {
+          "score": 0.0,
+          "evidence": "No connection to CWE-584 mechanism. The typo causes immediate NameError when bytecode cache is configured, unrelated to exception handling in finally blocks."
+        },
+        "diff_causality": {
+          "score": 0.0,
+          "evidence": "The patch introduces a typo that causes runtime error, not a return-in-finally-block vulnerability. Reverting would fix the typo, not change exception handling behavior."
+        },
+        "security_control": {
+          "score": 0.0,
+          "evidence": "",
+          "required_control": "Proper exception handling without returns in finally blocks",
+          "control_requirement_evidence": "CWE-584 requires that exceptions thrown in try blocks not be discarded by returns in finally blocks",
+          "existing_controls_checked": [
+            "No finally block exists in the code context",
+            "No try-except-finally structure present"
+          ],
+          "deficiency_evidence": "No deficiency in exception handling controls demonstrated; the issue is a simple variable name typo"
+        },
+        "concrete_impact": {
+          "score": 0.0,
+          "evidence": "No security impact related to CWE-584. The typo causes NameError and template loading failure when bytecode cache is configured, which is a reliability issue, not a security vulnerability."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the variable name would be corrected from 'bcc' to 'bbc', allowing the bytecode cache functionality to work properly instead of raising NameError.",
+      "supporting_evidence": [],
+      "contradicting_evidence": [
+        "No finally block exists in the code context",
+        "No return statement present in the candidate line or surrounding code",
+        "The demonstrated behavior is a variable name typo (bcc vs bbc), not exception handling",
+        "The code shows conditional execution (if bbc is not None), not try-finally structure"
+      ],
+      "contradiction_severity": "fatal",
+      "unresolved_facts": [],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.0,
+      "score": 0.0
+    }
+  ],
+  "stage4_status": "completed"
+}

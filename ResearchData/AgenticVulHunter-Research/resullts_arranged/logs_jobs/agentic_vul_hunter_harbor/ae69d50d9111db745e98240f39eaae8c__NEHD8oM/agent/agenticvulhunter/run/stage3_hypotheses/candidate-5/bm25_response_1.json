@@ -1,0 +1,249 @@
+{
+  "predictions": [
+    {
+      "candidate_id": "candidate-5",
+      "filepath": "shell/server/backup.js",
+      "changed_line": 125,
+      "statement": "var response = this.response;",
+      "change_type": "A",
+      "function_name": "downloadBackup",
+      "operation_type": "path_construction",
+      "selection_reason": "observable input/state -> exact operation -> security-sensitive effect",
+      "security_relevance_score": 0.7,
+      "code_context": "1: // Sandstorm - Personal Cloud Sandbox\n2: // Copyright (c) 2014 Sandstorm Development Group, Inc. and contributors\n3: // All rights reserved.\n4: //\n5: // Licensed under the Apache License, Version 2.0 (the \"License\");\n6: // you may not use this file except in compliance with the License.\n7: // You may obtain a copy of the License at\n8: //\n9: //   http://www.apache.org/licenses/LICENSE-2.0\n10: //\n11: // Unless required by applicable law or agreed to in writing, software\n12: // distributed under the License is distributed on an \"AS IS\" BASIS,\n13: // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: // See the License for the specific language governing permissions and\n15: // limitations under the License.\n16: \n17: var ChildProcess = Npm.require(\"child_process\");\n18: var Future = Npm.require(\"fibers/future\");\n19: var Promise = Npm.require(\"es6-promise\").Promise;\n20: var Capnp = Npm.require(\"capnp\");\n21: \n22: var GrainInfo = Capnp.importSystem(\"sandstorm/grain.capnp\").GrainInfo;\n23: \n24: var TOKEN_CLEANUP_MINUTES = 15;\n25: var TOKEN_CLEANUP_TIMER = TOKEN_CLEANUP_MINUTES * 60 * 1000;\n26: \n27: function cleanupToken(tokenId) {\n28:   check(tokenId, String);\n29:   waitPromise(sandstormBackend.deleteBackup(tokenId));\n30:   FileTokens.remove({_id: tokenId});\n31: }\n32: \n33: Meteor.startup(function () {\n34:   // Cleanup tokens every TOKEN_CLEANUP_MINUTES\n35:   Meteor.setInterval(function () {\n36:     var queryDate = new Date(Date.now() - TOKEN_CLEANUP_TIMER);\n37: \n38:     FileTokens.find({timestamp: {$lt: queryDate}}).forEach(function (token) {\n39:       cleanupToken(token._id);\n40:     });\n41:   }, TOKEN_CLEANUP_TIMER);\n42: });\n43: \n44: Meteor.methods({\n45:   backupGrain: function (grainId) {\n46:     check(grainId, String);\n47:     var grain = Grains.findOne(grainId);\n48:     if (!grain || !this.userId || grain.userId !== this.userId) {\n49:       throw new Meteor.Error(403, \"Unauthorized\", \"User is not the owner of this grain\");\n50:     }\n51: \n52:     this.unblock();\n53: \n54:     var token = {\n55:       _id: Random.id(),\n56:       timestamp: new Date(),\n57:       name: grain.title\n58:     };\n59: \n60:     // TODO(soon): does the grain need to be offline?\n61: \n62:     var grainInfo = _.pick(grain, \"appId\", \"appVersion\", \"title\");\n63: \n64:     FileTokens.insert(token);\n65:     waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));\n66: \n67:     return token._id;\n68:   },\n69: \n70:   restoreGrain: function (tokenId) {\n71:     check(tokenId, String);\n72:     var token = FileTokens.findOne(tokenId);\n73:     if (!token || !isSignedUpOrDemo()) {\n74:       throw new Meteor.Error(403, \"Unauthorized\",\n75:           \"Token was not found, or user cannot create grains\");\n76:     }\n77: \n78:     this.unblock();\n79: \n80:     var grainId = Random.id(22);\n81: \n82:     try {\n83:       var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;\n84:       if (!grainInfo.appId) {\n85:           throw new Meteor.Error(500, \"Metadata object for uploaded grain has no AppId\");\n86:       }\n87: \n88:       var action = UserActions.findOne({appId: grainInfo.appId, userId: this.userId});\n89:       if (!action) {\n90:         throw new Meteor.Error(500,\n91:                                \"App id for uploaded grain not installed\",\n92:                                \"App Id: \" + grainInfo.appId);\n93:       }\n94:       if (action.appVersion < grainInfo.appVersion) {\n95:         throw new Meteor.Error(500,\n96:                                \"App version for uploaded grain is newer than any \" +\n97:                                \"installed version. You need to upgrade your app first\",\n98:                                \"New version: \" + grainInfo.appVersion +\n99:                                \", Old version: \" + action.appVersion);\n100:       }\n101: \n102:       Grains.insert({\n103:         _id: grainId,\n104:         packageId: action.packageId,\n105:         appId: action.appId,\n106:         appVersion: action.appVersion,\n107:         userId: this.userId,\n108:         title: grainInfo.title,\n109:         private: true\n110:       });\n111:     } finally {\n112:       cleanupToken(tokenId);\n113:     }\n114: \n115:     return grainId;\n116:   },\n117: });\n118: \n119: Router.map(function () {\n120:   this.route(\"downloadBackup\", {\n121:     where: \"server\",\n122:     path: \"/downloadBackup/:tokenId\",\n123:     action: function () {\n124:       var token = FileTokens.findOne(this.params.tokenId);\n125:       var response = this.response;\n126:       if (!token) {\n127:         response.writeHead(404, {\"Content-Type\": \"text/plain\"});\n128:         return response.end(\"File does not exist\");\n129:       }\n130: \n131:       var started = false;\n132:       var filename = (token.name.replace(/[\"\\n]/g, \"\") || \"backup\") + \".zip\";\n133:       var sawEnd = false;\n134: \n135:       var stream = {\n136:         expectSize: function (size) {\n137:           if (!started) {\n138:             started = true;\n139:             response.writeHead(200, {\n140:               \"Content-Length\": size,\n141:               \"Content-Type\": \"application/zip\",\n142:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n143:             });\n144:           }\n145:         },\n146:         write: function (data) {\n147:           if (!started) {\n148:             started = true;\n149:             response.writeHead(200, {\n150:               \"Content-Type\": \"application/zip\",\n151:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n152:             });\n153:           }\n154:           response.write(data);\n155:         },\n156:         done: function (data) {\n157:           if (!started) {\n158:             started = true;\n159:             response.writeHead(200, {\n160:               \"Content-Length\": 0,\n161:               \"Content-Type\": \"application/zip\",\n162:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n163:             });\n164:           }\n165:           sawEnd = true;\n166:           response.end();\n167:         }\n168:       };\n169: \n170:       waitPromise(sandstormBackend.downloadBackup(this.params.tokenId, stream));\n171: \n172:       if (!sawEnd) {\n173:         console.error(\"backend failed to call done() when downloading backup\");\n174:         if (!started) {\n175:           throw new Meteor.Error(500, \"backend failed to produce data\");\n176:         }\n177:         response.end();\n178:       }\n179: \n180:       cleanupToken(this.params.tokenId);\n181:     }\n182:   });\n183: \n184:   this.route(\"uploadBackup\", {\n185:     where: \"server\",\n186:     path: \"/uploadBackup\",\n187:     action: function () {\n188:       if (this.request.method === \"POST\") {\n189:         var request = this.request;\n190:         try {\n191:           var token = {\n192:             _id: Random.id(),\n193:             timestamp: new Date()\n194:           };\n195:           var stream = sandstormBackend.uploadBackup(token._id).stream;\n196: \n197:           FileTokens.insert(token);\n198: \n199:           waitPromise(new Promise(function (resolve, reject) {\n200:             request.on(\"data\", function (data) {\n201:               stream.write(data);\n202:             });\n203:             request.on(\"end\", function () {\n204:               resolve(stream.done());\n205:             });\n206:             request.on(\"error\", function (err) {\n207:               stream.close();\n208:             });\n209:           }));\n210: \n211:           this.response.writeHead(200, {\n212:             \"Content-Length\": token._id.length,\n213:             \"Content-Type\": \"text/plain\"\n214:           });\n215:           this.response.write(token._id);\n216:           this.response.end();\n217:         } catch(error) {\n218:           console.error(error.stack);\n219:           this.response.writeHead(500, {\n220:             \"Content-Type\": \"text/plain\"\n221:           });\n222:           this.response.write(error.stack);\n223:           this.response.end();\n224:         }\n225:       } else {\n226:         this.response.writeHead(405, {\n227:           \"Content-Type\": \"text/plain\"\n228:         });\n229:         this.response.write(\"You can only POST here.\");\n230:         this.response.end();\n231:       }\n232:     }\n233:   });\n234: });",
+      "source_summary": "The token name comes from grain.title which is user-provided data when creating a backup. The token ID comes from the URL parameter :tokenId which is user-provided.",
+      "sink_summary": "The response object is used to write HTTP headers and data back to the client, including Content-Disposition header with filename that includes token.name.",
+      "guard_summary": "There is basic validation that the token exists in the database, but no sanitization of the token.name field before using it in the filename. The filename construction uses token.name.replace(/[\"\\n]/g, \"\") which removes quotes and newlines but does not prevent all path traversal attempts.",
+      "risk_pattern": "The filename used in Content-Disposition header is constructed from user-provided data (token.name) without sufficient sanitization, potentially allowing for path traversal or other file-related attacks if the name contains malicious characters or sequences.",
+      "used_variable_sources": [
+        "token.name",
+        "this.params.tokenId"
+      ],
+      "called_function_context": [
+        "sandstormBackend.downloadBackup(this.params.tokenId, stream)"
+      ],
+      "enclosing_conditions": [
+        "if (!token) { response.writeHead(404, {\"Content-Type\": \"text/plain\"}); return response.end(\"File does not exist\"); }"
+      ],
+      "context_summary": "In the downloadBackup route, a token is retrieved from FileTokens using the tokenId from URL parameters. The token's name field (originating from grain.title) is used to construct a filename for the Content-Disposition header without sufficient sanitization. The response object is assigned to a local variable and then used to write HTTP headers and data back to the client.",
+      "unresolved_facts": [
+        "The exact format of sandstormBackend.downloadBackup's stream interface and whether it handles user input directly",
+        "Whether there are additional security controls or sanitization applied beyond what's shown in the code"
+      ],
+      "language": "javascript",
+      "retrieval_skipped": false,
+      "retrieval_skip_reason": null,
+      "top_sast_rules": [
+        {
+          "rank": 1,
+          "rule_id": "fallback/cwe-93-improper-neutralization-of-crlf-sequences-crlf-injection",
+          "cwe_id": "CWE-93",
+          "cwe_name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')",
+          "language": "generic",
+          "severity": "high",
+          "sast_tool": "CWE-Fallback",
+          "is_fallback": true,
+          "score": 40.558,
+          "raw_bm25_score": 40.558,
+          "description": "Untrusted CR or LF characters are not neutralized before use in line-delimited protocol metadata.",
+          "pattern": "cwe-93 crlf-injection carriage-return line-feed newline header response-splitting http-header redirect cookie",
+          "remediation": "Reject CR/LF in protocol metadata and use validating framework APIs.",
+          "tags": [
+            "security",
+            "fallback",
+            "external/cwe/cwe-093"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 2,
+          "rule_id": "js/zipslip",
+          "cwe_id": "CWE-22",
+          "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.5102,
+          "raw_bm25_score": 29.5102,
+          "description": "Extracting files from a malicious ZIP file, or similar type of archive, without validating that the destination file path is within the destination directory can allow an attacker to unexpectedly gain access to resources.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement path validation using canonical paths. Reject paths containing '../' or similar traversal sequences.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-022"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 3,
+          "rule_id": "js/host-header-forgery-in-email-generation",
+          "cwe_id": "CWE-640",
+          "cwe_name": "Weak Password Recovery Mechanism for Forgotten Password",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 29.07,
+          "raw_bm25_score": 29.07,
+          "description": "Using the HTTP Host header to construct a link in an email can facilitate phishing attacks and leak password reset tokens.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-640"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 4,
+          "rule_id": "js/incomplete-sanitization",
+          "cwe_id": "CWE-80",
+          "cwe_name": "Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 28.2661,
+          "raw_bm25_score": 28.2661,
+          "description": "A string transformer that does not replace or escape all occurrences of a meta-character may be ineffective.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-080. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020",
+            "external/cwe/cwe-080",
+            "external/cwe/cwe-116"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 5,
+          "rule_id": "js/useless-regexp-character-escape",
+          "cwe_id": "CWE-20",
+          "cwe_name": "Improper Input Validation",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 25.3955,
+          "raw_bm25_score": 25.3955,
+          "description": "Prepending a backslash to an ordinary character in a string does not have any effect, and may make regular expressions constructed from this string behave unexpectedly.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement strict input validation using allowlists and reject invalid input rather than attempting to sanitize it.",
+          "tags": [
+            "correctness",
+            "security",
+            "external/cwe/cwe-020"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 6,
+          "rule_id": "js/useless-assignment-to-local",
+          "cwe_id": "CWE-563",
+          "cwe_name": "Assignment to Variable without Use",
+          "language": "javascript",
+          "severity": "low",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.8674,
+          "raw_bm25_score": 24.8674,
+          "description": "An assignment to a local variable that is not used later on, or whose value is always overwritten, has no effect.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Remove unused variables that may contain sensitive data. Use static analysis tools to identify unused code. Review code for potential logic errors.",
+          "tags": [
+            "quality",
+            "maintainability",
+            "useless-code",
+            "external/cwe/cwe-563"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 7,
+          "rule_id": "js/type-confusion-through-parameter-tampering",
+          "cwe_id": "CWE-843",
+          "cwe_name": "Access of Resource Using Incompatible Type ('Type Confusion')",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 24.6801,
+          "raw_bm25_score": 24.6801,
+          "description": "Sanitizing an HTTP request parameter may be ineffective if the user controls its type.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-843"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 8,
+          "rule_id": "js/insecure-helmet-configuration",
+          "cwe_id": "CWE-693",
+          "cwe_name": "Protection Mechanism Failure",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.9979,
+          "raw_bm25_score": 21.9979,
+          "description": "The Helmet middleware is used to set security-related HTTP headers in Express applications. This query finds instances where the middleware is configured with important security features disabled.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to this vulnerability type. Review the query logic for detailed requirements.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-693",
+            "external/cwe/cwe-1021"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 9,
+          "rule_id": "js/client-side-request-forgery",
+          "cwe_id": "CWE-918",
+          "cwe_name": "Server-Side Request Forgery (SSRF)",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.4996,
+          "raw_bm25_score": 21.4996,
+          "description": "Making a client-to-server request with user-controlled data in the URL allows a request forgery attack against the client.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement URL validation with allowlists of permitted destinations. Use network segmentation and validate all outbound requests.",
+          "tags": [
+            "security",
+            "external/cwe/cwe-918"
+          ],
+          "untrusted_hypothesis": true
+        },
+        {
+          "rank": 10,
+          "rule_id": "js/insecure-temporary-file",
+          "cwe_id": "CWE-378",
+          "cwe_name": "Creation of Temporary File With Insecure Permissions",
+          "language": "javascript",
+          "severity": "high",
+          "sast_tool": "CodeQL",
+          "is_fallback": false,
+          "score": 21.0398,
+          "raw_bm25_score": 21.0398,
+          "description": "Creating a temporary file that is accessible by other users can lead to information disclosure and sometimes remote code execution.",
+          "pattern": "Look for security-sensitive operations that handle user input without proper validation or sanitization",
+          "remediation": "Implement secure coding practices specific to CWE-378. Review OWASP guidelines and CWE documentation for detailed mitigation strategies.",
+          "tags": [
+            "external/cwe/cwe-377",
+            "external/cwe/cwe-378",
+            "security"
+          ],
+          "untrusted_hypothesis": true
+        }
+      ]
+    }
+  ]
+}

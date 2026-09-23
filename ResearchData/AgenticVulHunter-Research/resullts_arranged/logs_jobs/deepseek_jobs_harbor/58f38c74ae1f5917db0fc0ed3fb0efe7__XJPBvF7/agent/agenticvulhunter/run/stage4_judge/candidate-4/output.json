@@ -1,0 +1,319 @@
+{
+  "candidate_id": "candidate-4",
+  "filepath": "dbusmock/testcase.py",
+  "changed_line": 207,
+  "statement": "module = load_module(template)",
+  "change_type": "A",
+  "function_name": "spawn_server_template",
+  "operation_type": "dynamic_module_loading",
+  "selection_reason": "test method parameter -> load_module call -> arbitrary file loading",
+  "security_relevance_score": 0.6,
+  "code_context": "58:     @classmethod\n59:     def tearDownClass(klass):\n60:         '''Stop private session/system buses'''\n61: \n62:         if DBusTestCase.session_bus_pid is not None:\n63:             klass.stop_dbus(DBusTestCase.session_bus_pid)\n64:             del os.environ['DBUS_SESSION_BUS_ADDRESS']\n65:             DBusTestCase.session_bus_pid = None\n66:         if DBusTestCase.system_bus_pid is not None:\n67:             klass.stop_dbus(DBusTestCase.system_bus_pid)\n68:             del os.environ['DBUS_SYSTEM_BUS_ADDRESS']\n69:             DBusTestCase.system_bus_pid = None\n70: \n71:     @classmethod\n72:     def start_dbus(klass):\n73:         '''Start a D-BUS daemon\n74: \n75:         Return (pid, address) pair.\n76: \n77:         Normally you do not need to call this directly. Use start_system_bus()\n78:         and start_session_bus() instead.\n79:         '''\n80:         out = subprocess.check_output(['dbus-launch'], universal_newlines=True)\n81:         variables = {}\n82:         for line in out.splitlines():\n83:             (k, v) = line.split('=', 1)\n84:             variables[k] = v\n85:         return (int(variables['DBUS_SESSION_BUS_PID']),\n86:                 variables['DBUS_SESSION_BUS_ADDRESS'])\n87: \n88:     @classmethod\n89:     def stop_dbus(klass, pid):\n90:         '''Stop a D-BUS daemon\n91: \n92:         Normally you do not need to call this directly. When you use\n93:         start_system_bus() and start_session_bus(), these buses are\n94:         automatically stopped in tearDownClass().\n95:         '''\n96:         signal.signal(signal.SIGTERM, signal.SIG_IGN)\n97:         timeout = 50\n98:         while timeout > 0:\n99:             try:\n100:                 os.kill(pid, signal.SIGTERM)\n101:             except OSError as e:\n102:                 if e.errno == errno.ESRCH:\n103:                     break\n104:                 else:\n105:                     raise\n106:             time.sleep(0.1)\n107:         else:\n108:             sys.stderr.write('ERROR: timed out waiting for bus process to terminate\\n')\n109:             os.kill(pid, signal.SIGKILL)\n110:             time.sleep(0.5)\n111:         signal.signal(signal.SIGTERM, signal.SIG_DFL)\n112: \n113:     @classmethod\n114:     def get_dbus(klass, system_bus=False):\n115:         '''Get dbus.bus.BusConnection() object\n116: \n117:         This is preferrable to dbus.SystemBus() and dbus.SessionBus() as those\n118:         do not get along with multiple changing local test buses.\n119:         '''\n120:         if system_bus:\n121:             if os.environ.get('DBUS_SYSTEM_BUS_ADDRESS'):\n122:                 return dbus.bus.BusConnection(os.environ['DBUS_SYSTEM_BUS_ADDRESS'])\n123:             else:\n124:                 return dbus.SystemBus()\n125:         else:\n126:             if os.environ.get('DBUS_SESSION_BUS_ADDRESS'):\n127:                 return dbus.bus.BusConnection(os.environ['DBUS_SESSION_BUS_ADDRESS'])\n128:             else:\n129:                 return dbus.SessionBus()\n130: \n131:     @classmethod\n132:     def wait_for_bus_object(klass, dest, path, system_bus=False):\n133:         '''Wait for an object to appear on D-BUS\n134: \n135:         Raise an exception if object does not appear within 5 seconds.\n136:         '''\n137:         bus = klass.get_dbus(system_bus)\n138: \n139:         timeout = 50\n140:         last_exc = None\n141:         # we check whether the name is owned first, to avoid race conditions\n142:         # with service activation; once it's owned, wait until we can actually\n143:         # call methods\n144:         while timeout > 0:\n145:             if bus.name_has_owner(dest):\n146:                 try:\n147:                     p = dbus.Interface(bus.get_object(dest, path),\n148:                                        dbus_interface=dbus.INTROSPECTABLE_IFACE)\n149:                     p.Introspect()\n150:                     break\n151:                 except dbus.exceptions.DBusException as e:\n152:                     last_exc = e\n153:                     if '.UnknownInterface' in str(e):\n154:                         break\n155:                     pass\n156: \n157:             timeout -= 1\n158:             time.sleep(0.1)\n159:         if timeout <= 0:\n160:             assert timeout > 0, 'timed out waiting for D-BUS object %s: %s' % (path, last_exc)\n161: \n162:     @classmethod\n163:     def spawn_server(klass, name, path, interface, system_bus=False, stdout=None):\n164:         '''Run a DBusMockObject instance in a separate process\n165: \n166:         The daemon will terminate automatically when the D-BUS that it connects\n167:         to goes down.  If that does not happen (e. g. you test on the actual\n168:         system/session bus), you need to kill it manually.\n169: \n170:         This function blocks until the spawned DBusMockObject is ready and\n171:         listening on the bus.\n172: \n173:         Returns the Popen object of the spawned daemon.\n174:         '''\n175:         argv = [sys.executable, '-m', 'dbusmock']\n176:         if system_bus:\n177:             argv.append('--system')\n178:         argv.append(name)\n179:         argv.append(path)\n180:         argv.append(interface)\n181: \n182:         daemon = subprocess.Popen(argv, stdout=stdout)\n183: \n184:         # wait for daemon to start up\n185:         klass.wait_for_bus_object(name, path, system_bus)\n186: \n187:         return daemon\n188: \n189:     @classmethod\n190:     def spawn_server_template(klass, template, parameters=None, stdout=None):\n191:         '''Run a D-BUS mock template instance in a separate process\n192: \n193:         This starts a D-BUS mock process and loads the given template with\n194:         (optional) parameters into it. For details about templates see\n195:         dbusmock.DBusMockObject.AddTemplate().\n196: \n197:         The daemon will terminate automatically when the D-BUS that it connects\n198:         to goes down.  If that does not happen (e. g. you test on the actual\n199:         system/session bus), you need to kill it manually.\n200: \n201:         This function blocks until the spawned DBusMockObject is ready and\n202:         listening on the bus.\n203: \n204:         Returns a pair (daemon Popen object, main dbus object).\n205:         '''\n206:         # we need the bus address from the template module\n207:         module = load_module(template)\n208:         daemon = klass.spawn_server(module.BUS_NAME, module.MAIN_OBJ,\n209:                                     module.MAIN_IFACE, module.SYSTEM_BUS, stdout)\n210: \n211:         bus = klass.get_dbus(module.SYSTEM_BUS)\n212:         obj = bus.get_object(module.BUS_NAME, module.MAIN_OBJ)\n213:         if not parameters:\n214:             parameters = dbus.Dictionary({}, signature='sv')\n215:         obj.AddTemplate(template, parameters,\n216:                         dbus_interface=MOCK_IFACE)\n217: \n218:         return (daemon, obj)\n219: \n220: # Python 2 backwards compatibility\n221: if sys.version_info[0] < 3:\n222:     import re\n223: \n224:     def assertRegex(self, value, pattern):\n225:         if not re.search(pattern, value):\n226:             raise self.failureException('%r not found in %s' % (pattern, value))\n227:     DBusTestCase.assertRegex = assertRegex",
+  "source_summary": "template parameter passed to spawn_server_template method, which can be a template name or full path to a .py file",
+  "sink_summary": "load_module function that imports Python modules, potentially from arbitrary file paths",
+  "guard_summary": "load_module checks if path exists and has .py extension before adding to sys.path; otherwise loads from dbusmock.templates package",
+  "risk_pattern": "User-controlled template parameter flows to dynamic module loading that can import arbitrary Python files from the filesystem",
+  "used_variable_sources": [
+    "template"
+  ],
+  "called_function_context": [
+    "load_module",
+    "spawn_server",
+    "get_dbus",
+    "get_object",
+    "AddTemplate"
+  ],
+  "enclosing_conditions": [
+    "if not parameters: parameters = dbus.Dictionary({}, signature='sv')"
+  ],
+  "context_summary": "Test helper method that loads D-Bus mock templates; template parameter can be a template name or file path, passed to load_module which can import arbitrary .py files",
+  "unresolved_facts": [
+    "Whether template parameter is attacker-controlled in actual usage",
+    "Security controls on template parameter validation in calling contexts"
+  ],
+  "hypotheses": [
+    {
+      "cwe_id": "CWE-74",
+      "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+      "fit_reason": "Template parameter flows to load_module call enabling arbitrary Python module import - matches injection pattern where user input controls downstream component behavior",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-95",
+      "cwe_name": "Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+      "fit_reason": "Dynamic module loading from user-controlled template parameter can lead to arbitrary code execution similar to eval injection",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-502",
+      "cwe_name": "Deserialization of Untrusted Data",
+      "fit_reason": "Loading arbitrary Python modules from untrusted template parameter shares mechanism with unsafe deserialization - both allow code execution through data interpretation",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    },
+    {
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "fit_reason": "Template parameter may specify file paths for module loading, potentially enabling path traversal if validation is insufficient",
+      "proposal_source": "adaptive_bm25",
+      "retrieved_by_sast": true
+    }
+  ],
+  "retrieved_cwe_ids": [
+    "CWE-1236",
+    "CWE-179",
+    "CWE-208",
+    "CWE-22",
+    "CWE-23",
+    "CWE-477",
+    "CWE-502",
+    "CWE-59",
+    "CWE-628",
+    "CWE-685",
+    "CWE-687",
+    "CWE-74",
+    "CWE-95"
+  ],
+  "stage3_retrieval_mode": "adaptive_bm25",
+  "cwe_assessments": [
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "dbusmock/testcase.py",
+      "changed_line": 207,
+      "statement": "module = load_module(template)",
+      "cwe_id": "CWE-74",
+      "cwe_name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component ('Injection')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "CWE-74 requires injection into a downstream component's parsing/interpretation. Here, template parameter flows to load_module which parses Python code, but the mechanism is module loading rather than data/command injection into a parser."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "Template parameter from spawn_server_template method argument flows directly to load_module call without intermediate transformation, establishing clear data flow path."
+        },
+        "diff_causality": {
+          "score": 0.85,
+          "evidence": "If this line were reverted, the template parameter would not be passed to load_module, preventing the dynamic module loading behavior entirely."
+        },
+        "security_control": {
+          "score": 0.45,
+          "evidence": "",
+          "required_control": "Input validation/sanitization for module loading operations",
+          "control_requirement_evidence": "CWE-74 requires neutralization of special elements that could modify parsing; for module loading, this means restricting to safe module names/paths",
+          "existing_controls_checked": [
+            "load_module function checks if path exists and has .py extension before adding to sys.path; otherwise loads from dbusmock.templates package"
+          ],
+          "deficiency_evidence": "The control only validates file existence and extension, not whether the path/template name is within an allowed set or safe namespace"
+        },
+        "concrete_impact": {
+          "score": 0.4,
+          "evidence": "Potential arbitrary code execution if attacker controls template parameter, but impact depends on test environment isolation and attacker access level to filesystem."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the spawn_server_template method would fail to load the template module, breaking the D-Bus mock functionality entirely.",
+      "supporting_evidence": [
+        "Template parameter from method argument flows directly to load_module call",
+        "load_module function can import arbitrary .py files from filesystem based on template parameter",
+        "No validation restricting template to safe, predefined template names"
+      ],
+      "contradicting_evidence": [
+        "This is test code in a test helper method, not production code",
+        "load_module has some validation (file existence, .py extension check)",
+        "Template loading occurs in controlled test environment"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether template parameter is attacker-controlled in actual test usage scenarios",
+        "Security context and isolation of test environments where this code runs",
+        "Downstream impact scope within test infrastructure"
+      ],
+      "review_comment": "The spawn_server_template method passes user-provided template parameters directly to load_module, enabling arbitrary Python module loading. While some file validation exists, the control is insufficient to prevent loading of unintended modules. Restrict template parameters to a predefined allowlist of safe template names rather than accepting arbitrary paths or names.",
+      "change_type": "A",
+      "raw_score": 0.55,
+      "score": 0.55
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "dbusmock/testcase.py",
+      "changed_line": 207,
+      "statement": "module = load_module(template)",
+      "cwe_id": "CWE-95",
+      "cwe_name": "Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.25,
+          "evidence": "CWE-95 specifically addresses improper neutralization of code syntax before dynamic evaluation calls like eval(). The demonstrated mechanism is dynamic module loading via import, which is a form of code evaluation but operates at module granularity rather than expression evaluation. The load_module function checks for .py extension and path existence, but does not neutralize Python syntax or directives within the loaded file."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "The template parameter flows directly from the spawn_server_template method parameter to load_module call. The load_module function imports the module, executing its top-level code. If template is a file path, it adds the directory to sys.path and imports; if a template name, it imports from dbusmock.templates package."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "The candidate line is the addition of load_module(template). Reverting this line would remove the dynamic module loading capability entirely, preventing any template-based mock server spawning via this method. The patch creates the mechanism for loading arbitrary Python modules based on the template parameter."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "",
+          "required_control": "Neutralization of Python code syntax or validation/restriction of module paths",
+          "control_requirement_evidence": "CWE-95 requires neutralizing code syntax before dynamic evaluation. For module loading, this would mean validating that the loaded module contains only expected/safe code or restricting which modules can be loaded.",
+          "existing_controls_checked": [
+            "load_module checks if path exists and has .py extension",
+            "load_module falls back to dbusmock.templates package for non-path inputs"
+          ],
+          "deficiency_evidence": "The load_module function does not neutralize Python syntax within loaded files. It allows importing arbitrary .py files from the filesystem if they exist and have .py extension. No validation of module content or restriction to trusted locations is demonstrated. However, this is module loading rather than expression evaluation, and the deficiency is in path validation rather than syntax neutralization."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "If attacker controls template parameter and can point to a malicious .py file, arbitrary Python code execution occurs during import. The impact is code execution in the test process context, potentially compromising test environment or system if tests run with elevated privileges. However, attacker control of template parameter is not established in the evidence."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the spawn_server_template method would fail at line 207, preventing any template-based mock server spawning. The method would need to obtain BUS_NAME, MAIN_OBJ, MAIN_IFACE, and SYSTEM_BUS constants through another mechanism.",
+      "supporting_evidence": [
+        "template parameter flows directly to load_module call",
+        "load_module can import arbitrary .py files from filesystem if path exists",
+        "Module import executes top-level Python code in the loaded file",
+        "The patch adds this dynamic loading capability where it didn't exist before"
+      ],
+      "contradicting_evidence": [
+        "CWE-95 specifically addresses eval() and similar expression evaluation functions, not module imports",
+        "load_module has some validation (path existence, .py extension) before loading",
+        "The mechanism is module loading rather than directive injection into evaluated code"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether template parameter is attacker-controlled in actual usage scenarios",
+        "Security controls in calling contexts that validate template parameter before passing to spawn_server_template",
+        "Whether test environments typically allow arbitrary file path inputs to test methods"
+      ],
+      "review_comment": "The spawn_server_template method dynamically loads Python modules based on the template parameter, which can be a file path. While this enables flexible testing, it allows importing arbitrary .py files if the path is externally controlled. To mitigate this, restrict template loading to the dbusmock.templates package only by modifying load_module to reject file paths and only accept known template names. Alternatively, implement an allowlist of permitted template modules if file path support is required for specific test scenarios.",
+      "change_type": "A",
+      "raw_score": 0.5700000000000001,
+      "score": 0.5700000000000001
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "dbusmock/testcase.py",
+      "changed_line": 207,
+      "statement": "module = load_module(template)",
+      "cwe_id": "CWE-502",
+      "cwe_name": "Deserialization of Untrusted Data",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.25,
+          "evidence": "CWE-502 specifically addresses deserialization - converting serialized data back into objects. load_module() imports Python modules, which executes code but is not deserialization. Both involve interpreting data that can lead to code execution, but the mechanisms differ: deserialization reconstructs objects from serialized formats, while module loading executes Python source files."
+        },
+        "connection": {
+          "score": 0.7,
+          "evidence": "The template parameter flows directly to load_module() at line 207. load_module() checks if the template is a file path with .py extension and if so, adds its directory to sys.path and imports it, allowing arbitrary Python file execution. The path from parameter to code execution is direct and demonstrated in the code."
+        },
+        "diff_causality": {
+          "score": 0.9,
+          "evidence": "This line was added in the diff (change_type: 'A'). If this candidate line were reverted, the template parameter would not be passed to load_module(), preventing arbitrary module loading. The line materially creates the vulnerability mechanism by introducing the dynamic module loading."
+        },
+        "security_control": {
+          "score": 0.4,
+          "evidence": "load_module() has some validation: it checks if the template ends with .py and if the file exists before adding to sys.path. Otherwise, it loads from the dbusmock.templates package. However, this validation is insufficient as it still allows loading arbitrary .py files from the filesystem.",
+          "required_control": "Validation/sanitization of template parameter to restrict to trusted, allowlisted template names only",
+          "control_requirement_evidence": "For dynamic module loading from user input, the required control is to validate that the input corresponds to a known, safe template name, not an arbitrary file path, to prevent arbitrary code execution.",
+          "existing_controls_checked": [
+            "load_module's .py extension check and file existence check",
+            "Package-based fallback to dbusmock.templates"
+          ],
+          "deficiency_evidence": "The validation allows arbitrary .py file paths if they exist, enabling code execution from any location. The fallback to package loading only occurs if the path doesn't end with .py or the file doesn't exist, which is insufficient protection."
+        },
+        "concrete_impact": {
+          "score": 0.6,
+          "evidence": "If an attacker controls the template parameter, they can specify a path to a malicious Python file, leading to arbitrary code execution in the test process context. The impact is concrete: execution of arbitrary Python code with the privileges of the test runner."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the template parameter would not be passed to load_module(), preventing the dynamic loading of arbitrary Python modules from user-controlled template paths.",
+      "supporting_evidence": [
+        "template parameter flows directly to load_module() call",
+        "load_module() implementation shows it can import arbitrary .py files from the filesystem",
+        "The line is an addition (change_type: 'A') that introduces this behavior"
+      ],
+      "contradicting_evidence": [
+        "CWE-502 specifically addresses deserialization (unmarshalling, pickle, yaml, etc.), not Python module loading",
+        "The mechanism is module import/execution, not deserialization of data structures"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether template parameter is attacker-controlled in actual test usage scenarios",
+        "Security context of test execution environment and privileges",
+        "Whether test code using this method is exposed to untrusted input"
+      ],
+      "review_comment": "The spawn_server_template method loads Python modules dynamically from the template parameter, which can be a file path. While load_module includes some validation, it still permits loading arbitrary .py files from the filesystem if they exist. This creates a code execution vulnerability if the template parameter is controlled by an attacker. Restrict template loading to allowlisted template names from the dbusmock.templates package only, rejecting file paths entirely.",
+      "change_type": "A",
+      "raw_score": 0.5700000000000001,
+      "score": 0.5700000000000001
+    },
+    {
+      "candidate_id": "candidate-4",
+      "filepath": "dbusmock/testcase.py",
+      "changed_line": 207,
+      "statement": "module = load_module(template)",
+      "cwe_id": "CWE-22",
+      "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+      "cwe_relationship": "partial",
+      "category_scores": {
+        "exact_cwe_mechanism": {
+          "score": 0.35,
+          "evidence": "The load_module function accepts template parameter that can be a file path, but CWE-22 specifically requires path traversal through directory escape sequences, which is not demonstrated in the evidence."
+        },
+        "connection": {
+          "score": 0.45,
+          "evidence": "Template parameter flows directly to load_module call, which can import from file paths. However, evidence shows load_module has validation (checks .py extension, path existence) and attacker control of template parameter is unresolved."
+        },
+        "diff_causality": {
+          "score": 0.6,
+          "evidence": "The added line introduces the dynamic module loading capability. Reverting would remove the ability to load arbitrary template modules from file paths."
+        },
+        "security_control": {
+          "score": 0.3,
+          "evidence": "",
+          "required_control": "Path validation and restriction to prevent loading modules from arbitrary filesystem locations",
+          "control_requirement_evidence": "CWE-22 requires preventing path traversal to load files outside intended directories",
+          "existing_controls_checked": [
+            "load_module checks for .py extension and path existence before adding to sys.path",
+            "load_module falls back to package loading if path doesn't exist"
+          ],
+          "deficiency_evidence": "The control validates file existence and extension but does not demonstrate path canonicalization or directory restriction. The evidence shows defensive measures but lacks proof they are insufficient for CWE-22."
+        },
+        "concrete_impact": {
+          "score": 0.25,
+          "evidence": "Impact is speculative - could potentially lead to arbitrary code execution if path traversal is possible, but no evidence demonstrates actual traversal or code execution."
+        }
+      },
+      "diff_counterfactual": "If the candidate line were reverted, the spawn_server_template method would lose the ability to load template modules from file paths, falling back to only package-based template loading.",
+      "supporting_evidence": [
+        "Template parameter flows directly to load_module function call",
+        "load_module function can import Python modules from file system paths",
+        "Documentation indicates template can be 'a template name or full path to a .py file'"
+      ],
+      "contradicting_evidence": [
+        "load_module function includes validation for .py extension and path existence",
+        "Function has fallback to package loading if path doesn't exist",
+        "No evidence of actual path traversal sequences or directory escape attempts"
+      ],
+      "contradiction_severity": "material",
+      "unresolved_facts": [
+        "Whether template parameter is attacker-controlled in actual usage scenarios",
+        "Security controls on template parameter validation in calling contexts",
+        "Whether path traversal sequences can bypass the existing validation",
+        "Concrete demonstration of directory escape or loading files outside intended scope"
+      ],
+      "review_comment": "",
+      "change_type": "A",
+      "raw_score": 0.39,
+      "score": 0.39
+    }
+  ],
+  "stage4_status": "completed"
+}

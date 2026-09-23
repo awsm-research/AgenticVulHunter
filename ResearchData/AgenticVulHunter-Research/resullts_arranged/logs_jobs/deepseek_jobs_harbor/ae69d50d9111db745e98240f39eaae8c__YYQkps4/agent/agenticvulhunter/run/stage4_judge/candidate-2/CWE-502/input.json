@@ -1,0 +1,65 @@
+{
+  "candidate": {
+    "candidate_id": "candidate-2",
+    "filepath": "shell/server/backup.js",
+    "changed_line": 83,
+    "statement": "var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;",
+    "change_type": "A",
+    "function_name": "restoreGrain",
+    "operation_type": "backend_restore_operation",
+    "selection_reason": "user-controlled token ID -> executes backend restore operation -> unpacks potentially malicious backup content",
+    "security_relevance_score": 0.9,
+    "code_context": "1: // Sandstorm - Personal Cloud Sandbox\n2: // Copyright (c) 2014 Sandstorm Development Group, Inc. and contributors\n3: // All rights reserved.\n4: //\n5: // Licensed under the Apache License, Version 2.0 (the \"License\");\n6: // you may not use this file except in compliance with the License.\n7: // You may obtain a copy of the License at\n8: //\n9: //   http://www.apache.org/licenses/LICENSE-2.0\n10: //\n11: // Unless required by applicable law or agreed to in writing, software\n12: // distributed under the License is distributed on an \"AS IS\" BASIS,\n13: // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n14: // See the License for the specific language governing permissions and\n15: // limitations under the License.\n16: \n17: var ChildProcess = Npm.require(\"child_process\");\n18: var Future = Npm.require(\"fibers/future\");\n19: var Promise = Npm.require(\"es6-promise\").Promise;\n20: var Capnp = Npm.require(\"capnp\");\n21: \n22: var GrainInfo = Capnp.importSystem(\"sandstorm/grain.capnp\").GrainInfo;\n23: \n24: var TOKEN_CLEANUP_MINUTES = 15;\n25: var TOKEN_CLEANUP_TIMER = TOKEN_CLEANUP_MINUTES * 60 * 1000;\n26: \n27: function cleanupToken(tokenId) {\n28:   check(tokenId, String);\n29:   waitPromise(sandstormBackend.deleteBackup(tokenId));\n30:   FileTokens.remove({_id: tokenId});\n31: }\n32: \n33: Meteor.startup(function () {\n34:   // Cleanup tokens every TOKEN_CLEANUP_MINUTES\n35:   Meteor.setInterval(function () {\n36:     var queryDate = new Date(Date.now() - TOKEN_CLEANUP_TIMER);\n37: \n38:     FileTokens.find({timestamp: {$lt: queryDate}}).forEach(function (token) {\n39:       cleanupToken(token._id);\n40:     });\n41:   }, TOKEN_CLEANUP_TIMER);\n42: });\n43: \n44: Meteor.methods({\n45:   backupGrain: function (grainId) {\n46:     check(grainId, String);\n47:     var grain = Grains.findOne(grainId);\n48:     if (!grain || !this.userId || grain.userId !== this.userId) {\n49:       throw new Meteor.Error(403, \"Unauthorized\", \"User is not the owner of this grain\");\n50:     }\n51: \n52:     this.unblock();\n53: \n54:     var token = {\n55:       _id: Random.id(),\n56:       timestamp: new Date(),\n57:       name: grain.title\n58:     };\n59: \n60:     // TODO(soon): does the grain need to be offline?\n61: \n62:     var grainInfo = _.pick(grain, \"appId\", \"appVersion\", \"title\");\n63: \n64:     FileTokens.insert(token);\n65:     waitPromise(sandstormBackend.backupGrain(token._id, this.userId, grainId, grainInfo));\n66: \n67:     return token._id;\n68:   },\n69: \n70:   restoreGrain: function (tokenId) {\n71:     check(tokenId, String);\n72:     var token = FileTokens.findOne(tokenId);\n73:     if (!token || !isSignedUpOrDemo()) {\n74:       throw new Meteor.Error(403, \"Unauthorized\",\n75:           \"Token was not found, or user cannot create grains\");\n76:     }\n77: \n78:     this.unblock();\n79: \n80:     var grainId = Random.id(22);\n81: \n82:     try {\n83:       var grainInfo = waitPromise(sandstormBackend.restoreGrain(tokenId, this.userId, grainId)).info;\n84:       if (!grainInfo.appId) {\n85:           throw new Meteor.Error(500, \"Metadata object for uploaded grain has no AppId\");\n86:       }\n87: \n88:       var action = UserActions.findOne({appId: grainInfo.appId, userId: this.userId});\n89:       if (!action) {\n90:         throw new Meteor.Error(500,\n91:                                \"App id for uploaded grain not installed\",\n92:                                \"App Id: \" + grainInfo.appId);\n93:       }\n94:       if (action.appVersion < grainInfo.appVersion) {\n95:         throw new Meteor.Error(500,\n96:                                \"App version for uploaded grain is newer than any \" +\n97:                                \"installed version. You need to upgrade your app first\",\n98:                                \"New version: \" + grainInfo.appVersion +\n99:                                \", Old version: \" + action.appVersion);\n100:       }\n101: \n102:       Grains.insert({\n103:         _id: grainId,\n104:         packageId: action.packageId,\n105:         appId: action.appId,\n106:         appVersion: action.appVersion,\n107:         userId: this.userId,\n108:         title: grainInfo.title,\n109:         private: true\n110:       });\n111:     } finally {\n112:       cleanupToken(tokenId);\n113:     }\n114: \n115:     return grainId;\n116:   },\n117: });\n118: \n119: Router.map(function () {\n120:   this.route(\"downloadBackup\", {\n121:     where: \"server\",\n122:     path: \"/downloadBackup/:tokenId\",\n123:     action: function () {\n124:       var token = FileTokens.findOne(this.params.tokenId);\n125:       var response = this.response;\n126:       if (!token) {\n127:         response.writeHead(404, {\"Content-Type\": \"text/plain\"});\n128:         return response.end(\"File does not exist\");\n129:       }\n130: \n131:       var started = false;\n132:       var filename = (token.name.replace(/[\"\\n]/g, \"\") || \"backup\") + \".zip\";\n133:       var sawEnd = false;\n134: \n135:       var stream = {\n136:         expectSize: function (size) {\n137:           if (!started) {\n138:             started = true;\n139:             response.writeHead(200, {\n140:               \"Content-Length\": size,\n141:               \"Content-Type\": \"application/zip\",\n142:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n143:             });\n144:           }\n145:         },\n146:         write: function (data) {\n147:           if (!started) {\n148:             started = true;\n149:             response.writeHead(200, {\n150:               \"Content-Type\": \"application/zip\",\n151:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n152:             });\n153:           }\n154:           response.write(data);\n155:         },\n156:         done: function (data) {\n157:           if (!started) {\n158:             started = true;\n159:             response.writeHead(200, {\n160:               \"Content-Length\": 0,\n161:               \"Content-Type\": \"application/zip\",\n162:               \"Content-Disposition\": \"attachment;filename=\\\"\" + filename + \"\\\"\"\n163:             });\n164:           }\n165:           sawEnd = true;\n166:           response.end();\n167:         }\n168:       };\n169: \n170:       waitPromise(sandstormBackend.downloadBackup(this.params.tokenId, stream));\n171: \n172:       if (!sawEnd) {\n173:         console.error(\"backend failed to call done() when downloading backup\");\n174:         if (!started) {\n175:           throw new Meteor.Error(500, \"backend failed to produce data\");\n176:         }\n177:         response.end();\n178:       }\n179: \n180:       cleanupToken(this.params.tokenId);\n181:     }\n182:   });\n183: \n184:   this.route(\"uploadBackup\", {\n185:     where: \"server\",\n186:     path: \"/uploadBackup\",\n187:     action: function () {\n188:       if (this.request.method === \"POST\") {\n189:         var request = this.request;\n190:         try {\n191:           var token = {\n192:             _id: Random.id(),\n193:             timestamp: new Date()\n194:           };\n195:           var stream = sandstormBackend.uploadBackup(token._id).stream;\n196: \n197:           FileTokens.insert(token);\n198: \n199:           waitPromise(new Promise(function (resolve, reject) {\n200:             request.on(\"data\", function (data) {\n201:               stream.write(data);\n202:             });\n203:             request.on(\"end\", function () {\n204:               resolve(stream.done());\n205:             });\n206:             request.on(\"error\", function (err) {\n207:               stream.close();\n208:             });\n209:           }));\n210: \n211:           this.response.writeHead(200, {\n212:             \"Content-Length\": token._id.length,\n213:             \"Content-Type\": \"text/plain\"\n214:           });\n215:           this.response.write(token._id);\n216:           this.response.end();\n217:         } catch(error) {\n218:           console.error(error.stack);\n219:           this.response.writeHead(500, {\n220:             \"Content-Type\": \"text/plain\"\n221:           });\n222:           this.response.write(error.stack);\n223:           this.response.end();\n224:         }\n225:       } else {\n226:         this.response.writeHead(405, {\n227:           \"Content-Type\": \"text/plain\"\n228:         });\n229:         this.response.write(\"You can only POST here.\");\n230:         this.response.end();\n231:       }\n232:     }",
+    "source_summary": "tokenId from user input via Meteor method parameter, userId from authenticated session, grainId randomly generated",
+    "sink_summary": "sandstormBackend.restoreGrain() - backend operation that restores grain from backup data",
+    "guard_summary": "Token validation (FileTokens.findOne), user authentication (this.userId), signed-up/demo check (isSignedUpOrDemo()), app installation verification, version compatibility check",
+    "risk_pattern": "User-controlled token ID triggers backend restore operation that unpacks and processes backup content with limited validation of the backup data itself",
+    "used_variable_sources": [
+      "tokenId (method parameter)",
+      "this.userId (session)",
+      "grainId (randomly generated)"
+    ],
+    "called_function_context": [
+      "sandstormBackend.restoreGrain() - backend restore operation",
+      "FileTokens.findOne() - token validation",
+      "isSignedUpOrDemo() - user capability check"
+    ],
+    "enclosing_conditions": [
+      "if (!token || !isSignedUpOrDemo()) - token and user authorization check"
+    ],
+    "context_summary": "Restores grain from backup token after validating token existence and user permissions, then performs app installation and version checks",
+    "unresolved_facts": [
+      "Exact implementation and security controls in sandstormBackend.restoreGrain()",
+      "Backup data validation and sanitization in backend",
+      "Potential security implications of processing untrusted backup content"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  "target_cwe": {
+    "cwe_id": "CWE-502",
+    "cwe_name": "Deserialization of Untrusted Data",
+    "description": "The product deserializes untrusted data without sufficiently ensuring that the resulting data will be valid.",
+    "impact": "other vulnerability impact",
+    "patterns": [
+      "other"
+    ],
+    "detection_indicators": [
+      "other"
+    ],
+    "remediation_steps": [
+      "Follow secure coding practices and security guidelines",
+      "Implement defense-in-depth security measures"
+    ],
+    "related_cwes": [
+      "CWE-913",
+      "CWE-915"
+    ]
+  },
+  "stage3_hypothesis": {
+    "cwe_id": "CWE-502",
+    "cwe_name": "Deserialization of Untrusted Data",
+    "fit_reason": "Backup restoration likely involves deserializing grain metadata and content; malicious backup could contain dangerous serialized objects",
+    "proposal_source": "adaptive_bm25",
+    "retrieved_by_sast": true
+  }
+}

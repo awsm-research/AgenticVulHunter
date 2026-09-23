@@ -1,0 +1,235 @@
+[
+  {
+    "candidate_id": "candidate-1",
+    "filepath": "index.js",
+    "changed_line": 254,
+    "statement": "stream = xfs.createReadStream(srcpath)",
+    "change_type": "A",
+    "function_name": "onlink",
+    "operation_type": "file_read_operation",
+    "selection_reason": "header.linkname -> path.resolve -> createReadStream -> reads arbitrary file when hard link fails",
+    "security_relevance_score": 0.8,
+    "code_context": "105:       header.type = 'directory'\n106:       header = map(header) || header\n107:       return pack.entry(header, onnextentry)\n108:     }\n109: \n110:     if (stat.isSymbolicLink()) {\n111:       header.size = 0\n112:       header.type = 'symlink'\n113:       header = map(header) || header\n114:       return onsymlink(filename, header)\n115:     }\n116: \n117:     // TODO: add fifo etc...\n118: \n119:     header = map(header) || header\n120: \n121:     if (!stat.isFile()) {\n122:       if (strict) return pack.destroy(new Error('unsupported type for ' + filename))\n123:       return onnextentry()\n124:     }\n125: \n126:     var entry = pack.entry(header, onnextentry)\n127:     if (!entry) return\n128: \n129:     var rs = mapStream(xfs.createReadStream(path.join(cwd, filename)), header)\n130: \n131:     rs.on('error', function (err) { // always forward errors on destroy\n132:       entry.destroy(err)\n133:     })\n134: \n135:     pump(rs, entry)\n136:   }\n137: \n138:   var onnextentry = function (err) {\n139:     if (err) return pack.destroy(err)\n140:     statNext(onstat)\n141:   }\n142: \n143:   onnextentry()\n144: \n145:   return pack\n146: }\n147: \n148: var head = function (list) {\n149:   return list.length ? list[list.length - 1] : null\n150: }\n151: \n152: var processGetuid = function () {\n153:   return process.getuid ? process.getuid() : -1\n154: }\n155: \n156: var processUmask = function () {\n157:   return process.umask ? process.umask() : 0\n158: }\n159: \n160: exports.extract = function (cwd, opts) {\n161:   if (!cwd) cwd = '.'\n162:   if (!opts) opts = {}\n163: \n164:   var xfs = opts.fs || fs\n165:   var ignore = opts.ignore || opts.filter || noop\n166:   var map = opts.map || noop\n167:   var mapStream = opts.mapStream || echo\n168:   var own = opts.chown !== false && !win32 && processGetuid() === 0\n169:   var extract = opts.extract || tar.extract()\n170:   var stack = []\n171:   var now = new Date()\n172:   var umask = typeof opts.umask === 'number' ? ~opts.umask : ~processUmask()\n173:   var dmode = typeof opts.dmode === 'number' ? opts.dmode : 0\n174:   var fmode = typeof opts.fmode === 'number' ? opts.fmode : 0\n175:   var strict = opts.strict !== false\n176: \n177:   if (opts.strip) map = strip(map, opts.strip)\n178: \n179:   if (opts.readable) {\n180:     dmode |= parseInt(555, 8)\n181:     fmode |= parseInt(444, 8)\n182:   }\n183:   if (opts.writable) {\n184:     dmode |= parseInt(333, 8)\n185:     fmode |= parseInt(222, 8)\n186:   }\n187: \n188:   var utimesParent = function (name, cb) { // we just set the mtime on the parent dir again everytime we write an entry\n189:     var top\n190:     while ((top = head(stack)) && name.slice(0, top[0].length) !== top[0]) stack.pop()\n191:     if (!top) return cb()\n192:     xfs.utimes(top[0], now, top[1], cb)\n193:   }\n194: \n195:   var utimes = function (name, header, cb) {\n196:     if (opts.utimes === false) return cb()\n197: \n198:     if (header.type === 'directory') return xfs.utimes(name, now, header.mtime, cb)\n199:     if (header.type === 'symlink') return utimesParent(name, cb) // TODO: how to set mtime on link?\n200: \n201:     xfs.utimes(name, now, header.mtime, function (err) {\n202:       if (err) return cb(err)\n203:       utimesParent(name, cb)\n204:     })\n205:   }\n206: \n207:   var chperm = function (name, header, cb) {\n208:     var link = header.type === 'symlink'\n209:     var chmod = link ? xfs.lchmod : xfs.chmod\n210:     var chown = link ? xfs.lchown : xfs.chown\n211: \n212:     if (!chmod) return cb()\n213:     chmod(name, (header.mode | (header.type === 'directory' ? dmode : fmode)) & umask, function (err) {\n214:       if (err) return cb(err)\n215:       if (!own) return cb()\n216:       if (!chown) return cb()\n217:       chown(name, header.uid, header.gid, cb)\n218:     })\n219:   }\n220: \n221:   extract.on('entry', function (header, stream, next) {\n222:     header = map(header) || header\n223:     header.name = normalize(header.name)\n224:     var name = path.join(cwd, path.join('/', header.name))\n225: \n226:     if (ignore(name, header)) {\n227:       stream.resume()\n228:       return next()\n229:     }\n230: \n231:     var stat = function (err) {\n232:       if (err) return next(err)\n233:       utimes(name, header, function (err) {\n234:         if (err) return next(err)\n235:         if (win32) return next()\n236:         chperm(name, header, next)\n237:       })\n238:     }\n239: \n240:     var onsymlink = function () {\n241:       if (win32) return next() // skip symlinks on win for now before it can be tested\n242:       xfs.unlink(name, function () {\n243:         xfs.symlink(header.linkname, name, stat)\n244:       })\n245:     }\n246: \n247:     var onlink = function () {\n248:       if (win32) return next() // skip links on win for now before it can be tested\n249:       xfs.unlink(name, function () {\n250:         var srcpath = path.resolve(cwd, header.linkname)\n251: \n252:         xfs.link(srcpath, name, function (err) {\n253:           if (err && err.code === 'EPERM' && opts.hardlinkAsFilesFallback) {\n254:             stream = xfs.createReadStream(srcpath)\n255:             return onfile()\n256:           }\n257: \n258:           stat(err)\n259:         })\n260:       })\n261:     }\n262: \n263:     var onfile = function () {\n264:       var ws = xfs.createWriteStream(name)\n265:       var rs = mapStream(stream, header)\n266: \n267:       ws.on('error', function (err) { // always forward errors on destroy\n268:         rs.destroy(err)\n269:       })\n270: \n271:       pump(rs, ws, function (err) {\n272:         if (err) return next(err)\n273:         ws.on('close', stat)\n274:       })\n275:     }\n276: \n277:     if (header.type === 'directory') {\n278:       stack.push([name, header.mtime])\n279:       return mkdirp(name, {fs: xfs}, stat)\n280:     }\n281: \n282:     mkdirp(path.dirname(name), {fs: xfs}, function (err) {\n283:       if (err) return next(err)\n284: \n285:       switch (header.type) {\n286:         case 'file': return onfile()\n287:         case 'link': return onlink()\n288:         case 'symlink': return onsymlink()\n289:       }\n290: \n291:       if (strict) return next(new Error('unsupported type for ' + name + ' (' + header.type + ')'))\n292: \n293:       stream.resume()\n294:       next()\n295:     })\n296:   })\n297: \n298:   return extract\n299: }",
+    "source_summary": "header.linkname from tar archive entry, which can contain arbitrary paths controlled by archive creator",
+    "sink_summary": "xfs.createReadStream reads file content, xfs.createWriteStream writes to destination",
+    "guard_summary": "Only triggered when hardlink creation fails with EPERM and opts.hardlinkAsFilesFallback is enabled; no path traversal validation on header.linkname",
+    "risk_pattern": "Arbitrary file read via tar archive linkname when hardlink fallback is enabled",
+    "used_variable_sources": [
+      "header.linkname",
+      "cwd"
+    ],
+    "called_function_context": [
+      "path.resolve",
+      "xfs.createReadStream",
+      "xfs.createWriteStream",
+      "pump"
+    ],
+    "enclosing_conditions": [
+      "err.code === 'EPERM'",
+      "opts.hardlinkAsFilesFallback"
+    ],
+    "context_summary": "When extracting tar archive with hard links, if link creation fails due to permissions, falls back to reading source file and writing as regular file without validating linkname path",
+    "unresolved_facts": [
+      "Whether tar-stream validates linkname paths",
+      "Default value of hardlinkAsFilesFallback option",
+      "Any upstream validation of tar archive contents"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "Archive extraction reads arbitrary files via uncontrolled linkname path without validation - matches zipslip pattern",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "fit_reason": "Hardlink fallback mechanism follows linkname to read source file without proper validation of the resolved path",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "Path resolution of header.linkname allows relative paths to escape extraction directory",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-200",
+        "cwe_name": "Exposure of Sensitive Information to an Unauthorized Actor",
+        "fit_reason": "Arbitrary file read via hardlink fallback can expose sensitive information",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-378",
+        "cwe_name": "Creation of Temporary File With Insecure Permissions",
+        "fit_reason": "Fallback creates files without proper path validation, potentially exposing sensitive data",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-1004",
+      "CWE-119",
+      "CWE-200",
+      "CWE-22",
+      "CWE-23",
+      "CWE-264",
+      "CWE-378",
+      "CWE-561",
+      "CWE-563",
+      "CWE-59",
+      "CWE-643",
+      "CWE-830",
+      "CWE-912",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-2",
+    "filepath": "index.js",
+    "changed_line": 250,
+    "statement": "var srcpath = path.resolve(cwd, header.linkname)",
+    "change_type": "A",
+    "function_name": "onlink",
+    "operation_type": "path_resolution",
+    "selection_reason": "header.linkname -> path.resolve -> constructs absolute path for file operations",
+    "security_relevance_score": 0.6,
+    "code_context": "101:     }\n102: \n103:     if (stat.isDirectory()) {\n104:       header.size = 0\n105:       header.type = 'directory'\n106:       header = map(header) || header\n107:       return pack.entry(header, onnextentry)\n108:     }\n109: \n110:     if (stat.isSymbolicLink()) {\n111:       header.size = 0\n112:       header.type = 'symlink'\n113:       header = map(header) || header\n114:       return onsymlink(filename, header)\n115:     }\n116: \n117:     // TODO: add fifo etc...\n118: \n119:     header = map(header) || header\n120: \n121:     if (!stat.isFile()) {\n122:       if (strict) return pack.destroy(new Error('unsupported type for ' + filename))\n123:       return onnextentry()\n124:     }\n125: \n126:     var entry = pack.entry(header, onnextentry)\n127:     if (!entry) return\n128: \n129:     var rs = mapStream(xfs.createReadStream(path.join(cwd, filename)), header)\n130: \n131:     rs.on('error', function (err) { // always forward errors on destroy\n132:       entry.destroy(err)\n133:     })\n134: \n135:     pump(rs, entry)\n136:   }\n137: \n138:   var onnextentry = function (err) {\n139:     if (err) return pack.destroy(err)\n140:     statNext(onstat)\n141:   }\n142: \n143:   onnextentry()\n144: \n145:   return pack\n146: }\n147: \n148: var head = function (list) {\n149:   return list.length ? list[list.length - 1] : null\n150: }\n151: \n152: var processGetuid = function () {\n153:   return process.getuid ? process.getuid() : -1\n154: }\n155: \n156: var processUmask = function () {\n157:   return process.umask ? process.umask() : 0\n158: }\n159: \n160: exports.extract = function (cwd, opts) {\n161:   if (!cwd) cwd = '.'\n162:   if (!opts) opts = {}\n163: \n164:   var xfs = opts.fs || fs\n165:   var ignore = opts.ignore || opts.filter || noop\n166:   var map = opts.map || noop\n167:   var mapStream = opts.mapStream || echo\n168:   var own = opts.chown !== false && !win32 && processGetuid() === 0\n169:   var extract = opts.extract || tar.extract()\n170:   var stack = []\n171:   var now = new Date()\n172:   var umask = typeof opts.umask === 'number' ? ~opts.umask : ~processUmask()\n173:   var dmode = typeof opts.dmode === 'number' ? opts.dmode : 0\n174:   var fmode = typeof opts.fmode === 'number' ? opts.fmode : 0\n175:   var strict = opts.strict !== false\n176: \n177:   if (opts.strip) map = strip(map, opts.strip)\n178: \n179:   if (opts.readable) {\n180:     dmode |= parseInt(555, 8)\n181:     fmode |= parseInt(444, 8)\n182:   }\n183:   if (opts.writable) {\n184:     dmode |= parseInt(333, 8)\n185:     fmode |= parseInt(222, 8)\n186:   }\n187: \n188:   var utimesParent = function (name, cb) { // we just set the mtime on the parent dir again everytime we write an entry\n189:     var top\n190:     while ((top = head(stack)) && name.slice(0, top[0].length) !== top[0]) stack.pop()\n191:     if (!top) return cb()\n192:     xfs.utimes(top[0], now, top[1], cb)\n193:   }\n194: \n195:   var utimes = function (name, header, cb) {\n196:     if (opts.utimes === false) return cb()\n197: \n198:     if (header.type === 'directory') return xfs.utimes(name, now, header.mtime, cb)\n199:     if (header.type === 'symlink') return utimesParent(name, cb) // TODO: how to set mtime on link?\n200: \n201:     xfs.utimes(name, now, header.mtime, function (err) {\n202:       if (err) return cb(err)\n203:       utimesParent(name, cb)\n204:     })\n205:   }\n206: \n207:   var chperm = function (name, header, cb) {\n208:     var link = header.type === 'symlink'\n209:     var chmod = link ? xfs.lchmod : xfs.chmod\n210:     var chown = link ? xfs.lchown : xfs.chown\n211: \n212:     if (!chmod) return cb()\n213:     chmod(name, (header.mode | (header.type === 'directory' ? dmode : fmode)) & umask, function (err) {\n214:       if (err) return cb(err)\n215:       if (!own) return cb()\n216:       if (!chown) return cb()\n217:       chown(name, header.uid, header.gid, cb)\n218:     })\n219:   }\n220: \n221:   extract.on('entry', function (header, stream, next) {\n222:     header = map(header) || header\n223:     header.name = normalize(header.name)\n224:     var name = path.join(cwd, path.join('/', header.name))\n225: \n226:     if (ignore(name, header)) {\n227:       stream.resume()\n228:       return next()\n229:     }\n230: \n231:     var stat = function (err) {\n232:       if (err) return next(err)\n233:       utimes(name, header, function (err) {\n234:         if (err) return next(err)\n235:         if (win32) return next()\n236:         chperm(name, header, next)\n237:       })\n238:     }\n239: \n240:     var onsymlink = function () {\n241:       if (win32) return next() // skip symlinks on win for now before it can be tested\n242:       xfs.unlink(name, function () {\n243:         xfs.symlink(header.linkname, name, stat)\n244:       })\n245:     }\n246: \n247:     var onlink = function () {\n248:       if (win32) return next() // skip links on win for now before it can be tested\n249:       xfs.unlink(name, function () {\n250:         var srcpath = path.resolve(cwd, header.linkname)\n251: \n252:         xfs.link(srcpath, name, function (err) {\n253:           if (err && err.code === 'EPERM' && opts.hardlinkAsFilesFallback) {\n254:             stream = xfs.createReadStream(srcpath)\n255:             return onfile()\n256:           }\n257: \n258:           stat(err)\n259:         })\n260:       })\n261:     }\n262: \n263:     var onfile = function () {\n264:       var ws = xfs.createWriteStream(name)\n265:       var rs = mapStream(stream, header)\n266: \n267:       ws.on('error', function (err) { // always forward errors on destroy\n268:         rs.destroy(err)\n269:       })\n270: \n271:       pump(rs, ws, function (err) {\n272:         if (err) return next(err)\n273:         ws.on('close', stat)\n274:       })\n275:     }\n276: \n277:     if (header.type === 'directory') {\n278:       stack.push([name, header.mtime])\n279:       return mkdirp(name, {fs: xfs}, stat)\n280:     }\n281: \n282:     mkdirp(path.dirname(name), {fs: xfs}, function (err) {\n283:       if (err) return next(err)\n284: \n285:       switch (header.type) {\n286:         case 'file': return onfile()\n287:         case 'link': return onlink()\n288:         case 'symlink': return onsymlink()\n289:       }\n290: \n291:       if (strict) return next(new Error('unsupported type for ' + name + ' (' + header.type + ')'))\n292: \n293:       stream.resume()\n294:       next()\n295:     })\n296:   })\n297: \n298:   return extract\n299: }",
+    "source_summary": "header.linkname comes from tar archive metadata, normalized via strip() and map() functions. In pack mode, it's read from filesystem symlinks via xfs.readlink(). In extract mode, it comes directly from the tar entry header.",
+    "sink_summary": "srcpath is used in xfs.link(srcpath, name, ...) to create hard links, and if that fails with EPERM, falls back to xfs.createReadStream(srcpath) for file copying.",
+    "guard_summary": "header.linkname undergoes normalization (path normalization, Windows path conversion) and optional strip() processing. No path traversal validation beyond basic normalization. The operation is skipped on Windows (win32 check).",
+    "risk_pattern": "Untrusted tar archive content (header.linkname) is resolved to an absolute path and used for filesystem operations without path traversal validation, potentially allowing symlink/hardlink attacks.",
+    "used_variable_sources": [
+      "header.linkname",
+      "cwd"
+    ],
+    "called_function_context": [
+      "path.resolve",
+      "xfs.link",
+      "xfs.createReadStream"
+    ],
+    "enclosing_conditions": [
+      "if (!win32)",
+      "if (err && err.code === 'EPERM' && opts.hardlinkAsFilesFallback)"
+    ],
+    "context_summary": "The onlink function handles 'link' type tar entries. It resolves header.linkname relative to cwd, attempts to create a hard link, and falls back to file copying on permission errors.",
+    "unresolved_facts": [
+      "Whether tar-stream validates header.linkname for path traversal",
+      "Security properties of the tar-stream dependency",
+      "Whether map() function provides additional validation"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "fit_reason": "Untrusted tar archive linkname resolved to absolute path without validation, used for hardlink creation and file reading - matches link following vulnerability pattern",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "Archive extraction resolves header.linkname via path.resolve without traversal validation, allowing path traversal attacks",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "header.linkname from untrusted archive used in path.resolve(cwd, header.linkname) without proper relative path validation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-19",
+      "CWE-22",
+      "CWE-23",
+      "CWE-561",
+      "CWE-563",
+      "CWE-59",
+      "CWE-676",
+      "CWE-704",
+      "CWE-829",
+      "CWE-93"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  },
+  {
+    "candidate_id": "candidate-3",
+    "filepath": "index.js",
+    "changed_line": 252,
+    "statement": "xfs.link(srcpath, name, function (err) {",
+    "change_type": "A",
+    "function_name": "onlink",
+    "operation_type": "file_link_operation",
+    "selection_reason": "resolved srcpath -> xfs.link -> creates hard link to potentially arbitrary file",
+    "security_relevance_score": 0.5,
+    "code_context": "103:     if (stat.isDirectory()) {\n104:       header.size = 0\n105:       header.type = 'directory'\n106:       header = map(header) || header\n107:       return pack.entry(header, onnextentry)\n108:     }\n109: \n110:     if (stat.isSymbolicLink()) {\n111:       header.size = 0\n112:       header.type = 'symlink'\n113:       header = map(header) || header\n114:       return onsymlink(filename, header)\n115:     }\n116: \n117:     // TODO: add fifo etc...\n118: \n119:     header = map(header) || header\n120: \n121:     if (!stat.isFile()) {\n122:       if (strict) return pack.destroy(new Error('unsupported type for ' + filename))\n123:       return onnextentry()\n124:     }\n125: \n126:     var entry = pack.entry(header, onnextentry)\n127:     if (!entry) return\n128: \n129:     var rs = mapStream(xfs.createReadStream(path.join(cwd, filename)), header)\n130: \n131:     rs.on('error', function (err) { // always forward errors on destroy\n132:       entry.destroy(err)\n133:     })\n134: \n135:     pump(rs, entry)\n136:   }\n137: \n138:   var onnextentry = function (err) {\n139:     if (err) return pack.destroy(err)\n140:     statNext(onstat)\n141:   }\n142: \n143:   onnextentry()\n144: \n145:   return pack\n146: }\n147: \n148: var head = function (list) {\n149:   return list.length ? list[list.length - 1] : null\n150: }\n151: \n152: var processGetuid = function () {\n153:   return process.getuid ? process.getuid() : -1\n154: }\n155: \n156: var processUmask = function () {\n157:   return process.umask ? process.umask() : 0\n158: }\n159: \n160: exports.extract = function (cwd, opts) {\n161:   if (!cwd) cwd = '.'\n162:   if (!opts) opts = {}\n163: \n164:   var xfs = opts.fs || fs\n165:   var ignore = opts.ignore || opts.filter || noop\n166:   var map = opts.map || noop\n167:   var mapStream = opts.mapStream || echo\n168:   var own = opts.chown !== false && !win32 && processGetuid() === 0\n169:   var extract = opts.extract || tar.extract()\n170:   var stack = []\n171:   var now = new Date()\n172:   var umask = typeof opts.umask === 'number' ? ~opts.umask : ~processUmask()\n173:   var dmode = typeof opts.dmode === 'number' ? opts.dmode : 0\n174:   var fmode = typeof opts.fmode === 'number' ? opts.fmode : 0\n175:   var strict = opts.strict !== false\n176: \n177:   if (opts.strip) map = strip(map, opts.strip)\n178: \n179:   if (opts.readable) {\n180:     dmode |= parseInt(555, 8)\n181:     fmode |= parseInt(444, 8)\n182:   }\n183:   if (opts.writable) {\n184:     dmode |= parseInt(333, 8)\n185:     fmode |= parseInt(222, 8)\n186:   }\n187: \n188:   var utimesParent = function (name, cb) { // we just set the mtime on the parent dir again everytime we write an entry\n189:     var top\n190:     while ((top = head(stack)) && name.slice(0, top[0].length) !== top[0]) stack.pop()\n191:     if (!top) return cb()\n192:     xfs.utimes(top[0], now, top[1], cb)\n193:   }\n194: \n195:   var utimes = function (name, header, cb) {\n196:     if (opts.utimes === false) return cb()\n197: \n198:     if (header.type === 'directory') return xfs.utimes(name, now, header.mtime, cb)\n199:     if (header.type === 'symlink') return utimesParent(name, cb) // TODO: how to set mtime on link?\n200: \n201:     xfs.utimes(name, now, header.mtime, function (err) {\n202:       if (err) return cb(err)\n203:       utimesParent(name, cb)\n204:     })\n205:   }\n206: \n207:   var chperm = function (name, header, cb) {\n208:     var link = header.type === 'symlink'\n209:     var chmod = link ? xfs.lchmod : xfs.chmod\n210:     var chown = link ? xfs.lchown : xfs.chown\n211: \n212:     if (!chmod) return cb()\n213:     chmod(name, (header.mode | (header.type === 'directory' ? dmode : fmode)) & umask, function (err) {\n214:       if (err) return cb(err)\n215:       if (!own) return cb()\n216:       if (!chown) return cb()\n217:       chown(name, header.uid, header.gid, cb)\n218:     })\n219:   }\n220: \n221:   extract.on('entry', function (header, stream, next) {\n222:     header = map(header) || header\n223:     header.name = normalize(header.name)\n224:     var name = path.join(cwd, path.join('/', header.name))\n225: \n226:     if (ignore(name, header)) {\n227:       stream.resume()\n228:       return next()\n229:     }\n230: \n231:     var stat = function (err) {\n232:       if (err) return next(err)\n233:       utimes(name, header, function (err) {\n234:         if (err) return next(err)\n235:         if (win32) return next()\n236:         chperm(name, header, next)\n237:       })\n238:     }\n239: \n240:     var onsymlink = function () {\n241:       if (win32) return next() // skip symlinks on win for now before it can be tested\n242:       xfs.unlink(name, function () {\n243:         xfs.symlink(header.linkname, name, stat)\n244:       })\n245:     }\n246: \n247:     var onlink = function () {\n248:       if (win32) return next() // skip links on win for now before it can be tested\n249:       xfs.unlink(name, function () {\n250:         var srcpath = path.resolve(cwd, header.linkname)\n251: \n252:         xfs.link(srcpath, name, function (err) {\n253:           if (err && err.code === 'EPERM' && opts.hardlinkAsFilesFallback) {\n254:             stream = xfs.createReadStream(srcpath)\n255:             return onfile()\n256:           }\n257: \n258:           stat(err)\n259:         })\n260:       })\n261:     }\n262: \n263:     var onfile = function () {\n264:       var ws = xfs.createWriteStream(name)\n265:       var rs = mapStream(stream, header)\n266: \n267:       ws.on('error', function (err) { // always forward errors on destroy\n268:         rs.destroy(err)\n269:       })\n270: \n271:       pump(rs, ws, function (err) {\n272:         if (err) return next(err)\n273:         ws.on('close', stat)\n274:       })\n275:     }\n276: \n277:     if (header.type === 'directory') {\n278:       stack.push([name, header.mtime])\n279:       return mkdirp(name, {fs: xfs}, stat)\n280:     }\n281: \n282:     mkdirp(path.dirname(name), {fs: xfs}, function (err) {\n283:       if (err) return next(err)\n284: \n285:       switch (header.type) {\n286:         case 'file': return onfile()\n287:         case 'link': return onlink()\n288:         case 'symlink': return onsymlink()\n289:       }\n290: \n291:       if (strict) return next(new Error('unsupported type for ' + name + ' (' + header.type + ')'))\n292: \n293:       stream.resume()\n294:       next()\n295:     })\n296:   })\n297: \n298:   return extract\n299: }",
+    "source_summary": "header.linkname from tar archive entry, normalized but not validated for path traversal",
+    "sink_summary": "xfs.link() creates hard link from resolved srcpath to extracted file name",
+    "guard_summary": "Windows check prevents execution on win32; path.resolve() resolves relative paths but doesn't prevent traversal; no validation of header.linkname source",
+    "risk_pattern": "Untrusted tar archive header.linkname resolves to arbitrary filesystem path via path.resolve(), creating hard links to sensitive files",
+    "used_variable_sources": [
+      "header.linkname",
+      "cwd"
+    ],
+    "called_function_context": [
+      "path.resolve()",
+      "xfs.link()",
+      "xfs.unlink()"
+    ],
+    "enclosing_conditions": [
+      "header.type === 'link'",
+      "!win32"
+    ],
+    "context_summary": "Hard link creation in tar extraction for 'link' type entries, with fallback to file copy on EPERM",
+    "unresolved_facts": [
+      "Whether header.linkname validation occurs before this point",
+      "What security controls exist on the tar archive source",
+      "Whether path traversal protections are implemented elsewhere"
+    ],
+    "hypotheses": [
+      {
+        "cwe_id": "CWE-59",
+        "cwe_name": "Improper Link Resolution Before File Access ('Link Following')",
+        "fit_reason": "Untrusted tar header.linkname resolves to arbitrary filesystem path via path.resolve(), creating hard links to sensitive files without validation",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-22",
+        "cwe_name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+        "fit_reason": "Archive extraction creates hard links using unvalidated header.linkname that can traverse outside extraction directory",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      },
+      {
+        "cwe_id": "CWE-23",
+        "cwe_name": "Relative Path Traversal",
+        "fit_reason": "Relative paths in header.linkname combined with path.resolve() allow accessing files outside intended directory",
+        "proposal_source": "adaptive_bm25",
+        "retrieved_by_sast": true
+      }
+    ],
+    "retrieved_cwe_ids": [
+      "CWE-178",
+      "CWE-200",
+      "CWE-22",
+      "CWE-23",
+      "CWE-378",
+      "CWE-59",
+      "CWE-830",
+      "CWE-863",
+      "CWE-93",
+      "CWE-940",
+      "CWE-99"
+    ],
+    "stage3_retrieval_mode": "adaptive_bm25"
+  }
+]

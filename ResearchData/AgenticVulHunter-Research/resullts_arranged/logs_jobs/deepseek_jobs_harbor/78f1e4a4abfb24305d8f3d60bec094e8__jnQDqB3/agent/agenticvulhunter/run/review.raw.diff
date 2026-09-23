@@ -1,0 +1,190 @@
+diff --git a/src/calibre/gui2/viewer/documentview.py b/src/calibre/gui2/viewer/documentview.py
+index e2c8aeb065b7..36bf1111f85e 100644
+--- a/src/calibre/gui2/viewer/documentview.py
++++ b/src/calibre/gui2/viewer/documentview.py
+@@ -43,6 +43,20 @@ def apply_settings(settings, opts):
+     settings.setFontFamily(QWebSettings.FixedFont, opts.mono_family)
+     settings.setAttribute(QWebSettings.ZoomTextOnly, True)
+ 
++def apply_basic_settings(settings):
++    # Security
++    settings.setAttribute(QWebSettings.JavaEnabled, False)
++    settings.setAttribute(QWebSettings.PluginsEnabled, False)
++    settings.setAttribute(QWebSettings.JavascriptCanOpenWindows, False)
++    settings.setAttribute(QWebSettings.JavascriptCanAccessClipboard, False)
++    settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
++    settings.setAttribute(QWebSettings.NotificationsEnabled, False)
++    settings.setThirdPartyCookiePolicy(QWebSettings.AlwaysBlockThirdPartyCookies)
++
++    # Miscellaneous
++    settings.setAttribute(QWebSettings.LinksIncludedInFocusChain, True)
++    settings.setAttribute(QWebSettings.DeveloperExtrasEnabled, True)
++
+ 
+ class Document(QWebPage):  # {{{
+ 
+@@ -105,15 +119,7 @@ def __init__(self, shortcuts, parent=None, debug_javascript=False):
+         opts = config().parse()
+         self.set_font_settings(opts)
+ 
+-        # Security
+-        settings.setAttribute(QWebSettings.JavaEnabled, False)
+-        settings.setAttribute(QWebSettings.PluginsEnabled, False)
+-        settings.setAttribute(QWebSettings.JavascriptCanOpenWindows, False)
+-        settings.setAttribute(QWebSettings.JavascriptCanAccessClipboard, False)
+-
+-        # Miscellaneous
+-        settings.setAttribute(QWebSettings.LinksIncludedInFocusChain, True)
+-        settings.setAttribute(QWebSettings.DeveloperExtrasEnabled, True)
++        apply_basic_settings(settings)
+         self.set_user_stylesheet(opts)
+         self.misc_config(opts)
+ 
+@@ -509,6 +515,7 @@ def initialize_view(self, debug_javascript=False):
+         self.document = Document(self.shortcuts, parent=self,
+                 debug_javascript=debug_javascript)
+         self.footnotes = Footnotes(self)
++        self.document.settings_changed.connect(self.footnotes.clone_settings)
+         self.setPage(self.document)
+         self.inspector = WebInspector(self, self.document)
+         self.manager = None
+@@ -1309,9 +1316,12 @@ def event(self, ev):
+ 
+     def mouseReleaseEvent(self, ev):
+         url = self.document.mainFrame().hitTestContent(ev.pos()).linkUrl()
+-        if url.isValid():
++        if url.isValid() and self.manager is not None:
+             fd = self.footnotes.get_footnote_data(url)
+-        return
++            if fd:
++                self.manager.show_footnote_view()
++                ev.accept()
++                return
+         opos = self.document.ypos
+         if self.manager is not None:
+             prev_pos = self.manager.update_page_number()
+diff --git a/src/calibre/gui2/viewer/footnote.py b/src/calibre/gui2/viewer/footnote.py
+index 5b66667310f9..2c84759e9a7e 100644
+--- a/src/calibre/gui2/viewer/footnote.py
++++ b/src/calibre/gui2/viewer/footnote.py
+@@ -9,16 +9,55 @@
+ import json
+ from collections import defaultdict
+ 
+-from PyQt5.Qt import QUrl
++from PyQt5.Qt import QUrl, QWidget, QHBoxLayout, QSize
++from PyQt5.QtWebKitWidgets import QWebView, QWebPage
++from PyQt5.QtWebKit import QWebSettings
+ 
+ from calibre import prints
+ 
++class FootnotesPage(QWebPage):
++
++    def __init__(self, parent):
++        QWebPage.__init__(self, parent)
++        from calibre.gui2.viewer.documentview import apply_basic_settings
++        settings = self.settings()
++        apply_basic_settings(settings)
++        settings.setAttribute(QWebSettings.DeveloperExtrasEnabled, False)
++
++
++class FootnotesView(QWidget):
++
++    def __init__(self, parent):
++        QWidget.__init__(self, parent)
++        self.l = l = QHBoxLayout(self)
++        self.view = v = QWebView(self)
++        l.addWidget(v)
++
++    def page(self):
++        return self.view.page()
++
++    def sizeHint(self):
++        return QSize(400, 200)
++
++
+ class Footnotes(object):
+ 
+     def __init__(self, view):
+         self.view = view
+         self.clear()
+ 
++    def set_footnotes_view(self, fv):
++        self.footnotes_view = fv
++        self.clone_settings()
++
++    def clone_settings(self):
++        source = self.view.document.settings()
++        settings = self.footnotes_view.page().settings()
++        for x in 'DefaultFontSize DefaultFixedFontSize MinimumLogicalFontSize MinimumFontSize StandardFont SerifFont SansSerifFont FixedFont'.split():
++            func = 'setFontSize' if x.endswith('FontSize') else 'setFontFamily'
++            getattr(settings, func)(getattr(QWebSettings, x), getattr(source, 'f' + func[4:])(getattr(QWebSettings, x)))
++        settings.setUserStyleSheetUrl(source.userStyleSheetUrl())
++
+     def clear(self):
+         self.footnote_data_cache = {}
+         self.known_footnote_targets = defaultdict(set)
+diff --git a/src/calibre/gui2/viewer/main.py b/src/calibre/gui2/viewer/main.py
+index cd19c2c28a4f..907651d66362 100644
+--- a/src/calibre/gui2/viewer/main.py
++++ b/src/calibre/gui2/viewer/main.py
+@@ -278,6 +278,7 @@ def restore_state(self):
+                 self.restoreState(state, self.STATE_VERSION)
+             except:
+                 pass
++        self.initialize_dock_state()
+         mult = vprefs.get('multiplier', None)
+         if mult:
+             self.view.multiplier = mult
+@@ -979,6 +980,9 @@ def read_settings(self):
+         if self.height() > av:
+             self.resize(self.width(), av)
+ 
++    def show_footnote_view(self):
++        self.footnotes_dock.show()
++
+ def config(defaults=None):
+     desc = _('Options to control the ebook viewer')
+     if defaults is None:
+diff --git a/src/calibre/gui2/viewer/ui.py b/src/calibre/gui2/viewer/ui.py
+index 9683dd9f0785..8c382ab37e39 100644
+--- a/src/calibre/gui2/viewer/ui.py
++++ b/src/calibre/gui2/viewer/ui.py
+@@ -21,6 +21,7 @@
+ from calibre.gui2.viewer.documentview import DocumentView
+ from calibre.gui2.viewer.bookmarkmanager import BookmarkManager
+ from calibre.gui2.viewer.toc import TOCView, TOCSearch
++from calibre.gui2.viewer.footnote import FootnotesView
+ 
+ class DoubleSpinBox(QDoubleSpinBox):  # {{{
+ 
+@@ -269,6 +270,15 @@ def __init__(self, debug_javascript):
+         self.addDockWidget(Qt.RightDockWidgetArea, d)
+         d.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+ 
++        self.footnotes_dock = d = QDockWidget(_('Footnotes'), self)
++        self.footnotes_view = FootnotesView(self)
++        self.view.footnotes.set_footnotes_view(self.footnotes_view)
++        d.setObjectName('footnotes-dock')
++        d.setWidget(self.footnotes_view)
++        d.close()  # starts out hidden
++        self.addDockWidget(Qt.BottomDockWidgetArea, d)
++        d.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
++
+         self.create_actions()
+ 
+         self.metadata = Metadata(self.centralwidget)
+@@ -332,6 +342,13 @@ def resizeEvent(self, ev):
+             self.metadata.update_layout()
+         return MainWindow.resizeEvent(self, ev)
+ 
++    def initialize_dock_state(self):
++        self.setCorner(Qt.TopLeftCorner, Qt.LeftDockWidgetArea)
++        self.setCorner(Qt.BottomLeftCorner, Qt.LeftDockWidgetArea)
++        self.setCorner(Qt.TopRightCorner, Qt.RightDockWidgetArea)
++        self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
++        self.footnotes_dock.close()
++
+     def create_actions(self):
+         def a(name, text, icon, tb=None, sc_name=None, menu_name=None, popup_mode=QToolButton.MenuButtonPopup):
+             name = 'action_' + name
