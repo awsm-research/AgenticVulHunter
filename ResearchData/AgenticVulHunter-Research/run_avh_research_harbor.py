@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility entry point for the AgenticVulHunter Harbor adapter."""
+"""entry point for the AgenticVulHunter Harbor."""
 
 from avh_harbor import AgenticVulHunterResearchAgent, main
 
