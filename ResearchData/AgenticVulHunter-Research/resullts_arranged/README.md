@@ -1,14 +1,16 @@
-Results Arranged
+# Results Arranged
 
-This folder stores the arranged outputs from AgenticVulHunter and baseline experiments.
+This folder contains the arranged experiment outputs used for the AgenticVulHunter evaluation and baseline comparison.
 
-Folder Structure
+## Folder Structure
 
+```text
 results_arranged/
 ├── all_result_in_jsonl/
 ├── leader_board_logs/
 ├── logs_jobs/
 └── README.md
+```
 
 Main Folders
 
