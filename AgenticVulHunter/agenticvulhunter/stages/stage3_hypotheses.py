@@ -55,16 +55,16 @@ class Stage3Hypotheses(Stage):
     def __init__(self, config: Config, client: ChatClient, logger: RunLogger):
         self.config = config
         self.client = client
-        self.logger = logger
+        self._logger = logger
         self.bm25 = BM25Retriever(config.bm25, logger)
 
     def execute(self, value: Any) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = value
-        stage_dir = self.logger.stage_dir(self.name)
-        self.logger.write_json(stage_dir / "input.json", candidates)
+        stage_dir = self._logger.stage_dir(self.name)
+        self._logger.write_json(stage_dir / "input.json", candidates)
         results: list[dict[str, Any]] = []
         if not candidates:
-            self.logger.write_json(stage_dir / "output.json", results)
+            self._logger.write_json(stage_dir / "output.json", results)
             return results
 
         system = prompt("stage3_hypotheses.md").replace(
@@ -77,7 +77,7 @@ class Stage3Hypotheses(Stage):
             item_dir.mkdir(parents=True, exist_ok=True)
 
             initial = self.bm25.search(candidate, self.config.bm25.top_k)
-            self.logger.write_json(item_dir / "bm25_response_1.json", initial)
+            self._logger.write_json(item_dir / "bm25_response_1.json", initial)
             initial_rules = compact_rules(initial)
 
             tool = make_bm25_tool(
@@ -90,7 +90,7 @@ class Stage3Hypotheses(Stage):
             agent = AgentRunner(
                 self.client,
                 ToolRegistry([tool]),
-                self.logger,
+                self._logger,
                 stage=f"{self.name}:{candidate_id}",
                 max_steps=self.config.agents.stage3_max_steps,
                 artifact_dir=item_dir,
@@ -111,7 +111,7 @@ class Stage3Hypotheses(Stage):
                 output["hypotheses"] = []
                 output["retrieved_cwe_ids"] = sorted(allowed)
                 output["stage3_status"] = "model_output_error"
-                self.logger.write_json(
+                self._logger.write_json(
                     item_dir / "model_output_error.json",
                     {
                         "candidate_id": candidate_id,
@@ -120,7 +120,7 @@ class Stage3Hypotheses(Stage):
                     },
                 )
                 results.append(output)
-                self.logger.write_json(item_dir / "output.json", output)
+                self._logger.write_json(item_dir / "output.json", output)
                 continue
 
             if isinstance(answer, dict) and isinstance(answer.get("hypotheses"), list):
@@ -165,7 +165,7 @@ class Stage3Hypotheses(Stage):
             output["hypotheses"] = hypotheses
             output["retrieved_cwe_ids"] = sorted(allowed)
             results.append(output)
-            self.logger.write_json(item_dir / "output.json", output)
+            self._logger.write_json(item_dir / "output.json", output)
 
-        self.logger.write_json(stage_dir / "output.json", results)
+        self._logger.write_json(stage_dir / "output.json", results)
         return results

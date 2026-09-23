@@ -32,7 +32,7 @@ class Stage1Candidates(Stage):
     ):
         self.config = config
         self.client = client
-        self.logger = logger
+        self._logger = logger
         self.repo_tools = repo_tools
         self.diff_text = diff_text
 
@@ -73,10 +73,10 @@ class Stage1Candidates(Stage):
         return chunks or [text]
 
     def execute(self, _value: Any = None) -> list[dict[str, Any]]:
-        stage_dir = self.logger.stage_dir(self.name)
+        stage_dir = self._logger.stage_dir(self.name)
         parsed = parse_unified_diff(self.diff_text)
         annotated = annotate_diff(self.diff_text)
-        self.logger.write_text(stage_dir / "annotated.diff", annotated)
+        self._logger.write_text(stage_dir / "annotated.diff", annotated)
 
         # Runtime Stage 1 only selects exact added lines from the current diff.
         allowed = {
@@ -85,7 +85,7 @@ class Stage1Candidates(Stage):
             if key[2] == "A" and statement.strip()
         }
         if not allowed:
-            self.logger.write_json(stage_dir / "output.json", [])
+            self._logger.write_json(stage_dir / "output.json", [])
             return []
 
         system = prompt("stage1_candidates.md")
@@ -98,7 +98,7 @@ class Stage1Candidates(Stage):
         for index, chunk in enumerate(self._chunks(annotated, target), start=1):
             item_dir = stage_dir / f"batch-{index:03d}"
             item_dir.mkdir(parents=True, exist_ok=True)
-            self.logger.write_text(item_dir / "annotated_input.diff", chunk)
+            self._logger.write_text(item_dir / "annotated_input.diff", chunk)
             user = (
                 f"ANNOTATED DIFF BATCH:\n\n{chunk}\n\n"
                 "Follow the Stage 1 instructions and return only the JSON array."
@@ -106,7 +106,7 @@ class Stage1Candidates(Stage):
             agent = AgentRunner(
                 self.client,
                 registry,
-                self.logger,
+                self._logger,
                 stage=f"{self.name}:batch-{index}",
                 max_steps=self.config.agents.stage1_max_steps,
                 artifact_dir=item_dir,
@@ -115,7 +115,7 @@ class Stage1Candidates(Stage):
                 raw.extend(self._normalise_answer(agent.run(system, user)))
             except (AgentOutputError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 degraded += 1
-                self.logger.write_json(
+                self._logger.write_json(
                     item_dir / "model_output_error.json",
                     {"error_type": type(exc).__name__, "error": str(exc)},
                 )
@@ -169,7 +169,7 @@ class Stage1Candidates(Stage):
             output.append(candidate.to_dict())
             seen.add(key)
 
-        self.logger.event(
+        self._logger.event(
             "candidate_validation",
             {
                 "proposed": len(raw),
@@ -177,5 +177,5 @@ class Stage1Candidates(Stage):
                 "degraded_batches": degraded,
             },
         )
-        self.logger.write_json(stage_dir / "output.json", output)
+        self._logger.write_json(stage_dir / "output.json", output)
         return output
